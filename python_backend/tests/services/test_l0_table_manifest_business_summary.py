@@ -52,8 +52,9 @@ def test_ticket_table_l0_is_discoverable_by_product_without_claiming_product_gra
         assert forbidden not in serialized_l0
 
 
-def test_ticket_table_details_and_product_columns_require_progressive_reads() -> None:
-    catalog = SemanticCatalogService(TopicAssetService(get_settings()))
+def test_ticket_table_details_expose_navigation_but_require_exact_leaf_reads() -> None:
+    topic_assets = TopicAssetService(get_settings())
+    catalog = SemanticCatalogService(topic_assets)
 
     manifest_read = catalog.read(ref_id=f"semantic:{TOPIC}:manifest")
     assert manifest_read["success"] is True
@@ -68,8 +69,43 @@ def test_ticket_table_details_and_product_columns_require_progressive_reads() ->
     detail = json.loads(detail_read["content"])
     assert detail["dataGrain"] == "订单/子订单明细粒度"
     assert detail["dataGrain"] != "商品粒度"
-    assert "spu_id" not in detail_read["content"]
-    assert "spu_name" not in detail_read["content"]
+
+    navigation = detail["semanticNavigation"]
+    assert navigation["source"] == "published_asset"
+    assert navigation["questionIndependent"] is True
+    assert navigation["bindingEvidence"] is False
+    published_asset = topic_assets.load_table_asset(TOPIC, TABLE)
+    published_columns = {
+        str(item.get("columnName") or item.get("key") or ""): item
+        for item in published_asset.get("semanticColumns") or []
+        if isinstance(item, dict) and str(item.get("columnName") or item.get("key") or "")
+    }
+    advertised_columns = {
+        str(item.get("key") or ""): item
+        for item in navigation["columnLeaves"]
+        if isinstance(item, dict) and str(item.get("key") or "")
+    }
+    assert advertised_columns
+    assert set(advertised_columns).issubset(published_columns)
+    assert navigation["publishedCounts"]["columns"] == len(published_columns)
+    assert navigation["advertisedCounts"]["columns"] == len(advertised_columns)
+    for key, leaf in advertised_columns.items():
+        assert set(leaf).issubset(
+            {"key", "aliases", "refId", "path", "semanticRole", "timeRole"}
+        )
+        assert leaf["refId"]
+        assert leaf["path"]
+        assert "definition" not in leaf
+        assert "schemaContract" not in leaf
+        assert key in published_columns
+
+    exact_leaf = next(iter(advertised_columns.values()))
+    exact_read = catalog.read(ref_id=exact_leaf["refId"], max_chars=2_000_000)
+    assert exact_read["success"] is True
+    exact_payload = json.loads(exact_read["content"])
+    assert exact_payload["key"] == exact_leaf["key"]
+    assert exact_payload["definition"]["columnName"] == exact_leaf["key"]
+    assert exact_payload["definition"]["schemaContract"]
 
     schema_ref = next(child["refId"] for child in detail["children"] if child["kind"] == "SCHEMA")
     schema_read = catalog.read(ref_id=schema_ref, max_chars=2_000_000)

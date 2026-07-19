@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
+    "build": "npm run check:no-regex && vite build",
+    "check:no-regex": "node scripts/assert-no-regex.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
@@ -14,5 +15,7 @@
     "vue": "^3.5.13",
     "lucide-vue-next": "^0.468.0"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@babel/parser": "^7.29.3"
+  }
 }

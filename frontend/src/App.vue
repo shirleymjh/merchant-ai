@@ -4,18 +4,10 @@
       <button type="button" class="brand-menu" title="打开对话目录" @click="outlineOpen = true"><PanelLeftOpen :size="20" /></button>
       <div class="brand-mark"><ShoppingBag :size="24" /></div>
       <div class="brand-copy"><h1>yshopping 商家 AI 助手</h1><p>经营数据、分析与行动建议</p></div>
-      <label class="identity-selector" title="选择当前使用角色">
+      <div v-if="userIdentity.displayName || userIdentity.userId" class="identity-selector" title="当前认证身份">
         <span>当前身份</span>
-        <select v-model="userIdentity.role">
-          <option v-if="internalMode" value="platform_operator">平台运营管理员</option>
-          <option value="merchant_owner">店铺负责人</option>
-          <option value="merchant_operator">经营运营</option>
-          <option value="merchant_finance">财务</option>
-          <option value="merchant_customer_service">客服</option>
-          <option value="merchant_goods">商品运营</option>
-          <option value="merchant_fulfillment">履约运营</option>
-        </select>
-      </label>
+        <strong>{{ userIdentity.displayName || userIdentity.userId }}</strong>
+      </div>
       <button v-if="internalMode" type="button" class="brand-admin" title="打开内部经营配置" @click="governanceOpen = true"><Settings2 :size="17" />经营配置</button>
       <button type="button" class="brand-new-chat" @click="resetChat"><MessageCirclePlus :size="17" />新会话</button>
     </header>
@@ -156,36 +148,16 @@ const fileInput = ref(null)
 const attachments = ref([])
 const outlineOpen = ref(false)
 const governanceOpen = ref(false)
-const internalMode = new URLSearchParams(window.location.search).get('ops') === '1'
-const userIdentity = ref({
-  userId: internalMode ? 'platform_ops' : 'merchant_user_100',
-  displayName: internalMode ? '平台运营管理员' : '当前商家用户',
-  role: internalMode ? 'platform_operator' : 'merchant_operator',
-  region: 'CN', language: 'zh-CN', storeIds: [], permissions: internalMode ? ['merchant.read', 'governance.write'] : ['merchant.read']
-})
+const runtimeBootstrap = globalThis.__MERCHANT_AI_RUNTIME__ || {}
+const internalMode = runtimeBootstrap.internalMode === true
+const userIdentity = ref(cloneValue(runtimeBootstrap.identity || {}))
 const executedAdvice = ref(new Set())
 const dailyReport = ref(null)
 const merchantProfile = ref(null)
 const newSessionFlash = ref(false)
-const defaultSuggestions = [
-  '最近7天店铺整体经营情况怎么样？',
-  '最近7天订单量和退款金额有什么变化？',
-  '最近30天 GMV 为什么下降？',
-  '最近30天退款金额最高的前5个商品有哪些？',
-  '退款率高的商品是否也带来较多工单？',
-  '工单最多的问题类型有哪些？',
-  '最近7天客服工单量按天趋势如何？',
-  '最近10天商品审核拒绝明细',
-  '最近7天履约量和发货超时订单量',
-  '最近30天赔付金额最高的订单有哪些？',
-  '最近7天优惠金额和 GMV 表现如何？',
-  '保证金余额和冻结金额是否异常？',
-  '最近30天申诉次数和处罚次数',
-  '商品审核被拒后优先排查什么？',
-  '催单工单最近是否升高？'
-]
+const defaultSuggestions = []
 const suggestionPageSize = 3
-const initialSession = createConversationSession('经营分析工作台', '您好，我是 yshopping 商家经营助手。可以帮您查订单、退款售后、客服工单、商品审核、履约和经营趋势。')
+const initialSession = createConversationSession('分析工作台', '您好，请输入您的分析问题。')
 const restoredConversation = restorePersistedSessions(initialSession)
 const sessions = ref(restoredConversation.sessions)
 const activeSessionId = ref(restoredConversation.activeSessionId)
@@ -204,9 +176,8 @@ const showAnalysisRail = computed(() => hasConversation.value && hasMetricInsigh
 const currentAdvice = computed(() => {
   const advice = latestAssistantMessage.value?.merchantExperience?.businessAdvice || []
   const fallback = latestAssistantMessage.value?.merchantExperience?.drillDownActions?.map(item => item.label || item.question) || []
-  const answerAdvice = extractAdviceFromAnswer(latestAssistantMessage.value?.text || '')
   const suggested = latestAssistantMessage.value?.suggestions || []
-  const candidates = advice.length >= 2 ? advice : [...advice, ...answerAdvice, ...fallback, ...suggested]
+  const candidates = advice.length >= 2 ? advice : [...advice, ...fallback, ...suggested]
   return candidates
     .filter(Boolean)
     .filter((item, index, all) => all.indexOf(item) === index)
@@ -382,10 +353,7 @@ async function handleFiles(event) {
 }
 
 function removeAttachment(index) { attachments.value.splice(index, 1) }
-function adviceTitle(text) {
-  if (/退款|售后/.test(text)) return '控制退款风险'
-  if (/订单|转化|GMV|成交/.test(text)) return '提升交易表现'
-  if (/客服|工单|响应/.test(text)) return '优化服务体验'
+function adviceTitle() {
   return '建议立即关注'
 }
 function hasMetricInsightChart(message) {
@@ -402,12 +370,6 @@ function hasMetricInsightChart(message) {
       .filter(row => row.label && Number.isFinite(row.value))
     return dimensionRows.length > 1
   })
-}
-function extractAdviceFromAnswer(text) {
-  const lines = String(text || '').split('\n').map(line => line.trim())
-  const start = lines.findIndex(line => /^建议[:：]?$/.test(line))
-  if (start < 0) return []
-  return lines.slice(start + 1).filter(line => /^[-•]/.test(line)).map(line => line.replace(/^[-•]\s*/, '')).slice(0, 3)
 }
 function scrollToMessage(id) {
   document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -635,11 +597,11 @@ function appendAssistantToSession(sessionId, response, streamingRunId = '') {
     question: sourceQuestion,
     text: response.answer,
     steps: response.thinkingSteps || [],
-    tables: (response.dorisTables || []).filter(table => table !== 'dim_merchant_df'),
+    tables: response.dorisTables || [],
     dataRows: response.dataRows || [],
     dataSections: (response.dataSections || []).map(section => ({
       ...section,
-      dorisTables: (section.dorisTables || []).filter(table => table !== 'dim_merchant_df'),
+      dorisTables: section.dorisTables || [],
       dataRows: section.dataRows || []
     })),
     merchantExperience: response.merchantExperience || response.merchant_experience || {},
@@ -752,7 +714,7 @@ async function handleMetricDefinitionAction(payload) {
   try {
     await recordMetricDefinitionPreference({
       ...payload,
-      reviewer: userIdentity.value.displayName || userIdentity.value.userId || 'merchant_user'
+      reviewer: userIdentity.value.displayName || userIdentity.value.userId || ''
     })
   } catch {
     // 前端演示模式下忽略偏好写入失败。
@@ -773,7 +735,7 @@ async function handleKnowledgeProposalAction(payload) {
   updateProposal({ actionPending: true, actionError: '' })
   try {
     const result = await actOnKnowledgeSuggestion(payload.suggestionId, payload.action, {
-      actor: userIdentity.value.displayName || userIdentity.value.userId || 'merchant_user',
+      actor: userIdentity.value.displayName || userIdentity.value.userId || '',
       conflictResolution: payload.conflictResolution || ''
     })
     const suggestion = result.suggestion || {}
@@ -823,7 +785,7 @@ async function resetChat() {
   saveActiveSessionSnapshot()
   input.value = ''
   newSessionFlash.value = true
-  const session = createConversationSession('新会话', '您好，我是 yshopping 商家经营助手。新的经营分析会话已开启。')
+  const session = createConversationSession('新会话', '您好，请输入您的分析问题。')
   sessions.value = [session, ...sessions.value].slice(0, 6)
   loadSession(session.id)
   persistSessions()

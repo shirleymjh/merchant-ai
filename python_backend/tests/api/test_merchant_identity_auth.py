@@ -91,6 +91,16 @@ def test_verified_same_merchant_identity_can_access_run_listing_and_upload(tmp_p
     assert uploaded.json()["success"] is True
 
 
+def test_current_profile_scope_comes_from_verified_identity_not_frontend_default(tmp_path: Path) -> None:
+    client, secret = authenticated_client(tmp_path)
+    headers = {"Authorization": "Bearer %s" % identity_token(secret, merchant_id="200")}
+
+    response = client.get("/api/merchant-profile", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["profile"]["merchantId"] == "200"
+
+
 def test_explicitly_disabled_identity_auth_keeps_local_merchant_access(tmp_path: Path) -> None:
     client = TestClient(
         create_app(
@@ -104,6 +114,34 @@ def test_explicitly_disabled_identity_auth_keeps_local_merchant_access(tmp_path:
     )
 
     assert client.get("/api/runs?merchantId=100").status_code == 200
+
+
+def test_unconfigured_grounded_data_plane_is_typed_503_and_control_plane_stays_ready(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.setenv("YSHOPPING_LLM_API_KEY", "")
+    application = create_app(
+        Settings(
+            merchant_id="100",
+            allowed_merchant_ids="100",
+            identity_auth_required=False,
+            llm_api_key="",
+            harness_workspace_path=str(tmp_path),
+        )
+    )
+
+    assert application.state.runtime.runtime_trace()["onlineReady"] is False
+    response = TestClient(application).post(
+        "/api/chat",
+        json={"message": "最近7天订单量", "merchantId": "100"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == (
+        "GROUNDED_ONLINE_RUNTIME_UNAVAILABLE"
+    )
 
 
 def test_browser_bundle_does_not_embed_or_send_ops_credentials() -> None:

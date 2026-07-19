@@ -54,6 +54,56 @@ def extracted_metric_phrase(phrase: str, analysis_intent: str = "lookup") -> Sim
     )
 
 
+def test_structured_artifact_refs_disable_quick_metric_before_query() -> None:
+    metric = semantic_metric(
+        "runtime_attachment_metric",
+        "附件指标",
+        "MAX(snapshot_rate)",
+        "MAX(`snapshot_rate`)",
+        policy="daily_value_only",
+        grain="day",
+    )
+
+    class UnexpectedRepository:
+        def query(self, sql, params=None):
+            raise AssertionError("artifact-bearing requests must use the governed analysis path")
+
+    response = quick_metric_response(
+        "最近2天附件指标趋势",
+        "tenant-artifact",
+        UnexpectedRepository(),
+        extracted_metric_phrase("附件指标", analysis_intent="trend"),
+        [metric],
+        artifact_refs=[{"uri": "merchant://request/input.csv"}],
+    )
+
+    assert response is None
+
+
+def test_missing_structured_keywords_disable_quick_metric_before_query() -> None:
+    metric = semantic_metric(
+        "runtime_structured_gate_metric",
+        "结构门指标",
+        "MAX(snapshot_rate)",
+        "MAX(`snapshot_rate`)",
+        policy="daily_value_only",
+        grain="day",
+    )
+
+    class UnexpectedRepository:
+        def query(self, sql, params=None):
+            raise AssertionError("quick metric requires structured keyword evidence")
+
+    response = quick_metric_response(
+        "最近2天结构门指标趋势",
+        "tenant-structured-gate",
+        UnexpectedRepository(),
+        semantic_metrics=[metric],
+    )
+
+    assert response is None
+
+
 def test_compiler_preserves_published_temporal_governance_metadata() -> None:
     contract = compile_semantic_quick_metric(
         {

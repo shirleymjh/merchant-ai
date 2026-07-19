@@ -6,7 +6,6 @@ import hashlib
 import inspect
 import json
 import os
-import re
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -118,6 +117,7 @@ from merchant_ai.services.answer import (
     visible_successful_tasks,
 )
 from merchant_ai.services.analysis_worker import AnalysisWorkerExecutor
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.services.assets import (
     HybridRecallService,
     PlanningAssetPackBuilder,
@@ -151,6 +151,7 @@ from merchant_ai.services.grounded_query_contract import (
     merge_grounded_rejected_bindings,
 )
 from merchant_ai.services.latency import LatencyOptimizer
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.llm_recovery import (
     bounded_single_retry_count,
@@ -185,7 +186,11 @@ from merchant_ai.services.planning import (
 )
 from merchant_ai.services.planning_tooling import planner_failure_gap_code
 from merchant_ai.services.prompts import PromptAssembler
-from merchant_ai.services.quick_metrics import published_semantic_quick_metrics, quick_metric_response
+from merchant_ai.services.quick_metrics import (
+    is_metric_definition_question,
+    published_semantic_quick_metrics,
+    quick_metric_response,
+)
 from merchant_ai.services.query import (
     NodeWorkerExecutor,
     SqlValidationService,
@@ -232,6 +237,7 @@ from merchant_ai.services.tools import (
     semantic_file_tool_schemas,
 )
 from merchant_ai.services.time_semantics import apply_time_window_contract_to_plan, resolve_time_range, resolve_time_window_contract
+from merchant_ai.services.text_parsing import contains_any_literal, safe_ascii_component, split_on_characters
 from merchant_ai.services.tool_runtime import tool_runtime_scope
 from merchant_ai.services.security import identity_scope_hash, identity_scope_payload
 
@@ -471,7 +477,10 @@ class MerchantQaWorkflow:
             safety_finish_reasons=[],
             run_budget_report={},
             run_budget_exhausted=False,
-            run_started_at_ms=now_ms(),
+            # Run budgets use wall-clock epoch milliseconds so checkpoints can
+            # be compared across processes.  Trace spans intentionally use the
+            # monotonic ``now_ms`` helper and must not share this field.
+            run_started_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
             workspace_manifest=WorkspaceManifest(),
             run_steps=[],
             trace_spans=[],
@@ -913,13 +922,13 @@ class MerchantQaWorkflow:
             add_step(state, "Preflight Route Gate：识别为轻量对话，不做 Topic/Metric 解析")
         elif route == QuestionRoute.INVALID and not state.get("_preflight_requires_full_context"):
             if understanding.surface_signals.get("writeOperation"):
-                clarification = "当前 BI Agent 只支持只读查询和分析，不能执行删除、修改、创建或重建等写操作。请改成只读问题，例如“查看最近30天相关数据”。"
+                clarification = "当前 BI Agent 只支持只读查询和分析，不能执行写操作。请改成只读查询问题。"
                 options = ["改成只读查询", "取消本次操作"]
                 clarification_type = "write_operation"
                 stage = "UNSUPPORTED_OPERATION"
             else:
                 clarification = understanding.clarification_question or self.build_scope_clarification_prompt(state)
-                options = business_scope_examples()
+                options = business_scope_examples(self.recall_service.topic_assets)
                 clarification_type = "business_scope"
                 stage = "BUSINESS_SCOPE"
             self.request_human_clarification(state, clarification, stage, clarification_type, options)
@@ -1029,6 +1038,12 @@ class MerchantQaWorkflow:
             )
         context = state.get("request_context")
         if context and context.pending_clarification_type == "skill_confirm":
+            resolution = self.clarification_resolver.resolve_context(
+                context,
+                state.get("question", ""),
+            )
+            if resolution:
+                state["clarification_resolution"] = resolution
             self.restore_confirmation_evidence(state)
         if context and context.pending_clarification_stage and context.pending_question and not state.get("confirmation_evidence_reused"):
             resolution = self.clarification_resolver.resolve_context(context, state.get("question", ""))
@@ -2599,7 +2614,7 @@ class MerchantQaWorkflow:
         if route_slots.operation == "write_requested":
             self.request_human_clarification(
                 state,
-                "当前 BI Agent 只支持只读查询和分析，不能执行删除、修改、创建或重建等写操作。请改成只读问题，例如“查看最近30天相关数据”。",
+                "当前 BI Agent 只支持只读查询和分析，不能执行写操作。请改成只读查询问题。",
                 "UNSUPPORTED_OPERATION",
                 "write_operation",
                 ["改成只读查询", "取消本次操作"],
@@ -2692,7 +2707,7 @@ class MerchantQaWorkflow:
                 self.build_topic_clarification_prompt(state),
                 "BUSINESS_SCOPE",
                 "topic_required",
-                business_scope_examples(),
+                business_scope_examples(self.recall_service.topic_assets),
             )
         else:
             diagnostic_topics = self.apply_open_diagnostic_policy(state, decision)
@@ -2748,7 +2763,10 @@ class MerchantQaWorkflow:
         explicit_single_topic_lock = bool(
             len(topics) == 1
             and (
-                re.search(r"(?:只|仅|单独)(?:看|查|分析|关注)", str(state.get("question") or ""))
+                contains_any_literal(
+                    state.get("question") or "",
+                    load_language_policy().routing.scope_lock_markers,
+                )
                 or (
                     context
                     and context.pending_clarification_type == "topic_required"
@@ -3054,6 +3072,9 @@ class MerchantQaWorkflow:
             state.get("extracted_keywords"),
             semantic_metrics,
             timezone_name=self.settings.business_timezone,
+            artifact_refs=list(
+                getattr(state.get("request_context"), "offloaded_files", None) or []
+            ),
         )
         if response is None:
             state["fast_metric_completed"] = False
@@ -3303,6 +3324,8 @@ class MerchantQaWorkflow:
         business_topics = set(self._asset_backed_topic_categories(list(topics)))
         if fast.intent_kind in {"chat", "invalid", "write_requested", "rule_only"}:
             return {}
+        if is_metric_definition_question(str(state.get("question") or "")):
+            return {}
         if state.get("open_diagnostic_intent"):
             return {}
         if (
@@ -3542,7 +3565,7 @@ class MerchantQaWorkflow:
                     history_rows=state.get("history_rows", []),
                     knowledge_context=knowledge_context(state),
                     merchant_id=state["merchant"].merchant_id,
-                    access_role=state.get("access_role", "merchant_analyst"),
+                    access_role=state.get("access_role", load_authorization_policy().default_access_role),
                     permissions=list((state.get("user_identity") or {}).get("permissions") or []),
                     previous_user_question=previous_user_question(
                         state.get("message_history") or [],
@@ -4142,7 +4165,6 @@ class MerchantQaWorkflow:
         return has_rule_signal or has_rule_recall
 
     def requires_bi_execution(self, state: AgentState, keywords: ExtractedKeywords | None = None) -> bool:
-        text = str(state.get("question") or "").lower()
         keywords = keywords or state.get("extracted_keywords") or ExtractedKeywords()
         route_slots = state.get("route_slots") or RouteSlots()
         if route_slots.operation == "write_requested":
@@ -4155,27 +4177,7 @@ class MerchantQaWorkflow:
             return False
         if keywords.metric_keywords or keywords.dimension_keywords:
             return True
-        data_action_terms = [
-            "查询",
-            "查看",
-            "看下",
-            "看看",
-            "关联",
-            "对应",
-            "明细",
-            "详情",
-            "列表",
-            "记录",
-            "金额",
-            "趋势",
-            "top",
-            "前",
-            "最高",
-            "最多",
-            "多少",
-        ]
-        has_data_action = any(term in text for term in data_action_terms)
-        if has_data_action:
+        if keywords.action_keywords or keywords.ranking_keywords or route_slots.analysis_signals:
             return True
         if getattr(keywords, "time_keywords", []):
             return True
@@ -4490,7 +4492,7 @@ class MerchantQaWorkflow:
                 "这类查询需要明确时间范围，请问要查询最近多久？",
                 "QUERY_PLAN",
                 "time_window",
-                ["最近7天", "最近30天", "最近90天"],
+                list(load_language_policy().routing.time_clarification_options),
             )
             add_step(state, "Core Grounding：用户未提供时间范围，转入 ask_human，未编译或执行 SQL")
         self.planner.artifact_store.write_json(
@@ -6013,7 +6015,7 @@ class MerchantQaWorkflow:
                     state["question"],
                     graph_validator=self.graph_validator,
                     memory_constraints=state.get("memory_constraints", []),
-                    access_role=state.get("access_role", "merchant_operator"),
+                    access_role=state.get("access_role", load_authorization_policy().default_access_role),
                     user_scope=state.get("user_identity", {}),
                 )
                 state["plan"] = execution_preparation.plan
@@ -6124,7 +6126,7 @@ class MerchantQaWorkflow:
                 state["question"],
                 resume_task_results=(state.get("agent_run_result") or AgentRunResult()).task_results,
                 run_id=state.get("run_id", ""),
-                access_role=state.get("access_role", "merchant_operator"),
+                access_role=state.get("access_role", load_authorization_policy().default_access_role),
                 user_scope=state.get("user_identity", {}),
                 execution_mode=state.get("node_execution_mode", "auto"),
                 execution_preparation=execution_preparation,
@@ -6604,10 +6606,10 @@ class MerchantQaWorkflow:
 
     def _fallback_delegation_plan(self, state: AgentState, allowed_kinds: List[str]) -> SubAgentDelegationPlan:
         question = str(state.get("question") or "")
-        lowered = question.lower()
+        context = state.get("request_context")
+        files = list(getattr(context, "offloaded_files", None) or [])
         task_kind = ""
-        python_requested = any(token in lowered for token in ("python", "批量分析", "批处理", "模拟计算", "运行脚本"))
-        if "python_batch" in allowed_kinds and python_requested:
+        if "python_batch" in allowed_kinds and any(str(path).casefold().endswith(".py") for path in files):
             task_kind = "python_batch"
         elif "document_analysis" in allowed_kinds:
             task_kind = "document_analysis"
@@ -6651,7 +6653,8 @@ class MerchantQaWorkflow:
         actual_attempts = 0
         for attempt in range(attempts):
             actual_attempts = attempt + 1
-            task_id = "delegate_%s_%s" % (re.sub(r"[^a-zA-Z0-9_-]+", "_", task.task_kind), uuid.uuid4().hex[:12])
+            task_kind = safe_ascii_component(task.task_kind, extras=("_", "-"), default="worker")
+            task_id = "delegate_%s_%s" % (task_kind, uuid.uuid4().hex[:12])
             if bool(self.settings.distributed_subagents_enabled):
                 result = DistributedSubAgentClient(self.settings).execute(
                     str(state.get("run_id") or state.get("qa_id") or "delegation"),
@@ -6749,7 +6752,7 @@ class MerchantQaWorkflow:
                     "effectiveUserId": str((state.get("user_identity") or {}).get("userId") or ""),
                     "authorizedRegion": str((state.get("user_identity") or {}).get("region") or ""),
                     "authorizedStoreIds": list((state.get("user_identity") or {}).get("storeIds") or []),
-                    "accessRole": state.get("access_role", "merchant_analyst"),
+                    "accessRole": state.get("access_role", load_authorization_policy().default_access_role),
                     "question": task.objective or state.get("question", ""),
                     "subAgentRunId": str(state.get("run_id") or ""),
                     "workspacePath": state["thread_data"].workspace_path,
@@ -7170,7 +7173,7 @@ class MerchantQaWorkflow:
                 self.build_scope_clarification_prompt(state),
                 "BUSINESS_SCOPE",
                 "business_scope",
-                business_scope_examples(),
+                business_scope_examples(self.recall_service.topic_assets),
             )
             return self.human_in_loop(state)
         else:
@@ -7266,7 +7269,7 @@ class MerchantQaWorkflow:
             return False
         context = state.get("request_context")
         if context and context.pending_clarification_type == "skill_confirm":
-            if skill_confirmation_declined(state.get("original_question") or state.get("question") or ""):
+            if skill_confirmation_declined(state.get("clarification_resolution") or {}):
                 state["analysis_skill_bypassed"] = True
                 state["analysis_skill_status"] = {"status": "declined", "source": "user"}
                 return False
@@ -7476,7 +7479,9 @@ class MerchantQaWorkflow:
         state["confirmation_evidence_reused"] = True
         state["confirmation_source_run_id"] = source_run_id
         state["confirmation_token"] = ""
-        state["analysis_skill_bypassed"] = skill_confirmation_declined(state.get("original_question") or "")
+        state["analysis_skill_bypassed"] = skill_confirmation_declined(
+            state.get("clarification_resolution") or {}
+        )
         state["topic_routed"] = True
         state["fast_understood"] = True
         state["data_discovered"] = True
@@ -9363,18 +9368,6 @@ class MerchantQaWorkflow:
 
     def request_human_clarification(self, state: AgentState, question: str, stage: str, type_: str, options: List[str]) -> None:
         question_text = str(question or "").strip()
-        metric_gap = re.search(r"(?:当前)?候选(?:指标)?中没有明确的[“\"]?(.+?)[”\"]?指标", question_text)
-        if metric_gap:
-            metric_label = metric_gap.group(1).strip(" “”\"")
-            question_text = "我还不能确定你想看的%s口径，请确认一下。" % (metric_label or "指标")
-        else:
-            question_text = (
-                question_text.replace("当前候选中", "当前可用口径里")
-                .replace("当前候选指标中", "当前可用口径里")
-                .replace("候选指标中", "当前可用口径里")
-                .replace("候选中", "当前可用口径里")
-                .replace("QueryGraph", "查询计划")
-            )
         state["human_clarification_required"] = True
         state["scope_clarified"] = False
         state["human_clarification_question"] = question_text
@@ -9725,14 +9718,11 @@ def business_scope_options(topic_assets: Any = None) -> List[str]:
     return dedupe_texts(options)[:6]
 
 
-def business_scope_examples() -> List[str]:
-    """User-facing clarification examples; never expose internal Topic names."""
+def business_scope_examples(topic_assets: Any = None) -> List[str]:
+    """Read user-facing examples from published Topic clarification assets."""
 
-    return [
-        "最近30天的订单数和退款总额",
-        "最近7天按商品看的退款金额",
-        "查询某个订单或退款单的明细",
-    ]
+    contract = topic_clarification_contract(topic_assets, "business_scope")
+    return list(contract.get("options") or business_scope_options(topic_assets))
 
 
 def topic_clarification_contract(topic_assets: Any, clarification_type: str) -> Dict[str, Any]:
@@ -9789,21 +9779,12 @@ def merchant_analysis_action_label(skill_name: str, skills: Optional[List[Any]] 
     return requested or "已发布分析技能"
 
 
-def skill_confirmation_declined(text: str) -> bool:
-    normalized = str(text or "").strip().lower()
-    return any(term in normalized for term in ["先看当前结果", "暂不", "不用", "取消", "不开始", "先不", "no"])
+def skill_confirmation_declined(resolution: Dict[str, Any]) -> bool:
+    return str((resolution or {}).get("confirmationDecision") or "") == "declined"
 
 
 def merchant_access_role(role: str) -> str:
-    return {
-        "platform_operator": "merchant_admin",
-        "merchant_owner": "merchant_admin",
-        "merchant_operator": "merchant_analyst",
-        "merchant_finance": "merchant_finance",
-        "merchant_customer_service": "merchant_service",
-        "merchant_goods": "merchant_goods",
-        "merchant_fulfillment": "merchant_fulfillment",
-    }.get(str(role or ""), "merchant_analyst")
+    return load_authorization_policy().access_role_for_identity(role)
 
 
 def diagnostic_profile_for_question(
@@ -11032,7 +11013,7 @@ def rule_recall_item(item: Any) -> bool:
         or metadata.get("semanticKind")
         or ""
     ).upper()
-    answer_modes = {part.strip() for part in re.split(r"[,|/]", answer_mode) if part.strip()}
+    answer_modes = {part.strip() for part in split_on_characters(answer_mode, ",|/") if part.strip()}
     if answer_modes & {"RULE", "RULE_ANSWER", "RULE_REFERENCE"}:
         return True
     return source_type == "GOVERNED_RULE" or declared_role in {"RULE", "GOVERNED_RULE", "RULE_REFERENCE"}
@@ -11377,7 +11358,8 @@ def namespace_query_plan(plan: QueryPlan, namespace: str) -> QueryPlan:
     mapping: Dict[str, str] = {}
     for index, intent in enumerate(plan.intents, start=1):
         old_id = str(intent.plan_task_id or "node_%d" % index)
-        mapping[old_id] = "%s_%s" % (namespace, re.sub(r"[^a-zA-Z0-9_]+", "_", old_id))
+        normalized_id = safe_ascii_component(old_id, default="node_%d" % index)
+        mapping[old_id] = "%s_%s" % (namespace, normalized_id)
     intents = []
     for index, intent in enumerate(plan.intents, start=1):
         old_id = str(intent.plan_task_id or "node_%d" % index)
@@ -11619,8 +11601,12 @@ def write_rows_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def sanitize_download_name(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "query_result").strip())
-    return text.strip("._") or "query_result"
+    return safe_ascii_component(
+        str(value or "query_result").strip(),
+        extras=("_", ".", "-"),
+        default="query_result",
+        strip="._",
+    )
 
 
 def create_workflow(settings: Optional[Settings] = None) -> Any:

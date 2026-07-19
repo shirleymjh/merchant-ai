@@ -3537,10 +3537,7 @@
       "formula": "SUM(refund_bill_cnt) / NULLIF(SUM(order_detail_cnt), 0)",
       "unit": "%",
       "description": "商品粒度的退款明细单量占订单明细去重下单数的比例；这是商品退款订单占比，不是商家退货率或直接退款率。",
-      "sourceColumns": [
-        "refund_bill_cnt",
-        "order_detail_cnt"
-      ],
+      "sourceColumns": [],
       "aliases": [
         "商品退款订单占比",
         "按商品退款订单占比",

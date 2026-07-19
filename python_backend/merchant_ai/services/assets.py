@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import re
 import shutil
 from collections import Counter
 from datetime import datetime
@@ -29,9 +28,21 @@ from merchant_ai.models import (
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.context_filesystem import add_context_uri, merchant_uri_for_semantic_ref
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.repositories import DorisRepository, safe_identifier, write_json
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.semantic_joins import plan_governed_joins
+from merchant_ai.services.text_parsing import (
+    ASCII_DIGITS,
+    ASCII_LETTERS,
+    ASCII_WORD,
+    collapse_whitespace,
+    exact_path_segments,
+    is_ascii_word_phrase,
+    literal_spans,
+    replace_disallowed_runs,
+    safe_ascii_component,
+)
 from merchant_ai.services.time_semantics import resolve_time_range
 from merchant_ai.services.tools import AgentToolDefinition
 
@@ -182,6 +193,252 @@ ACTIVE_TABLE_SEMANTIC_FILENAMES = frozenset({"asset.json", *ACTIVE_SEMANTIC_SIDE
 EXECUTABLE_SEMANTIC_ASSET_STATUSES = frozenset({"ACTIVE", "PUBLISHED"})
 
 SemanticActivationSignature = Tuple[Tuple[str, int, int, int, int], ...]
+
+
+def _is_cjk_unified_character(value: str) -> bool:
+    return "\u4e00" <= value <= "\u9fff"
+
+
+def _json_file_stem(value: str) -> str:
+    text = str(value or "")
+    if not text.endswith(".json"):
+        return ""
+    stem = text[:-5]
+    return stem if stem and stem not in {".", ".."} else ""
+
+
+def _sql_lexemes(value: str) -> List[Tuple[str, str]]:
+    """Tokenize the small SQL/DDL surface used by semantic validation.
+
+    This scanner is deliberately not a SQL parser. It recognizes quoted
+    identifiers, bare identifiers, quoted literals and punctuation so callers
+    can make bounded structural checks without interpreting business SQL.
+    """
+
+    text = str(value or "")
+    tokens: List[Tuple[str, str]] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character == "`":
+            index += 1
+            content: List[str] = []
+            closed = False
+            while index < len(text):
+                if text[index] == "`":
+                    if index + 1 < len(text) and text[index + 1] == "`":
+                        content.append("`")
+                        index += 2
+                        continue
+                    index += 1
+                    closed = True
+                    break
+                content.append(text[index])
+                index += 1
+            if not closed:
+                return []
+            tokens.append(("QUOTED_IDENTIFIER", "".join(content)))
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            closed = False
+            while index < len(text):
+                if text[index] == quote:
+                    if index + 1 < len(text) and text[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    closed = True
+                    break
+                if text[index] == "\\" and index + 1 < len(text):
+                    index += 2
+                else:
+                    index += 1
+            if not closed:
+                return []
+            tokens.append(("LITERAL", ""))
+            continue
+        if character in ASCII_LETTERS or character == "_":
+            end = index + 1
+            while end < len(text) and text[end] in ASCII_WORD:
+                end += 1
+            tokens.append(("WORD", text[index:end]))
+            index = end
+            continue
+        if character in ASCII_DIGITS:
+            end = index + 1
+            while end < len(text) and (text[end] in ASCII_DIGITS or text[end] == "."):
+                end += 1
+            tokens.append(("NUMBER", text[index:end]))
+            index = end
+            continue
+        tokens.append(("SYMBOL", character))
+        index += 1
+    return tokens
+
+
+def _sql_function_call_count(value: str, names: FrozenSet[str]) -> int:
+    tokens = _sql_lexemes(value)
+    wanted = {name.upper() for name in names}
+    return sum(
+        1
+        for index, (kind, token) in enumerate(tokens[:-1])
+        if kind == "WORD"
+        and token.upper() in wanted
+        and tokens[index + 1] == ("SYMBOL", "(")
+    )
+
+
+def _parenthesized_sql_clause(
+    value: str,
+    leading_words: Tuple[str, ...],
+    optional_words: FrozenSet[str] = frozenset(),
+) -> List[Tuple[str, str]]:
+    tokens = _sql_lexemes(value)
+    wanted = tuple(word.upper() for word in leading_words)
+    for start in range(len(tokens)):
+        if start + len(wanted) > len(tokens):
+            break
+        candidate = tokens[start : start + len(wanted)]
+        if tuple(token.upper() for kind, token in candidate if kind == "WORD") != wanted:
+            continue
+        if any(kind != "WORD" for kind, _token in candidate):
+            continue
+        cursor = start + len(wanted)
+        while (
+            cursor < len(tokens)
+            and tokens[cursor][0] == "WORD"
+            and tokens[cursor][1].upper() in optional_words
+        ):
+            cursor += 1
+        if cursor >= len(tokens) or tokens[cursor] != ("SYMBOL", "("):
+            continue
+        depth = 0
+        content: List[Tuple[str, str]] = []
+        for kind, token in tokens[cursor:]:
+            if (kind, token) == ("SYMBOL", "("):
+                depth += 1
+                if depth > 1:
+                    content.append((kind, token))
+                continue
+            if (kind, token) == ("SYMBOL", ")"):
+                depth -= 1
+                if depth == 0:
+                    return content
+                content.append((kind, token))
+                continue
+            if depth > 0:
+                content.append((kind, token))
+        return []
+    return []
+
+
+_SQL_NON_COLUMN_WORDS = frozenset(
+    {
+        "ALL",
+        "AND",
+        "AS",
+        "ASC",
+        "BETWEEN",
+        "BIGINT",
+        "BOOLEAN",
+        "BY",
+        "CASE",
+        "CAST",
+        "CHAR",
+        "COUNT",
+        "DATE",
+        "DATETIME",
+        "DAY",
+        "DECIMAL",
+        "DESC",
+        "DISTINCT",
+        "DOUBLE",
+        "ELSE",
+        "END",
+        "FALSE",
+        "FILTER",
+        "FLOAT",
+        "FROM",
+        "GROUP",
+        "HASH",
+        "HOUR",
+        "IF",
+        "IN",
+        "INT",
+        "INTEGER",
+        "INTERVAL",
+        "IS",
+        "KEY",
+        "LIST",
+        "MAX",
+        "MIN",
+        "MINUTE",
+        "MONTH",
+        "NOT",
+        "NULL",
+        "NULLIF",
+        "OR",
+        "ORDER",
+        "OVER",
+        "PARTITION",
+        "QUARTER",
+        "RANGE",
+        "SECOND",
+        "STRING",
+        "SUM",
+        "THEN",
+        "TIMESTAMP",
+        "TRUE",
+        "VARCHAR",
+        "WHEN",
+        "WHERE",
+        "WEEK",
+        "YEAR",
+    }
+)
+
+
+def _sql_reference_identifiers_from_tokens(tokens: Sequence[Tuple[str, str]]) -> List[str]:
+    quoted = [token for kind, token in tokens if kind == "QUOTED_IDENTIFIER" and token]
+    if quoted:
+        return dedupe_strings(quoted)
+    identifiers: List[str] = []
+    for index, (kind, token) in enumerate(tokens):
+        if kind != "WORD" or token.upper() in _SQL_NON_COLUMN_WORDS:
+            continue
+        if index + 1 < len(tokens) and tokens[index + 1] == ("SYMBOL", "("):
+            continue
+        identifiers.append(token)
+    return dedupe_strings(identifiers)
+
+
+def _sql_reference_identifiers(value: str) -> List[str]:
+    return _sql_reference_identifiers_from_tokens(_sql_lexemes(value))
+
+
+def _strip_inline_sample_evidence(value: str) -> str:
+    text = str(value or "")
+    marker = "samples=["
+    search_from = 0
+    while True:
+        marker_index = text.find(marker, search_from)
+        if marker_index < 0:
+            return text.strip()
+        close_index = text.find("]", marker_index + len(marker))
+        if close_index < 0:
+            return text.strip()
+        remove_from = marker_index
+        while remove_from > 0 and text[remove_from - 1].isspace():
+            remove_from -= 1
+        if remove_from > 0 and text[remove_from - 1] == ";":
+            remove_from -= 1
+        text = text[:remove_from] + text[close_index + 1 :]
+        search_from = remove_from
 
 
 class TopicAssetService:
@@ -868,7 +1125,8 @@ class TopicAssetService:
             asset["metrics"] = upsert_semantic_suggestion_item(asset.get("metrics") or [], item, "sourceSuggestionId")
         else:
             item = {
-                "ruleId": "suggestion_%s" % re.sub(r"[^a-zA-Z0-9_]+", "_", suggestion_id).strip("_"),
+                "ruleId": "suggestion_%s"
+                % safe_ascii_component(suggestion_id, default="unknown"),
                 "title": metric_name or "商家确认经营规则",
                 "content": content or "商家已确认该经营口径。",
                 "keywords": list(dict.fromkeys([metric_name, *aliases]))[:12],
@@ -1120,12 +1378,14 @@ class SemanticCatalogService:
         if exact:
             return [exact]
 
-        section_match = re.fullmatch(
-            r"topics/([^/]+)/tables/([^/]+)/(metrics|columns|terms|rules)",
-            normalized,
-        )
-        if section_match:
-            topic, table, section = section_match.groups()
+        parts = exact_path_segments(normalized, prefix="topics") or ()
+        if (
+            len(parts) == 5
+            and parts[0] == "topics"
+            and parts[2] == "tables"
+            and parts[4] in self.TABLE_SECTION_FIELDS
+        ):
+            topic, table, section = parts[1], parts[3], parts[4]
             section_ref = self.table_section_ref(topic, table, section)
             if not section_ref:
                 return []
@@ -1142,9 +1402,8 @@ class SemanticCatalogService:
                     refs.append(entry)
             return refs
 
-        table_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)", normalized)
-        if table_match:
-            topic, table = table_match.groups()
+        if len(parts) == 4 and parts[0] == "topics" and parts[2] == "tables":
+            topic, table = parts[1], parts[3]
             if not self._manifest_item(topic, table):
                 return []
             refs = [self.table_detail_ref(topic, table)]
@@ -1155,9 +1414,8 @@ class SemanticCatalogService:
             )
             return refs
 
-        tables_match = re.fullmatch(r"topics/([^/]+)/tables", normalized)
-        if tables_match:
-            topic = tables_match.group(1)
+        if len(parts) == 3 and parts[0] == "topics" and parts[2] == "tables":
+            topic = parts[1]
             return [
                 self.table_detail_ref(
                     topic,
@@ -1169,9 +1427,8 @@ class SemanticCatalogService:
                 if isinstance(item, dict) and str(item.get("tableName") or "")
             ]
 
-        topic_match = re.fullmatch(r"topics/([^/]+)", normalized)
-        if topic_match:
-            return self._all_refs(topic=topic_match.group(1))
+        if len(parts) == 2 and parts[0] == "topics":
+            return self._all_refs(topic=parts[1])
         return []
 
     def write_proposal(self, topic: str, table: str, file_name: str, content: str) -> Dict[str, Any]:
@@ -1449,6 +1706,12 @@ class SemanticCatalogService:
             if _include_navigation
             else {}
         )
+        if _include_navigation:
+            asset = self.topic_assets.load_table_asset(topic, table)
+            payload["tableUsageProfile"] = normalize_table_usage_profile(
+                asset.get("tableUsageProfile") if isinstance(asset, dict) else {},
+                table,
+            )
         if semantic_navigation:
             payload["semanticNavigation"] = semantic_navigation
             self._trim_l1_navigation_to_budget(payload)
@@ -2060,9 +2323,9 @@ class SemanticCatalogService:
     def _ls_path(self, path: str, query: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         terms = question_match_terms(query) if query else []
         normalized = path.rstrip("/")
-        table_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)", normalized)
-        if table_match:
-            topic, table = table_match.groups()
+        parts = exact_path_segments(normalized, prefix="topics") or ()
+        if len(parts) == 4 and parts[0] == "topics" and parts[2] == "tables":
+            topic, table = parts[1], parts[3]
             item = self._manifest_item(topic, table)
             if not item:
                 return []
@@ -2081,9 +2344,13 @@ class SemanticCatalogService:
                 for ref in refs
                 if not terms or score_document(terms, ref.get("searchText", "")) > 0
             ][: max(1, limit)]
-        section_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)/(metrics|columns|terms|rules)", normalized)
-        if section_match:
-            topic, table, section = section_match.groups()
+        if (
+            len(parts) == 5
+            and parts[0] == "topics"
+            and parts[2] == "tables"
+            and parts[4] in self.TABLE_SECTION_FIELDS
+        ):
+            topic, table, section = parts[1], parts[3], parts[4]
             section_ref = self.table_section_ref(topic, table, section)
             if not section_ref:
                 return []
@@ -2101,9 +2368,8 @@ class SemanticCatalogService:
                 if len(refs) >= max(1, limit):
                     break
             return refs
-        relationship_match = re.fullmatch(r"topics/([^/]+)/relationships", normalized)
-        if relationship_match:
-            topic = relationship_match.group(1)
+        if len(parts) == 3 and parts[0] == "topics" and parts[2] == "relationships":
+            topic = parts[1]
             index_ref = self.relationship_index_ref(topic)
             try:
                 payload = json.loads(index_ref.get("content") or "{}")
@@ -2121,9 +2387,8 @@ class SemanticCatalogService:
                 if len(refs) >= max(1, limit):
                     break
             return refs
-        topic_match = re.fullmatch(r"topics/([^/]+)", normalized)
-        if topic_match:
-            return self.ls(topic=topic_match.group(1), query=query, limit=limit)
+        if len(parts) == 2 and parts[0] == "topics":
+            return self.ls(topic=parts[1], query=query, limit=limit)
         if normalized in {"", ".", "topics"}:
             refs = [self.manifest_ref(topic) for topic in self.topic_assets.all_topic_names()]
             return [self._public_ref(ref) for ref in refs[: max(1, limit)]]
@@ -2222,28 +2487,17 @@ class SkillLoader:
         return skills
 
     def select(self, question: str, topic_categories: Iterable[QuestionCategory]) -> List[SkillManifest]:
-        text = (question or "").lower()
         wanted_topics = {category_display(category) for category in topic_categories}
-        selected: List[SkillManifest] = []
-        for skill in self.all_skills():
-            terms = [term.lower() for term in skill.trigger_terms]
-            if (
-                any(term and term in text for term in terms)
-                or skill.display_name in wanted_topics
-                or self._matches_topic_policy(skill, wanted_topics, terms)
-            ):
-                selected.append(skill)
-        return selected
-
-    def _matches_topic_policy(self, skill: SkillManifest, wanted_topics: Set[str], terms: List[str]) -> bool:
-        display = (skill.display_name or skill.domain or "").lower()
-        for topic in wanted_topics:
-            topic_text = topic.lower()
-            if topic_text and (topic_text in display or display in topic_text):
-                return True
-            if any(term and len(term) >= 2 and term in topic_text for term in terms):
-                return True
-        return False
+        if not wanted_topics:
+            return []
+        # Selection is scoped only by the already-governed Topic decision.
+        # Trigger terms remain thin metadata for the Core model; the harness
+        # never treats keyword overlap as a Skill match.
+        return [
+            skill
+            for skill in self.all_skills()
+            if str(skill.display_name or "").strip() in wanted_topics
+        ]
 
     def _thin_policy_skill(self, skill: SkillManifest) -> SkillManifest:
         return skill.model_copy(
@@ -2836,7 +3090,7 @@ def quarantine_unapproved_semantic_enums(column: Dict[str, Any]) -> Dict[str, An
     sanitized.pop("sampleValues", None)
     evidence = sanitized.get("evidence")
     if isinstance(evidence, str):
-        sanitized["evidence"] = re.sub(r";?\s*samples=\[[^\]]*\]", "", evidence).strip()
+        sanitized["evidence"] = _strip_inline_sample_evidence(evidence)
     metadata = dict(column.get("enumMetadata") or {})
     metadata.setdefault("reviewStatus", "UNREVIEWED")
     metadata.update(
@@ -2880,7 +3134,7 @@ def enforce_sample_evidence_governance(asset: Dict[str, Any]) -> Dict[str, Any]:
             item.pop("sampleValues", None)
             evidence = item.get("evidence")
             if isinstance(evidence, str):
-                item["evidence"] = re.sub(r";?\s*samples=\[[^\]]*\]", "", evidence).strip()
+                item["evidence"] = _strip_inline_sample_evidence(evidence)
             items.append(item)
         sanitized[field] = items
     sanitized["sampleEvidenceGovernance"] = {**governance, "enforcedAtLoad": True}
@@ -3174,16 +3428,12 @@ class PlanningAssetPackBuilder:
         recalled_relationship_evidence = recalled_relationship_evidence_from_bundle(recall_bundle)
         if recalled_relationship_evidence:
             pack.metric_compaction["recalledRelationshipEvidence"] = recalled_relationship_evidence
-        if not pack.metrics and not recalled_metric_evidence and self._deferred_structured_understanding(targeted_traces):
-            metric_candidates, metric_candidate_traces = self._topic_metric_candidates_for_deferred_understanding(question, topics)
-            if metric_candidates:
-                pack.metrics.extend(metric_candidates)
-                pack.metric_compaction["deferredMetricCandidates"] = {
-                    "strategy": "topic_metric_candidates_only",
-                    "count": len(metric_candidates),
-                    "tables": sorted({item.table for item in metric_candidates if item.table}),
-                }
-                targeted_traces.extend(metric_candidate_traces)
+        if not pack.metrics and self._deferred_structured_understanding(targeted_traces):
+            pack.metric_compaction["deferredMetricCandidates"] = {
+                "strategy": "semantic_read_required",
+                "count": 0,
+                "tables": [],
+            }
         self._trim_metrics_for_question(pack, question)
         self._trim_terms_for_question(pack, question)
         metric_dependency_closure = self._expand_tables_for_metric_dependencies(pack, pack_tables, table_topic, question, allow_profile=allow_profile)
@@ -3288,64 +3538,6 @@ class PlanningAssetPackBuilder:
 
     def _deferred_structured_understanding(self, traces: List[str]) -> bool:
         return any("targeted_seed_source=deferred_structured_understanding" in str(item) for item in traces)
-
-    def _topic_metric_candidates_for_deferred_understanding(
-        self,
-        question: str,
-        topics: List[str],
-    ) -> Tuple[List[PlanningAssetEntry], List[str]]:
-        limit = max(4, min(int(self.topic_assets.settings.agent_planner_seed_metric_limit or 8), 10))
-        per_topic_limit = max(1, min(3, limit))
-        selected: List[PlanningAssetEntry] = []
-        traces: List[str] = []
-        seen: Set[Tuple[str, str]] = set()
-        for topic in topics:
-            candidates: List[Tuple[int, PlanningAssetEntry]] = []
-            for manifest_item in self.topic_assets.load_manifest(topic):
-                table = str(manifest_item.get("tableName") or "")
-                if not table:
-                    continue
-                for metric in self.topic_assets.load_table_metrics(topic, table):
-                    key = str(metric.get("metricKey") or "")
-                    if not key:
-                        continue
-                    entry = PlanningAssetEntry(
-                        key=key,
-                        table=table,
-                        topic=topic,
-                        title=str(metric.get("businessName") or key),
-                        columns=[str(column) for column in metric.get("sourceColumns") or []],
-                        aliases=[str(alias) for alias in metric.get("aliases") or []],
-                        description=json.dumps(metric, ensure_ascii=False),
-                        source_ref_id="semantic:%s:%s:metric:%s" % (topic, table, key),
-                        metadata=metric,
-                    )
-                    score = self._metric_relevance_score(entry, question)
-                    if score <= 0:
-                        level = str(metric.get("metricLevel") or metric.get("metric_level") or "").lower()
-                        score = int(metric.get("defaultCandidateScore") or (5 if "business" in level else 1))
-                    canonical_key = str(metric.get("canonicalMetricKey") or metric.get("canonical_metric_key") or "")
-                    alias_of = str(metric.get("aliasOf") or metric.get("alias_of") or "")
-                    if canonical_key and canonical_key == key and not alias_of:
-                        score += 2
-                    if alias_of:
-                        score -= 2
-                    candidates.append((score, entry))
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            topic_added = 0
-            for score, entry in candidates:
-                identity = (entry.table, entry.key)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                selected.append(entry)
-                topic_added += 1
-                traces.append("deferred_metric_candidate:%s:%s:%s" % (entry.table, entry.key, score))
-                if topic_added >= per_topic_limit or len(selected) >= limit:
-                    break
-            if len(selected) >= limit:
-                break
-        return selected, traces
 
     def expand_for_question_understanding(self, pack: PlanningAssetPack, understanding: Dict[str, Any]) -> List[str]:
         """Load extra semantic assets only when LLM understanding cites them.
@@ -3699,51 +3891,46 @@ class PlanningAssetPackBuilder:
             for table in explicit_tables
             if table_topic.get(table, "") in workspace_topics
         }
-        precise_recalled_tables: Set[str] = set()
-        recalled_relationship_seed_tables: Set[str] = set()
-        recalled_relationship_refs: Set[str] = set()
-        recalled_tables = {
-            item.table
+        recalled_coordinate_tables = {
+            table
             for item in recall_bundle.items
-            if item.table and self._table_allowed_for_recalled_item(question, item, item.table, allow_profile=allow_profile)
-        }
-        recalled_tables.update(
-            str(item.metadata.get("tableName") or "")
-            for item in recall_bundle.items
-            if item.metadata
-            and self._table_allowed_for_recalled_item(
-                question,
-                item,
-                str(item.metadata.get("tableName") or ""),
-                allow_profile=allow_profile,
+            for table in (
+                str(item.table or "").strip(),
+                str((item.metadata or {}).get("tableName") or "").strip(),
             )
+            if table
+        }
+        rejected_recall_coordinates = sorted(
+            table
+            for table in recalled_coordinate_tables
+            if table_topic.get(table, "") not in workspace_topics
         )
-        for item in recall_bundle.items:
-            if not self._recall_item_has_precise_table_evidence(item):
-                continue
-            item_tables = [item.table, str((item.metadata or {}).get("tableName") or "")]
-            for table in item_tables:
-                if table and self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
-                    precise_recalled_tables.add(table)
-        for item in recall_bundle.items:
-            if str(item.source_type or "").upper() != "SEMANTIC_RELATIONSHIP":
-                continue
-            relationship_ref = str((item.metadata or {}).get("semanticRefId") or item.doc_id or "")
-            if relationship_ref:
-                recalled_relationship_refs.add(relationship_ref)
-            for table in recalled_relationship_tables(item):
-                if self._table_allowed_for_recalled_item(question, item, table, allow_profile=allow_profile):
-                    recalled_tables.add(table)
-                    recalled_relationship_seed_tables.add(table)
-                    if self._recall_item_has_precise_table_evidence(item):
-                        precise_recalled_tables.add(table)
-        precise_metric_seed_tables, precise_metric_seed_traces = self._precise_metric_seed_tables(
-            question,
-            topics,
-            table_topic,
-            allow_profile=allow_profile,
+        deferred_recall_coordinates = sorted(
+            table
+            for table in recalled_coordinate_tables
+            if table_topic.get(table, "") in workspace_topics
         )
-        precise_seed_tables = explicit_tables | precise_recalled_tables | precise_metric_seed_tables
+        recall_coordinate_traces = [
+            *(
+                ["topic_manifest_boundary_rejected:%s" % ",".join(rejected_recall_coordinates)]
+                if rejected_recall_coordinates
+                else []
+            ),
+            *(
+                [
+                    "recall_coordinates_deferred_to_semantic_read:%s"
+                    % ",".join(deferred_recall_coordinates)
+                ]
+                if deferred_recall_coordinates
+                else []
+            ),
+        ]
+        # L0 never turns question text or RAG coordinates into a hidden table
+        # detail read.  Only an explicitly selected table may enter the pack;
+        # recalled metric/table refs remain advisory coordinates until Core
+        # performs semantic_read(manifest -> detail -> exact leaf).
+        precise_metric_seed_traces: List[str] = []
+        precise_seed_tables = explicit_tables
         if precise_seed_tables:
             if dimension_obligations:
                 dimension_seed_tables, dimension_traces = self._dimension_aware_seed_tables(
@@ -3751,21 +3938,14 @@ class PlanningAssetPackBuilder:
                     planning_hints=planning_hints,
                     precise_seed_tables=precise_seed_tables,
                     precise_metric_seed_traces=precise_metric_seed_traces,
-                    recalled_relationship_tables=recalled_relationship_seed_tables,
-                    recalled_relationship_refs=recalled_relationship_refs,
+                    recalled_relationship_tables=set(),
+                    recalled_relationship_refs=set(),
                     table_topic=table_topic,
                     all_relationships=all_relationships,
                     allow_profile=allow_profile,
                 )
                 if dimension_seed_tables:
                     return finalize(dimension_seed_tables, dimension_traces)
-            source_parts: List[str] = []
-            if explicit_tables:
-                source_parts.append("explicit_tables")
-            if precise_recalled_tables:
-                source_parts.append("recall_source_refs")
-            if precise_metric_seed_tables:
-                source_parts.append("semantic_metric_alias")
             traces = [
                 "targeted_seed_tables:%s"
                 % ",".join("%s=evidence_owner_table" % table for table in sorted(precise_seed_tables)),
@@ -3781,7 +3961,7 @@ class PlanningAssetPackBuilder:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-                "targeted_seed_source=%s" % "+".join(source_parts or ["evidence_owner_tables"]),
+                "targeted_seed_source=explicit_tables",
             ]
             return finalize(set(precise_seed_tables), traces + precise_metric_seed_traces)
         if self._broad_topic_question(question) and not allow_profile:
@@ -3800,25 +3980,9 @@ class PlanningAssetPackBuilder:
                     separators=(",", ":"),
                 ),
                 "targeted_seed_source=deferred_structured_understanding",
+                *recall_coordinate_traces,
             ]
             return finalize(set(), traces)
-        evidence_tables = {table for table in (explicit_tables | recalled_tables) if table}
-        if evidence_tables:
-            evidence_preview = [
-                {
-                    "table": table,
-                    "strategy": "recalled_owner_table",
-                    "topic": table_topic.get(table, ""),
-                }
-                for table in sorted(evidence_tables)
-            ]
-            traces = [
-                "targeted_seed_tables:%s" % ",".join("%s=recalled_owner_table" % table for table in sorted(evidence_tables)),
-                "table_selection_explanations:%s"
-                % json.dumps(evidence_preview, ensure_ascii=False, separators=(",", ":")),
-                "targeted_seed_source=recall_source_refs",
-            ]
-            return finalize(evidence_tables, traces)
         traces = [
             "targeted_seed_tables:",
             "table_selection_explanations:%s"
@@ -3834,42 +3998,9 @@ class PlanningAssetPackBuilder:
                 separators=(",", ":"),
             ),
             "targeted_seed_source=deferred_structured_understanding",
+            *recall_coordinate_traces,
         ]
         return finalize(set(), traces)
-
-    def _precise_metric_seed_tables(
-        self,
-        question: str,
-        topics: List[str],
-        table_topic: Dict[str, str],
-        allow_profile: bool = False,
-    ) -> Tuple[Set[str], List[str]]:
-        q = normalize_for_match(question)
-        if not q:
-            return set(), []
-        seed_tables: Set[str] = set()
-        traces: List[str] = []
-        for topic in topics:
-            for manifest_item in self.topic_assets.load_manifest(topic):
-                table = str(manifest_item.get("tableName") or "")
-                if not table or table_topic.get(table) != topic:
-                    continue
-                if not self._table_queryable_for_topic(topic, table):
-                    continue
-                for metric in self.topic_assets.load_table_metrics(topic, table):
-                    metric_key = str(metric.get("metricKey") or "")
-                    labels = [
-                        str(metric.get("displayName") or ""),
-                        str(metric.get("businessName") or ""),
-                        metric_key,
-                        *[str(alias) for alias in metric.get("aliases") or []],
-                    ]
-                    matched = next((label for label in labels if label and normalize_for_match(label) in q), "")
-                    if not matched:
-                        continue
-                    seed_tables.add(table)
-                    traces.append("precise_metric_seed:%s:%s:%s" % (table, metric_key, matched))
-        return seed_tables, traces
 
     def _dimension_aware_seed_tables(
         self,
@@ -4149,19 +4280,8 @@ class PlanningAssetPackBuilder:
                         continue
                     if is_preferred_target:
                         similarity = max(similarity, 160)
-                    metric_kind = str(metric.get("tableKind") or "").lower()
-                    metric_intent = str(metric.get("metricIntent") or "").lower()
                     dimension_score = self._table_dimension_score(table, obligations, table_topic)
                     score = similarity + dimension_score
-                    if "detail" in metric_kind or "detail" in metric_intent:
-                        score += 24
-                    formula = str(metric.get("formula") or "")
-                    if re.search(r"\b(case|when|filter)\b", formula, re.I):
-                        # Conditional variants remain eligible when the user's
-                        # phrase names the condition, but do not outrank the
-                        # unconditioned base measure merely because their label
-                        # contains more words.
-                        score -= 28
                     if distance is not None:
                         score += max(0, 12 - distance * 3)
                     candidates.append(
@@ -4435,14 +4555,27 @@ class PlanningAssetPackBuilder:
 
     def _metric_dependency_keys(self, metric: PlanningAssetEntry, metrics_by_key: Dict[str, List[PlanningAssetEntry]]) -> List[str]:
         formula = str(metric.metadata.get("formula") or metric.metadata.get("metricFormula") or metric.description or "")
-        deps: List[str] = []
+        deps = [
+            ref
+            for ref in semantic_metric_dependency_refs(metric.metadata)
+            if ref != metric.key and ref in metrics_by_key
+        ]
         for ref in metric.metadata.get("sourceColumns") or metric.metadata.get("source_columns") or []:
             ref_key = str(ref or "")
             if ref_key and ref_key != metric.key and ref_key in metrics_by_key:
                 deps.append(ref_key)
-        for key in metrics_by_key:
-            if key != metric.key and re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(key), formula):
-                deps.append(key)
+        if not deps:
+            # Backward compatibility for a pre-migration asset.  Current
+            # published assets must carry requiresMetrics; this fallback never
+            # guesses from business labels and only accepts an exact canonical
+            # metric key in the parsed formula text.
+            for key in metrics_by_key:
+                if key != metric.key and literal_spans(
+                    formula,
+                    [key],
+                    ascii_word_boundary=True,
+                ):
+                    deps.append(key)
         return sorted(set(deps), key=deps.index)
 
     def _reconcile_skills(self, skills: List[SkillManifest], pack: PlanningAssetPack) -> List[SkillManifest]:
@@ -4618,7 +4751,11 @@ class PlanningAssetPackBuilder:
         for column in missing_live_columns:
             if column in table_metric_keys or column in missing:
                 continue
-            if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(column), formula):
+            if literal_spans(
+                formula,
+                [column],
+                ascii_word_boundary=True,
+            ):
                 missing.append(column)
         return sorted(set(missing))
 
@@ -5661,7 +5798,10 @@ def automatic_l1_navigation_aliases(
     candidates = [
         item
         for item in candidates
-        if item and item != entry_key and len(item) <= 48 and not re.fullmatch(r"[A-Za-z0-9_]+", item)
+        if item
+        and item != entry_key
+        and len(item) <= 48
+        and not is_ascii_word_phrase(item)
     ]
     if not candidates:
         return []
@@ -5781,50 +5921,79 @@ def parse_semantic_relationship_entry_identity(
 ) -> Tuple[str, str, str] | None:
     wanted_ref = str(ref_id or "").strip()
     wanted_path = normalize_semantic_path(path)
-    index_ref = re.fullmatch(r"semantic:([^:]+):relationship_index", wanted_ref)
-    if index_ref:
-        return "index", str(index_ref.group(1)), ""
-    index_path = re.fullmatch(r"topics/([^/]+)/relationships/index\.json", wanted_path)
-    if index_path:
-        return "index", str(index_path.group(1)), ""
-    entry_ref = re.fullmatch(r"semantic:([^:]+):relationship:(.+)", wanted_ref)
-    if entry_ref:
-        return "entry", str(entry_ref.group(1)), str(entry_ref.group(2))
-    entry_path = re.fullmatch(
-        r"topics/([^/]+)/relationships/([^/]+)\.json",
-        wanted_path,
-    )
-    if entry_path:
-        return "entry", str(entry_path.group(1)), str(entry_path.group(2))
+    ref_parts = wanted_ref.split(":", 3)
+    if (
+        len(ref_parts) == 3
+        and ref_parts[0] == "semantic"
+        and ref_parts[1]
+        and ref_parts[2] == "relationship_index"
+    ):
+        return "index", ref_parts[1], ""
+    if (
+        len(ref_parts) == 4
+        and ref_parts[0] == "semantic"
+        and ref_parts[1]
+        and ref_parts[2] == "relationship"
+        and ref_parts[3]
+    ):
+        return "entry", ref_parts[1], ref_parts[3]
+    path_parts = exact_path_segments(wanted_path, prefix="topics") or ()
+    if (
+        len(path_parts) == 4
+        and path_parts[2] == "relationships"
+        and path_parts[3] == "index.json"
+    ):
+        return "index", path_parts[1], ""
+    if len(path_parts) == 4 and path_parts[2] == "relationships":
+        entry_key = _json_file_stem(path_parts[3])
+        if entry_key and entry_key != "index":
+            return "entry", path_parts[1], entry_key
     return None
 
 
 def parse_semantic_metric_identity(ref_id: str, path: str) -> Tuple[str, str, str] | None:
-    ref_match = re.fullmatch(r"semantic:([^:]+):([^:]+):metric:(.+)", str(ref_id or "").strip())
-    if ref_match:
-        return tuple(str(item) for item in ref_match.groups())
-    path_match = re.fullmatch(
-        r"topics/([^/]+)/tables/([^/]+)/metrics/([^/]+)\.json",
-        normalize_semantic_path(path),
-    )
-    if path_match:
-        identity = tuple(str(item) for item in path_match.groups())
-        return identity if identity[-1] != "index" else None
+    ref_parts = str(ref_id or "").strip().split(":", 4)
+    if (
+        len(ref_parts) == 5
+        and ref_parts[0] == "semantic"
+        and ref_parts[1]
+        and ref_parts[2]
+        and ref_parts[3] == "metric"
+        and ref_parts[4]
+    ):
+        return ref_parts[1], ref_parts[2], ref_parts[4]
+    path_parts = exact_path_segments(normalize_semantic_path(path), prefix="topics") or ()
+    if len(path_parts) == 6 and path_parts[2] == "tables" and path_parts[4] == "metrics":
+        metric_key = _json_file_stem(path_parts[5])
+        if metric_key and metric_key != "index":
+            return path_parts[1], path_parts[3], metric_key
     return None
 
 
 def parse_semantic_table_entry_identity(ref_id: str, path: str) -> Tuple[str, str, str, str] | None:
     wanted_ref = str(ref_id or "").strip()
     wanted_path = normalize_semantic_path(path)
-    ref_match = re.fullmatch(r"semantic:([^:]+):([^:]+):(field|term|rule):(.+)", wanted_ref)
-    if ref_match:
-        topic, table, singular, key = ref_match.groups()
+    ref_parts = wanted_ref.split(":", 4)
+    if (
+        len(ref_parts) == 5
+        and ref_parts[0] == "semantic"
+        and ref_parts[1]
+        and ref_parts[2]
+        and ref_parts[3] in {"field", "term", "rule"}
+        and ref_parts[4]
+    ):
+        topic, table, singular, key = ref_parts[1:]
         section = {"field": "columns", "term": "terms", "rule": "rules"}[singular]
         return topic, table, section, key
-    path_match = re.fullmatch(r"topics/([^/]+)/tables/([^/]+)/(columns|terms|rules)/([^/]+)\.json", wanted_path)
-    if path_match:
-        topic, table, section, key = path_match.groups()
-        return (topic, table, section, key) if key != "index" else None
+    path_parts = exact_path_segments(wanted_path, prefix="topics") or ()
+    if (
+        len(path_parts) == 6
+        and path_parts[2] == "tables"
+        and path_parts[4] in {"columns", "terms", "rules"}
+    ):
+        key = _json_file_stem(path_parts[5])
+        if key and key != "index":
+            return path_parts[1], path_parts[3], path_parts[4], key
     return None
 
 
@@ -5833,47 +6002,48 @@ def parse_semantic_file_identity(ref_id: str, path: str) -> Tuple[str, str, str,
 
     wanted_ref = str(ref_id or "").strip()
     wanted_path = normalize_semantic_path(path)
-    manifest_match = re.fullmatch(r"semantic:([^:]+):manifest", wanted_ref)
-    if manifest_match:
-        return "manifest", manifest_match.group(1), "", ""
-    relationship_match = re.fullmatch(r"semantic:([^:]+):relationships", wanted_ref)
-    if relationship_match:
-        return "relationships", relationship_match.group(1), "", ""
-    table_match = re.fullmatch(
-        r"semantic:([^:]+):([^:]+):(asset|detail|metrics|columns|schema|terms|rules)",
-        wanted_ref,
-    )
-    if table_match:
-        topic, table, suffix = table_match.groups()
+    ref_parts = wanted_ref.split(":")
+    if len(ref_parts) == 3 and ref_parts[0] == "semantic" and ref_parts[1]:
+        if ref_parts[2] == "manifest":
+            return "manifest", ref_parts[1], "", ""
+        if ref_parts[2] == "relationships":
+            return "relationships", ref_parts[1], "", ""
+    if (
+        len(ref_parts) == 4
+        and ref_parts[0] == "semantic"
+        and ref_parts[1]
+        and ref_parts[2]
+        and ref_parts[3] in {"asset", "detail", "metrics", "columns", "schema", "terms", "rules"}
+    ):
+        topic, table, suffix = ref_parts[1:]
         if suffix == "asset":
             return "asset", topic, table, ""
         if suffix == "detail":
             return "detail", topic, table, ""
         return "section", topic, table, suffix
-    manifest_path_match = re.fullmatch(r"topics/([^/]+)/manifest\.json", wanted_path)
-    if manifest_path_match:
-        return "manifest", manifest_path_match.group(1), "", ""
-    relationship_path_match = re.fullmatch(r"topics/([^/]+)/relationships\.json", wanted_path)
-    if relationship_path_match:
-        return "relationships", relationship_path_match.group(1), "", ""
-    table_path_match = re.fullmatch(
-        r"topics/([^/]+)/tables/([^/]+)/(asset|detail|schema)\.json",
-        wanted_path,
-    )
-    if table_path_match:
-        topic, table, suffix = table_path_match.groups()
+    path_parts = exact_path_segments(wanted_path, prefix="topics") or ()
+    if len(path_parts) == 3 and path_parts[2] == "manifest.json":
+        return "manifest", path_parts[1], "", ""
+    if len(path_parts) == 3 and path_parts[2] == "relationships.json":
+        return "relationships", path_parts[1], "", ""
+    if (
+        len(path_parts) == 5
+        and path_parts[2] == "tables"
+        and path_parts[4] in {"asset.json", "detail.json", "schema.json"}
+    ):
+        topic, table, suffix = path_parts[1], path_parts[3], path_parts[4][:-5]
         if suffix == "asset":
             return "asset", topic, table, ""
         if suffix == "detail":
             return "detail", topic, table, ""
         return "section", topic, table, suffix
-    section_index_match = re.fullmatch(
-        r"topics/([^/]+)/tables/([^/]+)/(metrics|columns|terms|rules)/index\.json",
-        wanted_path,
-    )
-    if section_index_match:
-        topic, table, section = section_index_match.groups()
-        return "section", topic, table, section
+    if (
+        len(path_parts) == 6
+        and path_parts[2] == "tables"
+        and path_parts[4] in {"metrics", "columns", "terms", "rules"}
+        and path_parts[5] == "index.json"
+    ):
+        return "section", path_parts[1], path_parts[3], path_parts[4]
     return None
 
 
@@ -6016,34 +6186,21 @@ def parse_doris_create_table_metadata(ddl: str) -> Dict[str, Any]:
         return {}
     key_model = ""
     primary_key_columns: List[str] = []
-    key_match = re.search(
-        r"\b(?P<model>DUPLICATE|UNIQUE|AGGREGATE|PRIMARY)\s+KEY\s*\((?P<columns>[^)]*)\)",
+    for model in ("DUPLICATE", "UNIQUE", "AGGREGATE", "PRIMARY"):
+        key_tokens = _parenthesized_sql_clause(text, (model, "KEY"))
+        if not key_tokens:
+            continue
+        key_model = "%s KEY" % model
+        primary_key_columns = _sql_reference_identifiers_from_tokens(key_tokens)
+        break
+    partition_tokens = _parenthesized_sql_clause(
         text,
-        re.I | re.S,
+        ("PARTITION", "BY"),
+        frozenset({"RANGE", "LIST"}),
     )
-    if key_match:
-        key_model = "%s KEY" % key_match.group("model").upper()
-        primary_key_columns = parse_identifier_list(key_match.group("columns"))
-    partition_columns: List[str] = []
-    partition_match = re.search(
-        r"\bPARTITION\s+BY\s+(?:RANGE|LIST)?\s*\((?P<columns>[^)]*)\)",
-        text,
-        re.I | re.S,
-    )
-    if partition_match:
-        partition_columns = parse_identifier_list(partition_match.group("columns"))
-    if not partition_columns:
-        auto_partition_match = re.search(
-            r"\bAUTO\s+PARTITION\s+BY\s+(?:RANGE|LIST)?\s*\((?P<expr>.*?)\)\s*\(",
-            text,
-            re.I | re.S,
-        )
-        if auto_partition_match:
-            partition_columns = parse_identifier_list(auto_partition_match.group("expr"))
-    bucket_columns: List[str] = []
-    bucket_match = re.search(r"\bDISTRIBUTED\s+BY\s+HASH\s*\((?P<columns>[^)]*)\)", text, re.I | re.S)
-    if bucket_match:
-        bucket_columns = parse_identifier_list(bucket_match.group("columns"))
+    partition_columns = _sql_reference_identifiers_from_tokens(partition_tokens)
+    bucket_tokens = _parenthesized_sql_clause(text, ("DISTRIBUTED", "BY", "HASH"))
+    bucket_columns = _sql_reference_identifiers_from_tokens(bucket_tokens)
     result = {
         "keyModel": key_model,
         "primaryKeyColumns": dedupe_strings(primary_key_columns),
@@ -6055,17 +6212,7 @@ def parse_doris_create_table_metadata(ddl: str) -> Dict[str, Any]:
 
 
 def parse_identifier_list(expression: str) -> List[str]:
-    identifiers = re.findall(r"`([^`]+)`", str(expression or ""))
-    if identifiers:
-        return dedupe_strings(identifiers)
-    values = []
-    for raw in re.split(r",", str(expression or "")):
-        token = raw.strip()
-        token = re.sub(r"\b(date_trunc|date_floor|date_ceil|to_date|cast)\s*\(", "(", token, flags=re.I)
-        match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", token)
-        if match:
-            values.append(match.group(1))
-    return dedupe_strings(values)
+    return _sql_reference_identifiers(expression)
 
 
 def normalize_semantic_path(path: str) -> str:
@@ -6081,7 +6228,14 @@ def normalize_semantic_path(path: str) -> str:
 
 def sanitize_semantic_file_name(file_name: str) -> str:
     text = str(file_name or "proposal.md").strip().replace("\\", "_").replace("/", "_")
-    text = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "_", text)
+    text = replace_disallowed_runs(
+        text,
+        allowed=lambda character: (
+            character in ASCII_WORD
+            or character in {".", "-"}
+            or _is_cjk_unified_character(character)
+        ),
+    )
     return text or "proposal.md"
 
 
@@ -6117,9 +6271,21 @@ def normalize_column_type(row: Dict[str, Any]) -> str:
     raw = str(row.get("type") or row.get("Type") or row.get("dataType") or row.get("columnType") or "").strip().lower()
     if not raw:
         return ""
-    raw = re.sub(r"\s+", " ", raw)
-    raw = re.sub(r"\(.+?\)", "", raw)
-    return raw.strip()
+    raw = collapse_whitespace(raw)
+    without_parameters: List[str] = []
+    index = 0
+    while index < len(raw):
+        if raw[index] != "(":
+            without_parameters.append(raw[index])
+            index += 1
+            continue
+        close_index = raw.find(")", index + 1)
+        if close_index < 0:
+            without_parameters.append(raw[index])
+            index += 1
+            continue
+        index = close_index + 1
+    return "".join(without_parameters).strip()
 
 
 def question_understanding_metric_requests(understanding: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -6360,7 +6526,7 @@ def metric_phrase_terms(phrase: str) -> List[str]:
             continue
         if normalized.isdigit():
             continue
-        if normalized in {"最高", "最低", "最多", "最少", "前5", "前10", "top", "top5", "top10"}:
+        if governed_ranking_noise(normalized):
             continue
         if normalized not in terms:
             terms.append(normalized)
@@ -6368,6 +6534,23 @@ def metric_phrase_terms(phrase: str) -> List[str]:
     if whole and whole not in terms:
         terms.append(whole)
     return terms
+
+
+def governed_ranking_noise(value: str) -> bool:
+    normalized = normalize_for_match(value)
+    policy = load_language_policy().routing
+    operators = {normalize_for_match(item) for item in policy.ranking_operators}
+    if normalized in operators:
+        return True
+    prefixes = (*policy.ranking_ordinal_prefixes, *policy.ranking_top_prefixes)
+    for raw_prefix in prefixes:
+        prefix = normalize_for_match(raw_prefix)
+        if not prefix or not normalized.startswith(prefix):
+            continue
+        suffix = normalized[len(prefix) :]
+        if not suffix or all(character in ASCII_DIGITS for character in suffix):
+            return True
+    return False
 
 
 def metric_phrase_directly_names_metric(metric: PlanningAssetEntry, phrase: str) -> bool:
@@ -6444,6 +6627,7 @@ def catalog_metric_evidence_payload(metric: PlanningAssetEntry, matched_label: s
         "zeroValueMeaning": str(metadata.get("zeroValueMeaning") or ""),
         "formula": str(metadata.get("formula") or metadata.get("metricFormula") or ""),
         "sourceColumns": metadata.get("sourceColumns") or metadata.get("source_columns") or metric.columns,
+        "requiresMetrics": semantic_metric_dependency_refs(metadata),
         "aliases": list(dict.fromkeys([*metric.aliases, *[str(alias) for alias in metadata.get("aliases") or []]])),
         "recallQuery": matched_label,
         "recallQueries": [matched_label] if matched_label else [],
@@ -6458,7 +6642,7 @@ def catalog_metric_evidence_payload(metric: PlanningAssetEntry, matched_label: s
 def is_strong_label_text_match(normalized_label: str, normalized_phrase: str) -> bool:
     if not normalized_label or not normalized_phrase:
         return False
-    if re.search(r"[a-z0-9]", normalized_label):
+    if any(character in ASCII_LETTERS or character in ASCII_DIGITS for character in normalized_label):
         return len(normalized_label) >= 3 and normalized_label in normalized_phrase
     if len(normalized_label) >= 4 and normalized_label in normalized_phrase:
         return True
@@ -7414,7 +7598,12 @@ class TopicBuilderWorkflow:
     def _text_mentions_any_column(self, text: str, columns: Set[str]) -> bool:
         source = str(text or "")
         return any(
-            re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(column), source, flags=re.IGNORECASE)
+            literal_spans(
+                source,
+                [column],
+                case_sensitive=False,
+                ascii_word_boundary=True,
+            )
             for column in columns
             if column
         )
@@ -8838,7 +9027,7 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
             field_time_grain = str(field.get("applicableTimeGrain") or "").strip().lower()
             if not field_time_grain:
                 errors.append({"code": "DAILY_VALUE_TIME_GRAIN_UNDECLARED", "column": column_name})
-            if re.search(r"\b(?:SUM|AVG)\s*\(", metric_formula, flags=re.IGNORECASE):
+            if _sql_function_call_count(metric_formula, frozenset({"SUM", "AVG"})):
                 errors.append(
                     {
                         "code": "DAILY_VALUE_CROSS_DAY_AGGREGATION_FORBIDDEN",
@@ -8856,6 +9045,23 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         if metric_key in seen_metrics:
             errors.append({"code": "DUPLICATE_METRIC_KEY", "metricKey": metric_key})
         seen_metrics.add(metric_key)
+        for dependency_ref in semantic_metric_dependency_refs(metric):
+            if dependency_ref == metric_key:
+                errors.append(
+                    {
+                        "code": "METRIC_DEPENDENCY_SELF_REFERENCE",
+                        "metricKey": metric_key,
+                        "metricRef": dependency_ref,
+                    }
+                )
+            elif dependency_ref not in metric_keys:
+                warnings.append(
+                    {
+                        "code": "EXTERNAL_METRIC_DEPENDENCY",
+                        "metricKey": metric_key,
+                        "metricRef": dependency_ref,
+                    }
+                )
         for column in semantic_metric_source_columns(metric):
             if column in metric_keys:
                 continue
@@ -8904,7 +9110,10 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
                     "aggregationPolicy": aggregation_policy,
                 }
             )
-        if aggregation_policy == "period_rollup" and re.search(r"\bAVG\s*\(", formula, flags=re.IGNORECASE):
+        if aggregation_policy == "period_rollup" and _sql_function_call_count(
+            formula,
+            frozenset({"AVG"}),
+        ):
             errors.append(
                 {
                     "code": "PERIOD_ROLLUP_NON_ADDITIVE_FORMULA",
@@ -8915,7 +9124,7 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         if ratio_metric and aggregation_policy not in {"ratio_of_sums", "daily_value_only", "period_rollup"}:
             errors.append({"code": "RATIO_AGGREGATION_POLICY_UNDECLARED", "metricKey": metric_key})
         if aggregation_policy == "ratio_of_sums" and (
-            "/" not in formula or len(re.findall(r"\bSUM\s*\(", formula, flags=re.IGNORECASE)) < 2
+            "/" not in formula or _sql_function_call_count(formula, frozenset({"SUM"})) < 2
         ):
             errors.append(
                 {
@@ -9022,7 +9231,7 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
                         "applicableTimeGrain": applicable_time_grain,
                     }
                 )
-            if re.search(r"\b(?:SUM|AVG)\s*\(", formula, flags=re.IGNORECASE):
+            if _sql_function_call_count(formula, frozenset({"SUM", "AVG"})):
                 errors.append(
                     {
                         "code": "DAILY_VALUE_CROSS_DAY_AGGREGATION_FORBIDDEN",
@@ -9613,7 +9822,7 @@ def combine_semantic_conflict_detection(*reports: Dict[str, Any]) -> Dict[str, A
 
 
 def normalize_semantic_formula(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "")).upper()
+    return "".join(character for character in str(value or "") if not character.isspace()).upper()
 
 
 def semantic_metric_alias_requires_global_owner(metric: Dict[str, Any], alias: str) -> bool:
@@ -9731,6 +9940,7 @@ def semantic_asset_lineage(
                 "metricKey": str(metric.get("metricKey") or metric.get("key") or ""),
                 "ownerTable": table,
                 "sourceColumns": semantic_metric_source_columns(metric),
+                "requiresMetrics": semantic_metric_dependency_refs(metric),
                 "formula": str(metric.get("formula") or ""),
             }
         )
@@ -9810,7 +10020,11 @@ def append_semantic_publish_history(target_dir: Path, payload: Dict[str, Any]) -
 
 
 def sanitize_asset_path_part(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("._")
+    text = safe_ascii_component(
+        value,
+        extras=("_", ".", "-"),
+        strip="._",
+    )
     return text or "unknown"
 
 
@@ -9824,20 +10038,39 @@ def column_name_set(schema: List[Dict[str, Any]]) -> set[str]:
 
 
 def semantic_metric_source_columns(metric: Dict[str, Any]) -> List[str]:
+    dependency_refs = set(semantic_metric_dependency_refs(metric))
     result: List[str] = []
     for value in metric.get("sourceColumns") or metric.get("source_columns") or []:
         text = str(value or "").strip().strip("`")
-        if text and text not in result:
+        if text and text not in dependency_refs and text not in result:
             result.append(text)
-    if result:
+    if result or dependency_refs:
         return result
     formula = str(metric.get("formula") or metric.get("metricFormula") or "")
-    for token in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`|\\b([A-Za-z_][A-Za-z0-9_]*)\\b", formula):
-        text = (token[0] or token[1] or "").strip()
-        if text.lower() in {"sum", "count", "distinct", "avg", "min", "max", "case", "when", "then", "else", "end", "nullif"}:
+    for token in _sql_reference_identifiers(formula):
+        if token not in result:
+            result.append(token)
+    return result
+
+
+def semantic_metric_dependency_refs(metric: Dict[str, Any]) -> List[str]:
+    """Return formally declared metric lineage, independent of source columns."""
+
+    result: List[str] = []
+    for key in ("requiresMetrics", "metricDependencies", "externalMetricRefs"):
+        for item in metric.get(key) or []:
+            if isinstance(item, dict):
+                ref = str(item.get("metricRef") or item.get("metricKey") or "").strip()
+            else:
+                ref = str(item or "").strip()
+            if ref and ref not in result:
+                result.append(ref)
+    for item in metric.get("sourceReferences") or []:
+        if not isinstance(item, dict) or str(item.get("referenceType") or "").upper() != "METRIC":
             continue
-        if text and text not in result:
-            result.append(text)
+        ref = str(item.get("reference") or item.get("metricRef") or item.get("metricKey") or "").strip()
+        if ref and ref not in result:
+            result.append(ref)
     return result
 
 
@@ -9845,18 +10078,7 @@ def external_metric_dependency(metric: Dict[str, Any], ref: str) -> bool:
     wanted = str(ref or "").strip()
     if not wanted:
         return False
-    declared: List[str] = []
-    for key in ("metricDependencies", "requiresMetrics", "externalMetricRefs"):
-        for item in metric.get(key) or []:
-            if isinstance(item, dict):
-                declared.append(str(item.get("metricRef") or item.get("metricKey") or "").strip())
-            else:
-                declared.append(str(item or "").strip())
-    for item in metric.get("sourceReferences") or []:
-        if not isinstance(item, dict) or str(item.get("referenceType") or "").upper() != "METRIC":
-            continue
-        declared.append(str(item.get("reference") or item.get("metricRef") or item.get("metricKey") or "").strip())
-    return wanted in {item for item in declared if item}
+    return wanted in set(semantic_metric_dependency_refs(metric))
 
 
 def metric_shaped_reference(ref: str) -> bool:
@@ -10114,6 +10336,7 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                 "temporalVariants": metadata.get("temporalVariants") or {},
                 "formula": str(metadata.get("formula") or ""),
                 "sourceColumns": metadata.get("sourceColumns") or [],
+                "requiresMetrics": semantic_metric_dependency_refs(metadata),
                 "aliases": metadata.get("aliases") or [],
                 "recallQuery": recall_queries[-1] if recall_queries else "",
                 "recallQueries": recall_queries,
@@ -10170,6 +10393,11 @@ def recalled_metric_evidence_from_bundle(recall_bundle: RecallBundle) -> List[Di
                     "temporalVariants": metadata.get("temporalVariants") or current.get("temporalVariants") or {},
                     "formula": str(metadata.get("formula") or current.get("formula") or ""),
                     "sourceColumns": metadata.get("sourceColumns") or current.get("sourceColumns") or [],
+                    "requiresMetrics": (
+                        semantic_metric_dependency_refs(metadata)
+                        or current.get("requiresMetrics")
+                        or []
+                    ),
                     "aliases": metadata.get("aliases") or current.get("aliases") or [],
                     "matchedMetricLabel": str(metadata.get("matchedMetricLabel") or metadata.get("matchedExactMetricLabel") or current.get("matchedMetricLabel") or ""),
                     "metricResolutionType": str(metadata.get("metricResolutionType") or current.get("metricResolutionType") or ""),
@@ -10307,17 +10535,43 @@ def score_document(terms: List[str], document: str) -> float:
 
 
 def normalize_for_match(text: str) -> str:
-    return re.sub(r"\s+", "", str(text or "")).lower()
+    return "".join(character for character in str(text or "") if not character.isspace()).lower()
 
 
 def question_match_terms(question: str) -> List[str]:
     text = str(question or "")
     terms: List[str] = []
-    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+", text):
-        normalized = token.lower()
-        if normalized and normalized not in terms:
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character in ASCII_LETTERS or character == "_":
+            end = index + 1
+            while end < len(text) and text[end] in ASCII_WORD:
+                end += 1
+        elif character in ASCII_DIGITS:
+            end = index + 1
+            while end < len(text) and text[end] in ASCII_DIGITS:
+                end += 1
+        else:
+            index += 1
+            continue
+        normalized = text[index:end].lower()
+        if normalized not in terms:
             terms.append(normalized)
-    for seq in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        index = end
+    cjk_sequences: List[str] = []
+    index = 0
+    while index < len(text):
+        if not _is_cjk_unified_character(text[index]):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and _is_cjk_unified_character(text[end]):
+            end += 1
+        if end - index >= 2:
+            cjk_sequences.append(text[index:end])
+        index = end
+    for seq in cjk_sequences:
         for size in range(2, min(6, len(seq)) + 1):
             for index in range(0, len(seq) - size + 1):
                 gram = seq[index : index + size]

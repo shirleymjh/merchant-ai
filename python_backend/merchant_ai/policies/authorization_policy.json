@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "policyId": "merchant-runtime-authorization",
+  "revision": "2026-07-19",
+  "defaults": {
+    "identityRole": "merchant_operator",
+    "accessRole": "merchant_analyst",
+    "opsPrincipalRole": "ops_admin"
+  },
+  "identityRoles": {
+    "platform_operator": {
+      "accessRole": "merchant_admin",
+      "principalRoles": ["ops_admin"],
+      "isOps": true
+    },
+    "merchant_owner": {
+      "accessRole": "merchant_admin",
+      "principalRoles": ["merchant_admin"],
+      "isOps": false
+    },
+    "merchant_operator": {
+      "accessRole": "merchant_analyst",
+      "principalRoles": ["merchant_analyst"],
+      "isOps": false
+    },
+    "merchant_finance": {
+      "accessRole": "merchant_finance",
+      "principalRoles": ["merchant_finance"],
+      "isOps": false
+    },
+    "merchant_customer_service": {
+      "accessRole": "merchant_service",
+      "principalRoles": ["merchant_service"],
+      "isOps": false
+    },
+    "merchant_goods": {
+      "accessRole": "merchant_goods",
+      "principalRoles": ["merchant_goods"],
+      "isOps": false
+    },
+    "merchant_fulfillment": {
+      "accessRole": "merchant_fulfillment",
+      "principalRoles": ["merchant_fulfillment"],
+      "isOps": false
+    }
+  },
+  "accessRoles": {
+    "merchant_analyst": {
+      "permissions": ["chat.run", "run.read", "memory.read"]
+    },
+    "merchant_admin": {
+      "permissions": ["chat.run", "run.read", "run.cancel", "memory.read", "memory.write"]
+    },
+    "merchant_finance": {
+      "permissions": ["chat.run", "run.read", "memory.read"]
+    },
+    "merchant_service": {
+      "permissions": ["chat.run", "run.read", "memory.read"]
+    },
+    "merchant_goods": {
+      "permissions": ["chat.run", "run.read", "memory.read"]
+    },
+    "merchant_fulfillment": {
+      "permissions": ["chat.run", "run.read", "memory.read"]
+    },
+    "ops_admin": {
+      "permissions": ["*"]
+    }
+  }
+}

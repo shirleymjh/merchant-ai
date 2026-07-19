@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
 import uuid
 from datetime import datetime
@@ -50,6 +49,7 @@ from merchant_ai.services.memory import (
 )
 from merchant_ai.services.memory_constraints import build_memory_constraints
 from merchant_ai.services.observability import artifact_ref_from_path
+from merchant_ai.services.text_parsing import safe_ascii_component
 
 
 TERMINAL_TOOL_STATUSES = {"success", "failed", "error", "timeout", "rate_limited", "circuit_blocked", "skipped"}
@@ -1441,7 +1441,20 @@ def default_middleware_order() -> List[str]:
 
 
 def middleware_names_from_config(value: str) -> List[str]:
-    return [name.strip() for name in re.split(r"[,;\s]+", str(value or "")) if name.strip()]
+    names: List[str] = []
+    current: List[str] = []
+    for character in str(value or ""):
+        if character in {",", ";"} or character.isspace():
+            name = "".join(current).strip()
+            if name:
+                names.append(name)
+            current = []
+            continue
+        current.append(character)
+    name = "".join(current).strip()
+    if name:
+        names.append(name)
+    return names
 
 
 def configured_middleware_order(settings: Settings, registry: Dict[str, MiddlewareFactory]) -> List[str]:
@@ -1675,7 +1688,12 @@ def loop_guard_key_args(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def sanitize_artifact_name(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "artifact").strip())
+    text = safe_ascii_component(
+        str(value or "artifact").strip(),
+        extras=("_", ".", "-"),
+        default="artifact",
+        strip="._",
+    )
     return text.strip("._") or "artifact"
 
 
@@ -1767,6 +1785,12 @@ def normalize_run_started_at_ms(value: Any, now_ms_value: int) -> int:
         return now_ms_value
     if started <= 0:
         return now_ms_value
+    monotonic_now = int(time.perf_counter() * 1000)
+    if abs(started - monotonic_now) <= 31_536_000_000:
+        # Compatibility for checkpoints produced before run_started_at_ms was
+        # separated from the monotonic trace clock.  Preserve elapsed duration
+        # while translating the value into the epoch domain used by budgets.
+        return max(1, now_ms_value - max(0, monotonic_now - started))
     if started < 1_000_000_000:
         return now_ms_value
     if started < 10_000_000_000:
@@ -1843,7 +1867,11 @@ def estimate_text_tokens(text: str) -> int:
     value = str(text or "")
     if not value:
         return 1
-    cjk_count = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", value))
+    cjk_count = sum(
+        1
+        for character in value
+        if "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
+    )
     non_cjk_count = max(0, len(value) - cjk_count)
     return max(1, cjk_count + int((non_cjk_count + 3) / 4))
 

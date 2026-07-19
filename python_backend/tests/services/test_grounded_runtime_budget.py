@@ -189,10 +189,11 @@ def test_stage_context_aggregates_repeated_durations_and_errors() -> None:
 
     with budget.stage("recall"):
         monotonic.advance(0.25)
-    with pytest.raises(ValueError, match="broken"):
+    with pytest.raises(ValueError) as exc_info:
         with budget.stage("recall"):
             monotonic.advance(0.75)
             raise ValueError("broken")
+    assert "broken" in str(exc_info.value)
 
     report = budget.report()
     assert report["stages"]["recall"] == {

@@ -9,7 +9,13 @@ def test_migration_materializes_policy_driven_temporal_contracts_without_busines
     asset = {
         "tableName": "fact_metrics",
         "timeColumn": "event_day",
-        "semanticColumns": [{"columnName": "entity_id", "role": "ENTITY"}],
+        "semanticColumns": [
+            {
+                "columnName": "entity_id",
+                "canonicalEntityRef": "entity:generic",
+                "isUniqueEntityKey": True,
+            }
+        ],
         "metrics": [
             {
                 "metricKey": "count_metric",
@@ -77,6 +83,125 @@ def test_migration_preserves_existing_temporal_declarations() -> None:
     assert metric["timeColumn"] == "business_day"
     assert metric["timeSemantics"]["selectionPolicy"] == "custom_selection"
     assert metric["timeSemantics"]["asOfPolicy"] == "calendar"
+
+
+def test_migration_separates_derived_metric_lineage_from_physical_source_columns() -> None:
+    asset = {
+        "tableName": "fact_events",
+        "timeColumn": "event_day",
+        "schemaColumns": [
+            {"columnName": "event_day"},
+            {"columnName": "accepted_flag"},
+            {"columnName": "entity_id"},
+        ],
+        "metrics": [
+            {
+                "metricKey": "accepted_measure",
+                "formula": "SUM(accepted_flag)",
+                "sourceColumns": ["accepted_flag"],
+                "aggregationPolicy": "period_rollup",
+            },
+            {
+                "metricKey": "total_measure",
+                "formula": "COUNT(DISTINCT entity_id)",
+                "sourceColumns": ["entity_id"],
+                "aggregationPolicy": "period_rollup",
+            },
+            {
+                "metricKey": "acceptance_ratio",
+                "formula": "SUM(accepted_measure) / NULLIF(SUM(total_measure), 0)",
+                "sourceColumns": [],
+                "semanticCleanup": {
+                    "droppedNonSchemaSourceColumns": [
+                        "accepted_measure",
+                        "total_measure",
+                    ]
+                },
+                "aggregationPolicy": "ratio_of_sums",
+            },
+        ],
+    }
+
+    migrated, changes, errors = migrate_published_semantic_asset(asset)
+
+    assert not errors
+    metrics = {metric["metricKey"]: metric for metric in migrated["metrics"]}
+    assert metrics["acceptance_ratio"]["requiresMetrics"] == [
+        "accepted_measure",
+        "total_measure",
+    ]
+    assert metrics["acceptance_ratio"]["sourceColumns"] == []
+    assert metrics["accepted_measure"]["sourceColumns"] == ["accepted_flag"]
+    assert metrics["total_measure"]["sourceColumns"] == ["entity_id"]
+    assert "fact_events.acceptance_ratio.requiresMetrics" in changes
+
+
+def test_migration_does_not_infer_metric_lineage_from_a_physical_name_collision() -> None:
+    asset = {
+        "tableName": "fact_events",
+        "timeColumn": "event_day",
+        "schemaColumns": [
+            {"columnName": "event_day"},
+            {"columnName": "measure_value"},
+        ],
+        "metrics": [
+            {
+                "metricKey": "measure_value",
+                "formula": "SUM(measure_value)",
+                "sourceColumns": ["measure_value"],
+                "aggregationPolicy": "period_rollup",
+            },
+            {
+                "metricKey": "physical_rollup",
+                "formula": "SUM(measure_value)",
+                "sourceColumns": ["measure_value"],
+                "aggregationPolicy": "period_rollup",
+            },
+        ],
+    }
+
+    migrated, _, errors = migrate_published_semantic_asset(asset)
+
+    assert not errors
+    metrics = {metric["metricKey"]: metric for metric in migrated["metrics"]}
+    assert metrics["physical_rollup"].get("requiresMetrics") is None
+    assert metrics["physical_rollup"]["sourceColumns"] == ["measure_value"]
+
+
+def test_migration_preserves_formally_declared_external_metric_lineage() -> None:
+    asset = {
+        "tableName": "fact_events",
+        "timeColumn": "event_day",
+        "schemaColumns": [
+            {"columnName": "event_day"},
+            {"columnName": "local_value"},
+        ],
+        "metrics": [
+            {
+                "metricKey": "local_measure",
+                "formula": "SUM(local_value)",
+                "sourceColumns": ["local_value"],
+                "aggregationPolicy": "period_rollup",
+            },
+            {
+                "metricKey": "cross_source_ratio",
+                "formula": "SUM(local_measure) / NULLIF(SUM(external_measure), 0)",
+                "sourceColumns": ["local_measure", "external_measure"],
+                "metricDependencies": ["local_measure", "external_measure"],
+                "aggregationPolicy": "ratio_of_sums",
+            },
+        ],
+    }
+
+    migrated, _, errors = migrate_published_semantic_asset(asset)
+
+    assert not errors
+    metrics = {metric["metricKey"]: metric for metric in migrated["metrics"]}
+    assert metrics["cross_source_ratio"]["requiresMetrics"] == [
+        "local_measure",
+        "external_measure",
+    ]
+    assert metrics["cross_source_ratio"]["sourceColumns"] == []
 
 
 def test_checked_in_published_catalog_passes_the_complete_semantic_asset_contract() -> None:

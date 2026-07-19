@@ -349,7 +349,7 @@ def test_unverified_or_unknown_query_artifacts_are_rejected() -> None:
         passed=False,
     )
 
-    with pytest.raises(ValueError, match="not verified"):
+    with pytest.raises(ValueError) as unverified_error:
         build_grounded_analysis_skill_input(
             goal_contract=goal_contract,
             analysis_goal_id="analysis.main",
@@ -357,7 +357,9 @@ def test_unverified_or_unknown_query_artifacts_are_rejected() -> None:
             verified_query_artifacts=[failed],
             artifact_goal_ids={"query-failed": ["metric.x"]},
         )
-    with pytest.raises(ValueError, match="not in the verified ledger"):
+    assert "not verified" in str(unverified_error.value)
+
+    with pytest.raises(ValueError) as unknown_artifact_error:
         build_grounded_analysis_skill_input(
             goal_contract=goal_contract,
             analysis_goal_id="analysis.main",
@@ -365,6 +367,7 @@ def test_unverified_or_unknown_query_artifacts_are_rejected() -> None:
             verified_query_artifacts=[],
             artifact_goal_ids={},
         )
+    assert "not in the verified ledger" in str(unknown_artifact_error.value)
 
 
 @pytest.mark.parametrize(

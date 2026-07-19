@@ -209,11 +209,19 @@ def test_business_clarification_never_asks_merchant_to_choose_internal_topic() -
     assert "系统自动选择" in scope_prompt
     assert "系统自动选择" in ambiguous_prompt
     assert "请从已发布 Topic" not in ambiguous_prompt
-    assert business_scope_examples() == [
-        "最近30天的订单数和退款总额",
-        "最近7天按商品看的退款金额",
-        "查询某个订单或退款单的明细",
-    ]
+    assert business_scope_examples() == []
+    published_assets = SimpleNamespace(
+        topic_contracts=lambda: [
+            {
+                "metadata": {
+                    "clarificationContracts": {
+                        "business_scope": {"options": ["已发布示例一", "已发布示例二"]}
+                    }
+                }
+            }
+        ]
+    )
+    assert business_scope_examples(published_assets) == ["已发布示例一", "已发布示例二"]
 
 
 def test_core_observation_exposes_auditable_automatic_topic_selection(topic_runtime) -> None:

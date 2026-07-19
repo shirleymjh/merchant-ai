@@ -1,43 +1,27 @@
-const METRIC_LABELS = {
-  gmv: 'GMV',
-  order_gmv_amt_1d: 'GMV',
-  pay_gmv_amt_1d: '支付 GMV',
-  trade_success_gmv_amt_1d: '交易成功 GMV',
-  refund_amt_1d: '退款金额',
-  refund_rate: '退款率',
-  order_cnt: '订单量',
-  order_detail_cnt: '订单量',
-  ticket_cnt: '客服工单量',
-  sku_name: '商品名称',
-  sku_title: '商品标题',
-  reason: '退款原因',
-  value: '指标值'
-}
-
-const TABLE_LABELS = {
-  ads_merchant_profile: '店铺经营指标',
-  dwm_trade_order_detail_di: '订单数据',
-  dwm_trade_refund_detail_di: '退款/售后数据',
-  dwm_goods_detail_df: '商品数据',
-  dwm_cs_ticket_detail_di: '客服工单数据',
-  dwm_cs_repay_detail_df: '赔付数据',
-  dwm_coupon_detail_di: '优惠券数据',
-  dwm_scm_detail_di: '供应链履约数据',
-  dim_merchant_df: '商家资料'
-}
+import {
+  compactFixed,
+  escapeHtml,
+  humanizeIdentifier,
+  isAsciiIdentifier,
+  markdownLine,
+  safeFileName,
+  stripDatabaseQualifier,
+  trimTrailingCharacters
+} from '../utils/textParsing'
 
 export function buildAnalysisReport(input = {}) {
   const experience = input.merchantExperience || {}
   const sections = normalizeSections(input.dataSections, input.dataRows, input.tables)
-  const metricCards = buildMetricCards(sections)
-  const trends = buildTrends(sections)
-  const detailTables = buildDetailTables(sections)
+  const presentation = presentationMetadata(experience.metricDisclosures || [])
+  const metricCards = buildMetricCards(sections, presentation)
+  const trends = buildTrends(sections, presentation)
+  const detailTables = buildDetailTables(sections, presentation)
   const traceability = experience.traceability || {}
   const sources = unique([
     ...(traceability.sourceTables || []),
     ...(input.tables || []),
     ...sections.flatMap(section => section.tables)
-  ]).map(table => TABLE_LABELS[cleanTable(table)] || cleanTable(table)).filter(Boolean)
+  ]).map(stripDatabaseQualifier).filter(Boolean)
   const definitions = (experience.metricDisclosures || []).map(item => ({
     name: item.displayName || item.metricKey || '指标口径',
     description: item.description || item.formula || '采用当前已发布的业务口径。'
@@ -47,7 +31,7 @@ export function buildAnalysisReport(input = {}) {
     title: buildTitle(input.question, sections),
     question: String(input.question || '').trim(),
     generatedAt: formatDateTime(new Date()),
-    timeRange: traceability.timeRange || inferTimeRange(input.question) || '本次查询范围',
+    timeRange: traceability.timeRange || '本次查询范围',
     dataUpdatedAt: traceability.dataUpdatedAt || '',
     evidenceStatus: traceability.evidenceStatus || '',
     summary: summarizeAnswer(input.answer),
@@ -132,13 +116,15 @@ function normalizeSections(dataSections = [], dataRows = [], tables = []) {
   const sections = (dataSections || []).map(section => ({
     title: section.title || section.resultSummary || '经营数据',
     rows: (section.dataRows || []).filter(Boolean),
-    tables: section.dorisTables || []
+    tables: section.dorisTables || [],
+    columnLabels: section.columnLabels || {},
+    columnFormats: section.columnFormats || {}
   })).filter(section => section.rows.length)
   if (sections.length) return sections
   return (dataRows || []).length ? [{ title: '经营数据', rows: dataRows, tables: tables || [] }] : []
 }
 
-function buildMetricCards(sections) {
+function buildMetricCards(sections, presentation) {
   const cards = []
   for (const section of sections) {
     const rows = section.rows
@@ -146,21 +132,21 @@ function buildMetricCards(sections) {
       const groups = groupBy(rows, row => row.metric_name || section.title)
       for (const [metric, points] of Object.entries(groups)) {
         const latest = points[points.length - 1]
-        cards.push({ label: metricLabel(metric), value: formatMetric(latest.value, metric), context: `最新值 · ${latest.pt || ''}` })
+        cards.push({ label: metricLabel(metric, presentation, section), value: formatMetric(latest.value, metric, presentation), context: `最新值 · ${latest.pt || ''}` })
       }
       continue
     }
     if (rows.length === 1) {
       for (const [key, value] of Object.entries(rows[0])) {
         if (key.startsWith('__') || isIdentifier(key) || !isNumeric(value)) continue
-        cards.push({ label: metricLabel(key), value: formatMetric(value, key), context: section.title })
+        cards.push({ label: metricLabel(key, presentation, section), value: formatMetric(value, key, presentation), context: section.title })
       }
     }
   }
   return dedupeBy(cards, card => card.label).slice(0, 4)
 }
 
-function buildTrends(sections) {
+function buildTrends(sections, presentation) {
   return sections.filter(section => section.rows.every(isTrendRow)).flatMap(section => {
     const groups = groupBy(section.rows, row => row.metric_name || section.title)
     return Object.entries(groups).map(([metric, rows]) => {
@@ -168,10 +154,10 @@ function buildTrends(sections) {
       const values = latest.map(row => Number(row.value) || 0)
       const max = Math.max(...values.map(Math.abs), 1)
       return {
-        title: metricLabel(metric),
+        title: metricLabel(metric, presentation, section),
         points: latest.map((row, index) => ({
           label: shortDate(row.pt),
-          value: formatMetric(values[index], metric),
+          value: formatMetric(values[index], metric, presentation),
           height: Math.max(4, Math.round(Math.abs(values[index]) / max * 100))
         }))
       }
@@ -179,12 +165,12 @@ function buildTrends(sections) {
   }).slice(0, 2)
 }
 
-function buildDetailTables(sections) {
+function buildDetailTables(sections, presentation) {
   return sections.filter(section => !section.rows.every(isTrendRow) && section.rows.length).map(section => {
     const keys = unique(section.rows.flatMap(row => Object.keys(row || {}))).filter(key => !key.startsWith('__')).slice(0, 8)
     return {
       title: section.title || '经营明细',
-      columns: keys.map(key => ({ key, label: metricLabel(key) })),
+      columns: keys.map(key => ({ key, label: metricLabel(key, presentation, section) })),
       rows: section.rows.slice(0, 10)
     }
   }).slice(0, 2)
@@ -196,42 +182,39 @@ function renderListPanel(title, items, kind) {
 }
 
 function summarizeAnswer(answer) {
-  const paragraphs = String(answer || '').split('\n').map(line => line.trim()
-    .replace(/^#{1,6}\s*/, '')
-    .replace(/^[-*•]\s*/, '')
-    .replace(/\*\*/g, '')
-  ).filter(line => line && !/^(经营结论|关键发现|核心结论|建议|行动建议)[:：]?$/.test(line) && !/^说明[:：]/.test(line))
+  const paragraphs = String(answer || '')
+    .split('\n')
+    .map(markdownLine)
+    .filter(line => line.kind === 'text' || line.kind === 'bullet')
+    .map(line => line.text)
+    .filter(Boolean)
   return paragraphs.slice(0, 3).join(' ').slice(0, 420)
 }
 
 function buildTitle(question, sections) {
-  const text = String(question || '').trim().replace(/[？?。.]$/, '')
+  const text = trimTrailingCharacters(String(question || '').trim(), '？?。.')
   if (text) return text.length > 34 ? `${text.slice(0, 34)}…` : `${text}｜经营分析报告`
   return `${sections[0]?.title || '商家经营'}｜经营分析报告`
 }
 
-function inferTimeRange(question) {
-  return String(question || '').match(/(最近|近|过去)?\s*\d+\s*(天|日|周|个月|月)|昨日|今天|本周|本月/)?.[0] || ''
-}
-
-function metricLabel(value) {
+function metricLabel(value, presentation, section = {}) {
   const raw = String(value || '').trim()
   if (!raw) return '经营指标'
-  const normalized = raw.toLowerCase()
-  if (METRIC_LABELS[normalized]) return METRIC_LABELS[normalized]
-  if (/^[a-z][a-z0-9_]*$/i.test(raw)) {
-    return raw.split('_').map(token => ({ amt: '金额', cnt: '数量', rate: '率', refund: '退款', order: '订单', pay: '支付', ticket: '工单', pt: '日期' }[token] || token)).join('')
-  }
-  return raw
+  return section.columnLabels?.[raw]
+    || presentation[raw.toLowerCase()]?.displayName
+    || (isAsciiIdentifier(raw) ? humanizeIdentifier(raw) : raw)
 }
 
-function formatMetric(value, key) {
+function formatMetric(value, key, presentation) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return formatCell(value)
-  const text = String(key || '')
-  if (/rate|率/.test(text)) return `${(Math.abs(numeric) <= 1 ? numeric * 100 : numeric).toFixed(2).replace(/\.00$/, '')}%`
-  const compact = Math.abs(numeric) >= 10000 ? `${(numeric / 10000).toFixed(2).replace(/\.00$/, '')}万` : numeric.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
-  return /gmv|amt|amount|金额|销售额|成交额/i.test(text) ? `¥${compact}` : compact
+  const metadata = presentation[String(key || '').toLowerCase()] || {}
+  const scale = Number(metadata.scale ?? 1)
+  const displayed = numeric * (Number.isFinite(scale) ? scale : 1)
+  const compact = Math.abs(displayed) >= 10000
+    ? `${compactFixed(displayed / 10000)}万`
+    : displayed.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+  return `${metadata.prefix || ''}${compact}${metadata.unit || metadata.suffix || ''}`
 }
 
 function formatCell(value) {
@@ -276,21 +259,25 @@ function dedupeBy(items, selector) {
   })
 }
 
-function cleanTable(table) {
-  return String(table || '').replace(/^yshopping\./, '').trim()
-}
-
 function shortDate(value) {
   const text = String(value || '')
   return text.length >= 10 ? text.slice(5, 10) : text
 }
 
-function safeFileName(value) {
-  return String(value || '商家经营分析报告').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').slice(0, 70)
-}
-
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]))
+function presentationMetadata(disclosures) {
+  const result = {}
+  for (const item of disclosures || []) {
+    const key = String(item?.metricKey || '').trim().toLowerCase()
+    if (!key) continue
+    result[key] = {
+      displayName: item.displayName || item.metricKey,
+      unit: item.unit || '',
+      prefix: item.prefix || '',
+      suffix: item.suffix || '',
+      scale: item.scale ?? 1
+    }
+  }
+  return result
 }
 
 function formatDateTime(date) {

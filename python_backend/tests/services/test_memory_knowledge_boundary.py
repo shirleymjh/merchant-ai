@@ -1,12 +1,16 @@
 from types import SimpleNamespace
 
 from merchant_ai.config import get_settings
+from merchant_ai.models import AnswerMode, QueryPlan, QuestionIntent
 from merchant_ai.services.memory import (
     KnowledgeCuratorService,
     KnowledgeSuggestionGovernanceService,
+    MemoryIngestionService,
     MemoryWriteGate,
+    StructuredMemoryStore,
     default_memory_status,
     filter_memory_items,
+    is_metric_definition_dispute,
     knowledge_suggestion_proposed_scope,
     memory_item_counts,
 )
@@ -44,6 +48,42 @@ class _CuratorLlm:
                     "confidence": 0.96,
                     "reason": "the user explicitly stated an individual focus preference",
                 }
+            ],
+        }
+
+
+class _MixedCuratorLlm:
+    configured = True
+
+    def tool_json_chat(self, *args, **kwargs):
+        return {
+            "shouldExtract": True,
+            "reason": "the turn contains independent knowledge and personal signals",
+            "candidates": [
+                {
+                    "kind": "merchant_rule",
+                    "scope": "merchant",
+                    "title": "售后风险关注规则",
+                    "content": "本店售后风险不按退款金额判断。",
+                    "evidenceQuote": "不对，这次不是退款金额",
+                    "topic": "",
+                    "metricName": "refund_rate",
+                    "aliases": [],
+                    "confidence": 0.94,
+                    "reason": "explicit merchant correction",
+                },
+                {
+                    "kind": "personal_preference",
+                    "scope": "personal",
+                    "title": "售后风险指标偏好",
+                    "content": "以后看售后风险默认按退款率。",
+                    "evidenceQuote": "以后看售后风险默认按退款率",
+                    "topic": "",
+                    "metricName": "refund_rate",
+                    "aliases": [],
+                    "confidence": 0.96,
+                    "reason": "explicit personal preference",
+                },
             ],
         }
 
@@ -116,6 +156,64 @@ def test_curator_routes_personal_preference_directly_to_memory(tmp_path):
     assert preference["reviewStatus"] == "auto"
     assert preference["writePolicy"]["humanReviewRequired"] is False
     assert preference["scope"]["userId"] == "user_1"
+
+
+def test_derived_metric_selection_is_not_itself_a_definition_dispute() -> None:
+    plan = QueryPlan(intents=[QuestionIntent(answer_mode=AnswerMode.DERIVED)])
+
+    assert not is_metric_definition_dispute(
+        "不对，这次不是退款金额，是退款率。",
+        ["refund_rate"],
+        plan=plan,
+    )
+    assert is_metric_definition_dispute(
+        "退款率应该用退款单数 / 订单数。",
+        ["refund_rate"],
+        plan=plan,
+    )
+
+
+def test_mixed_correction_keeps_independent_curated_personal_preference(tmp_path) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "memory_curator_enabled": True,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(
+        settings,
+        curator=KnowledgeCuratorService(settings, llm=_MixedCuratorLlm()),
+    )
+
+    memory = store.update_from_state(
+        {
+            "question": "不对，这次不是退款金额；以后看售后风险默认按退款率。",
+            "requested_merchant_id": "seller_1",
+            "plan": QueryPlan(
+                intents=[
+                    QuestionIntent(
+                        answer_mode=AnswerMode.DERIVED,
+                        metric_resolution={"metricKey": "refund_rate"},
+                    )
+                ]
+            ),
+            "answer": "已分别记录知识候选与个人偏好。",
+        }
+    )
+
+    assert memory["events"][-1]["memoryType"] == "correction"
+    assert memory["events"][-1]["status"] == "quarantined"
+    assert memory["knowledgeSuggestions"]
+    preference = next(
+        item
+        for item in memory["preferences"]
+        if item["memoryType"] == "user_preference"
+    )
+    assert preference["memoryTier"] == "core"
+    assert preference["status"] == "active"
+    assert "退款率" in preference["value"]
 
 
 def test_quarantined_memory_is_hidden_from_active_management_view():

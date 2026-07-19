@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -11,6 +10,7 @@ from merchant_ai.config import Settings
 from merchant_ai.models import ArtifactRef, ContextDelta, ContextPackage, ContextSnapshot, ImportantFact, SourceRef
 from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.security import identity_scope_payload
+from merchant_ai.services.text_parsing import collapse_whitespace
 
 
 class ImportantFactExtractor:
@@ -194,13 +194,16 @@ class ImportantFactExtractor:
 
     def _extract_user_correction_facts(self, facts: List[ImportantFact], state: Dict[str, Any], stage: str) -> None:
         rows = []
-        for message in list(state.get("message_history") or [])[-16:]:
-            role = str(self._value(message, "role") or "").lower()
-            text = str(self._value(message, "text") or "").strip()
-            if role != "user" or not text:
-                continue
-            if re.search(r"(不是|不对|纠正|应该|不能|别按|口径)", text):
-                rows.append(re.sub(r"\s+", " ", text)[:300])
+        injection = state.get("memory_injection") or {}
+        for item in list(injection.get("relevantCorrections") or [])[-4:]:
+            text = (
+                self._value(item, "correctionText")
+                or self._value(item, "correction_text")
+                or self._value(item, "content")
+            )
+            normalized = collapse_whitespace(text)
+            if normalized:
+                rows.append(normalized[:300])
         self._add(facts, "user_corrections", " | ".join(rows[-4:]), "correction", 99, stage)
 
     def _compact_dict(self, item: Any, keys: List[str]) -> str:

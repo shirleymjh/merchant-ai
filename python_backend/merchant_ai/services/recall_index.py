@@ -4,7 +4,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import threading
 import uuid
 from contextlib import contextmanager
@@ -18,6 +17,7 @@ import requests
 from merchant_ai.config import Settings
 from merchant_ai.models import RecallItem
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.text_parsing import safe_ascii_component
 
 
 class RecallDocumentProvider(Protocol):
@@ -602,8 +602,20 @@ class EsRecallIndexAdapter:
 
     @staticmethod
     def _physical_index_name(alias: str, version: str) -> str:
-        safe_alias = re.sub(r"[^a-z0-9._-]+", "_", alias.lower()).strip("_-.+") or "merchant_ai_recall"
-        safe_version = re.sub(r"[^a-z0-9_-]+", "_", version.lower()).strip("_-") or "unknown"
+        safe_alias = safe_ascii_component(
+            alias,
+            extras=("_", ".", "-"),
+            default="merchant_ai_recall",
+            lowercase=True,
+            strip="_-.+",
+        )
+        safe_version = safe_ascii_component(
+            version,
+            extras=("_", "-"),
+            default="unknown",
+            lowercase=True,
+            strip="_-",
+        )
         return "%s__v_%s_%s" % (safe_alias[:180], safe_version[:40], uuid.uuid4().hex[:10])
 
     def _recall_item_to_es_doc(self, item: RecallItem) -> dict[str, Any]:

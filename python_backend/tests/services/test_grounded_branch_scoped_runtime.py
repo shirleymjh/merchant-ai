@@ -8,9 +8,13 @@ from typing import Any
 
 from merchant_ai.models import (
     AgentRunResult,
+    AgentTaskResult,
+    DataSnapshotContract,
+    FreshnessCheckResult,
     MerchantInfo,
     QueryBundle,
     QueryPlan,
+    SqlValidationResult,
     VerifiedEvidence,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
@@ -33,6 +37,7 @@ from merchant_ai.services.grounded_goal_contract import (
     original_question_goal_contract_fingerprint,
 )
 from merchant_ai.services.grounded_execution_graph import (
+    build_grounded_execution_graph_replan_evidence,
     discovery_evidence_snapshot_fingerprint,
 )
 from merchant_ai.services.grounded_query_contract import (
@@ -236,15 +241,35 @@ class _BranchKernel:
         return attempt
 
     @staticmethod
+    def capture_data_snapshot(
+        semantic_activation_fingerprint: str,
+    ) -> DataSnapshotContract:
+        return DataSnapshotContract(
+            datasource_fingerprint="a" * 64,
+            datasource_environment="test",
+            data_epoch="epoch-1",
+            consistency_mode="AS_OF_READ",
+            semantic_activation_fingerprint=(
+                semantic_activation_fingerprint or "b" * 64
+            ),
+            cache_generation="generation-1",
+        )
+
+    @staticmethod
     def execute_active(
         session: GroundedRuntimeSession,
         **kwargs: Any,
     ) -> AgentRunResult:
-        del kwargs
+        snapshot = kwargs.get("data_snapshot_contract")
         result = AgentRunResult(
             merged_query_bundle=QueryBundle(
                 rows=[{"branch": session.session_id, "value": 1}],
                 tables=[session.session_id],
+                data_snapshot=(
+                    snapshot
+                    if isinstance(snapshot, DataSnapshotContract)
+                    else DataSnapshotContract()
+                ),
             )
         )
         session.run_result = result
@@ -339,6 +364,99 @@ def _context(
     )
 
 
+def _retain_test_discovery_paths(
+    runtime: GroundedDeepAgentRuntime,
+    context: GroundedDeepAgentRunContext,
+    paths: list[str],
+) -> list[str]:
+    retained: list[str] = []
+    existing_refs = {
+        str(item.get("refId") or "")
+        for item in context.session.core_semantic_evidence
+    }
+    for path in paths:
+        result = runtime.semantic_catalog.read(
+            path=path,
+            max_chars=2_000_000,
+            offset=0,
+        )
+        assert result["success"] is True
+        content = str(result.get("content") or "")
+        ref_id = str(result.get("refId") or "")
+        retained.append(ref_id)
+        if ref_id in existing_refs:
+            continue
+        context.session.core_semantic_evidence.append(
+            {
+                "refId": ref_id,
+                "path": str(result.get("path") or path),
+                "kind": str(result.get("kind") or ""),
+                "topic": str(result.get("topic") or ""),
+                "table": str(result.get("table") or ""),
+                "contentSnippet": content,
+                "contentHash": hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest(),
+                "contentComplete": True,
+                "offset": 0,
+            }
+        )
+        existing_refs.add(ref_id)
+    return retained
+
+
+def _propose_test_execution_graph(
+    runtime: GroundedDeepAgentRuntime,
+    context: GroundedDeepAgentRunContext,
+    *,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    goal_contract = context.session.question_goal_contract
+    assert goal_contract is not None
+    proposal_nodes: list[dict[str, Any]] = []
+    documents = dict(runtime.semantic_catalog.documents)
+    for raw_node in nodes:
+        node = dict(raw_node)
+        paths = list(node.pop("evidencePaths", []) or [])
+        if not paths:
+            topic_scope = set(node.get("topicScope") or [])
+            paths = [
+                path
+                for path, document in documents.items()
+                if str(document.get("topic") or "") in topic_scope
+            ][:1]
+        node["evidenceRefIds"] = _retain_test_discovery_paths(
+            runtime,
+            context,
+            paths,
+        )
+        proposal_nodes.append(node)
+    tools = {item.name: item for item in runtime.tools}
+    return json.loads(
+        tools["propose_grounded_execution_graph"].func(
+            proposal={
+                "baseVersion": (
+                    context.session.execution_graph_generation
+                ),
+                "goalContractFingerprint": (
+                    original_question_goal_contract_fingerprint(
+                        goal_contract
+                    )
+                ),
+                "discoverySnapshotFingerprint": (
+                    discovery_evidence_snapshot_fingerprint(
+                        context.session.core_semantic_evidence
+                    )
+                ),
+                "nodes": proposal_nodes,
+                "edges": list(edges or []),
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+
 def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None:
     runtime, kernel, _ = _runtime()
     context = _context(kernel, "订单量和退款金额分别是多少")
@@ -362,32 +480,41 @@ def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None
         )
     )
     assert goal_result["nextAction"] == ("DISCOVER_SEMANTIC_EVIDENCE")
-    declared = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
+    declared = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
                 {
-                    "queryId": "orders",
+                    "clientKey": "orders",
                     "objective": "订单量",
                     "goalIds": ["metric.orders"],
                     "topicScope": ["电商交易"],
+                    "evidencePaths": [
+                        "topics/电商交易/tables/orders/detail.json",
+                        "topics/电商交易/tables/orders/metrics/order_count.json",
+                    ],
                 },
                 {
-                    "queryId": "refunds",
+                    "clientKey": "refunds",
                     "objective": "退款金额",
                     "goalIds": ["metric.refunds"],
                     "topicScope": ["电商退货"],
+                    "evidencePaths": [
+                        "topics/电商退货/tables/refunds/detail.json",
+                        "topics/电商退货/tables/refunds/metrics/refund_amount.json",
+                    ],
                 },
             ],
-            runtime=SimpleNamespace(context=context),
-        )
     )
     assert declared["status"] == "FROZEN"
+    orders_id = declared["clientNodeIds"]["orders"]
+    refunds_id = declared["clientNodeIds"]["refunds"]
 
     prepared = json.loads(
         tools["prepare_grounded_query_batch"].func(
             queries=[
                 {
-                    "queryId": "orders",
+                    "queryId": orders_id,
                     "semanticPaths": [
                         "topics/电商交易/tables/orders/detail.json",
                         "topics/电商交易/tables/orders/metrics/order_count.json",
@@ -398,7 +525,7 @@ def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None
                     },
                 },
                 {
-                    "queryId": "refunds",
+                    "queryId": refunds_id,
                     "semanticPaths": [
                         "topics/电商退货/tables/refunds/detail.json",
                         "topics/电商退货/tables/refunds/metrics/refund_amount.json",
@@ -417,24 +544,30 @@ def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None
     assert prepared["compatMode"] == "BRANCH_SCOPED_V2"
     assert prepared["preparedInParallel"] is True
     assert kernel.max_active_prepares == 2
-    assert context.session.core_semantic_evidence == []
-    orders = context.session.query_branch_contexts["orders"]
-    refunds = context.session.query_branch_contexts["refunds"]
+    assert len(context.session.core_semantic_evidence) == 4
+    orders = context.session.query_branch_contexts[orders_id]
+    refunds = context.session.query_branch_contexts[refunds_id]
     assert orders.effective_topics() == ["电商交易"]
     assert refunds.effective_topics() == ["电商退货"]
     assert all(item["topic"] == "电商交易" for item in orders.semantic_ledger.evidence())
     assert all(item["topic"] == "电商退货" for item in refunds.semantic_ledger.evidence())
-    assert set(context.session.parallel_branches) == {"orders", "refunds"}
+    assert set(context.session.parallel_branches) == {
+        orders_id,
+        refunds_id,
+    }
 
     executed = json.loads(
         tools["execute_grounded_query_batch"].func(
-            queries=[{"queryId": "orders"}, {"queryId": "refunds"}],
+            queries=[
+                {"queryId": orders_id},
+                {"queryId": refunds_id},
+            ],
             reason="independent metrics",
             runtime=SimpleNamespace(context=context),
         )
     )
 
-    assert executed["status"] == "VERIFIED"
+    assert executed["status"] == "VERIFIED", executed
     assert executed["executedInParallel"] is True
     assert len(context.session.runtime.verified_query_ledger) == 2
     assert orders.status == "VERIFIED"
@@ -455,51 +588,62 @@ def test_entity_chain_downstream_waits_before_contract_preparation() -> None:
                     goal_id="metric.top_products",
                     label="商品排行",
                 ),
-                    MetricQuestionGoal(
-                        goal_id="metric.refunds",
-                        label="商品集合退款",
-                    ),
-                    DependencyQuestionGoal(
-                        goal_id="dependency.entity_set",
-                        label="商品集合传递",
-                        dependency_type="entity_chain",
-                        artifact_kind="VERIFIED_ENTITY_SET",
-                        upstream_goal_ids=["metric.top_products"],
-                        downstream_goal_ids=["metric.refunds"],
-                    ),
+                MetricQuestionGoal(
+                    goal_id="metric.refunds",
+                    label="商品集合退款",
+                ),
+                DependencyQuestionGoal(
+                    goal_id="dependency.entity_set",
+                    label="商品集合传递",
+                    dependency_type="entity_chain",
+                    artifact_kind="VERIFIED_ENTITY_SET",
+                    upstream_goal_ids=["metric.top_products"],
+                    downstream_goal_ids=["metric.refunds"],
+                ),
             ],
         ),
         runtime=SimpleNamespace(context=context),
     )
-    declared = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
+    declared = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
                 {
-                    "queryId": "top-products",
+                    "clientKey": "top-products",
                     "goalIds": ["metric.top_products"],
                     "topicScope": ["电商交易"],
                 },
                 {
-                    "queryId": "product-refunds",
+                    "clientKey": "product-refunds",
                     "goalIds": ["metric.refunds"],
                     "topicScope": ["电商退货"],
                 },
             ],
-            runtime=SimpleNamespace(context=context),
-        )
+        edges=[
+            {
+                "sourceClientKey": "top-products",
+                "targetClientKey": "product-refunds",
+                "dependencyMode": "VERIFIED_ARTIFACT",
+                "artifactKind": "VERIFIED_ENTITY_SET",
+                "targetBindingRef": "population.product_refunds",
+            }
+        ],
     )
-    assert declared["waitingForVerifiedEntitySetQueryIds"] == ["product-refunds"]
+    downstream_id = declared["clientNodeIds"]["product-refunds"]
+    assert declared["waitingForVerifiedArtifactQueryIds"] == [
+        downstream_id
+    ]
 
     result = json.loads(
         tools["prepare_grounded_query_batch"].func(
-            queries=[{"queryId": "product-refunds"}],
+            queries=[{"queryId": downstream_id}],
             runtime=SimpleNamespace(context=context),
         )
     )
 
     assert result["status"] == "BLOCKED"
     assert result["queries"][0]["status"] == ("WAITING_VERIFIED_ENTITY_SET")
-    assert context.session.query_branch_contexts["product-refunds"].runtime is None
+    assert context.session.query_branch_contexts[downstream_id].runtime is None
     assert kernel.max_active_prepares == 0
 
 
@@ -532,42 +676,41 @@ def test_ranking_metric_and_dimension_goals_must_share_its_branch() -> None:
         runtime=SimpleNamespace(context=context),
     )
 
-    rejected = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
-                {
-                    "queryId": "sales-inputs",
-                    "goalIds": ["metric.sales", "dimension.product"],
-                    "topicScope": ["电商交易"],
-                },
-                {
-                    "queryId": "ranking",
-                    "goalIds": ["ranking.top_products"],
-                    "topicScope": ["电商交易"],
-                },
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
+    rejected = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
+            {
+                "clientKey": "sales-inputs",
+                "goalIds": ["metric.sales", "dimension.product"],
+                "topicScope": ["电商交易"],
+            },
+            {
+                "clientKey": "ranking",
+                "goalIds": ["ranking.top_products"],
+                "topicScope": ["电商交易"],
+            },
+        ],
     )
 
     assert rejected["status"] == "REJECTED"
+    assert rejected["code"] == "EXECUTION_GRAPH_GOAL_TOPOLOGY_INVALID"
     assert {item["code"] for item in rejected["issues"]} == {"QUERY_BRANCH_STRUCTURAL_GOALS_NOT_COLOCATED"}
 
-    accepted = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
-                {
-                    "queryId": "ranking",
-                    "goalIds": [
-                        "metric.sales",
-                        "dimension.product",
-                        "ranking.top_products",
-                    ],
-                    "topicScope": ["电商交易"],
-                }
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
+    accepted = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
+            {
+                "clientKey": "ranking",
+                "goalIds": [
+                    "metric.sales",
+                    "dimension.product",
+                    "ranking.top_products",
+                ],
+                "topicScope": ["电商交易"],
+            }
+        ],
     )
     assert accepted["status"] == "FROZEN"
 
@@ -624,35 +767,34 @@ def test_same_branch_prerequisites_are_local_not_entity_chain_dependencies() -> 
         runtime=SimpleNamespace(context=context),
     )
 
-    declared = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
-                {
-                    "queryId": "orders",
-                    "goalIds": ["time.recent10d", "detail.orders"],
-                    "topicScope": ["电商交易"],
-                },
-                {
-                    "queryId": "refund-ranking",
-                    "goalIds": [
-                        "time.recent10d",
-                        "metric.refund_amount",
-                        "dimension.order_id",
-                        "ranking.refunds",
-                    ],
-                    "topicScope": ["电商退货"],
-                },
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
+    declared = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
+            {
+                "clientKey": "orders",
+                "goalIds": ["time.recent10d", "detail.orders"],
+                "topicScope": ["电商交易"],
+            },
+            {
+                "clientKey": "refund-ranking",
+                "goalIds": [
+                    "time.recent10d",
+                    "metric.refund_amount",
+                    "dimension.order_id",
+                    "ranking.refunds",
+                ],
+                "topicScope": ["电商退货"],
+            },
+        ],
     )
 
     assert declared["status"] == "FROZEN"
     assert set(declared["readyQueryIds"]) == {
-        "orders",
-        "refund-ranking",
+        declared["clientNodeIds"]["orders"],
+        declared["clientNodeIds"]["refund-ranking"],
     }
-    assert declared["waitingForVerifiedEntitySetQueryIds"] == []
+    assert declared["waitingForVerifiedArtifactQueryIds"] == []
 
 
 def test_contract_scope_population_keeps_both_execution_nodes_ready() -> None:
@@ -732,15 +874,9 @@ def test_contract_scope_population_keeps_both_execution_nodes_ready() -> None:
         tools["propose_grounded_execution_graph"].func(
             proposal={
                 "baseVersion": 0,
-                "goalContractFingerprint": (
-                    original_question_goal_contract_fingerprint(
-                        goal_contract
-                    )
-                ),
+                "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
                 "discoverySnapshotFingerprint": (
-                    discovery_evidence_snapshot_fingerprint(
-                        context.session.core_semantic_evidence
-                    )
+                    discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
                 ),
                 "nodes": [
                     {
@@ -750,9 +886,7 @@ def test_contract_scope_population_keeps_both_execution_nodes_ready() -> None:
                             "detail.orders",
                         ],
                         "topicScope": ["电商交易"],
-                        "evidenceRefIds": [
-                            "semantic:trade:orders:detail"
-                        ],
+                        "evidenceRefIds": ["semantic:trade:orders:detail"],
                     },
                     {
                         "clientKey": "refund_ranking",
@@ -813,22 +947,21 @@ def test_detail_input_goals_are_colocated_but_analysis_inputs_may_branch() -> No
         ),
         runtime=SimpleNamespace(context=detail_context),
     )
-    rejected = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
-                {
-                    "queryId": "orders",
-                    "goalIds": ["metric.orders"],
-                    "topicScope": ["电商交易"],
-                },
-                {
-                    "queryId": "order-detail",
-                    "goalIds": ["detail.orders"],
-                    "topicScope": ["电商交易"],
-                },
-            ],
-            runtime=SimpleNamespace(context=detail_context),
-        )
+    rejected = _propose_test_execution_graph(
+        runtime,
+        detail_context,
+        nodes=[
+            {
+                "clientKey": "orders",
+                "goalIds": ["metric.orders"],
+                "topicScope": ["电商交易"],
+            },
+            {
+                "clientKey": "order-detail",
+                "goalIds": ["detail.orders"],
+                "topicScope": ["电商交易"],
+            },
+        ],
     )
     assert rejected["issues"][0]["code"] == ("QUERY_BRANCH_STRUCTURAL_GOALS_NOT_COLOCATED")
 
@@ -855,25 +988,27 @@ def test_detail_input_goals_are_colocated_but_analysis_inputs_may_branch() -> No
         ),
         runtime=SimpleNamespace(context=analysis_context),
     )
-    accepted = json.loads(
-        tools["declare_grounded_query_branches"].func(
-            branches=[
-                {
-                    "queryId": "orders",
-                    "goalIds": ["metric.orders"],
-                    "topicScope": ["电商交易"],
-                },
-                {
-                    "queryId": "refunds",
-                    "goalIds": ["metric.refunds"],
-                    "topicScope": ["电商退货"],
-                },
-            ],
-            runtime=SimpleNamespace(context=analysis_context),
-        )
+    accepted = _propose_test_execution_graph(
+        runtime,
+        analysis_context,
+        nodes=[
+            {
+                "clientKey": "orders",
+                "goalIds": ["metric.orders"],
+                "topicScope": ["电商交易"],
+            },
+            {
+                "clientKey": "refunds",
+                "goalIds": ["metric.refunds"],
+                "topicScope": ["电商退货"],
+            },
+        ],
     )
     assert accepted["status"] == "FROZEN"
-    assert accepted["readyQueryIds"] == ["orders", "refunds"]
+    assert accepted["readyQueryIds"] == [
+        accepted["clientNodeIds"]["orders"],
+        accepted["clientNodeIds"]["refunds"],
+    ]
 
 
 def test_l0_detail_path_yields_bounded_l1_navigation_then_exact_leaf_ready() -> None:
@@ -892,33 +1027,16 @@ def test_l0_detail_path_yields_bounded_l1_navigation_then_exact_leaf_ready() -> 
         ),
         runtime=SimpleNamespace(context=context),
     )
-    tools["declare_grounded_query_branches"].func(
-        branches=[
-            {
-                "queryId": "orders",
-                "goalIds": ["metric.orders"],
-                "topicScope": ["电商交易"],
-            }
-        ],
-        runtime=SimpleNamespace(context=context),
+    _retain_test_discovery_paths(
+        runtime,
+        context,
+        ["topics/电商交易/tables/orders/detail.json"],
     )
-
-    first = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {
-                    "queryId": "orders",
-                    "semanticPaths": ["topics/电商交易/tables/orders/detail.json"],
-                    "bindingHints": {"tableRefs": ["semantic:电商交易:orders:detail"]},
-                }
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert first["status"] == "BLOCKED"
-    receipt = first["queries"][0]["semanticReceipts"][0]
-    navigation = receipt["summary"]["semanticNavigation"]
+    detail_evidence = context.session.core_semantic_evidence[-1]
+    navigation = _semantic_payload_summary(
+        str(detail_evidence["kind"]),
+        str(detail_evidence["contentSnippet"]),
+    )["semanticNavigation"]
     assert navigation["bindingEvidence"] is False
     assert navigation["advertisedCounts"] == {"metrics": 1, "columns": 0}
     assert navigation["metricLeaves"] == [
@@ -929,13 +1047,33 @@ def test_l0_detail_path_yields_bounded_l1_navigation_then_exact_leaf_ready() -> 
             "path": "topics/电商交易/tables/orders/metrics/order_count.json",
         }
     ]
-
-    second = json.loads(
+    metric_path = navigation["metricLeaves"][0]["path"]
+    frozen = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
+            {
+                "clientKey": "orders",
+                "goalIds": ["metric.orders"],
+                "topicScope": ["电商交易"],
+                "evidencePaths": [
+                    "topics/电商交易/tables/orders/detail.json",
+                    metric_path,
+                ],
+            }
+        ],
+    )
+    assert frozen["status"] == "FROZEN"
+    query_id = frozen["clientNodeIds"]["orders"]
+    prepared = json.loads(
         tools["prepare_grounded_query_batch"].func(
             queries=[
                 {
-                    "queryId": "orders",
-                    "semanticPaths": [navigation["metricLeaves"][0]["path"]],
+                    "queryId": query_id,
+                    "semanticPaths": [
+                        "topics/电商交易/tables/orders/detail.json",
+                        metric_path,
+                    ],
                     "bindingHints": {
                         "tableRefs": ["semantic:电商交易:orders:detail"],
                         "metricRefs": [navigation["metricLeaves"][0]["refId"]],
@@ -946,13 +1084,13 @@ def test_l0_detail_path_yields_bounded_l1_navigation_then_exact_leaf_ready() -> 
         )
     )
 
-    assert second["status"] == "PREPARED"
-    branch = context.session.query_branch_contexts["orders"]
+    assert prepared["status"] == "PREPARED"
+    branch = context.session.query_branch_contexts[query_id]
     assert branch.semantic_ledger.refs() == [
         "semantic:电商交易:orders:detail",
         "semantic:电商交易:orders:metric:order_count",
     ]
-    assert branch.budget.report()["usage"]["semanticReads"] == 2
+    assert branch.budget.report()["usage"]["semanticReads"] == 0
 
 
 def test_l1_receipt_keeps_every_publisher_bounded_column_coordinate() -> None:
@@ -1004,21 +1142,23 @@ def test_multi_branch_boundary_rejects_global_filesystem_retrieval() -> None:
         ),
         runtime=SimpleNamespace(context=context),
     )
-    tools["declare_grounded_query_branches"].func(
-        branches=[
+    frozen = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
             {
-                "queryId": "orders",
+                "clientKey": "orders",
                 "goalIds": ["metric.orders"],
                 "topicScope": ["电商交易"],
             },
             {
-                "queryId": "refunds",
+                "clientKey": "refunds",
                 "goalIds": ["metric.refunds"],
                 "topicScope": ["电商退货"],
             },
         ],
-        runtime=SimpleNamespace(context=context),
     )
+    assert frozen["status"] == "FROZEN"
     boundary = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(catalog))
     request = SimpleNamespace(
         runtime=SimpleNamespace(context=context),
@@ -1080,15 +1220,9 @@ def test_query_goal_allows_discovery_before_execution_graph_freeze() -> None:
         tools["propose_grounded_execution_graph"].func(
             proposal={
                 "baseVersion": 0,
-                "goalContractFingerprint": (
-                    original_question_goal_contract_fingerprint(
-                        goal_contract
-                    )
-                ),
+                "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
                 "discoverySnapshotFingerprint": (
-                    discovery_evidence_snapshot_fingerprint(
-                        context.session.core_semantic_evidence
-                    )
+                    discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
                 ),
                 "nodes": [
                     {
@@ -1106,9 +1240,7 @@ def test_query_goal_allows_discovery_before_execution_graph_freeze() -> None:
     assert frozen["receipt"]["version"] == 1
     assert frozen["receipt"]["fingerprint"]
     query_id = frozen["clientNodeIds"]["orders"]
-    inherited = context.session.query_branch_contexts[
-        query_id
-    ].semantic_ledger.refs()
+    inherited = context.session.query_branch_contexts[query_id].semantic_ledger.refs()
     assert inherited == ["semantic:电商交易:orders:detail"]
 
 
@@ -1148,15 +1280,9 @@ def _freeze_reopenable_execution_graph(
         tools["propose_grounded_execution_graph"].func(
             proposal={
                 "baseVersion": base_version,
-                "goalContractFingerprint": (
-                    original_question_goal_contract_fingerprint(
-                        goal_contract
-                    )
-                ),
+                "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
                 "discoverySnapshotFingerprint": (
-                    discovery_evidence_snapshot_fingerprint(
-                        context.session.core_semantic_evidence
-                    )
+                    discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
                 ),
                 "nodes": [
                     {
@@ -1206,9 +1332,7 @@ def test_gapped_unexecuted_graph_reopens_discovery_and_refreezes_with_cas() -> N
     assert context.session.execution_graph_generation == 1
     assert context.session.execution_graph_receipt is None
     assert context.session.query_branch_contexts == {}
-    assert context.session.execution_graph_history[-1]["status"] == (
-        "GAPPED_REOPENED"
-    )
+    assert context.session.execution_graph_history[-1]["status"] == ("GAPPED_REOPENED")
 
     second = _freeze_reopenable_execution_graph(
         runtime,
@@ -1297,8 +1421,593 @@ def test_execution_graph_reopen_is_forbidden_after_verified_artifact() -> None:
     )
 
     assert rejected["status"] == "REJECTED"
-    assert rejected["code"] == (
-        "EXECUTION_GRAPH_REOPEN_AFTER_EXECUTION_FORBIDDEN"
-    )
+    assert rejected["code"] == ("EXECUTION_GRAPH_REOPEN_AFTER_EXECUTION_FORBIDDEN")
     assert rejected["executedQueryIds"] == [query_id]
     assert context.session.execution_graph_receipt is not None
+
+
+def _install_graph_replan_trigger(
+    context: GroundedDeepAgentRunContext,
+    *,
+    query_id: str,
+    trigger_kind: str,
+    source_stage: str,
+) -> dict[str, Any]:
+    receipt = context.session.execution_graph_receipt
+    assert receipt is not None
+    evidence = build_grounded_execution_graph_replan_evidence(
+        trigger_kind=trigger_kind,
+        source_stage=source_stage,
+        source_query_node_id=query_id,
+        code="STRUCTURED_RUNTIME_TEST_TRIGGER",
+        graph_receipt=receipt,
+        details={"gapCodes": ["STRUCTURED_RUNTIME_GAP"]},
+    )
+    context.session.execution_graph_replan_evidence[evidence.evidence_id] = evidence
+    return evidence.model_dump(by_alias=True, mode="json")
+
+
+def _set_frozen_branch_evidence_kind(
+    context: GroundedDeepAgentRunContext,
+    *,
+    query_id: str,
+    evidence_kind: str,
+) -> None:
+    branch = context.session.query_branch_contexts[query_id]
+    ref_id = branch.semantic_ledger.refs()[0]
+    with branch.semantic_ledger.lock:
+        branch.semantic_ledger.evidence_by_ref[ref_id]["kind"] = evidence_kind
+
+
+def test_contract_gap_is_sealed_as_data_gap_trigger_by_prepare_tool() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    query_id = frozen["clientNodeIds"]["primary_query"]
+    _set_frozen_branch_evidence_kind(
+        context,
+        query_id=query_id,
+        evidence_kind="TABLE_DETAIL",
+    )
+
+    prepared = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    query_result = prepared["queries"][0]
+    assert query_result["code"] == "PARALLEL_CONTRACT_NOT_READY"
+    assert query_result["replanEvidence"]["triggerKind"] == ("DATA_GAP")
+    assert query_result["replanEvidence"]["sourceStage"] == ("CONTRACT")
+    assert query_result["replanEvidence"]["sourceQueryNodeId"] == (query_id)
+
+
+def test_datasource_delay_is_sealed_as_table_delay_trigger_by_execute_tool() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    query_id = frozen["clientNodeIds"]["primary_query"]
+    _set_frozen_branch_evidence_kind(
+        context,
+        query_id=query_id,
+        evidence_kind="METRIC",
+    )
+    prepared = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert prepared["queries"][0]["status"] == "PREPARED"
+
+    def delayed_execute(
+        session: GroundedRuntimeSession,
+        **kwargs: Any,
+    ) -> AgentRunResult:
+        del session, kwargs
+        return AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="delayed-table",
+                    success=True,
+                    freshness_reports=[
+                        FreshnessCheckResult(
+                            task_id="delayed-table",
+                            table="governed_table",
+                            checked=True,
+                            status=("STALE_REQUIRES_GRAPH_REPREPARATION"),
+                            coverage_complete=False,
+                            reason="structured coverage gap",
+                        )
+                    ],
+                )
+            ],
+            merged_query_bundle=QueryBundle(),
+        )
+
+    def gapped_verify(
+        session: GroundedRuntimeSession,
+    ) -> VerifiedEvidence:
+        del session
+        return VerifiedEvidence(passed=False)
+
+    kernel.execute_active = delayed_execute  # type: ignore[method-assign]
+    kernel.verify_active = gapped_verify  # type: ignore[method-assign]
+    executed = json.loads(
+        tools["execute_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            reason="execute governed branch",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    query_result = executed["queries"][0]
+    assert query_result["status"] == "REPLAN_REQUIRED"
+    assert query_result["replanEvidence"]["triggerKind"] == ("TABLE_DELAY")
+    assert query_result["replanEvidence"]["sourceStage"] == ("DATASOURCE")
+
+
+def test_unstructured_execution_exception_is_terminal_without_replan_trigger() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    query_id = frozen["clientNodeIds"]["primary_query"]
+    _set_frozen_branch_evidence_kind(
+        context,
+        query_id=query_id,
+        evidence_kind="METRIC",
+    )
+    prepared = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert prepared["queries"][0]["status"] == "PREPARED"
+
+    def failed_execute(
+        session: GroundedRuntimeSession,
+        **kwargs: Any,
+    ) -> AgentRunResult:
+        del session, kwargs
+        raise RuntimeError("structured execution failure")
+
+    kernel.execute_active = failed_execute  # type: ignore[method-assign]
+    executed = json.loads(
+        tools["execute_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            reason="execute governed branch",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    query_result = executed["queries"][0]
+    assert executed["status"] == "OPERATIONAL_FAILURE"
+    assert query_result["status"] == "OPERATIONAL_FAILURE"
+    assert query_result["failureDisposition"] == "OPERATIONAL_TERMINAL"
+    assert query_result["replanEvidence"] == {}
+    assert context.session.execution_graph_replan_evidence == {}
+    assert context.session.operational_failure["retryable"] is False
+
+
+def test_structured_doris_failure_is_sealed_as_execution_error_trigger() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    query_id = frozen["clientNodeIds"]["primary_query"]
+    _set_frozen_branch_evidence_kind(
+        context,
+        query_id=query_id,
+        evidence_kind="METRIC",
+    )
+    prepared = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert prepared["queries"][0]["status"] == "PREPARED"
+
+    failed_bundle = QueryBundle(
+        failed=True,
+        error="DORIS_ERROR: backend unavailable",
+    )
+
+    def failed_execute(
+        session: GroundedRuntimeSession,
+        **kwargs: Any,
+    ) -> AgentRunResult:
+        del session, kwargs
+        return AgentRunResult(
+            task_results=[
+                AgentTaskResult(
+                    task_id="doris-query",
+                    success=False,
+                    query_bundle=failed_bundle,
+                    validation_results=[
+                        SqlValidationResult(
+                            valid=False,
+                            error_code="DORIS_ERROR",
+                            message="backend unavailable",
+                        )
+                    ],
+                )
+            ],
+            merged_query_bundle=failed_bundle,
+        )
+
+    kernel.execute_active = failed_execute  # type: ignore[method-assign]
+    executed = json.loads(
+        tools["execute_grounded_query_batch"].func(
+            queries=[{"queryId": query_id}],
+            reason="execute governed branch",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    query_result = executed["queries"][0]
+    assert executed["status"] == "REPLAN_REQUIRED"
+    assert query_result["status"] == "REPLAN_REQUIRED"
+    assert query_result["failureDisposition"] == "RECOVERABLE_EXECUTION"
+    assert query_result["replanEvidence"]["triggerKind"] == "EXECUTION_ERROR"
+    assert query_result["replanEvidence"]["sourceStage"] == "EXECUTION"
+
+
+def test_failed_execution_replans_by_appending_recovery_and_retires_old_id() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    old_query_id = frozen["clientNodeIds"]["primary_query"]
+    context.session.query_branch_contexts[old_query_id].status = "FAILED"
+    context.session.execution_graph_max_revision_count = 1
+    trigger = _install_graph_replan_trigger(
+        context,
+        query_id=old_query_id,
+        trigger_kind="EXECUTION_ERROR",
+        source_stage="EXECUTION",
+    )
+    goal_contract = context.session.question_goal_contract
+    assert goal_contract is not None
+
+    revision_payload = {
+        "baseGraphId": frozen["receipt"]["graphId"],
+        "baseVersion": frozen["receipt"]["version"],
+        "baseFingerprint": frozen["receipt"]["fingerprint"],
+        "triggerEvidenceId": trigger["evidenceId"],
+        "triggerEvidenceFingerprint": trigger["evidenceFingerprint"],
+        "graph": {
+            "baseVersion": frozen["receipt"]["version"],
+            "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
+            "discoverySnapshotFingerprint": (
+                discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
+            ),
+            "nodes": [
+                {
+                    "clientKey": "primary_recovery",
+                    "goalIds": ["metric.primary"],
+                    "topicScope": ["电商交易"],
+                    "evidenceRefIds": ["semantic:discovery:metric"],
+                }
+            ],
+        },
+    }
+    revised = json.loads(
+        tools["revise_grounded_execution_graph"].func(
+            revision=revision_payload,
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert revised["status"] == "REVISED"
+    assert revised["receipt"]["parentVersion"] == 1
+    assert revised["retiredQueryNodeIds"] == [old_query_id]
+    recovery_id = revised["clientNodeIds"]["primary_recovery"]
+    assert recovery_id != old_query_id
+    assert set(context.session.query_branch_contexts) == {recovery_id}
+    assert context.session.execution_graph_revision_count == 1
+    assert trigger["evidenceFingerprint"] in (context.session.execution_graph_used_replan_fingerprints)
+    stale_revision = json.loads(
+        tools["revise_grounded_execution_graph"].func(
+            revision=revision_payload,
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert stale_revision["status"] == "REVISED"
+    assert stale_revision["idempotent"] is True
+    assert stale_revision["receipt"]["fingerprint"] == (
+        revised["receipt"]["fingerprint"]
+    )
+    assert context.session.execution_graph_revision_count == 1
+    stale_reopen = json.loads(
+        tools["reopen_grounded_execution_graph_discovery"].func(
+            graph_id=frozen["receipt"]["graphId"],
+            version=frozen["receipt"]["version"],
+            reason="structured trigger",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert stale_reopen["code"] == "EXECUTION_GRAPH_REOPEN_STALE"
+
+
+def test_published_node_is_carried_unchanged_when_revision_appends_node() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    published_id = frozen["clientNodeIds"]["primary_query"]
+    published_context = context.session.query_branch_contexts[published_id]
+    published_context.verified_artifact_ids = ["artifact:published"]
+    trigger = _install_graph_replan_trigger(
+        context,
+        query_id=published_id,
+        trigger_kind="DATA_GAP",
+        source_stage="CONTRACT",
+    )
+    goal_contract = context.session.question_goal_contract
+    active_proposal = context.session.execution_graph_proposal
+    assert goal_contract is not None
+    assert active_proposal is not None
+
+    revised = json.loads(
+        tools["revise_grounded_execution_graph"].func(
+            revision={
+                "baseGraphId": frozen["receipt"]["graphId"],
+                "baseVersion": frozen["receipt"]["version"],
+                "baseFingerprint": frozen["receipt"]["fingerprint"],
+                "triggerEvidenceId": trigger["evidenceId"],
+                "triggerEvidenceFingerprint": trigger["evidenceFingerprint"],
+                "graph": {
+                    "baseVersion": frozen["receipt"]["version"],
+                    "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
+                    "discoverySnapshotFingerprint": (
+                        discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
+                    ),
+                    "nodes": [
+                        active_proposal.nodes[0].model_dump(
+                            by_alias=True,
+                            mode="json",
+                        ),
+                        {
+                            "clientKey": "additional_check",
+                            "goalIds": ["metric.primary"],
+                            "topicScope": ["电商交易"],
+                            "evidenceRefIds": ["semantic:discovery:metric"],
+                        },
+                    ],
+                },
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert revised["status"] == "REVISED"
+    assert revised["clientNodeIds"]["primary_query"] == published_id
+    assert revised["carriedForwardQueryNodeIds"] == [published_id]
+    assert context.session.query_branch_contexts[published_id] is (published_context)
+
+
+def test_executed_graph_opens_only_trigger_bound_revision_discovery() -> None:
+    runtime, kernel, catalog = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "primary metric")
+    tools = {item.name: item for item in runtime.tools}
+    frozen = _freeze_reopenable_execution_graph(runtime, context)
+    query_id = frozen["clientNodeIds"]["primary_query"]
+    context.session.query_branch_contexts[query_id].verified_artifact_ids = ["artifact:published"]
+    trigger = _install_graph_replan_trigger(
+        context,
+        query_id=query_id,
+        trigger_kind="DATA_GAP",
+        source_stage="CONTRACT",
+    )
+
+    opened = json.loads(
+        tools["reopen_grounded_execution_graph_discovery"].func(
+            graph_id=frozen["receipt"]["graphId"],
+            version=frozen["receipt"]["version"],
+            reason="structured trigger",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert opened["status"] == "REVISION_DISCOVERY_OPENED"
+    assert opened["triggerEvidence"]["evidenceId"] == (trigger["evidenceId"])
+    boundary = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(catalog))
+    request = SimpleNamespace(
+        runtime=SimpleNamespace(context=context),
+        tool_call={
+            "id": "revision-read",
+            "name": "read_file",
+            "args": {"file_path": ("/knowledge/topics/电商交易/tables/orders/detail.json")},
+        },
+    )
+    result = boundary.wrap_tool_call(
+        request,
+        lambda _request: SimpleNamespace(
+            content="governed table detail",
+            status="success",
+            name="read_file",
+            tool_call_id="revision-read",
+        ),
+    )
+
+    assert result.status != "error"
+    assert "REVISION_DISCOVERY_OPEN" in str(result.content)
+    assert any(
+        item.get("refId") == "semantic:电商交易:orders:detail" for item in context.session.core_semantic_evidence
+    )
+
+
+def test_data_gap_replaces_only_unexecuted_downstream_after_semantic_recheck() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "orders and refunds")
+    tools = {item.name: item for item in runtime.tools}
+    tools["declare_original_question_goals"].func(
+        contract=OriginalQuestionGoalContract(
+            question=context.session.runtime.question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.orders",
+                    label="orders",
+                ),
+                MetricQuestionGoal(
+                    goal_id="metric.refunds",
+                    label="refunds",
+                ),
+            ],
+        ),
+        runtime=SimpleNamespace(context=context),
+    )
+    context.session.core_semantic_evidence = [
+        {
+            "refId": "semantic:orders:metric",
+            "path": "topics/电商交易/orders/metric.json",
+            "topic": "电商交易",
+            "contentHash": "orders-metric-hash",
+            "contentComplete": True,
+        },
+        {
+            "refId": "semantic:refunds:metric",
+            "path": "topics/电商退货/refunds/metric.json",
+            "topic": "电商退货",
+            "contentHash": "refunds-metric-hash",
+            "contentComplete": True,
+        },
+    ]
+    goal_contract = context.session.question_goal_contract
+    assert goal_contract is not None
+    frozen = json.loads(
+        tools["propose_grounded_execution_graph"].func(
+            proposal={
+                "baseVersion": 0,
+                "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
+                "discoverySnapshotFingerprint": (
+                    discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
+                ),
+                "nodes": [
+                    {
+                        "clientKey": "orders",
+                        "goalIds": ["metric.orders"],
+                        "topicScope": ["电商交易"],
+                        "evidenceRefIds": ["semantic:orders:metric"],
+                    },
+                    {
+                        "clientKey": "refunds",
+                        "goalIds": ["metric.refunds"],
+                        "topicScope": ["电商退货"],
+                        "evidenceRefIds": ["semantic:refunds:metric"],
+                    },
+                ],
+                "edges": [
+                    {
+                        "sourceClientKey": "orders",
+                        "targetClientKey": "refunds",
+                        "dependencyMode": "CONTRACT_SCOPE",
+                    }
+                ],
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    orders_id = frozen["clientNodeIds"]["orders"]
+    old_refunds_id = frozen["clientNodeIds"]["refunds"]
+    orders_context = context.session.query_branch_contexts[orders_id]
+    orders_context.verified_artifact_ids = ["artifact:orders"]
+    refunds_context = context.session.query_branch_contexts[old_refunds_id]
+    refunds_context.status = "CONTRACT_GAPPED"
+    refunds_context.last_gaps = [{"code": "REFUND_SOURCE_GAP"}]
+    trigger = _install_graph_replan_trigger(
+        context,
+        query_id=old_refunds_id,
+        trigger_kind="DATA_GAP",
+        source_stage="CONTRACT",
+    )
+
+    def revision_payload() -> dict[str, Any]:
+        return {
+            "baseGraphId": frozen["receipt"]["graphId"],
+            "baseVersion": frozen["receipt"]["version"],
+            "baseFingerprint": frozen["receipt"]["fingerprint"],
+            "triggerEvidenceId": trigger["evidenceId"],
+            "triggerEvidenceFingerprint": trigger["evidenceFingerprint"],
+            "replaceUnexecutedClientKeys": ["refunds"],
+            "graph": {
+                "baseVersion": frozen["receipt"]["version"],
+                "goalContractFingerprint": (original_question_goal_contract_fingerprint(goal_contract)),
+                "discoverySnapshotFingerprint": (
+                    discovery_evidence_snapshot_fingerprint(context.session.core_semantic_evidence)
+                ),
+                "nodes": [
+                    context.session.execution_graph_proposal.nodes[0].model_dump(by_alias=True, mode="json"),
+                    {
+                        "clientKey": "refunds",
+                        "objective": "revised refunds",
+                        "goalIds": ["metric.refunds"],
+                        "topicScope": ["电商退货"],
+                        "evidenceRefIds": ["semantic:refunds:fallback"],
+                    },
+                ],
+                "edges": [
+                    {
+                        "sourceClientKey": "orders",
+                        "targetClientKey": "refunds",
+                        "dependencyMode": "CONTRACT_SCOPE",
+                    }
+                ],
+            },
+        }
+
+    missing_semantic = json.loads(
+        tools["revise_grounded_execution_graph"].func(
+            revision=revision_payload(),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    missing_codes = {item["code"] for item in missing_semantic.get("issues", [])}
+    assert missing_semantic["status"] == "REJECTED"
+    assert "EXECUTION_GRAPH_EVIDENCE_NOT_READ" in missing_codes
+
+    context.session.core_semantic_evidence.append(
+        {
+            "refId": "semantic:refunds:fallback",
+            "path": "topics/电商退货/refunds/fallback.json",
+            "topic": "电商退货",
+            "contentHash": "refunds-fallback-hash",
+            "contentComplete": True,
+        }
+    )
+    revised = json.loads(
+        tools["revise_grounded_execution_graph"].func(
+            revision=revision_payload(),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert revised["status"] == "REVISED"
+    assert revised["clientNodeIds"]["orders"] == orders_id
+    new_refunds_id = revised["clientNodeIds"]["refunds"]
+    assert new_refunds_id != old_refunds_id
+    assert revised["retiredQueryNodeIds"] == [old_refunds_id]
+    assert context.session.query_branch_contexts[orders_id] is (orders_context)
+    new_context = context.session.query_branch_contexts[new_refunds_id]
+    assert new_context.status == "DECLARED"
+    assert new_context.runtime is not None
+    assert new_context.runtime.active_contract is None
+    assert new_refunds_id not in context.session.parallel_branches
+    execution_without_reauthorization = json.loads(
+        tools["execute_grounded_query_batch"].func(
+            queries=[{"queryId": new_refunds_id}],
+            reason="must not reuse retired node authorization",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert execution_without_reauthorization["status"] == "REJECTED"
+    assert execution_without_reauthorization["code"] == (
+        "PARALLEL_BRANCH_NOT_PREPARED"
+    )

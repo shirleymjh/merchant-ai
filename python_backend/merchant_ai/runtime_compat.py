@@ -8,10 +8,11 @@ domain graph or the Deep Agent harness.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from typing import Dict, Iterable, Tuple
+
+from merchant_ai.services.text_parsing import ASCII_DIGITS
 
 
 MIN_PYTHON = (3, 11)
@@ -31,10 +32,15 @@ class RuntimeCompatibilityError(RuntimeError):
 
 
 def _numeric_version(raw: str) -> Tuple[int, ...]:
-    match = re.match(r"^(\d+(?:\.\d+)*)", str(raw or "").strip())
-    if not match:
+    text = str(raw or "").strip()
+    cursor = 0
+    while cursor < len(text) and (text[cursor] in ASCII_DIGITS or text[cursor] == "."):
+        cursor += 1
+    prefix = text[:cursor].strip(".")
+    parts = prefix.split(".") if prefix else []
+    if not parts or any(not part or any(character not in ASCII_DIGITS for character in part) for part in parts):
         return ()
-    return tuple(int(part) for part in match.group(1).split("."))
+    return tuple(int(part) for part in parts)
 
 
 def _format_version(parts: Iterable[int]) -> str:

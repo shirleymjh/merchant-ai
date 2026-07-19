@@ -295,8 +295,9 @@ def test_complex_contract_accepts_core_sql_and_executes_without_template(
     assert entity_set.values == ["b-1"]
     assert entity_set.source_entity_identity == "entity:buyer"
     assert entity_set.truncated is False
-    with pytest.raises(RuntimeError, match="SQL_EXECUTION_NO_PROGRESS"):
+    with pytest.raises(RuntimeError) as exc_info:
         kernel.execute_active(session)
+    assert "SQL_EXECUTION_NO_PROGRESS" in str(exc_info.value)
 
 
 def test_same_invalid_sql_is_fused_as_no_progress() -> None:
@@ -418,7 +419,7 @@ def test_sql_submission_rejects_stale_contract_generation() -> None:
     proposed = kernel.propose_contract(session, [], {})
     activated = kernel.activate_contract(session, proposed.attempt_id)
 
-    with pytest.raises(RuntimeError, match="SQL_CANDIDATE_STALE_CONTRACT"):
+    with pytest.raises(RuntimeError) as exc_info:
         kernel.submit_sql_candidate(
             session,
             "SELECT 1",
@@ -427,6 +428,7 @@ def test_sql_submission_rejects_stale_contract_generation() -> None:
                 activated.contract
             ),
         )
+    assert "SQL_CANDIDATE_STALE_CONTRACT" in str(exc_info.value)
 
 
 def test_rejected_latest_candidate_invalidates_previous_accepted_sql() -> None:
@@ -471,8 +473,9 @@ def test_rejected_latest_candidate_invalidates_previous_accepted_sql() -> None:
     assert rejected.status == "REJECTED"
     assert session.active_preparation is None
     assert session.active_sql_candidate is None
-    with pytest.raises(RuntimeError, match="latest SQL candidate is not"):
+    with pytest.raises(RuntimeError) as exc_info:
         kernel.execute_active(session)
+    assert "latest SQL candidate is not" in str(exc_info.value)
 
 
 def test_identical_contract_reactivation_does_not_reset_generation_or_budget() -> None:

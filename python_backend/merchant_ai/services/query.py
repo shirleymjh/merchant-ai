@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextvars import copy_context
@@ -73,6 +72,13 @@ from merchant_ai.services.formulas import (
     compile_metric_formula as compile_reconciled_metric_formula,
     equivalent_formula_text,
     formula_columns as reconciled_formula_columns,
+)
+from merchant_ai.services.language_policy import load_language_policy
+from merchant_ai.services.text_parsing import (
+    contains_any_literal,
+    is_ascii_identifier,
+    safe_ascii_component,
+    split_on_characters,
 )
 from merchant_ai.services.entity_contracts import (
     canonical_entity_values,
@@ -433,9 +439,76 @@ def metric_time_execution_rule(contract: Dict[str, Any]) -> str:
 
 def partition_execution_value(value: date, source_sample: str) -> str:
     sample = str(source_sample or "").strip()
-    if re.fullmatch(r"\d{8}(?:\D.*)?", sample):
+    if (
+        len(sample) >= 8
+        and sample[:8].isascii()
+        and sample[:8].isdigit()
+        and (len(sample) == 8 or not sample[8].isdigit())
+    ):
         return value.strftime("%Y%m%d")
     return value.isoformat()
+
+
+def _replace_runtime_current_date(
+    sql: str,
+    replacement: str,
+) -> tuple[str, bool]:
+    text = str(sql or "")
+    output: list[str] = []
+    cursor = 0
+    replaced = False
+    while cursor < len(text):
+        character = text[cursor]
+        if character in {"'", '"', "`"}:
+            quote = character
+            start = cursor
+            cursor += 1
+            while cursor < len(text):
+                if text[cursor] != quote:
+                    cursor += 1
+                    continue
+                if cursor + 1 < len(text) and text[cursor + 1] == quote:
+                    cursor += 2
+                    continue
+                cursor += 1
+                break
+            output.append(text[start:cursor])
+            continue
+        if not (
+            character.isascii()
+            and (character.isalpha() or character == "_")
+        ):
+            output.append(character)
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and (
+            text[cursor].isascii()
+            and (text[cursor].isalnum() or text[cursor] == "_")
+        ):
+            cursor += 1
+        token = text[start:cursor].casefold()
+        scan = cursor
+        while scan < len(text) and text[scan].isspace():
+            scan += 1
+        has_call = (
+            scan + 1 < len(text)
+            and text[scan] == "("
+            and text[scan + 1] == ")"
+        )
+        if token == "curdate" and has_call:
+            output.append(replacement)
+            cursor = scan + 2
+            replaced = True
+            continue
+        if token == "current_date":
+            output.append(replacement)
+            cursor = scan + 2 if has_call else cursor
+            replaced = True
+            continue
+        output.append(text[start:cursor])
+    return "".join(output), replaced
 
 
 def latest_as_of_partition_predicate(
@@ -604,15 +677,47 @@ def node_tool_execution_identity(
 
 def sql_references_filter_column(sql: str, column: str) -> bool:
     value = str(column or "").strip().strip("`")
-    return bool(value and re.search(r"(?<![A-Za-z0-9_])`?%s`?\s*(?:=|IN\s*\()" % re.escape(value), sql or "", flags=re.I))
+    return _sql_column_has_predicate(sql, value, (exp.EQ, exp.In))
 
 
 def sql_filters_column(sql: str, column: str) -> bool:
     value = str(column or "").strip().strip("`")
-    if not value:
+    return _sql_column_has_predicate(
+        sql,
+        value,
+        (
+            exp.EQ,
+            exp.NEQ,
+            exp.GT,
+            exp.GTE,
+            exp.LT,
+            exp.LTE,
+            exp.Between,
+            exp.In,
+        ),
+    )
+
+
+def _sql_column_has_predicate(
+    sql: str,
+    column: str,
+    predicate_types: tuple[type[exp.Expression], ...],
+) -> bool:
+    if not column or not is_ascii_identifier(column):
         return False
-    predicate = r"(?<![A-Za-z0-9_])`?%s`?\s*(?:=|!=|<>|<|>|<=|>=|BETWEEN\b|IN\s*\()" % re.escape(value)
-    return bool(re.search(predicate, sql or "", flags=re.I))
+    try:
+        parsed = sqlglot.parse_one(str(sql or ""), read="doris")
+    except Exception:
+        return False
+    normalized = column.casefold()
+    return any(
+        any(
+            candidate.name.casefold() == normalized
+            for candidate in predicate.find_all(exp.Column)
+        )
+        for predicate_type in predicate_types
+        for predicate in parsed.find_all(predicate_type)
+    )
 
 
 def sql_uses_latest_as_of_partition(
@@ -977,6 +1082,40 @@ class NodeAgent:
         return str(intent.answer_mode or "QUERY")
 
 
+def node_time_window_contract_issue(contract: NodePlanContract) -> str:
+    """Validate the typed time binding before any SQL can be drafted.
+
+    ``days`` expresses a bounded execution obligation, but it does not name a
+    physical field.  Only the sealed ``timeWindowContract`` may supply that
+    field; guessing from a conventional column name or a GROUP BY would turn a
+    missing semantic binding into an unbounded query.
+    """
+
+    time_contract = dict(contract.time_window_contract or {})
+    requested_days = int(contract.days or 0)
+    if requested_days > 0 and not time_contract:
+        return "bounded node has days but no sealed timeWindowContract"
+    if not time_contract:
+        return ""
+    partition_column = str(time_contract.get("partitionColumn") or "").strip()
+    if not partition_column:
+        return "timeWindowContract has no partitionColumn"
+    if partition_column not in set(contract.allowed_columns):
+        return "timeWindowContract partitionColumn is outside the node schema"
+    declared_table = str(time_contract.get("table") or "").strip()
+    if declared_table and declared_table != contract.preferred_table:
+        return "timeWindowContract table differs from preferredTable"
+    declared_days = time_contract.get("days")
+    if requested_days > 0 and declared_days not in (None, ""):
+        try:
+            normalized_days = int(declared_days)
+        except (TypeError, ValueError):
+            return "timeWindowContract days is not an integer"
+        if normalized_days != requested_days:
+            return "timeWindowContract days differs from the node days obligation"
+    return ""
+
+
 class NodeExecutionContractValidator:
     """Deterministic execution gate; it has no planning or repair authority."""
 
@@ -1007,6 +1146,15 @@ class NodeExecutionContractValidator:
             issues.append(issue("MISSING_GROUP_BY_COLUMN", "aggregate node has no groupByColumn or outputKeys"))
         if contract.group_by_column and contract.group_by_column not in allowed:
             issues.append(issue("MISSING_GROUP_BY_COLUMN", "groupByColumn is not available in node schema", contract.group_by_column))
+        time_window_issue = node_time_window_contract_issue(contract)
+        if time_window_issue:
+            issues.append(
+                issue(
+                    "INVALID_TIME_WINDOW_CONTRACT",
+                    time_window_issue,
+                    str((contract.time_window_contract or {}).get("partitionColumn") or ""),
+                )
+            )
         required_entity_obligations = [item for item in contract.entity_filter_obligations if item.required]
         if required_entity_obligations and not contract.filter_column:
             issues.append(issue("MISSING_ENTITY_FILTER", "required entity filter obligation has no bound filterColumn"))
@@ -1864,7 +2012,11 @@ class NodeWorkerExecutor:
             score += 2
         if intent.answer_mode in {AnswerMode.DERIVED, AnswerMode.DETAIL, AnswerMode.TOPN}:
             score += 1
-        if re.search(r"原因|归因|为什么|诊断|异常|分析|建议|下钻|关联", "%s %s" % (question or "", intent.question or ""), re.I):
+        if contains_any_literal(
+            "%s %s" % (question or "", intent.question or ""),
+            load_language_policy().routing.action_markers,
+            case_sensitive=False,
+        ):
             score += 2
         if intent.answer_mode in {AnswerMode.METRIC, AnswerMode.GROUP_AGG} and not intent.depends_on_task_ids:
             score -= 1
@@ -4434,11 +4586,12 @@ class NodeWorkerExecutor:
         if not anchor:
             return sql, ""
         anchor_text = anchor.isoformat()
-        if not re.search(r"\b(CURDATE\(\)|CURRENT_DATE(?:\(\))?)", str(sql or ""), flags=re.I):
-            return sql, ""
         normalized_sql = normalize_inclusive_relative_window_sql(str(sql or ""), intent.days)
-        anchored_sql = re.sub(r"\b(CURDATE\(\)|CURRENT_DATE(?:\(\))?)", "'%s'" % anchor_text, normalized_sql, flags=re.I)
-        if anchored_sql == sql:
+        anchored_sql, replaced = _replace_runtime_current_date(
+            normalized_sql,
+            "'%s'" % anchor_text,
+        )
+        if not replaced:
             return sql, ""
         freshness.reason = append_note(freshness.reason, "relative time anchored to max_pt=%s" % anchor_text)
         return anchored_sql, anchor_text
@@ -7218,8 +7371,12 @@ def trim_sql(sql: str, limit: int = 260) -> str:
 
 
 def sanitize_node_artifact_name(value: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "node")).strip("._")
-    return text or "node"
+    return safe_ascii_component(
+        value or "node",
+        extras=("_", ".", "-"),
+        default="node",
+        strip="._",
+    )
 
 
 def prompt_trace_key(intent: QuestionIntent, phase: str) -> str:
@@ -7294,7 +7451,7 @@ def canonical_sql(sql: str) -> str:
     source = str(sql or "").strip()
     if not source:
         return ""
-    parseable = re.sub(r"%s\b", "__sql_bind_param__", source, flags=re.I)
+    parseable = _replace_percent_s_bind_markers(source)
     try:
         statements = [statement for statement in sqlglot.parse(parseable, read="doris") if statement is not None]
         if not statements:
@@ -7333,6 +7490,34 @@ def canonical_sql(sql: str) -> str:
             return "|".join(normalized_tokens)
         except Exception:
             return " ".join(source.rstrip(";").split()).lower()
+
+
+def _replace_percent_s_bind_markers(value: str) -> str:
+    text = str(value or "")
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if (
+            cursor + 1 < len(text)
+            and text[cursor] == "%"
+            and text[cursor + 1] in {"s", "S"}
+            and (
+                cursor + 2 == len(text)
+                or not (
+                    text[cursor + 2].isascii()
+                    and (
+                        text[cursor + 2].isalnum()
+                        or text[cursor + 2] == "_"
+                    )
+                )
+            )
+        ):
+            output.append("__sql_bind_param__")
+            cursor += 2
+            continue
+        output.append(text[cursor])
+        cursor += 1
+    return "".join(output)
 
 
 def canonical_sql_hash(sql: str) -> str:
@@ -8068,7 +8253,13 @@ def semantic_filter_predicate_expression(
 def semantic_filter_sql_literal(value: Any, data_type: str) -> str:
     if data_type == "integer":
         text = str(value).strip()
-        if isinstance(value, bool) or not re.fullmatch(r"[-+]?\d+", text):
+        unsigned = text[1:] if text.startswith(("-", "+")) else text
+        if (
+            isinstance(value, bool)
+            or not unsigned
+            or not unsigned.isascii()
+            or not unsigned.isdigit()
+        ):
             raise SemanticFilterCompilationError(
                 "SEMANTIC_FILTER_VALUE_TYPE_MISMATCH",
                 "resolved value %r is not an integer" % value,
@@ -8872,7 +9063,7 @@ def split_intent_filter_values(value: Any) -> List[Any]:
     if isinstance(value, (list, tuple, set)):
         raw_values = list(value)
     else:
-        raw_values = re.split(r"[,，]", str(value or ""))
+        raw_values = split_on_characters(value, (",", "，"))
     values: List[Any] = []
     for item in raw_values:
         normalized = item.strip() if isinstance(item, str) else item
@@ -9071,7 +9262,13 @@ def sql_has_global_row_limit(sql: str) -> bool:
     try:
         parsed = sqlglot.parse_one(str(sql or "").strip(), read="doris")
     except Exception:
-        return bool(re.search(r"\blimit\s+\d+\s*$", str(sql or ""), flags=re.I))
+        parts = str(sql or "").strip().split()
+        return bool(
+            len(parts) >= 2
+            and parts[-2].casefold() == "limit"
+            and parts[-1].isascii()
+            and parts[-1].isdigit()
+        )
     return parsed.args.get("limit") is not None
 
 

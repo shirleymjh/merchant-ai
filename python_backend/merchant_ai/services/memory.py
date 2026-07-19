@@ -5,7 +5,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import threading
 import time
@@ -35,7 +34,18 @@ from merchant_ai.models import (
     RetrievalIssue,
 )
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.authorization_policy import load_authorization_policy
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.llm import TaskModelRouter
+from merchant_ai.services.text_parsing import (
+    ASCII_DIGITS,
+    ASCII_LETTERS,
+    ASCII_WORD,
+    contains_any_literal,
+    iter_ascii_digit_spans,
+    safe_ascii_component,
+)
+from merchant_ai.services.time_semantics import extract_temporal_lexical_spans
 
 
 MEMORY_SCHEMA_VERSION = "merchant_memory.v2"
@@ -58,26 +68,6 @@ QUARANTINED_MEMORY_STATUSES = {
 }
 INACTIVE_MEMORY_STATUSES = {"deleted", "disabled", "inactive", "rejected", "archived", "expired", "superseded"}
 STRONG_CONSTRAINT_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
-EXPLICIT_HABIT_TERMS = {
-    "以后",
-    "后续",
-    "默认",
-    "固定",
-    "优先",
-    "每次",
-    "一直",
-    "长期",
-    "常用",
-    "习惯",
-    "记住",
-    "以后都",
-    "默认按",
-    "优先看",
-    "不用",
-    "不要只",
-}
-
-
 def normalize_memory_recall_issues(values: Any) -> List[RetrievalIssue]:
     """Normalize and deduplicate operational memory-recall issues."""
 
@@ -178,12 +168,6 @@ class MemoryWriteGate:
     review belong exclusively to the separate knowledge-suggestion lifecycle.
     """
 
-    SENSITIVE_PATTERNS = [
-        re.compile(r"\b\d{15,19}\b"),
-        re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    ]
-
     def evaluate(self, event: Dict[str, Any], merchant_id: str) -> Dict[str, Any]:
         memory_type = str(event.get("memoryType") or event.get("memory_type") or "query_event")
         confidence = float(event.get("confidence") or 0.0)
@@ -213,7 +197,7 @@ class MemoryWriteGate:
             action = "quarantine"
             gate_status = "low_trust"
             reasons.append("low_trust_memory_quarantined")
-        if any(pattern.search(question) or pattern.search(answer_preview) for pattern in self.SENSITIVE_PATTERNS):
+        if contains_sensitive_identifier(question) or contains_sensitive_identifier(answer_preview):
             # Do not persist raw sensitive identifiers into a queue for a
             # person to inspect.  Rejecting the memory write is the safe
             # automatic outcome; the answer itself is unaffected.
@@ -244,6 +228,73 @@ class MemoryWriteGate:
         if policy["action"] == "quarantine":
             event["status"] = "quarantined"
         return event
+
+
+def contains_sensitive_identifier(value: str) -> bool:
+    text = str(value or "")
+    return (
+        contains_long_bounded_digit_identifier(text)
+        or contains_segmented_personal_identifier(text)
+        or contains_email_address(text)
+    )
+
+
+def contains_long_bounded_digit_identifier(value: str) -> bool:
+    text = str(value or "")
+    for start, end, digits in iter_ascii_digit_spans(text):
+        if not 15 <= len(digits) <= 19:
+            continue
+        left_bounded = start == 0 or text[start - 1] not in ASCII_WORD
+        right_bounded = end == len(text) or text[end] not in ASCII_WORD
+        if left_bounded and right_bounded:
+            return True
+    return False
+
+
+def contains_segmented_personal_identifier(value: str) -> bool:
+    text = str(value or "")
+    for start, first_end, first in iter_ascii_digit_spans(text):
+        if len(first) != 3 or first_end >= len(text) or text[first_end] != "-":
+            continue
+        second_start = first_end + 1
+        second_end = second_start + 2
+        third_start = second_end + 1
+        third_end = third_start + 4
+        if (
+            third_end > len(text)
+            or text[second_end : second_end + 1] != "-"
+            or any(character not in ASCII_DIGITS for character in text[second_start:second_end])
+            or any(character not in ASCII_DIGITS for character in text[third_start:third_end])
+        ):
+            continue
+        left_bounded = start == 0 or text[start - 1] not in ASCII_WORD
+        right_bounded = third_end == len(text) or text[third_end] not in ASCII_WORD
+        if left_bounded and right_bounded:
+            return True
+    return False
+
+
+def contains_email_address(value: str) -> bool:
+    text = str(value or "")
+    local_characters = ASCII_LETTERS | ASCII_DIGITS | {".", "_", "%", "+", "-"}
+    domain_characters = ASCII_LETTERS | ASCII_DIGITS | {".", "-"}
+    for at_index, character in enumerate(text):
+        if character != "@":
+            continue
+        left = at_index - 1
+        while left >= 0 and text[left] in local_characters:
+            left -= 1
+        right = at_index + 1
+        while right < len(text) and text[right] in domain_characters:
+            right += 1
+        local = text[left + 1 : at_index]
+        domain = text[at_index + 1 : right]
+        if not local or not domain or domain.startswith(".") or domain.endswith("."):
+            continue
+        suffix = domain.rsplit(".", 1)[-1] if "." in domain else ""
+        if len(suffix) >= 2 and all(character in ASCII_LETTERS for character in suffix):
+            return True
+    return False
 
 
 def canceled_memory_update(memory: Dict[str, Any]) -> Dict[str, Any]:
@@ -398,14 +449,13 @@ def reusable_knowledge_assertion_present(state: AgentState, event: Dict[str, Any
     question = str(state.get("question") or "").strip()
     if question and (not messages or messages[-1] != question):
         messages.append(question)
-    text = "\n".join(messages[-8:])
-    return bool(
-        re.search(
-            r"(请记住|记住这个|以后(?:都|默认|请)|默认使用|我(?:更)?希望|我(?:更)?喜欢|我们(?:店|公司|团队).{0,24}(规定|要求|口径|默认|定义)|"
-            r"(?:这个|该|指标|规则).{0,16}(?:定义|口径).{0,8}(?:是|为)|不是.{0,30}而是|你说错了|纠正一下|长期使用|固定使用)",
-            text,
-            flags=re.I,
-        )
+    # This governed policy is only a cheap invocation gate.  The Curator still
+    # owns semantic classification and must return typed evidence before any
+    # Memory or Knowledge write can occur.
+    return contains_any_literal(
+        "\n".join(str(message or "") for message in messages[-8:]),
+        load_language_policy().routing.memory_authoring_markers,
+        case_sensitive=False,
     )
 
 
@@ -487,11 +537,12 @@ class MemoryIngestionService:
             or write_policy.get("action") == "quarantine"
             else upsert_habit_preferences(memory, event)
         )
-        if (
-            personal_memory_candidates
-            and event.get("memoryType") not in {"correction", "metric_dispute"}
-            and write_policy.get("action") != "quarantine"
-        ):
+        if personal_memory_candidates and write_policy.get("action") != "quarantine":
+            # One utterance may contain both a correction that must enter the
+            # governed Knowledge review path and a separately evidenced
+            # personal preference.  The Curator has already classified and
+            # quoted each personal candidate independently, so the coarse
+            # turn-level event type must not discard that orthogonal signal.
             preferences = [item for item in memory.get("preferences") or [] if isinstance(item, dict)]
             for preference in personal_memory_candidates:
                 preferences, did_update = upsert_preference(preferences, preference)
@@ -515,7 +566,7 @@ class MemoryIngestionService:
             ingestion_trace["knowledgeSuggestionId"] = str(suggestions[0].get("suggestionId") or "")
             ingestion_trace["knowledgeSuggestionIds"] = [str(item.get("suggestionId") or "") for item in suggestions]
             ingestion_trace["knowledgeSuggestionCount"] = len(memory.get("knowledgeSuggestions") or [])
-        memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
+        refresh_memory_rollups(memory)
         memory["memoryIngestionTrace"] = ingestion_trace
         if cancel_check and cancel_check():
             return canceled_memory_update(memory)
@@ -550,7 +601,7 @@ class MemoryIngestionService:
             reduce_related_memory(memory, event, reason="negative feedback")
         elif write_policy.get("action") != "quarantine":
             upsert_habit_preferences(memory, event)
-        memory["recentFocus"] = aggregate_recent_focus(memory.get("events") or [], memory.get("preferences") or [])
+        refresh_memory_rollups(memory)
         memory["memoryIngestionTrace"] = {
             "eventId": event.get("eventId"),
             "memoryType": event.get("memoryType"),
@@ -776,7 +827,12 @@ class StructuredMemoryStore(MemoryStore):
         self._local_file_transactions = True
 
     def memory_path(self, merchant_id: str) -> Path:
-        safe_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", merchant_id or self.settings.merchant_id or "default")
+        safe_id = safe_ascii_component(
+            merchant_id or self.settings.merchant_id or "default",
+            extras=("_", ".", "-"),
+            default="default",
+            strip="._",
+        )
         return self.settings.resolved_workspace_path / "memory" / ("%s.memory.json" % safe_id)
 
     def load(self, merchant_id: str) -> Dict[str, Any]:
@@ -2526,7 +2582,11 @@ class MemoryManagementService:
             state: Dict[str, Any] = {
                 "question": question,
                 "requested_merchant_id": target,
-                "access_role": str(case.get("accessRole") or case.get("access_role") or "merchant_analyst"),
+                "access_role": str(
+                    case.get("accessRole")
+                    or case.get("access_role")
+                    or default_memory_access_role()
+                ),
                 "memory_eval_context": {
                     "topics": unique_strings(case.get("topics") or []),
                     "metrics": unique_strings(case.get("metrics") or []),
@@ -3137,7 +3197,7 @@ def conservative_token_estimate(text: str) -> int:
     value = str(text or "")
     if not value:
         return 1
-    cjk_count = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", value))
+    cjk_count = sum(1 for character in value if is_cjk_character(character))
     non_cjk_count = max(0, len(value) - cjk_count)
     return max(1, cjk_count + int((non_cjk_count + 3) / 4))
 
@@ -3176,7 +3236,7 @@ def truncate_memory_text_by_tokens(text: str, budget_tokens: int) -> str:
     units = 0
     chars: List[str] = []
     for char in value:
-        units += 4 if re.match(r"[\u3400-\u9fff\uf900-\ufaff]", char) else 1
+        units += 4 if is_cjk_character(char) else 1
         if units > units_budget:
             break
         chars.append(char)
@@ -3954,22 +4014,22 @@ def default_preference_memory_tier(item: Dict[str, Any]) -> str:
         return default_memory_tier(memory_type, memory_status(item), float((item or {}).get("confidence") or 0.55))
     if int((item or {}).get("hitCount") or (item or {}).get("hit_count") or 0) >= HABIT_CORE_PROMOTION_HIT_COUNT:
         return "core"
-    if habit_source_is_governed(item) or habit_text_is_explicit(item) or positive_feedback_signal(str((item or {}).get("feedbackSignal") or "")):
+    if habit_source_is_governed(item) or positive_feedback_signal(
+        str((item or {}).get("feedbackSignal") or "")
+    ):
         return "core"
     return "retrieval"
 
 
 def habit_source_is_governed(item: Dict[str, Any]) -> bool:
-    source = str((item or {}).get("source") or "").strip().lower()
-    return bool((item or {}).get("approvedBy") or (item or {}).get("approved_by") or source in {"manual", "feedback", "correction", "governance"})
-
-
-def habit_text_is_explicit(item: Dict[str, Any]) -> bool:
-    text = " ".join(
-        str((item or {}).get(key) or "")
-        for key in ["question", "answerPreview", "answer_preview", "correctionText", "correction_text", "key", "value", "content"]
+    review_status = str(
+        (item or {}).get("reviewStatus") or (item or {}).get("review_status") or ""
+    ).strip().lower()
+    return bool(
+        (item or {}).get("approvedBy")
+        or (item or {}).get("approved_by")
+        or review_status in {"approved", "reviewed", "published", "indexed"}
     )
-    return any(term in text for term in EXPLICIT_HABIT_TERMS)
 
 
 def positive_feedback_signal(signal: str) -> bool:
@@ -4018,18 +4078,17 @@ def default_memory_visibility(memory_type: str) -> str:
 
 
 def default_memory_allowed_roles(memory_type: str) -> List[str]:
-    normalized = str(memory_type or "")
-    if normalized in {"past_case", "procedure"}:
-        return ["merchant_admin", "merchant_analyst", "system"]
-    return [
-        "merchant_admin",
-        "merchant_analyst",
-        "merchant_finance",
-        "merchant_service",
-        "merchant_goods",
-        "merchant_fulfillment",
-        "system",
-    ]
+    del memory_type
+    policy = load_authorization_policy()
+    return sorted(
+        role
+        for role, permissions in policy.access_role_permissions.items()
+        if "memory.read" in permissions or "*" in permissions
+    )
+
+
+def default_memory_access_role() -> str:
+    return load_authorization_policy().default_access_role
 
 
 def build_core_memory_profile(memory: Dict[str, Any]) -> Dict[str, Any]:
@@ -4484,7 +4543,7 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
             time_windows.append(days)
     question = str(state.get("question") or "")[:1000]
     correction_text = extract_correction_text(question)
-    if correction_text and is_metric_definition_dispute(question, metrics):
+    if correction_text and is_metric_definition_dispute(question, metrics, plan=plan):
         memory_type = "metric_dispute"
     elif correction_text:
         memory_type = "correction"
@@ -4883,8 +4942,8 @@ def memory_knowledge_title(item: Dict[str, Any]) -> str:
 
 
 def knowledge_text_features(text: str) -> set[str]:
-    normalized = re.sub(r"\s+", "", str(text or "").lower())
-    features = set(re.findall(r"[a-z][a-z0-9_]{1,}|[\u4e00-\u9fff]{2,6}", normalized))
+    normalized = "".join(character for character in str(text or "").lower() if not character.isspace())
+    features = set(text_feature_runs(normalized, cjk_maximum=6))
     features.update(normalized[index : index + 2] for index in range(max(0, len(normalized) - 1)))
     return {item for item in features if item}
 
@@ -4903,8 +4962,8 @@ def knowledge_text_similarity(left: str, right: str) -> float:
 
 def deterministic_conflict_assessment(new_text: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
     existing_text = str(candidate.get("text") or "")
-    normalized_new = re.sub(r"\s+|[，。；、,.!?！？]", "", new_text).lower()
-    normalized_existing = re.sub(r"\s+|[，。；、,.!?！？]", "", existing_text).lower()
+    normalized_new = normalize_similarity_text(new_text)
+    normalized_existing = normalize_similarity_text(existing_text)
     similarity = float(candidate.get("similarity") or knowledge_text_similarity(new_text, existing_text))
     if normalized_new == normalized_existing or normalized_new in normalized_existing or normalized_existing in normalized_new:
         relation = "duplicate"
@@ -4923,6 +4982,15 @@ def deterministic_conflict_assessment(new_text: str, candidate: Dict[str, Any]) 
         "recommendedAction": action,
         "mergedContent": "",
     }
+
+
+def normalize_similarity_text(value: str) -> str:
+    ignored = frozenset("，。；、,.!?！？")
+    return "".join(
+        character
+        for character in str(value or "").lower()
+        if not character.isspace() and character not in ignored
+    )
 
 
 def apply_conflict_resolution(
@@ -5083,7 +5151,7 @@ def personal_memory_preference_from_curator_suggestion(
     return MemoryPreference(
         preference_id=preference_id,
         memory_type="user_preference",
-        memory_tier="core" if confidence >= 0.8 or habit_text_is_explicit(event) else "retrieval",
+        memory_tier="core" if confidence >= 0.8 else "retrieval",
         memory_class=default_memory_class("user_preference"),
         key="personal:%s" % stable_slug(content[:80]),
         value=content,
@@ -5415,8 +5483,7 @@ def analysis_intent_from_plan(plan: Any) -> str:
 
 
 def memory_question_terms(question: str) -> List[str]:
-    text = str(question or "")
-    terms = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", text))
+    terms = set(text_feature_runs(str(question or "")))
     return unique_strings(sorted(terms, key=lambda item: (-len(item), item)))
 
 
@@ -5774,7 +5841,7 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
             "source": str(model_profile.get("source") or "rule_fallback"),
             "status": str(model_profile.get("status") or ""),
         },
-        "accessRole": str(state.get("access_role") or "merchant_analyst"),
+        "accessRole": str(state.get("access_role") or default_memory_access_role()),
         "userId": str(identity.get("userId") or identity.get("user_id") or ""),
         "storeIds": unique_strings(identity.get("storeIds") or identity.get("store_ids") or []),
         "permissions": unique_strings(identity.get("permissions") or []),
@@ -5793,7 +5860,10 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
             if not isinstance(item, dict):
                 continue
             memory_id = str(item.get(memory_id_key) or "")
-            permitted = memory_visible_to_role(item, str(context.get("accessRole") or "merchant_analyst"))
+            permitted = memory_visible_to_role(
+                item,
+                str(context.get("accessRole") or default_memory_access_role()),
+            )
             principal_permitted = memory_visible_to_principal(item, context)
             # Authorization is a hard boundary, not a ranking/filtering hint. Do
             # not retain unauthorized IDs or payloads in candidates because the
@@ -6295,7 +6365,7 @@ def event_promotes_habit_to_core(event: Dict[str, Any]) -> bool:
         return True
     if positive_feedback_signal(str((event or {}).get("feedbackSignal") or "")):
         return True
-    return habit_text_is_explicit(event)
+    return habit_source_is_governed(event)
 
 
 def upsert_preference(items: List[Dict[str, Any]], preference: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], bool]:
@@ -6438,7 +6508,9 @@ def upsert_fact(items: List[Dict[str, Any]], fact: Dict[str, Any]) -> List[Dict[
 def resolve_memory_conflicts(memory: Dict[str, Any], event: Dict[str, Any]) -> Optional[MemoryConflictResolution]:
     event_id = str(event.get("eventId") or "")
     scope_terms = set(unique_strings(event.get("topics") or [])) | set(unique_strings(event.get("metrics") or []))
-    correction_terms = set(re.findall(r"[\w\u4e00-\u9fff]{2,}", str(event.get("correctionText") or event.get("question") or "")))
+    correction_terms = set(
+        text_feature_runs(str(event.get("correctionText") or event.get("question") or ""))
+    )
     all_terms = scope_terms | correction_terms
     losers: List[str] = []
     for group in ["events", "preferences", "facts"]:
@@ -6545,7 +6617,14 @@ def build_focus_summary(topic_counter: Counter[str], metric_counter: Counter[str
 
 
 def rank_memory_events(events: List[Dict[str, Any]], question: str) -> List[Dict[str, Any]]:
-    context = {"question": question, "terms": set(re.findall(r"[\w\u4e00-\u9fff]{2,}", question or "")), "topics": set(), "metrics": extract_metric_like_terms(question), "timeWindows": set(extract_time_windows(question)), "analysisIntent": ""}
+    context = {
+        "question": question,
+        "terms": set(text_feature_runs(question)),
+        "topics": set(),
+        "metrics": extract_metric_like_terms(question),
+        "timeWindows": set(extract_time_windows(question)),
+        "analysisIntent": "",
+    }
     scored = []
     for index, event in enumerate(events):
         score, _ = memory_relevance_score(event, context, "event")
@@ -6627,15 +6706,15 @@ def is_memory_expired(item: Dict[str, Any]) -> bool:
 
 def memory_visible_to_role(item: Dict[str, Any], access_role: str) -> bool:
     visibility = str(item.get("visibility") or "merchant").strip().lower()
-    if visibility == "public":
-        return True
+    policy = load_authorization_policy()
+    role = str(access_role or policy.default_access_role).strip()
+    permissions = policy.permissions_for_access_role(role)
+    if "memory.read" not in permissions and "*" not in permissions:
+        return False
     roles = unique_strings(item.get("allowedRoles") or item.get("allowed_roles") or [])
-    role = str(access_role or "merchant_analyst").strip()
     if roles and role not in roles:
         return False
-    if visibility == "planner_only":
-        return role in (set(roles) if roles else {"merchant_admin", "merchant_analyst", "system"})
-    return visibility in {"merchant", "role", "principal", "restricted"}
+    return visibility in {"public", "merchant", "role", "principal", "restricted", "planner_only"}
 
 
 def memory_visible_to_principal(item: Dict[str, Any], context: Dict[str, Any]) -> bool:
@@ -6667,7 +6746,7 @@ def memory_visible_to_context(memory: Dict[str, Any], context: Dict[str, Any]) -
     """
 
     visible = dict(memory or {})
-    access_role = str(context.get("accessRole") or "merchant_analyst")
+    access_role = str(context.get("accessRole") or default_memory_access_role())
     for group in ["events", "preferences", "facts"]:
         visible[group] = [
             item
@@ -6698,59 +6777,69 @@ def extract_correction_text(question: str) -> str:
     text = str(question or "").strip()
     if not text:
         return ""
-    correction_markers = ["不是", "不对", "错了", "纠正", "应该是", "改成", "以后按", "以后都", "别再"]
-    if any(marker in text for marker in correction_markers):
+    if any(marker in text for marker in load_language_policy().routing.correction_markers):
         return text[:500]
     return ""
 
 
-def is_metric_definition_dispute(question: str, metrics: Iterable[Any] = ()) -> bool:
+def is_metric_definition_dispute(
+    question: str,
+    metrics: Iterable[Any] = (),
+    *,
+    plan: Any = None,
+) -> bool:
     text = str(question or "").strip()
     if not text:
         return False
     metric_terms = set(unique_strings(metrics)) | extract_metric_like_terms(text)
-    has_metric_context = bool(metric_terms) or any(marker in text for marker in ["指标", "口径"])
-    if not has_metric_context:
+    if not metric_terms:
         return False
-    dispute_markers = [
-        "口径",
-        "公式",
-        "算法",
-        "指标定义",
-        "统计口径",
-        "计算口径",
-        "不是这么算",
-        "不该这么算",
-        "不应该这么算",
-        "怎么算",
-        "分母",
-        "分子",
-        "除以",
-        "剔除",
-        "包含",
-        "不包含",
-        "来源字段",
-    ]
-    if any(marker in text for marker in dispute_markers):
+    if contains_bounded_formula_expression(text):
         return True
-    return bool(re.search(r"[^\s]{1,32}\s*(?:=|/|÷)\s*[^\s]{1,32}", text))
+    understanding = getattr(plan, "question_understanding", {}) or {}
+    if isinstance(understanding, dict) and (
+        understanding.get("calculationIntents") or understanding.get("calculation_intents")
+    ):
+        return True
+    return False
 
 
 def extract_metric_like_terms(text: str) -> set[str]:
-    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text or ""))
+    # Free-text ASCII words are not metric evidence.  Only retain canonical
+    # semantic references; normal metric discovery comes from the plan, route
+    # contract, semantic catalog, or the query-understanding model.
+    terms: set[str] = set()
+    value = str(text or "")
+    cursor = 0
+    terminators = frozenset(" \t\r\n,，;；()（）[]【】{}<>《》\"'")
+    while cursor < len(value):
+        start = value.find("semantic:", cursor)
+        if start < 0:
+            break
+        end = start
+        while end < len(value) and value[end] not in terminators:
+            end += 1
+        parts = value[start:end].split(":")
+        try:
+            marker_index = parts.index("metric")
+        except ValueError:
+            cursor = max(start + 1, end)
+            continue
+        if marker_index + 1 < len(parts):
+            metric_key = parts[marker_index + 1]
+            if metric_key and all(character in ASCII_WORD for character in metric_key):
+                terms.add(metric_key)
+        cursor = max(start + 1, end)
+    return terms
 
 
 def extract_time_windows(text: str) -> List[int]:
-    days: List[int] = []
-    for match in re.findall(r"最近\s*(\d+)\s*天", text or ""):
-        try:
-            days.append(int(match))
-        except Exception:
-            pass
-    if "最近一周" in text or "近一周" in text:
-        days.append(7)
-    if "最近一个月" in text or "近一个月" in text:
-        days.append(30)
+    unit_days = {"day": 1, "week": 7, "month": 30}
+    days = [
+        int(span.value or 0) * unit_days[span.unit]
+        for span in extract_temporal_lexical_spans(str(text or ""))
+        if span.unit in unit_days and int(span.value or 0) > 0
+    ]
     return sorted(set(days))
 
 
@@ -6782,8 +6871,73 @@ def unique_ints(items: Iterable[Any]) -> List[int]:
 
 
 def stable_slug(value: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "").strip())
-    return safe[:80] or str(abs(hash(value)))
+    safe = safe_ascii_component(
+        str(value or "").strip(),
+        extras=("_", ".", "-"),
+        strip="._",
+    )
+    return safe[:80] or hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
+
+
+def contains_bounded_formula_expression(value: str) -> bool:
+    text = str(value or "")
+    for index, character in enumerate(text):
+        if character not in {"=", "/", "÷"}:
+            continue
+        left_end = index
+        while left_end > 0 and text[left_end - 1].isspace():
+            left_end -= 1
+        left_start = left_end
+        while left_start > 0 and not text[left_start - 1].isspace() and left_end - left_start < 32:
+            left_start -= 1
+        right_start = index + 1
+        while right_start < len(text) and text[right_start].isspace():
+            right_start += 1
+        right_end = right_start
+        while right_end < len(text) and not text[right_end].isspace() and right_end - right_start < 32:
+            right_end += 1
+        if left_end > left_start and right_end > right_start:
+            return True
+    return False
+
+
+def is_cjk_character(character: str) -> bool:
+    return bool(character) and (
+        "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
+    )
+
+
+def text_feature_runs(value: str, *, cjk_maximum: int = 0) -> List[str]:
+    text = str(value or "")
+    tokens: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if is_cjk_character(text[cursor]):
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and is_cjk_character(text[cursor]):
+                cursor += 1
+            token = text[start:cursor]
+            if cjk_maximum > 0:
+                tokens.extend(
+                    token[index : index + cjk_maximum]
+                    for index in range(0, len(token), cjk_maximum)
+                    if len(token[index : index + cjk_maximum]) >= 2
+                )
+            elif len(token) >= 2:
+                tokens.append(token)
+            continue
+        if text[cursor] in ASCII_LETTERS | {"_"}:
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and text[cursor] in ASCII_WORD:
+                cursor += 1
+            token = text[start:cursor]
+            if len(token) >= 2:
+                tokens.append(token)
+            continue
+        cursor += 1
+    return tokens
 
 
 def memory_ids_from_selected(selected: Dict[str, Any]) -> List[str]:

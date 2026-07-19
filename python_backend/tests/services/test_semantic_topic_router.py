@@ -175,7 +175,8 @@ def test_router_reads_complete_topic_cards_and_returns_only_scope() -> None:
     assert decision.selection_evidence["keywordRoutingUsed"] is False
     prompt = llm.calls[0]
     assert [item["topic"] for item in prompt["user"]["topicDirectory"]] == assets.all_topic_names()
-    assert "最近10天卖得最多的商品" in prompt["system"]
+    assert "覆盖这些能力的全部 Topic" in prompt["system"]
+    assert "最近10天卖得最多的商品" not in prompt["system"]
     assert "不代表主表" in prompt["system"]
     assert set(prompt["tool"]["function"]["parameters"]["properties"]) == {
         "status",

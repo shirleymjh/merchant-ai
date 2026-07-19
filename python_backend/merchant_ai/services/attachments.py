@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import time
 import uuid
@@ -11,6 +10,7 @@ from threading import Lock
 from typing import Any, Iterable
 
 from merchant_ai.config import Settings
+from merchant_ai.services.text_parsing import is_ascii_hex
 
 
 class AttachmentStore:
@@ -51,7 +51,7 @@ class AttachmentStore:
         sections: list[str] = []
         for reference in references or []:
             attachment_id = str(getattr(reference, "id", "") or "")
-            if not re.fullmatch(r"attachment_[a-f0-9]{32}", attachment_id):
+            if not _is_attachment_id(attachment_id):
                 continue
             metadata_path = self.root / attachment_id / "metadata.json"
             try:
@@ -86,8 +86,17 @@ class AttachmentStore:
 
 def safe_filename(name: str) -> str:
     value = Path(str(name or "attachment")).name
-    value = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", value)
+    value = "".join(
+        character if character.isalnum() or character in {"_", ".", "-"} else "_"
+        for character in value
+    )
     return value[:160] or "attachment"
+
+
+def _is_attachment_id(value: str) -> bool:
+    prefix = "attachment_"
+    suffix = value[len(prefix) :] if value.startswith(prefix) else ""
+    return len(suffix) == 32 and suffix == suffix.lower() and is_ascii_hex(suffix, minimum=32)
 
 
 _OCR_ENGINE: Any = None

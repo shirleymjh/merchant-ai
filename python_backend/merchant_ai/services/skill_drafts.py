@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.models import AgentRunResult, QueryPlan, SkillDraft, SkillDraftReviewRequest, category_display
+from merchant_ai.services.text_parsing import safe_ascii_component
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -27,7 +27,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _slug(value: str) -> str:
-    text = re.sub(r"[^a-zA-Z0-9_]+", "_", value or "").strip("_").lower()
+    text = safe_ascii_component(value, lowercase=True)
     return text[:48] or "generated_skill"
 
 

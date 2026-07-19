@@ -126,7 +126,7 @@ def test_distributed_document_fallback_is_terminal_partial_not_completed(tmp_pat
         "run_document_partial",
         "task_document_partial",
         "document_analysis",
-        {"content": "duplicate submission"},
+        {"content": "GMV 增长 12%，退款率上升。", "question": "总结异常"},
     ).status == "partial"
 
 

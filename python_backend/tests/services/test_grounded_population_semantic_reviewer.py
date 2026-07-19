@@ -529,13 +529,14 @@ def test_review_cannot_be_reused_after_nonpopulation_goal_skeleton_changes() -> 
     outcome = _review(StructuredProvider(), contract=original)
     changed = _contract(label="different answer target")
 
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(ValueError) as exc_info:
         goal_declaration_population_input_from_review(
             changed,
             outcome,
             declaration_author_fingerprint=CORE_AUTHORITY,
             trusted_semantic_verifier_fingerprints=(REVIEWER_AUTHORITY,),
         )
+    assert "does not match" in str(exc_info.value)
 
 
 def test_request_fingerprint_is_deterministic_and_bound_to_exact_skeleton() -> None:
@@ -552,8 +553,9 @@ def test_request_fingerprint_is_deterministic_and_bound_to_exact_skeleton() -> N
 
 
 def test_semantic_reviewer_source_has_no_regular_expression_dependency() -> None:
-    source_path = Path(
-        "python_backend/merchant_ai/services/grounded_population_semantic_reviewer.py"
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / "merchant_ai/services/grounded_population_semantic_reviewer.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     blocked_modules = {"re", "regex"}

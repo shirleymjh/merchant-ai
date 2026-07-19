@@ -5,6 +5,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
     AnswerMode,
+    ExtractedKeywords,
     PlanDependency,
     QueryBundle,
     QueryPlan,
@@ -118,7 +119,18 @@ def test_quick_metric_projects_declared_event_day_to_generic_time_dimension():
                 ]
             return [{"value": 22}]
 
-    response = quick_metric_response("最近2天指标A趋势", "tenant-1", Repository(), semantic_metrics=[metric])
+    response = quick_metric_response(
+        "最近2天指标A趋势",
+        "tenant-1",
+        Repository(),
+        ExtractedKeywords(
+            normalized_question="最近2天指标a趋势",
+            metric_keywords=["指标a"],
+            action_keywords=["趋势"],
+            analysis_intent="trend",
+        ),
+        semantic_metrics=[metric],
+    )
 
     assert response is not None
     assert "`event_day` AS `time_dimension`" in calls[0][0]

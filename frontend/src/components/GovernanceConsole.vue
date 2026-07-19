@@ -67,7 +67,7 @@
         <div class="section-title"><div><h3>专项分析方案</h3><p>普通商家只会看到“经营体检、原因诊断”等业务动作。</p></div><button @click="loadCatalog">刷新</button></div>
         <div class="plan-grid">
           <article v-for="item in catalog" :key="item.skillName" class="plan-card">
-            <b>{{ planLabel(item.skillName) }}</b><p>{{ item.displayName || item.skillName }}</p><span>{{ item.status || 'available' }}</span>
+            <b>{{ item.displayName || item.skillName }}</b><p>{{ item.description || '' }}</p><span>{{ item.status || 'available' }}</span>
             <button class="primary" @click="install(item)">启用分析方案</button>
           </article>
         </div>
@@ -80,6 +80,7 @@
 import { computed, markRaw, onMounted, ref, watch } from 'vue'
 import { BookOpenCheck, Boxes, LoaderCircle, Workflow, X } from 'lucide-vue-next'
 import { buildTopicAsset, getAnalysisCatalog, getKnowledgeSuggestions, getTopicAssets, getTopicTableGovernance, getTopics, installAnalysisPlan, publishKnowledgeSuggestion, publishTopicTable, reviewKnowledgeSuggestion, rollbackTopicTable, saveTopicTableDraft } from '../api/client'
+import { pathSegment } from '../utils/textParsing'
 
 defineEmits(['close'])
 const tabs = [
@@ -109,19 +110,19 @@ async function loadKnowledge() { await run(async () => { suggestions.value = ((a
 async function loadTopics() { await run(async () => { topics.value = (await getTopics()).items || []; builder.value.topic ||= topics.value[0] || ''; assetTopic.value ||= topics.value[0] || ''; await loadAssetTables(false) }) }
 async function loadCatalog() { await run(async () => { catalog.value = (await getAnalysisCatalog()).items || [] }) }
 async function review(item, approved) {
-  await run(async () => { await reviewKnowledgeSuggestion(item.suggestionId, { approved, action: approved ? 'approve' : 'reject', reviewer: 'merchant_ops' }); await loadKnowledge() })
+  await run(async () => { await reviewKnowledgeSuggestion(item.suggestionId, { approved, action: approved ? 'approve' : 'reject' }); await loadKnowledge() })
 }
 async function publish(item) {
-  await run(async () => { await publishKnowledgeSuggestion(item.suggestionId, { reviewer: 'merchant_ops', topic: item.topic, tableName: item.sourceTable, autoIndex: true }); await loadKnowledge() })
+  await run(async () => { await publishKnowledgeSuggestion(item.suggestionId, { topic: item.topic, tableName: item.sourceTable, autoIndex: true }); await loadKnowledge() })
 }
 async function buildAsset() {
-  await run(async () => { buildResult.value = await buildTopicAsset({ topic: builder.value.topic, tableName: builder.value.tableName, merchantId: '100', businessKnowledge: builder.value.businessKnowledge }) })
+  await run(async () => { buildResult.value = await buildTopicAsset({ topic: builder.value.topic, tableName: builder.value.tableName, businessKnowledge: builder.value.businessKnowledge }) })
 }
 async function loadAssetTables(withLoading = true) {
   const action = async () => {
     if (!assetTopic.value) return
     const files = (await getTopicAssets(assetTopic.value)).items || []
-    assetTables.value = [...new Set(files.map(path => path.match(/^tables\/([^/]+)\//)?.[1]).filter(Boolean))]
+    assetTables.value = [...new Set(files.map(path => pathSegment(path, 'tables/', 0)).filter(Boolean))]
     if (!assetTables.value.includes(assetTable.value)) assetTable.value = assetTables.value[0] || ''
     if (assetTable.value) await loadGovernance(false)
   }
@@ -141,14 +142,13 @@ async function loadGovernance(withLoading = true) {
   }
   if (withLoading) await run(action); else await action()
 }
-async function saveDraft() { await run(async () => { await saveTopicTableDraft(assetTopic.value, assetTable.value, { ...JSON.parse(assetJson.value), editor: 'merchant_ops' }); await loadGovernance(false) }) }
-async function publishAsset() { await run(async () => { await saveTopicTableDraft(assetTopic.value, assetTable.value, { ...JSON.parse(assetJson.value), editor: 'merchant_ops' }); const result = await publishTopicTable(assetTopic.value, assetTable.value, { approved: true, reviewer: 'merchant_ops', reviewNote: '内部管理台审核发布' }); if (!result.success) throw new Error(result.status || '预检未通过'); await loadGovernance(false) }) }
+async function saveDraft() { await run(async () => { await saveTopicTableDraft(assetTopic.value, assetTable.value, JSON.parse(assetJson.value)); await loadGovernance(false) }) }
+async function publishAsset() { await run(async () => { await saveTopicTableDraft(assetTopic.value, assetTable.value, JSON.parse(assetJson.value)); const result = await publishTopicTable(assetTopic.value, assetTable.value, { approved: true }); if (!result.success) throw new Error(result.status || '预检未通过'); await loadGovernance(false) }) }
 async function rollbackAsset(version) { await run(async () => { const result = await rollbackTopicTable(assetTopic.value, assetTable.value, version); if (!result.success) throw new Error(result.status || '回滚失败'); await loadGovernance(false) }) }
-async function install(item) { await run(async () => { await installAnalysisPlan(item.skillName, { scope: 'merchant', merchantIds: ['100'], trafficPercent: 100 }); await loadCatalog() }) }
+async function install(item) { await run(async () => { await installAnalysisPlan(item.skillName, item.installDefaults || {}); await loadCatalog() }) }
 async function run(fn) { loading.value = true; error.value = ''; try { await fn() } catch (e) { error.value = `操作失败：${e.message || e}` } finally { loading.value = false } }
 function publishable(item) { return ['approved', 'publish_requested', 'published', 'indexed'].includes(String(item.status || '').toLowerCase()) && item.topic && item.sourceTable }
-function statusLabel(value) { return ({ candidate: '等待商家确认', platform_suggested: '待平台审核', reviewed: '已复核', approved: '已通过', rejected: '已舍弃', published: '已发布', indexed: '已生效' })[String(value || '').toLowerCase()] || value || '待处理' }
-function planLabel(name) { return ({ bi_trend_attribution: '指标波动原因深挖', gmv_drop_diagnosis: 'GMV下降原因诊断', merchant_daily_briefing: '店铺经营体检', new_product_risk: '新品经营风险排查', ratio_analysis: '占比口径核验', refund_rate_diagnosis: '退款压力专项诊断', risk_analysis: '经营风险优先级分析', rule_compliance: '平台规则影响核对' })[name] || '经营专项分析' }
+function statusLabel(value) { return value || '待处理' }
 </script>
 
 <style scoped>

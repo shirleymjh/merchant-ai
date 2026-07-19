@@ -8,6 +8,8 @@ from typing import Any, Callable, Optional, Sequence
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.models import ChatContext, ChatResponse, ConversationMessage
 from merchant_ai.services.answer import AnswerComposeService
+from merchant_ai.services.access_control import AccessControlService
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.services.assets import (
     HybridRecallService,
     TopicAssetService,
@@ -54,6 +56,16 @@ from merchant_ai.services.security import identity_scope_payload
 EventListener = Callable[[str, str, dict[str, Any]], None]
 
 
+class GroundedOnlineRuntimeUnavailable(RuntimeError):
+    """Typed fail-closed signal for an unavailable grounded data plane."""
+
+    code = "GROUNDED_ONLINE_RUNTIME_UNAVAILABLE"
+
+    def __init__(self, reason: str) -> None:
+        self.reason = str(reason or "required model authority is unavailable")
+        super().__init__("%s: %s" % (self.code, self.reason))
+
+
 @dataclass(frozen=True)
 class RuntimeServices:
     topic_assets: TopicAssetService
@@ -83,14 +95,16 @@ class GroundedApplicationRuntime:
         self,
         *,
         settings: Settings,
-        core: GroundedDeepAgentRuntime,
+        core: Optional[GroundedDeepAgentRuntime],
         services: RuntimeServices,
         checkpoint_manager: CheckpointManager,
+        unavailable_reason: str = "",
     ):
         self.settings = settings
         self.core = core
         self.services = services
         self._checkpoint_manager = checkpoint_manager
+        self._unavailable_reason = str(unavailable_reason or "").strip()
         self._closed = False
         self.runtime_kind = "grounded_deepagent"
 
@@ -107,9 +121,22 @@ class GroundedApplicationRuntime:
         effective_merchant_id = str(merchant_id or self.settings.merchant_id).strip()
         actual_thread_id = thread_id or "thread_%s" % uuid.uuid4().hex
         actual_run_id = run_id or "run_%s" % uuid.uuid4().hex
+        if self.core is None:
+            reason = self._unavailable_reason or "required model authority is unavailable"
+            _emit(
+                listener,
+                "runtime.failed",
+                "GROUNDED_CORE",
+                {
+                    "runtime": self.runtime_kind,
+                    "errorType": "GroundedOnlineRuntimeUnavailable",
+                    "error": reason,
+                },
+            )
+            raise GroundedOnlineRuntimeUnavailable(reason)
         identity = getattr(context, "user_identity", None) if context is not None else None
         user_scope = identity_scope_payload(identity, effective_merchant_id)
-        access_role = _merchant_access_role(str(user_scope.get("role") or ""))
+        access_role = load_authorization_policy().access_role_for_identity(str(user_scope.get("role") or ""))
         merchant = self.services.merchant_service.current_merchant(effective_merchant_id)
 
         _emit(
@@ -222,6 +249,11 @@ class GroundedApplicationRuntime:
         )
 
     def checkpoint_state_summary(self, thread_id: str, run_id: str) -> dict[str, Any]:
+        if self.core is None:
+            raise GroundedOnlineRuntimeUnavailable(
+                self._unavailable_reason
+                or "required model authority is unavailable"
+            )
         config = self._checkpoint_manager.config_for_deep_agent(thread_id, run_id)
         snapshot = self.core.deep_agent_graph.get_state(config)
         values = snapshot.values if hasattr(snapshot, "values") else {}
@@ -248,6 +280,8 @@ class GroundedApplicationRuntime:
     def runtime_trace(self) -> dict[str, Any]:
         return {
             "runtime": self.runtime_kind,
+            "onlineReady": self.core is not None,
+            "unavailableReason": self._unavailable_reason,
             "planner": None,
             "nodeAgent": None,
             "dataEngine": "GroundedQueryExecutionKernel",
@@ -291,6 +325,37 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
 
     keyword_service = KeywordExtractService(topic_assets)
     topic_router = SemanticTopicRouterService(settings, topic_assets)
+    answer_service = AnswerComposeService(LlmClient(settings))
+    merchant_service = MerchantService(
+        settings,
+        doris_repository,
+        SemanticRuntimeBindingRegistry(settings).resolve("principal_profile"),
+    )
+    checkpoint_manager = CheckpointManager(settings)
+    memory_store = create_memory_store(settings)
+    merchant_profile_store = MerchantProfileStore(settings)
+
+    def runtime_services(access_control: Any) -> RuntimeServices:
+        return RuntimeServices(
+            topic_assets=topic_assets,
+            recall_service=recall_service,
+            knowledge_retriever=knowledge_retriever,
+            doris_repository=doris_repository,
+            access_control=access_control,
+            merchant_service=merchant_service,
+            answer_repository=answer_repository,
+            pending_store=pending_store,
+            keyword_service=keyword_service,
+            answer_service=answer_service,
+            memory_store=memory_store,
+            merchant_profile_store=merchant_profile_store,
+            recall_cache_clearers=(
+                recall_service.clear_cache,
+                doris_repository.clear_cache,
+                keyword_service.reload_semantic_lexicon,
+            ),
+        )
+
     population_model_name = str(
         settings.llm_balanced_model
         or settings.llm_fast_model
@@ -300,6 +365,27 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         1,
         int(settings.llm_analysis_timeout_seconds or 0),
     )
+    deep_agent_timeout_seconds = _deep_agent_timeout_seconds(settings)
+    lead_model = LlmClient(settings).chat_model(
+        timeout_seconds=deep_agent_timeout_seconds
+    )
+    population_model = LlmClient(
+        settings,
+        model_name=population_model_name,
+    ).chat_model(timeout_seconds=population_timeout_seconds)
+    if lead_model is None or population_model is None:
+        # Management/control-plane APIs must remain available for health,
+        # identity, uploads and governance when inference credentials are not
+        # installed.  The data plane stays fail-closed: no population gate,
+        # query executor or Core is constructed, and every chat/run call is
+        # rejected explicitly by the facade.
+        return GroundedApplicationRuntime(
+            settings=settings,
+            core=None,
+            services=runtime_services(AccessControlService(settings)),
+            checkpoint_manager=checkpoint_manager,
+            unavailable_reason="required grounded model authority is not configured",
+        )
     population_deployment = {
         "model": population_model_name,
         "baseUrl": str(settings.openai_base_url or "").rstrip("/"),
@@ -312,10 +398,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         )
     )
     population_provider = StructuredPopulationSemanticModelProvider(
-        LlmClient(
-            settings,
-            model_name=population_model_name,
-        ).chat_model(timeout_seconds=population_timeout_seconds),
+        population_model,
         authority_fingerprint=semantic_authority,
     )
     population_gate = GroundedPopulationExecutionGate(
@@ -363,10 +446,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         )
     )
     conversation_provider = StructuredConversationSemanticProvider(
-        LlmClient(
-            settings,
-            model_name=population_model_name,
-        ).chat_model(timeout_seconds=population_timeout_seconds),
+        population_model,
         authority_fingerprint=conversation_semantic_authority,
     )
     conversation_online_authority = (
@@ -396,13 +476,6 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         settings,
         population_execution_gate=population_gate,
     )
-    answer_service = AnswerComposeService(LlmClient(settings))
-    merchant_service = MerchantService(
-        settings,
-        doris_repository,
-        SemanticRuntimeBindingRegistry(settings).resolve("principal_profile"),
-    )
-    checkpoint_manager = CheckpointManager(settings)
     kernel = GroundedRuntimeKernel(
         topic_assets,
         keyword_service=keyword_service,
@@ -412,12 +485,9 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         verifier=EvidenceVerifier(),
         answer_composer=answer_service,
     )
-    deep_agent_timeout_seconds = _deep_agent_timeout_seconds(settings)
     core = GroundedDeepAgentRuntime(
         kernel,
-        lead_model=LlmClient(settings).chat_model(
-            timeout_seconds=deep_agent_timeout_seconds
-        ),
+        lead_model=lead_model,
         isolated_subagent_model=LlmClient(
             settings,
             model_name=str(
@@ -443,25 +513,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
     return GroundedApplicationRuntime(
         settings=settings,
         core=core,
-        services=RuntimeServices(
-            topic_assets=topic_assets,
-            recall_service=recall_service,
-            knowledge_retriever=knowledge_retriever,
-            doris_repository=doris_repository,
-            access_control=query_executor.access_control,
-            merchant_service=merchant_service,
-            answer_repository=answer_repository,
-            pending_store=pending_store,
-            keyword_service=keyword_service,
-            answer_service=answer_service,
-            memory_store=create_memory_store(settings),
-            merchant_profile_store=MerchantProfileStore(settings),
-            recall_cache_clearers=(
-                recall_service.clear_cache,
-                doris_repository.clear_cache,
-                keyword_service.reload_semantic_lexicon,
-            ),
-        ),
+        services=runtime_services(query_executor.access_control),
         checkpoint_manager=checkpoint_manager,
     )
 
@@ -481,18 +533,6 @@ def _deep_agent_timeout_seconds(settings: Settings) -> int:
         int(settings.llm_lead_timeout_seconds or 0),
         int(settings.llm_analysis_timeout_seconds or 0),
     )
-
-
-def _merchant_access_role(role: str) -> str:
-    return {
-        "platform_operator": "merchant_admin",
-        "merchant_owner": "merchant_admin",
-        "merchant_operator": "merchant_analyst",
-        "merchant_finance": "merchant_finance",
-        "merchant_customer_service": "merchant_service",
-        "merchant_goods": "merchant_goods",
-        "merchant_fulfillment": "merchant_fulfillment",
-    }.get(str(role or ""), "merchant_analyst")
 
 
 def _emit(

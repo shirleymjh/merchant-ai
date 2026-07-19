@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
@@ -14,33 +13,30 @@ from merchant_ai.models import (
     RouteLexicalSpan,
     RouteSpanType,
 )
+from merchant_ai.services.language_policy import load_language_policy
+from merchant_ai.services.text_parsing import (
+    ASCII_DIGITS,
+    contains_any_literal,
+    leading_iso_date_parts,
+    literal_spans,
+    safe_ascii_component,
+    separator_contains_only,
+)
 
 
 CALENDAR_ANCHOR_POLICY = "calendar"
 LATEST_PARTITION_ANCHOR_POLICY = "latest_available_partition"
-EXPLICIT_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日)?(?!\d)")
-COMPARISON_MARKER_PATTERN = re.compile(r"相比|对比|比较|变化|环比|较|比|上升|下降|增长|减少|升高|降低")
-DAILY_GRAIN_PATTERN = re.compile(r"每天|每日|按天|逐日|日趋势|每天的|按日|走势|趋势")
-TIME_SERIES_ANALYSIS_PATTERN = re.compile(r"波动|同步上升|同步下降|持续上升|持续下降|上升|下降|增长|减少|变化|异常|走势|趋势")
-TEMPORAL_QUANTITY_SPAN_PATTERN = re.compile(
-    r"(?:(?P<prefix>最近|近|过去|前)\s*)?"
-    r"(?P<value>\d+|[零〇一二两三四五六七八九十百]+)\s*"
-    r"(?P<unit>个月|星期|礼拜|天|日|周|月)"
-)
-TEMPORAL_NAMED_SPAN_PATTERN = re.compile(
-    r"(?P<day>昨天|昨日|今天|今日)|(?P<week>上周|本周|这周)|(?P<month>上个月|本月)"
-)
-TEMPORAL_UNIT_ALIASES = {
-    "天": "day",
-    "日": "day",
-    "周": "week",
-    "星期": "week",
-    "礼拜": "week",
-    "月": "month",
-    "个月": "month",
-}
-COORDINATED_TIME_WINDOW_SEPARATOR_PATTERN = re.compile(r"^[\s,，、和与及跟同以及还有]+$")
-COMPARISON_TIME_WINDOW_SEPARATOR_PATTERN = re.compile(r"^[\s,，、比较相比对比和与]+$")
+_TEMPORAL_LANGUAGE = load_language_policy().temporal
+COMPARISON_MARKERS = _TEMPORAL_LANGUAGE.comparison_markers
+DAILY_GRAIN_MARKERS = _TEMPORAL_LANGUAGE.daily_grain_markers
+TIME_SERIES_ANALYSIS_MARKERS = _TEMPORAL_LANGUAGE.time_series_markers
+TEMPORAL_PREFIXES = _TEMPORAL_LANGUAGE.prefixes
+TEMPORAL_UNITS = tuple(sorted(_TEMPORAL_LANGUAGE.units, key=lambda item: (-len(item), item)))
+TEMPORAL_NAMED_WINDOWS = _TEMPORAL_LANGUAGE.named_windows
+TEMPORAL_NAMED_WINDOW_SEMANTICS = _TEMPORAL_LANGUAGE.named_window_semantics
+TEMPORAL_UNIT_ALIASES = _TEMPORAL_LANGUAGE.units
+COORDINATED_TIME_WINDOW_SEPARATOR_CHARACTERS = _TEMPORAL_LANGUAGE.coordinated_separator_characters
+COMPARISON_TIME_WINDOW_SEPARATOR_CHARACTERS = _TEMPORAL_LANGUAGE.comparison_separator_characters
 CHINESE_TEMPORAL_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -57,6 +53,19 @@ CHINESE_TEMPORAL_DIGITS = {
 }
 
 
+def _temporal_label(key: str, *, days: int = 0) -> str:
+    template = str(_TEMPORAL_LANGUAGE.labels[key])
+    return template.replace("{days}", str(max(0, int(days or 0))))
+
+
+def _named_semantics_in_text(value: str) -> set[str]:
+    return {
+        str(TEMPORAL_NAMED_WINDOW_SEMANTICS.get(phrase) or "")
+        for _start, _end, phrase in literal_spans(value, TEMPORAL_NAMED_WINDOW_SEMANTICS)
+        if TEMPORAL_NAMED_WINDOW_SEMANTICS.get(phrase)
+    }
+
+
 def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
     """Return canonical typed time spans without interpreting business text.
 
@@ -67,34 +76,40 @@ def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
 
     value = str(text or "")
     spans: list[RouteLexicalSpan] = []
-    for match in TEMPORAL_QUANTITY_SPAN_PATTERN.finditer(value):
-        prefix = str(match.group("prefix") or "")
-        quantity = parse_temporal_quantity(match.group("value"))
+    cursor = 0
+    while cursor < len(value):
+        parsed = _temporal_quantity_span_at(value, cursor)
+        if parsed is None:
+            cursor += 1
+            continue
+        end, prefix, quantity_text, unit_text = parsed
+        quantity = parse_temporal_quantity(quantity_text)
         if quantity <= 0:
+            cursor += 1
             continue
         spans.append(
             RouteLexicalSpan(
                 span_type=RouteSpanType.TEMPORAL,
-                start=match.start(),
-                end=match.end(),
-                text=match.group(0),
+                start=cursor,
+                end=end,
+                text=value[cursor:end],
                 source="quantity_window",
                 value=quantity,
-                unit=TEMPORAL_UNIT_ALIASES.get(str(match.group("unit") or ""), ""),
+                unit=TEMPORAL_UNIT_ALIASES.get(unit_text, ""),
                 role="previous_period" if prefix == "前" else "primary",
             )
         )
-    for match in TEMPORAL_NAMED_SPAN_PATTERN.finditer(value):
-        unit = next((name for name in ("day", "week", "month") if match.group(name)), "")
+        cursor = end
+    for start, end, window_text in literal_spans(value, TEMPORAL_NAMED_WINDOWS):
         spans.append(
             RouteLexicalSpan(
                 span_type=RouteSpanType.TEMPORAL,
-                start=match.start(),
-                end=match.end(),
-                text=match.group(0),
+                start=start,
+                end=end,
+                text=window_text,
                 source="named_calendar_window",
                 value=1,
-                unit=unit,
+                unit=TEMPORAL_NAMED_WINDOWS[window_text],
                 role="primary",
             )
         )
@@ -105,6 +120,77 @@ def extract_temporal_lexical_spans(text: str) -> list[RouteLexicalSpan]:
             continue
         accepted.append(candidate)
     return accepted
+
+
+def _temporal_quantity_span_at(value: str, start: int) -> tuple[int, str, str, str] | None:
+    cursor = start
+    prefix = next((item for item in TEMPORAL_PREFIXES if value.startswith(item, cursor)), "")
+    if prefix:
+        cursor += len(prefix)
+        cursor = _skip_whitespace(value, cursor)
+    quantity_start = cursor
+    allowed_quantity = {*CHINESE_TEMPORAL_DIGITS, "十", "百"}
+    while cursor < len(value) and (value[cursor].isdigit() or value[cursor] in allowed_quantity):
+        cursor += 1
+    if cursor == quantity_start:
+        return None
+    quantity_text = value[quantity_start:cursor]
+    cursor = _skip_whitespace(value, cursor)
+    unit = next((item for item in TEMPORAL_UNITS if value.startswith(item, cursor)), "")
+    if not unit:
+        return None
+    return cursor + len(unit), prefix, quantity_text, unit
+
+
+def _skip_whitespace(value: str, cursor: int) -> int:
+    while cursor < len(value) and value[cursor].isspace():
+        cursor += 1
+    return cursor
+
+
+def _extract_explicit_dates(value: str) -> list[date]:
+    dates: list[date] = []
+    cursor = 0
+    while cursor < len(value):
+        parsed = _explicit_date_at(value, cursor)
+        if parsed is None:
+            cursor += 1
+            continue
+        end, parts = parsed
+        target = safe_date(*parts)
+        if target is not None:
+            dates.append(target)
+        cursor = end
+    return dates
+
+
+def _explicit_date_at(value: str, start: int) -> tuple[int, tuple[str, str, str]] | None:
+    if start > 0 and value[start - 1] in ASCII_DIGITS:
+        return None
+    year_end = start + 4
+    if year_end >= len(value) or any(character not in ASCII_DIGITS for character in value[start:year_end]):
+        return None
+    if value[year_end] not in {"-", "/", "年"}:
+        return None
+    cursor = year_end + 1
+    month_start = cursor
+    while cursor < len(value) and value[cursor] in ASCII_DIGITS and cursor - month_start < 2:
+        cursor += 1
+    month = value[month_start:cursor]
+    if not month or cursor >= len(value) or value[cursor] not in {"-", "/", "月"}:
+        return None
+    cursor += 1
+    day_start = cursor
+    while cursor < len(value) and value[cursor] in ASCII_DIGITS and cursor - day_start < 2:
+        cursor += 1
+    day = value[day_start:cursor]
+    if not day:
+        return None
+    if cursor < len(value) and value[cursor] == "日":
+        cursor += 1
+    if cursor < len(value) and value[cursor] in ASCII_DIGITS:
+        return None
+    return cursor, (value[start:year_end], month, day)
 
 
 def parse_temporal_quantity(value: object) -> int:
@@ -155,33 +241,25 @@ def resolve_time_range(
 ) -> ResolvedTimeRange:
     today = local_today(timezone_name, now)
     text = str(question or "")
-    explicit_dates = [safe_date(*match.groups()) for match in EXPLICIT_DATE_PATTERN.finditer(text)]
-    explicit_dates = [item for item in explicit_dates if item]
+    explicit_dates = _extract_explicit_dates(text)
     if len(explicit_dates) >= 2:
         start, end = sorted(explicit_dates[:2])
         return resolved_range("explicit_range", start, end, timezone_name, "%s 至 %s" % (start, end), "question_dates")
     if len(explicit_dates) == 1:
         target = explicit_dates[0]
         return resolved_range("exact_date", target, target, timezone_name, target.isoformat(), "question_date")
-    if "昨天" in text or "昨日" in text:
-        target = today - timedelta(days=1)
-        return resolved_range("exact_date", target, target, timezone_name, "昨天", "relative_yesterday")
-    if "今天" in text or "今日" in text:
-        return resolved_range("exact_date", today, today, timezone_name, "今天", "relative_today")
-    if "本月" in text or "这个月" in text:
-        start = today.replace(day=1)
-        return resolved_range("calendar_month", start, today, timezone_name, "本月", "calendar_current_month")
-    if "上月" in text or "上个月" in text:
-        end = today.replace(day=1) - timedelta(days=1)
-        start = end.replace(day=1)
-        return resolved_range("calendar_month", start, end, timezone_name, "上月", "calendar_previous_month")
-    if "本周" in text or "这周" in text:
-        start = today - timedelta(days=today.weekday())
-        return resolved_range("calendar_week", start, today, timezone_name, "本周", "calendar_current_week")
-    if "上周" in text or "上星期" in text:
-        end = today - timedelta(days=today.weekday() + 1)
-        start = end - timedelta(days=6)
-        return resolved_range("calendar_week", start, end, timezone_name, "上周", "calendar_previous_week")
+    named_span = next(
+        (
+            span
+            for span in extract_temporal_lexical_spans(text)
+            if span.source == "named_calendar_window"
+        ),
+        None,
+    )
+    if named_span:
+        named_range = resolved_time_range_for_span(named_span, timezone_name, now=now)
+        if named_range is not None:
+            return named_range
     quantity_span = next(
         (
             span
@@ -197,7 +275,14 @@ def resolve_time_range(
         return resolved_range("rolling", start, today, timezone_name, label, source)
     days = max(1, int(default_days or 7))
     start = today - timedelta(days=days - 1)
-    return resolved_range("rolling", start, today, timezone_name, "最近%d天" % days, "default_days")
+    return resolved_range(
+        "rolling",
+        start,
+        today,
+        timezone_name,
+        _temporal_label("default_rolling_days", days=days),
+        "default_days",
+    )
 
 
 def resolve_time_window_contract(
@@ -316,18 +401,16 @@ def resolve_coordinated_time_windows(
     if len(resolved) < 2:
         return [], ""
     coordinated = all(
-        bool(
-            COORDINATED_TIME_WINDOW_SEPARATOR_PATTERN.fullmatch(
-                value[current[0].end : following[0].start]
-            )
+        separator_contains_only(
+            value[current[0].end : following[0].start],
+            COORDINATED_TIME_WINDOW_SEPARATOR_CHARACTERS,
         )
         for current, following in zip(resolved, resolved[1:])
     )
-    explicit_comparison = bool(COMPARISON_MARKER_PATTERN.search(value)) and all(
-        bool(
-            COMPARISON_TIME_WINDOW_SEPARATOR_PATTERN.fullmatch(
-                value[current[0].end : following[0].start]
-            )
+    explicit_comparison = contains_any_literal(value, COMPARISON_MARKERS) and all(
+        separator_contains_only(
+            value[current[0].end : following[0].start],
+            COMPARISON_TIME_WINDOW_SEPARATOR_CHARACTERS,
         )
         for current, following in zip(resolved, resolved[1:])
     )
@@ -367,18 +450,22 @@ def resolved_time_range_for_span(
         )
     if span.source != "named_calendar_window":
         return None
-    if label in {"今天", "今日"}:
+    semantic = str(TEMPORAL_NAMED_WINDOW_SEMANTICS.get(label) or "")
+    if semantic == "current_day":
         return resolved_range("exact_date", today, today, timezone_name, label, "relative_today")
-    if label in {"昨天", "昨日"}:
+    if semantic == "previous_day":
         target = today - timedelta(days=1)
         return resolved_range("exact_date", target, target, timezone_name, label, "relative_yesterday")
-    if label in {"本周", "这周"}:
+    if semantic == "two_days_ago":
+        target = today - timedelta(days=2)
+        return resolved_range("exact_date", target, target, timezone_name, label, "relative_two_days_ago")
+    if semantic == "current_week":
         start = today - timedelta(days=today.weekday())
         return resolved_range("calendar_week", start, today, timezone_name, label, "calendar_current_week")
-    if label == "上周":
+    if semantic == "previous_week":
         end = today - timedelta(days=today.weekday() + 1)
         return resolved_range("calendar_week", end - timedelta(days=6), end, timezone_name, label, "calendar_previous_week")
-    if label == "本月":
+    if semantic == "current_month":
         return resolved_range(
             "calendar_month",
             today.replace(day=1),
@@ -387,7 +474,7 @@ def resolved_time_range_for_span(
             label,
             "calendar_current_month",
         )
-    if label == "上个月":
+    if semantic == "previous_month":
         end = today.replace(day=1) - timedelta(days=1)
         return resolved_range(
             "calendar_month",
@@ -423,7 +510,7 @@ def resolve_comparison_time_range(
         ),
         None,
     )
-    if "同比" in text or "去年同期" in text:
+    if contains_any_literal(text, _TEMPORAL_LANGUAGE.year_over_year_markers):
         start = parse_iso_date(primary.start_date)
         end = parse_iso_date(primary.end_date)
         if start and end:
@@ -432,20 +519,40 @@ def resolve_comparison_time_range(
                 shift_year(start, -1),
                 shift_year(end, -1),
                 timezone_name,
-                "去年同期",
+                _temporal_label("year_over_year"),
                 "year_over_year",
                 comparison_type="year_over_year",
             )
-    if primary.kind in {"calendar_month"} and ("上月" in text or "上个月" in text or "环比" in text or "上期" in text):
+    named_semantics = _named_semantics_in_text(text)
+    period_over_period = contains_any_literal(text, _TEMPORAL_LANGUAGE.period_over_period_markers)
+    if primary.kind in {"calendar_month"} and (
+        "previous_month" in named_semantics or period_over_period
+    ):
         end = parse_iso_date(primary.start_date) or today.replace(day=1)
         end = end - timedelta(days=1)
         start = end.replace(day=1)
-        return resolved_comparison_range("calendar_month", start, end, timezone_name, "上月", "previous_calendar_month")
-    if primary.kind in {"calendar_week"} and ("上周" in text or "上星期" in text or "环比" in text or "上期" in text):
+        return resolved_comparison_range(
+            "calendar_month",
+            start,
+            end,
+            timezone_name,
+            _temporal_label("previous_month"),
+            "previous_calendar_month",
+        )
+    if primary.kind in {"calendar_week"} and (
+        "previous_week" in named_semantics or period_over_period
+    ):
         start_primary = parse_iso_date(primary.start_date) or (today - timedelta(days=today.weekday()))
         end = start_primary - timedelta(days=1)
         start = end - timedelta(days=6)
-        return resolved_comparison_range("calendar_week", start, end, timezone_name, "上周", "previous_calendar_week")
+        return resolved_comparison_range(
+            "calendar_week",
+            start,
+            end,
+            timezone_name,
+            _temporal_label("previous_week"),
+            "previous_calendar_week",
+        )
     if primary.kind == "exact_date":
         target = (parse_iso_date(primary.start_date) or today) - timedelta(days=1)
         return resolved_comparison_range(
@@ -453,7 +560,7 @@ def resolve_comparison_time_range(
             target,
             target,
             timezone_name,
-            "前一天",
+            _temporal_label("previous_day"),
             "previous_day",
             offset_days=1,
         )
@@ -465,7 +572,7 @@ def resolve_comparison_time_range(
     else:
         days = max(1, int(primary.days or 1))
         start = end - timedelta(days=days - 1)
-        label = "前%d天" % days
+        label = _temporal_label("previous_days", days=days)
         source = "previous_period"
     # offsetDays shifts the comparison anchor away from the primary anchor;
     # it is independent of the comparison window's own duration.
@@ -485,39 +592,45 @@ def comparison_requested(text: str) -> bool:
     value = str(text or "")
     if not value:
         return False
-    if "去年同期" in value or "同比" in value or "环比" in value:
+    if contains_any_literal(
+        value,
+        (*_TEMPORAL_LANGUAGE.year_over_year_markers, *_TEMPORAL_LANGUAGE.period_over_period_markers),
+    ):
         return True
-    if any(span.role == "previous_period" for span in extract_temporal_lexical_spans(value)) and COMPARISON_MARKER_PATTERN.search(value):
+    if any(span.role == "previous_period" for span in extract_temporal_lexical_spans(value)) and contains_any_literal(value, COMPARISON_MARKERS):
         return True
-    if any(marker in value for marker in ["上月", "上个月", "上周", "上星期", "前天"]) and COMPARISON_MARKER_PATTERN.search(value):
+    if (
+        _named_semantics_in_text(value) & _TEMPORAL_LANGUAGE.comparison_named_semantics
+        and contains_any_literal(value, COMPARISON_MARKERS)
+    ):
         return True
-    if any(marker in value for marker in ["上期", "上一期", "上一周期"]) and COMPARISON_MARKER_PATTERN.search(value):
+    if contains_any_literal(value, _TEMPORAL_LANGUAGE.previous_period_markers) and contains_any_literal(value, COMPARISON_MARKERS):
         return True
     return False
 
 
 def ambiguous_recent_month(text: str) -> bool:
     value = str(text or "")
-    if "自然月" in value:
+    if contains_any_literal(value, _TEMPORAL_LANGUAGE.natural_month_markers):
         return False
     return any(
         span.source == "quantity_window"
         and span.role == "primary"
         and span.unit == "month"
-        and str(span.text or "").strip().startswith(("最近", "近", "过去"))
+        and str(span.text or "").strip().startswith(_TEMPORAL_LANGUAGE.rolling_month_prefixes)
         for span in extract_temporal_lexical_spans(value)
     )
 
 
 def resolve_time_grain(text: str, comparison: Optional[ResolvedTimeRange]) -> str:
     value = str(text or "")
-    if DAILY_GRAIN_PATTERN.search(value):
+    if contains_any_literal(value, DAILY_GRAIN_MARKERS):
         return "day"
     # If the user explicitly asks for a period-to-period comparison, keep the
     # answer at period grain unless they also ask for daily/point trends.
     if comparison:
         return "period"
-    if TIME_SERIES_ANALYSIS_PATTERN.search(value):
+    if contains_any_literal(value, TIME_SERIES_ANALYSIS_MARKERS):
         return "day"
     return "period"
 
@@ -1030,8 +1143,8 @@ def declared_time_column_for_intent(
     ).lower()
     mode = str(getattr(getattr(intent, "answer_mode", ""), "value", getattr(intent, "answer_mode", "")) or "").upper()
     question_declares_series = mode in {"GROUP_AGG", "DERIVED"} and bool(
-        DAILY_GRAIN_PATTERN.search(str(getattr(intent, "question", "") or ""))
-        or TIME_SERIES_ANALYSIS_PATTERN.search(str(getattr(intent, "question", "") or ""))
+        contains_any_literal(str(getattr(intent, "question", "") or ""), DAILY_GRAIN_MARKERS)
+        or contains_any_literal(str(getattr(intent, "question", "") or ""), TIME_SERIES_ANALYSIS_MARKERS)
     )
     if (
         accept_selected_group
@@ -1166,7 +1279,7 @@ def unique_baseline_task_id(task_id: str, existing_ids: set[str]) -> str:
 def unique_time_window_task_id(task_id: str, role: str, existing_ids: set[str]) -> str:
     if role == "comparison":
         return unique_baseline_task_id(task_id, existing_ids)
-    safe_role = re.sub(r"[^A-Za-z0-9_]+", "_", str(role or "additional")).strip("_") or "additional"
+    safe_role = safe_ascii_component(role, default="additional")
     base = "%s_%s" % (str(task_id or "task").strip(), safe_role)
     candidate = base
     index = 2
@@ -1188,12 +1301,12 @@ def partition_date_matches(value: object, expected: str) -> bool:
 
 def normalize_partition_date(value: object) -> str:
     text = str(value or "").strip()
-    if re.fullmatch(r"\d{8}", text):
+    if len(text) == 8 and text.isascii() and text.isdigit():
         return "%s-%s-%s" % (text[:4], text[4:6], text[6:8])
-    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", text)
-    if not match:
+    date_parts = leading_iso_date_parts(text)
+    if date_parts is None:
         return ""
-    target = safe_date(*match.groups())
+    target = safe_date(*date_parts)
     return target.isoformat() if target else ""
 
 

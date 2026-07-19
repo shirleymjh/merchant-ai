@@ -229,8 +229,9 @@ def test_evidence_request_has_no_executable_data_selection_surface(
     payload = request().model_dump(by_alias=True, mode="json")
     payload[field_name] = field_value
 
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+    with pytest.raises(ValidationError) as exc_info:
         EvidenceRequest.model_validate(payload)
+    assert "Extra inputs are not permitted" in str(exc_info.value)
 
 
 def test_scope_signatures_allow_inheritance_or_pre_authorized_narrowing() -> None:
@@ -327,7 +328,7 @@ def test_evidence_request_fingerprint_is_semantic_stable_and_deduplicated() -> N
 
 
 def test_analysis_plan_dependencies_are_known_and_acyclic() -> None:
-    with pytest.raises(ValidationError, match="unknown step"):
+    with pytest.raises(ValidationError) as unknown_step_error:
         AnalysisPlan(
             plan_id="plan.unknown",
             steps=(
@@ -340,8 +341,9 @@ def test_analysis_plan_dependencies_are_known_and_acyclic() -> None:
             ),
             terminal_step_ids=("step.one",),
         )
+    assert "unknown step" in str(unknown_step_error.value)
 
-    with pytest.raises(ValidationError, match="acyclic"):
+    with pytest.raises(ValidationError) as cycle_error:
         AnalysisPlan(
             plan_id="plan.cycle",
             steps=(
@@ -360,6 +362,7 @@ def test_analysis_plan_dependencies_are_known_and_acyclic() -> None:
             ),
             terminal_step_ids=("step.two",),
         )
+    assert "acyclic" in str(cycle_error.value)
 
 
 @pytest.mark.parametrize(
@@ -405,8 +408,9 @@ def test_ledger_is_hash_chained_cas_guarded_and_append_only() -> None:
     assert next_state.events == (first,)
     assert next_state.head_event_fingerprint == first.event_fingerprint
 
-    with pytest.raises(ValueError, match="revision conflict"):
+    with pytest.raises(ValueError) as revision_error:
         append_ledger_event(next_state, first, expected_revision=0)
+    assert "revision conflict" in str(revision_error.value)
 
     wrong_parent = build_ledger_event(
         event_id="event.two",
@@ -417,5 +421,6 @@ def test_ledger_is_hash_chained_cas_guarded_and_append_only() -> None:
         payload_fingerprint="payload.two",
         previous_event_fingerprint="different.head",
     )
-    with pytest.raises(ValueError, match="current head"):
+    with pytest.raises(ValueError) as head_error:
         append_ledger_event(next_state, wrong_parent, expected_revision=1)
+    assert "current head" in str(head_error.value)

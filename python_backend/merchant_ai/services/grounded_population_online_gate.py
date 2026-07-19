@@ -38,6 +38,7 @@ from merchant_ai.services.grounded_population_gate_coordinator import (
     PopulationPreExecutionCommand,
     PopulationPublishedArtifactReceipt,
     PopulationResultSelection,
+    population_dynamic_graph_receipt_fingerprint,
     population_execution_graph_binding_fingerprint,
     population_gate_state_fingerprint,
     population_node_gate_record_fingerprint,
@@ -64,6 +65,7 @@ from merchant_ai.services.grounded_population_verifier import (
     PopulationVerificationStage,
     population_attestation_fingerprint,
 )
+
 if TYPE_CHECKING:
     from merchant_ai.services.grounded_runtime_kernel import (
         GroundedVerifiedQueryArtifact,
@@ -112,22 +114,14 @@ def _stable_fingerprint(value: Any) -> str:
 
 def _valid_sha256(value: Any) -> bool:
     candidate = str(value or "")
-    return len(candidate) == 64 and all(
-        character in "0123456789abcdef" for character in candidate
-    )
+    return len(candidate) == 64 and all(character in "0123456789abcdef" for character in candidate)
 
 
 def _safe_relative_path(value: Any) -> str:
     raw = _text(value).replace("\\", "/")
     path = Path(raw)
-    if (
-        not raw
-        or path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts)
-    ):
-        raise PopulationOnlineLedgerError(
-            "POPULATION_LEDGER_ARTIFACT_PATH_INVALID"
-        )
+    if not raw or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise PopulationOnlineLedgerError("POPULATION_LEDGER_ARTIFACT_PATH_INVALID")
     return path.as_posix()
 
 
@@ -167,12 +161,9 @@ Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, 
     ) -> PopulationSemanticProviderOutput:
         if float(timeout_seconds) <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if (
-            request.request_fingerprint
-            != population_semantic_reviewer_request_fingerprint(request)
-            or request.goal_skeleton_fingerprint
-            != population_goal_skeleton_fingerprint(request.goal_skeleton)
-        ):
+        if request.request_fingerprint != population_semantic_reviewer_request_fingerprint(
+            request
+        ) or request.goal_skeleton_fingerprint != population_goal_skeleton_fingerprint(request.goal_skeleton):
             raise RuntimeError("POPULATION_MODEL_REQUEST_BINDING_INVALID")
         bind = getattr(self.model, "with_structured_output", None)
         if not callable(bind):
@@ -184,10 +175,7 @@ Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, 
         )
         model_payload = {
             "question": request.effective_question,
-            "goalSkeleton": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in request.goal_skeleton
-            ],
+            "goalSkeleton": [item.model_dump(by_alias=True, mode="json") for item in request.goal_skeleton],
         }
         raw = structured_model.invoke(
             [
@@ -202,9 +190,7 @@ Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, 
         return PopulationSemanticProviderOutput(
             request_fingerprint=request.request_fingerprint,
             question_fingerprint=request.question_fingerprint,
-            goal_skeleton_fingerprint=(
-                request.goal_skeleton_fingerprint
-            ),
+            goal_skeleton_fingerprint=(request.goal_skeleton_fingerprint),
             complete=decision.complete,
             decisions=decision.decisions,
         )
@@ -214,14 +200,10 @@ Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, 
         if isinstance(value, PopulationZeroToolModelDecision):
             return value
         if isinstance(value, Mapping):
-            return PopulationZeroToolModelDecision.model_validate(
-                dict(value)
-            )
+            return PopulationZeroToolModelDecision.model_validate(dict(value))
         content: Optional[Any] = getattr(value, "content", None)
         if isinstance(content, Mapping):
-            return PopulationZeroToolModelDecision.model_validate(
-                dict(content)
-            )
+            return PopulationZeroToolModelDecision.model_validate(dict(content))
         raise TypeError("structured population model returned an invalid value")
 
 
@@ -296,30 +278,20 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             raise ValueError("checkpoint_namespace is required")
         supplied_root = Path(workspace.root)
         if supplied_root.is_symlink():
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_WORKSPACE_SYMLINK_REJECTED"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_WORKSPACE_SYMLINK_REJECTED")
         try:
             root = supplied_root.resolve(strict=True)
         except OSError as exc:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_WORKSPACE_INVALID"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_WORKSPACE_INVALID") from exc
         if not root.is_dir():
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_WORKSPACE_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_WORKSPACE_INVALID")
         owner = _text(workspace.owner_fingerprint)
         if not _valid_sha256(owner):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_OWNER_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_OWNER_INVALID")
         self.workspace = workspace
         self.workspace_root = root
         self.owner_fingerprint = owner
-        self.checkpoint_namespace_fingerprint = _stable_fingerprint(
-            {"checkpointNamespace": namespace}
-        )
+        self.checkpoint_namespace_fingerprint = _stable_fingerprint({"checkpointNamespace": namespace})
         descriptor = self._open_directory(
             (
                 *self._BASE_COMPONENTS,
@@ -405,9 +377,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
     ) -> bool:
         normalized_gate_id = _text(gate_id)
         if next_state.gate_id != normalized_gate_id:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_NEXT_STATE_BINDING_MISMATCH"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NEXT_STATE_BINDING_MISMATCH")
         self._validate_new_state(
             next_state,
             expected_revision=int(expected_revision) + 1,
@@ -431,8 +401,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             if (
                 current is None
                 or current.revision != int(expected_revision)
-                or current.state_fingerprint
-                != _text(expected_state_fingerprint)
+                or current.state_fingerprint != _text(expected_state_fingerprint)
             ):
                 return False
             self._validate_state_transition(current, next_state)
@@ -469,27 +438,14 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         *,
         create: bool,
     ) -> int:
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self.workspace_root, flags)
         try:
             if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_WORKSPACE_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_WORKSPACE_INVALID")
             for component in components:
-                if (
-                    not component
-                    or component in {".", ".."}
-                    or "/" in component
-                    or "\\" in component
-                ):
-                    raise PopulationOnlineGateStorageError(
-                        "POPULATION_GATE_CHECKPOINT_COMPONENT_INVALID"
-                    )
+                if not component or component in {".", ".."} or "/" in component or "\\" in component:
+                    raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_COMPONENT_INVALID")
                 if create:
                     try:
                         os.mkdir(
@@ -502,9 +458,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 child = os.open(component, flags, dir_fd=descriptor)
                 if not stat.S_ISDIR(os.fstat(child).st_mode):
                     os.close(child)
-                    raise PopulationOnlineGateStorageError(
-                        "POPULATION_GATE_CHECKPOINT_DIRECTORY_INVALID"
-                    )
+                    raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_DIRECTORY_INVALID")
                 os.close(descriptor)
                 descriptor = child
             return descriptor
@@ -516,21 +470,15 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         try:
             lock_descriptor = os.open(
                 self._LOCK_NAME,
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
                 dir_fd=descriptor,
             )
         except OSError as exc:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_LOCK_INVALID"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_LOCK_INVALID") from exc
         if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
             os.close(lock_descriptor)
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_LOCK_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_LOCK_INVALID")
         fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
         return lock_descriptor
 
@@ -549,36 +497,23 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             )
         except FileNotFoundError:
             try:
-                retained_names = {
-                    name
-                    for name in os.listdir(descriptor)
-                    if name != self._LOCK_NAME
-                }
+                retained_names = {name for name in os.listdir(descriptor) if name != self._LOCK_NAME}
             except OSError as exc:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_CHECKPOINT_LIST_FAILED"
-                ) from exc
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_LIST_FAILED") from exc
             if retained_names:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_HEAD_MISSING_WITH_HISTORY"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_HEAD_MISSING_WITH_HISTORY")
             return None
         try:
             head = _PopulationCheckpointHead.model_validate_json(encoded_head)
         except Exception as exc:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_HEAD_INVALID"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_HEAD_INVALID") from exc
         if (
             head.owner_fingerprint != self.owner_fingerprint
-            or head.checkpoint_namespace_fingerprint
-            != self.checkpoint_namespace_fingerprint
+            or head.checkpoint_namespace_fingerprint != self.checkpoint_namespace_fingerprint
             or head.gate_id_fingerprint != gate_fingerprint
             or head.head_fingerprint != _checkpoint_head_fingerprint(head)
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_HEAD_BINDING_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_HEAD_BINDING_INVALID")
         state_name = self._state_artifact_name(
             head.revision,
             head.state_fingerprint,
@@ -590,34 +525,23 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             max_bytes=self._MAX_STATE_BYTES,
         )
         try:
-            envelope = _PopulationStateEnvelope.model_validate_json(
-                encoded_state
-            )
+            envelope = _PopulationStateEnvelope.model_validate_json(encoded_state)
         except Exception as exc:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_STATE_ARTIFACT_INVALID"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_STATE_ARTIFACT_INVALID") from exc
         state = envelope.state
         if (
             envelope.owner_fingerprint != self.owner_fingerprint
-            or envelope.checkpoint_namespace_fingerprint
-            != self.checkpoint_namespace_fingerprint
+            or envelope.checkpoint_namespace_fingerprint != self.checkpoint_namespace_fingerprint
             or envelope.gate_id_fingerprint != gate_fingerprint
             or state.gate_id != gate_id
             or state.revision != head.revision
             or state.state_fingerprint != head.state_fingerprint
             or state.state_fingerprint != population_gate_state_fingerprint(state)
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_STATE_BINDING_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_STATE_BINDING_INVALID")
         expected_attestations = self._state_attestations(state)
-        if set(envelope.attestation_artifact_sha256) != set(
-            expected_attestations
-        ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_ATTESTATION_SET_INVALID"
-            )
+        if set(envelope.attestation_artifact_sha256) != set(expected_attestations):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_ATTESTATION_SET_INVALID")
         for stage, attestation in expected_attestations.items():
             self._validate_attestation(attestation, expected_stage=stage)
             attestation_envelope = self._attestation_envelope(
@@ -627,13 +551,8 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             )
             expected_bytes = _stable_json_bytes(attestation_envelope)
             expected_sha256 = hashlib.sha256(expected_bytes).hexdigest()
-            if (
-                envelope.attestation_artifact_sha256.get(stage)
-                != expected_sha256
-            ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_ATTESTATION_BINDING_INVALID"
-                )
+            if envelope.attestation_artifact_sha256.get(stage) != expected_sha256:
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_ATTESTATION_BINDING_INVALID")
             observed = self._read_immutable_at(
                 descriptor,
                 self._attestation_artifact_name(
@@ -644,12 +563,8 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 max_bytes=self._MAX_ATTESTATION_BYTES,
             )
             if observed != expected_bytes:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_ATTESTATION_CONTENT_INVALID"
-                )
-        return PopulationGateState.model_validate(
-            state.model_dump(by_alias=True, mode="json")
-        )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_ATTESTATION_CONTENT_INVALID")
+        return PopulationGateState.model_validate(state.model_dump(by_alias=True, mode="json"))
 
     def _publish_state_locked(
         self,
@@ -680,9 +595,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             attestation_sha256[stage] = digest
         state_envelope = _PopulationStateEnvelope(
             owner_fingerprint=self.owner_fingerprint,
-            checkpoint_namespace_fingerprint=(
-                self.checkpoint_namespace_fingerprint
-            ),
+            checkpoint_namespace_fingerprint=(self.checkpoint_namespace_fingerprint),
             gate_id_fingerprint=gate_fingerprint,
             state=state,
             attestation_artifact_sha256=attestation_sha256,
@@ -696,21 +609,13 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         self._write_immutable_at(descriptor, state_name, encoded_state)
         pending_head = _PopulationCheckpointHead(
             owner_fingerprint=self.owner_fingerprint,
-            checkpoint_namespace_fingerprint=(
-                self.checkpoint_namespace_fingerprint
-            ),
+            checkpoint_namespace_fingerprint=(self.checkpoint_namespace_fingerprint),
             gate_id_fingerprint=gate_fingerprint,
             revision=state.revision,
             state_fingerprint=state.state_fingerprint,
             state_artifact_sha256=state_sha256,
         )
-        head = pending_head.model_copy(
-            update={
-                "head_fingerprint": _checkpoint_head_fingerprint(
-                    pending_head
-                )
-            }
-        )
+        head = pending_head.model_copy(update={"head_fingerprint": _checkpoint_head_fingerprint(pending_head)})
         self._atomic_replace_at(
             descriptor,
             self._HEAD_NAME,
@@ -725,9 +630,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
     ) -> _PopulationAttestationEnvelope:
         return _PopulationAttestationEnvelope(
             owner_fingerprint=self.owner_fingerprint,
-            checkpoint_namespace_fingerprint=(
-                self.checkpoint_namespace_fingerprint
-            ),
+            checkpoint_namespace_fingerprint=(self.checkpoint_namespace_fingerprint),
             gate_id_fingerprint=gate_fingerprint,
             stage=PopulationVerificationStage(stage),
             attestation=attestation,
@@ -737,19 +640,11 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
     def _state_attestations(
         state: PopulationGateState,
     ) -> dict[str, PopulationVerificationAttestation]:
-        retained = {
-            PopulationVerificationStage.GOAL_DECLARATION.value: (
-                state.goal_attestation
-            )
-        }
+        retained = {PopulationVerificationStage.GOAL_DECLARATION.value: (state.goal_attestation)}
         if state.pre_execution_attestation is not None:
-            retained[PopulationVerificationStage.PRE_EXECUTION.value] = (
-                state.pre_execution_attestation
-            )
+            retained[PopulationVerificationStage.PRE_EXECUTION.value] = state.pre_execution_attestation
         if state.post_result_attestation is not None:
-            retained[PopulationVerificationStage.POST_RESULT.value] = (
-                state.post_result_attestation
-            )
+            retained[PopulationVerificationStage.POST_RESULT.value] = state.post_result_attestation
         return retained
 
     @staticmethod
@@ -761,12 +656,9 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         if (
             _enum_value(attestation.stage) != expected_stage
             or not attestation.attestation_fingerprint
-            or attestation.attestation_fingerprint
-            != population_attestation_fingerprint(attestation)
+            or attestation.attestation_fingerprint != population_attestation_fingerprint(attestation)
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_ATTESTATION_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_ATTESTATION_INVALID")
 
     @staticmethod
     def _validate_new_state(
@@ -777,36 +669,27 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         if (
             state.revision != expected_revision
             or not state.state_fingerprint
-            or state.state_fingerprint
-            != population_gate_state_fingerprint(state)
+            or state.state_fingerprint != population_gate_state_fingerprint(state)
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_NEXT_STATE_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NEXT_STATE_INVALID")
 
     @classmethod
     def _validate_initial_state(cls, state: PopulationGateState) -> None:
         cls._validate_attestation(
             state.goal_attestation,
-            expected_stage=(
-                PopulationVerificationStage.GOAL_DECLARATION.value
-            ),
+            expected_stage=(PopulationVerificationStage.GOAL_DECLARATION.value),
         )
         if (
-            _enum_value(state.phase)
-            != PopulationGatePhase.GOAL_DECLARATION.value
+            _enum_value(state.phase) != PopulationGatePhase.GOAL_DECLARATION.value
             or state.graph_fingerprint
             or state.graph_binding is not None
             or state.pre_execution_attestation is not None
             or state.post_result_attestation is not None
-            or state.goal_attestation.goal_contract_fingerprint
-            != state.goal_contract_fingerprint
+            or state.goal_attestation.goal_contract_fingerprint != state.goal_contract_fingerprint
             or not state.goal_attestation.passed
             or not state.goal_attestation.gate_open
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_INITIAL_STATE_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INITIAL_STATE_INVALID")
 
     @classmethod
     def _validate_state_transition(
@@ -816,13 +699,23 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
     ) -> None:
         if (
             next_state.gate_id != current.gate_id
-            or next_state.goal_contract_fingerprint
-            != current.goal_contract_fingerprint
+            or next_state.goal_contract_fingerprint != current.goal_contract_fingerprint
             or next_state.goal_attestation != current.goal_attestation
         ):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_IMMUTABLE_BINDING_CHANGED"
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_BINDING_CHANGED")
+        if (
+            current.graph_receipt is not None
+            or next_state.graph_receipt is not None
+            or current.node_gate_records
+            or next_state.node_gate_records
+            or current.retired_node_gate_records
+            or next_state.retired_node_gate_records
+        ):
+            cls._validate_incremental_state_transition(
+                current,
+                next_state,
             )
+            return
         current_phase = _enum_value(current.phase)
         next_phase = _enum_value(next_state.phase)
         if current_phase == PopulationGatePhase.GOAL_DECLARATION.value:
@@ -832,51 +725,37 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 next_phase != PopulationGatePhase.PRE_EXECUTION.value
                 or not next_state.graph_fingerprint
                 or binding is None
-                or binding.graph_fingerprint
-                != next_state.graph_fingerprint
-                or binding.binding_fingerprint
-                != population_execution_graph_binding_fingerprint(binding)
+                or binding.graph_fingerprint != next_state.graph_fingerprint
+                or binding.binding_fingerprint != population_execution_graph_binding_fingerprint(binding)
                 or pre is None
                 or next_state.post_result_attestation is not None
                 or current.pre_execution_attestation is not None
             ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_PRE_TRANSITION_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_PRE_TRANSITION_INVALID")
             cls._validate_attestation(
                 pre,
-                expected_stage=(
-                    PopulationVerificationStage.PRE_EXECUTION.value
-                ),
+                expected_stage=(PopulationVerificationStage.PRE_EXECUTION.value),
             )
             if (
                 not pre.passed
                 or not pre.gate_open
-                or pre.goal_contract_fingerprint
-                != current.goal_contract_fingerprint
+                or pre.goal_contract_fingerprint != current.goal_contract_fingerprint
                 or pre.graph_fingerprint != next_state.graph_fingerprint
-                or pre.previous_attestation_fingerprint
-                != current.goal_attestation.attestation_fingerprint
+                or pre.previous_attestation_fingerprint != current.goal_attestation.attestation_fingerprint
             ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_PRE_ATTESTATION_CHAIN_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_PRE_ATTESTATION_CHAIN_INVALID")
             return
         if current_phase == PopulationGatePhase.PRE_EXECUTION.value:
             post = next_state.post_result_attestation
             if (
                 next_phase != PopulationGatePhase.POST_RESULT.value
-                or next_state.graph_fingerprint
-                != current.graph_fingerprint
+                or next_state.graph_fingerprint != current.graph_fingerprint
                 or next_state.graph_binding != current.graph_binding
-                or next_state.pre_execution_attestation
-                != current.pre_execution_attestation
+                or next_state.pre_execution_attestation != current.pre_execution_attestation
                 or post is None
                 or current.post_result_attestation is not None
             ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_POST_TRANSITION_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_POST_TRANSITION_INVALID")
             cls._validate_attestation(
                 post,
                 expected_stage=PopulationVerificationStage.POST_RESULT.value,
@@ -884,35 +763,225 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             if (
                 not post.passed
                 or not post.gate_open
-                or post.goal_contract_fingerprint
-                != current.goal_contract_fingerprint
+                or post.goal_contract_fingerprint != current.goal_contract_fingerprint
                 or post.graph_fingerprint != current.graph_fingerprint
                 or current.pre_execution_attestation is None
-                or post.previous_attestation_fingerprint
-                != current.pre_execution_attestation.attestation_fingerprint
+                or post.previous_attestation_fingerprint != current.pre_execution_attestation.attestation_fingerprint
             ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_POST_ATTESTATION_CHAIN_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_POST_ATTESTATION_CHAIN_INVALID")
             return
-        raise PopulationOnlineGateStorageError(
-            "POPULATION_GATE_TERMINAL_STATE_IMMUTABLE"
+        raise PopulationOnlineGateStorageError("POPULATION_GATE_TERMINAL_STATE_IMMUTABLE")
+
+    @classmethod
+    def _validate_incremental_node_record(
+        cls,
+        record: Any,
+        *,
+        receipts: tuple[Any, ...],
+        goal_contract_fingerprint: str,
+    ) -> None:
+        if record.record_fingerprint != population_node_gate_record_fingerprint(record):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_RECORD_INVALID")
+        matches = tuple(
+            receipt for receipt in receipts if receipt.receipt_fingerprint == record.graph_receipt_fingerprint
         )
+        if len(matches) != 1:
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_RECEIPT_INVALID")
+        receipt = matches[0]
+        nodes = {item.query_node_id: item for item in receipt.nodes}
+        node = nodes.get(record.query_node_id)
+        if (
+            node is None
+            or record.query_node_id != record.node_binding.query_node_id
+            or set(node.consumer_goal_ids) != set(record.node_binding.consumer_goal_ids)
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_BINDING_INVALID")
+        pre = record.pre_execution_attestation
+        cls._validate_attestation(
+            pre,
+            expected_stage=(PopulationVerificationStage.PRE_EXECUTION.value),
+        )
+        if (
+            not pre.passed
+            or not pre.gate_open
+            or pre.goal_contract_fingerprint != goal_contract_fingerprint
+            or pre.graph_fingerprint != receipt.graph_fingerprint
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_PRE_INVALID")
+        post = record.post_result_attestation
+        if post is None:
+            return
+        cls._validate_attestation(
+            post,
+            expected_stage=(PopulationVerificationStage.POST_RESULT.value),
+        )
+        if (
+            not post.passed
+            or not post.gate_open
+            or post.goal_contract_fingerprint != goal_contract_fingerprint
+            or post.graph_fingerprint != receipt.graph_fingerprint
+            or post.previous_attestation_fingerprint != pre.attestation_fingerprint
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_POST_INVALID")
+
+    @classmethod
+    def _validate_incremental_state_transition(
+        cls,
+        current: PopulationGateState,
+        next_state: PopulationGateState,
+    ) -> None:
+        if (
+            next_state.graph_binding != current.graph_binding
+            or next_state.pre_execution_attestation != current.pre_execution_attestation
+            or next_state.post_result_attestation != current.post_result_attestation
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_LEGACY_STATE_CHANGED")
+        current_receipt = current.graph_receipt
+        next_receipt = next_state.graph_receipt
+        if next_receipt is None:
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_RECEIPT_REQUIRED")
+        if next_receipt.receipt_fingerprint != population_dynamic_graph_receipt_fingerprint(next_receipt):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_RECEIPT_INVALID")
+        receipts = tuple(
+            [
+                *next_state.graph_receipt_history,
+                next_receipt,
+            ]
+        )
+        receipt_fingerprints = [item.receipt_fingerprint for item in receipts]
+        if len(set(receipt_fingerprints)) != len(receipt_fingerprints):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_RECEIPT_HISTORY_DUPLICATE")
+        active_ids = {item.query_node_id for item in next_state.node_gate_records}
+        retired_ids = {item.query_node_id for item in next_state.retired_node_gate_records}
+        if (
+            len(active_ids) != len(next_state.node_gate_records)
+            or len(retired_ids) != len(next_state.retired_node_gate_records)
+            or active_ids.intersection(retired_ids)
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_RECORD_SET_INVALID")
+        for record in (
+            *next_state.node_gate_records,
+            *next_state.retired_node_gate_records,
+        ):
+            cls._validate_incremental_node_record(
+                record,
+                receipts=receipts,
+                goal_contract_fingerprint=(next_state.goal_contract_fingerprint),
+            )
+
+        if current_receipt is None:
+            if (
+                next_state.graph_receipt_history != current.graph_receipt_history
+                or next_state.graph_revision_evidence_fingerprints != current.graph_revision_evidence_fingerprints
+                or next_state.retired_node_gate_records != current.retired_node_gate_records
+                or len(next_state.node_gate_records) != 1
+                or _enum_value(next_state.phase) != PopulationGatePhase.PRE_EXECUTION.value
+                or next_state.graph_fingerprint != next_receipt.graph_fingerprint
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_FIRST_NODE_PRE_INVALID")
+            return
+
+        graph_changed = current_receipt.receipt_fingerprint != next_receipt.receipt_fingerprint
+        if graph_changed:
+            if (
+                next_receipt.parent_receipt_fingerprint != current_receipt.receipt_fingerprint
+                or next_receipt.graph_version != current_receipt.graph_version + 1
+                or next_state.graph_receipt_history
+                != tuple(
+                    [
+                        *current.graph_receipt_history,
+                        current_receipt,
+                    ]
+                )
+                or len(next_state.graph_revision_evidence_fingerprints)
+                != len(current.graph_revision_evidence_fingerprints) + 1
+                or tuple(next_state.graph_revision_evidence_fingerprints[:-1])
+                != current.graph_revision_evidence_fingerprints
+                or next_state.graph_revision_evidence_fingerprints[-1] != next_receipt.revision_evidence_fingerprint
+                or next_state.graph_fingerprint != next_receipt.graph_fingerprint
+                or next_state.phase != current.phase
+                or next_state.ledger_snapshot_fingerprint != current.ledger_snapshot_fingerprint
+                or next_state.published_receipt_fingerprints != current.published_receipt_fingerprints
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_GRAPH_REVISION_INVALID")
+            next_active = {item.query_node_id: item for item in next_state.node_gate_records}
+            current_active = {item.query_node_id: item for item in current.node_gate_records}
+            if any(
+                current_active[node_id] != record
+                for node_id, record in next_active.items()
+                if node_id in current_active
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_CARRIED_RECORD_CHANGED")
+            newly_retired = tuple(item for item in current.node_gate_records if item.query_node_id not in next_active)
+            if next_state.retired_node_gate_records != tuple(
+                [
+                    *current.retired_node_gate_records,
+                    *newly_retired,
+                ]
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_RETIRED_RECORD_SET_INVALID")
+            return
+
+        if (
+            next_state.graph_receipt_history != current.graph_receipt_history
+            or next_state.graph_revision_evidence_fingerprints != current.graph_revision_evidence_fingerprints
+            or next_state.retired_node_gate_records != current.retired_node_gate_records
+            or next_state.graph_fingerprint != current.graph_fingerprint
+        ):
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_GRAPH_CHANGED")
+        current_records = {item.query_node_id: item for item in current.node_gate_records}
+        next_records = {item.query_node_id: item for item in next_state.node_gate_records}
+        added_ids = set(next_records) - set(current_records)
+        removed_ids = set(current_records) - set(next_records)
+        changed_ids = {
+            node_id
+            for node_id in set(current_records).intersection(next_records)
+            if current_records[node_id] != next_records[node_id]
+        }
+        if removed_ids:
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_RECORD_REMOVED")
+        if len(added_ids) == 1 and not changed_ids:
+            added = next_records[next(iter(added_ids))]
+            if (
+                added.post_result_attestation is not None
+                or _enum_value(next_state.phase) != PopulationGatePhase.PRE_EXECUTION.value
+                or next_state.ledger_snapshot_fingerprint != current.ledger_snapshot_fingerprint
+                or next_state.published_receipt_fingerprints != current.published_receipt_fingerprints
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_PRE_APPEND_INVALID")
+            return
+        if not added_ids and len(changed_ids) == 1:
+            node_id = next(iter(changed_ids))
+            before = current_records[node_id]
+            after = next_records[node_id]
+            if (
+                before.post_result_attestation is not None
+                or after.post_result_attestation is None
+                or before.model_copy(
+                    update={
+                        "post_result_attestation": (after.post_result_attestation),
+                        "ledger_snapshot_fingerprint": (after.ledger_snapshot_fingerprint),
+                        "published_receipt_fingerprints": (after.published_receipt_fingerprints),
+                        "record_fingerprint": (after.record_fingerprint),
+                    }
+                )
+                != after
+                or _enum_value(next_state.phase) != PopulationGatePhase.POST_RESULT.value
+            ):
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_NODE_POST_UPDATE_INVALID")
+            return
+        raise PopulationOnlineGateStorageError("POPULATION_GATE_INCREMENTAL_TRANSITION_INVALID")
 
     def _gate_id_fingerprint(self, gate_id: str) -> str:
         normalized = _text(gate_id)
         if not normalized:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_ID_REQUIRED"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_ID_REQUIRED")
         return _stable_fingerprint({"gateId": normalized})
 
     @staticmethod
     def _state_artifact_name(revision: int, fingerprint: str) -> str:
         if int(revision) <= 0 or not _valid_sha256(fingerprint):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_STATE_IDENTITY_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_STATE_IDENTITY_INVALID")
         return "state_%020d_%s.json" % (int(revision), fingerprint)
 
     @staticmethod
@@ -924,9 +993,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         }
         slug = slugs.get(stage)
         if slug is None or not _valid_sha256(fingerprint):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_ATTESTATION_IDENTITY_INVALID"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_ATTESTATION_IDENTITY_INVALID")
         return "attestation_%s_%s.json" % (slug, fingerprint)
 
     @classmethod
@@ -943,27 +1010,25 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         max_bytes: int,
     ) -> bytes:
         if not _valid_sha256(expected_sha256):
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_IMMUTABLE_DIGEST_INVALID"
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_DIGEST_INVALID")
+        marker = (
+            cls._read_regular_at(
+                descriptor,
+                cls._immutable_marker_name(name),
+                max_bytes=128,
             )
-        marker = cls._read_regular_at(
-            descriptor,
-            cls._immutable_marker_name(name),
-            max_bytes=128,
-        ).decode("ascii").strip()
+            .decode("ascii")
+            .strip()
+        )
         if marker != expected_sha256:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_IMMUTABLE_MARKER_MISMATCH"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_MARKER_MISMATCH")
         encoded = cls._read_regular_at(
             descriptor,
             name,
             max_bytes=max_bytes,
         )
         if hashlib.sha256(encoded).hexdigest() != expected_sha256:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_IMMUTABLE_HASH_MISMATCH"
-            )
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_HASH_MISMATCH")
         return encoded
 
     @classmethod
@@ -989,9 +1054,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             )
         else:
             if observed != encoded:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_IMMUTABLE_CONFLICT"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_CONFLICT")
         marker_name = cls._immutable_marker_name(name)
         marker_bytes = digest.encode("ascii")
         try:
@@ -1009,9 +1072,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
             )
         else:
             if marker != marker_bytes:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_IMMUTABLE_MARKER_CONFLICT"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_IMMUTABLE_MARKER_CONFLICT")
 
     @staticmethod
     def _create_regular_at(
@@ -1025,17 +1086,12 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         try:
             file_descriptor = os.open(
                 name,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 mode,
                 dir_fd=descriptor,
             )
             if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_CHECKPOINT_FILE_INVALID"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_FILE_INVALID")
             offset = 0
             while offset < len(encoded):
                 offset += os.write(file_descriptor, encoded[offset:])
@@ -1044,9 +1100,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         except PopulationOnlineGateStorageError:
             raise
         except OSError as exc:
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_CHECKPOINT_WRITE_FAILED"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_WRITE_FAILED") from exc
         finally:
             if file_descriptor >= 0:
                 os.close(file_descriptor)
@@ -1066,14 +1120,8 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 dir_fd=descriptor,
             )
             metadata = os.fstat(file_descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size < 0
-                or metadata.st_size > max_bytes
-            ):
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_CHECKPOINT_FILE_INVALID"
-                )
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 0 or metadata.st_size > max_bytes:
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_FILE_INVALID")
             chunks: list[bytes] = []
             remaining = int(metadata.st_size)
             while remaining > 0:
@@ -1084,9 +1132,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 remaining -= len(chunk)
             encoded = b"".join(chunks)
             if len(encoded) != metadata.st_size:
-                raise PopulationOnlineGateStorageError(
-                    "POPULATION_GATE_CHECKPOINT_READ_INCOMPLETE"
-                )
+                raise PopulationOnlineGateStorageError("POPULATION_GATE_CHECKPOINT_READ_INCOMPLETE")
             return encoded
         finally:
             if file_descriptor >= 0:
@@ -1099,9 +1145,7 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
         name: str,
         encoded: bytes,
     ) -> None:
-        temporary = ".head_%s.tmp" % hashlib.sha256(
-            os.urandom(32)
-        ).hexdigest()
+        temporary = ".head_%s.tmp" % hashlib.sha256(os.urandom(32)).hexdigest()
         cls._create_regular_at(
             descriptor,
             temporary,
@@ -1121,34 +1165,19 @@ class GroundedWorkspacePopulationGateStateStore(PopulationGateStateStore):
                 os.unlink(temporary, dir_fd=descriptor)
             except OSError:
                 pass
-            raise PopulationOnlineGateStorageError(
-                "POPULATION_GATE_HEAD_COMMIT_FAILED"
-            ) from exc
+            raise PopulationOnlineGateStorageError("POPULATION_GATE_HEAD_COMMIT_FAILED") from exc
 
 
 def _snapshot_publication_identity(snapshot: Any) -> dict[str, str]:
     return {
-        "datasourceFingerprint": _text(
-            getattr(snapshot, "datasource_fingerprint", "")
-        ),
-        "datasourceEnvironment": _text(
-            getattr(snapshot, "datasource_environment", "")
-        ),
+        "datasourceFingerprint": _text(getattr(snapshot, "datasource_fingerprint", "")),
+        "datasourceEnvironment": _text(getattr(snapshot, "datasource_environment", "")),
         "dataEpoch": _text(getattr(snapshot, "data_epoch", "")),
-        "consistencyMode": _text(
-            getattr(snapshot, "consistency_mode", "UNSUPPORTED")
-        )
-        or "UNSUPPORTED",
-        "semanticActivationFingerprint": _text(
-            getattr(snapshot, "semantic_activation_fingerprint", "")
-        ),
-        "cacheGeneration": _text(
-            getattr(snapshot, "cache_generation", "")
-        ),
+        "consistencyMode": _text(getattr(snapshot, "consistency_mode", "UNSUPPORTED")) or "UNSUPPORTED",
+        "semanticActivationFingerprint": _text(getattr(snapshot, "semantic_activation_fingerprint", "")),
+        "cacheGeneration": _text(getattr(snapshot, "cache_generation", "")),
         "capturedAt": _text(getattr(snapshot, "captured_at", "")),
-        "unsupportedReason": _text(
-            getattr(snapshot, "unsupported_reason", "")
-        ),
+        "unsupportedReason": _text(getattr(snapshot, "unsupported_reason", "")),
     }
 
 
@@ -1163,9 +1192,7 @@ def _population_coverage(value: Any) -> PopulationArtifactCoverage:
         PopulationArtifactCoverage.PARTIAL.value,
     }
     return PopulationArtifactCoverage(
-        normalized
-        if normalized in supported
-        else PopulationArtifactCoverage.UNKNOWN.value
+        normalized if normalized in supported else PopulationArtifactCoverage.UNKNOWN.value
     )
 
 
@@ -1178,9 +1205,7 @@ class PublishedGroundedPopulationLedgerReader:
         settings: Any,
         workspace: GroundedContextWorkspace,
         state_store: PopulationGateStateStore,
-        ledger_provider: Callable[
-            [], Sequence[GroundedVerifiedQueryArtifact]
-        ],
+        ledger_provider: Callable[[], Sequence[GroundedVerifiedQueryArtifact]],
         authority_fingerprint: str,
     ) -> None:
         authority = _text(authority_fingerprint)
@@ -1193,19 +1218,13 @@ class PublishedGroundedPopulationLedgerReader:
         if not authority:
             raise ValueError("authority_fingerprint is required")
         try:
-            configured_root = Path(
-                settings.resolved_workspace_path
-            ).resolve(strict=True)
+            configured_root = Path(settings.resolved_workspace_path).resolve(strict=True)
             workspace_root = Path(workspace.root).resolve(strict=True)
-            artifact_root = Path(workspace.artifacts_root).resolve(
-                strict=True
-            )
+            artifact_root = Path(workspace.artifacts_root).resolve(strict=True)
             workspace_root.relative_to(configured_root)
             artifact_root.relative_to(workspace_root)
         except (AttributeError, OSError, ValueError) as exc:
-            raise ValueError(
-                "workspace and settings roots do not share one authority"
-            ) from exc
+            raise ValueError("workspace and settings roots do not share one authority") from exc
         self.settings = settings
         self.workspace = workspace
         self.state_store = state_store
@@ -1234,29 +1253,22 @@ class PublishedGroundedPopulationLedgerReader:
 
         state = self.state_store.load_population_gate(_text(gate_id))
         if state is None:
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_GATE_STATE_NOT_FOUND"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_GATE_STATE_NOT_FOUND")
         legacy_pre = state.pre_execution_attestation
         node_records = tuple(state.node_gate_records)
         node_pre_valid = bool(node_records) and all(
-            record.record_fingerprint
-            == population_node_gate_record_fingerprint(record)
+            record.record_fingerprint == population_node_gate_record_fingerprint(record)
             and record.pre_execution_attestation.attestation_fingerprint
-            == population_attestation_fingerprint(
-                record.pre_execution_attestation
-            )
+            == population_attestation_fingerprint(record.pre_execution_attestation)
             for record in node_records
         )
         legacy_pre_valid = bool(
             legacy_pre is not None
-            and legacy_pre.attestation_fingerprint
-            == population_attestation_fingerprint(legacy_pre)
+            and legacy_pre.attestation_fingerprint == population_attestation_fingerprint(legacy_pre)
         )
         if (
             state.state_fingerprint != population_gate_state_fingerprint(state)
-            or state.goal_contract_fingerprint
-            != _text(goal_contract_fingerprint)
+            or state.goal_contract_fingerprint != _text(goal_contract_fingerprint)
             or state.graph_fingerprint != _text(graph_fingerprint)
             or _enum_value(state.phase)
             not in {
@@ -1265,19 +1277,11 @@ class PublishedGroundedPopulationLedgerReader:
             }
             or not (legacy_pre_valid or node_pre_valid)
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_GATE_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_GATE_BINDING_INVALID")
         pre_scopes = tuple(
             scope
-            for attestation in (
-                [legacy_pre] if legacy_pre_valid else []
-            )
-            + [
-                record.pre_execution_attestation
-                for record in node_records
-                if node_pre_valid
-            ]
+            for attestation in ([legacy_pre] if legacy_pre_valid else [])
+            + [record.pre_execution_attestation for record in node_records if node_pre_valid]
             for scope in attestation.accepted_scopes
         )
         entries: list[PopulationArtifactLedgerEntry] = []
@@ -1285,116 +1289,74 @@ class PublishedGroundedPopulationLedgerReader:
         try:
             raw_ledger = tuple(self.ledger_provider())
         except Exception as exc:
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_PROVIDER_FAILED"
-            ) from exc
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_PROVIDER_FAILED") from exc
         for artifact in raw_ledger:
             if not isinstance(artifact, GroundedVerifiedQueryArtifact):
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_ARTIFACT_TYPE_INVALID"
-                )
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_ARTIFACT_TYPE_INVALID")
             if _text(artifact.publication_status) != "PUBLISHED":
                 continue
             if not verified_query_artifact_integrity_valid(artifact):
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_ARTIFACT_INTEGRITY_INVALID"
-                )
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_ARTIFACT_INTEGRITY_INVALID")
             if not artifact.verified_evidence.passed:
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_ARTIFACT_NOT_VERIFIED"
-                )
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_ARTIFACT_NOT_VERIFIED")
             bundle = artifact.run_result.merged_query_bundle
             snapshot = bundle.data_snapshot
-            normalized_snapshot_fingerprint = (
-                grounded_data_snapshot_fingerprint(snapshot)
-            )
+            normalized_snapshot_fingerprint = grounded_data_snapshot_fingerprint(snapshot)
             publication_snapshot = _snapshot_publication_identity(snapshot)
-            publication_snapshot_fingerprint = _stable_fingerprint(
-                publication_snapshot
-            )
+            publication_snapshot_fingerprint = _stable_fingerprint(publication_snapshot)
             matching_scopes = tuple(
                 scope
                 for scope in pre_scopes
                 if scope.generation == artifact.generation
                 and scope.attempt_id == artifact.attempt_id
-                and scope.query_contract_fingerprint
-                == artifact.contract_fingerprint
+                and scope.query_contract_fingerprint == artifact.contract_fingerprint
                 and scope.sql_ast_fingerprint == artifact.sql_fingerprint
-                and scope.snapshot_fingerprint
-                == normalized_snapshot_fingerprint
+                and scope.snapshot_fingerprint == normalized_snapshot_fingerprint
             )
             if not matching_scopes:
                 continue
             receipts = tuple(artifact.result_artifact_receipts or ())
             if not receipts:
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_PUBLISHED_RECEIPT_REQUIRED"
-                )
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_PUBLISHED_RECEIPT_REQUIRED")
             for raw_receipt in receipts:
                 if not isinstance(raw_receipt, Mapping):
-                    raise PopulationOnlineLedgerError(
-                        "POPULATION_LEDGER_PUBLISHED_RECEIPT_INVALID"
-                    )
+                    raise PopulationOnlineLedgerError("POPULATION_LEDGER_PUBLISHED_RECEIPT_INVALID")
                 receipt = dict(raw_receipt)
                 manifest = self._validate_published_receipt(
                     artifact,
                     receipt,
                     publication_snapshot=publication_snapshot,
-                    publication_snapshot_fingerprint=(
-                        publication_snapshot_fingerprint
-                    ),
+                    publication_snapshot_fingerprint=(publication_snapshot_fingerprint),
                 )
                 for scope in matching_scopes:
                     if not scope.consumer_goal_id or not scope.query_node_id:
-                        raise PopulationOnlineLedgerError(
-                            "POPULATION_LEDGER_PRE_SCOPE_INVALID"
-                        )
+                        raise PopulationOnlineLedgerError("POPULATION_LEDGER_PRE_SCOPE_INVALID")
                     entry_id = "population_result_%s" % _stable_fingerprint(
                         {
                             "queryArtifactId": artifact.artifact_id,
-                            "publishedArtifactFingerprint": receipt.get(
-                                "artifactFingerprint"
-                            ),
+                            "publishedArtifactFingerprint": receipt.get("artifactFingerprint"),
                             "consumerGoalId": scope.consumer_goal_id,
                             "queryNodeId": scope.query_node_id,
                         }
                     )
                     if entry_id in observed_entry_ids:
-                        raise PopulationOnlineLedgerError(
-                            "POPULATION_LEDGER_ENTRY_CONFLICT"
-                        )
+                        raise PopulationOnlineLedgerError("POPULATION_LEDGER_ENTRY_CONFLICT")
                     observed_entry_ids.add(entry_id)
                     evidence = PopulationArtifactEvidence(
-                        artifact_id=_text(
-                            receipt.get("artifactFingerprint")
-                        ),
-                        artifact_fingerprint=_text(
-                            receipt.get("artifactFingerprint")
-                        ),
+                        artifact_id=_text(receipt.get("artifactFingerprint")),
+                        artifact_fingerprint=_text(receipt.get("artifactFingerprint")),
                         artifact_kind=PopulationArtifactKind.QUERY_RESULT,
-                        coverage=_population_coverage(
-                            manifest.get("resultCoverage")
-                        ),
-                        population_fingerprint=(
-                            scope.population_fingerprint
-                        ),
+                        coverage=_population_coverage(manifest.get("resultCoverage")),
+                        population_fingerprint=(scope.population_fingerprint),
                         verifier_fingerprint=self.authority_fingerprint,
                         verified=True,
                         immutable=True,
-                        goal_contract_fingerprint=(
-                            state.goal_contract_fingerprint
-                        ),
+                        goal_contract_fingerprint=(state.goal_contract_fingerprint),
                         graph_fingerprint=state.graph_fingerprint,
-                        query_contract_fingerprint=(
-                            artifact.contract_fingerprint
-                        ),
+                        query_contract_fingerprint=(artifact.contract_fingerprint),
                         sql_ast_fingerprint=artifact.sql_fingerprint,
-                        snapshot_fingerprint=(
-                            normalized_snapshot_fingerprint
-                        ),
-                        lineage_proof_fingerprints=(
-                            scope.proof_fingerprints
-                        ),
+                        snapshot_fingerprint=(normalized_snapshot_fingerprint),
+                        lineage_proof_fingerprints=(scope.proof_fingerprints),
                     )
                     published = seal_population_published_artifact_receipt(
                         PopulationPublishedArtifactReceipt(
@@ -1403,23 +1365,13 @@ class PublishedGroundedPopulationLedgerReader:
                             publication_status="PUBLISHED",
                             generation=artifact.generation,
                             attempt_id=artifact.attempt_id,
-                            goal_contract_fingerprint=(
-                                state.goal_contract_fingerprint
-                            ),
+                            goal_contract_fingerprint=(state.goal_contract_fingerprint),
                             graph_fingerprint=state.graph_fingerprint,
                             query_node_id=scope.query_node_id,
-                            covered_consumer_goal_ids=(
-                                scope.consumer_goal_id,
-                            ),
-                            result_is_truncated=bool(
-                                manifest.get("resultIsTruncated")
-                            ),
-                            stored_row_count=int(
-                                manifest.get("storedRowCount") or 0
-                            ),
-                            exact_result_row_count=int(
-                                manifest.get("exactResultRowCount") or 0
-                            ),
+                            covered_consumer_goal_ids=(scope.consumer_goal_id,),
+                            result_is_truncated=bool(manifest.get("resultIsTruncated")),
+                            stored_row_count=int(manifest.get("storedRowCount") or 0),
+                            exact_result_row_count=int(manifest.get("exactResultRowCount") or 0),
                             evidence=evidence,
                         )
                     )
@@ -1433,17 +1385,13 @@ class PublishedGroundedPopulationLedgerReader:
                         )
                     )
             if not verified_query_artifact_integrity_valid(artifact):
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_ARTIFACT_CHANGED_DURING_READ"
-                )
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_ARTIFACT_CHANGED_DURING_READ")
         return seal_population_artifact_ledger_snapshot(
             PopulationArtifactLedgerSnapshot(
                 ledger_id="population_ledger_%s"
                 % _stable_fingerprint(
                     {
-                        "ownerFingerprint": (
-                            self.workspace.owner_fingerprint
-                        ),
+                        "ownerFingerprint": (self.workspace.owner_fingerprint),
                         "gateId": gate_id,
                         "authorityFingerprint": self.authority_fingerprint,
                     }
@@ -1481,47 +1429,27 @@ class PublishedGroundedPopulationLedgerReader:
             "attemptFingerprint",
         )
         if any(not _valid_sha256(receipt.get(key)) for key in digest_fields):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_RECEIPT_DIGEST_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_RECEIPT_DIGEST_INVALID")
         for address_key, digest_key in (
             ("manifestContentAddress", "queryManifestSha256"),
             ("rowsContentAddress", "rowsSha256"),
             ("sqlContentAddress", "sqlSha256"),
         ):
-            if _text(receipt.get(address_key)) != "sha256:%s" % _text(
-                receipt.get(digest_key)
-            ):
-                raise PopulationOnlineLedgerError(
-                    "POPULATION_LEDGER_RECEIPT_CONTENT_ADDRESS_INVALID"
-                )
+            if _text(receipt.get(address_key)) != "sha256:%s" % _text(receipt.get(digest_key)):
+                raise PopulationOnlineLedgerError("POPULATION_LEDGER_RECEIPT_CONTENT_ADDRESS_INVALID")
         if (
             receipt.get("executionGeneration") != artifact.generation
             or _text(receipt.get("attemptFingerprint"))
-            != hashlib.sha256(
-                artifact.attempt_id.encode("utf-8")
-            ).hexdigest()
-            or _text(receipt.get("contractFingerprint"))
-            != artifact.contract_fingerprint
-            or _text(receipt.get("sqlEvidenceFingerprint"))
-            != artifact.sql_fingerprint
-            or _text(receipt.get("contextOwnerFingerprint"))
-            != self.workspace.owner_fingerprint
-            or _text(receipt.get("dataSnapshotFingerprint"))
-            != publication_snapshot_fingerprint
+            != hashlib.sha256(artifact.attempt_id.encode("utf-8")).hexdigest()
+            or _text(receipt.get("contractFingerprint")) != artifact.contract_fingerprint
+            or _text(receipt.get("sqlEvidenceFingerprint")) != artifact.sql_fingerprint
+            or _text(receipt.get("contextOwnerFingerprint")) != self.workspace.owner_fingerprint
+            or _text(receipt.get("dataSnapshotFingerprint")) != publication_snapshot_fingerprint
             or _text(receipt.get("semanticActivationFingerprint"))
-            != _text(
-                publication_snapshot.get(
-                    "semanticActivationFingerprint"
-                )
-            )
+            != _text(publication_snapshot.get("semanticActivationFingerprint"))
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_RECEIPT_BINDING_INVALID"
-            )
-        manifest_path = _safe_relative_path(
-            receipt.get("manifestRelativePath")
-        )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_RECEIPT_BINDING_INVALID")
+        manifest_path = _safe_relative_path(receipt.get("manifestRelativePath"))
         manifest_result = self.artifact_store.read(
             manifest_path,
             offset=0,
@@ -1531,24 +1459,16 @@ class PublishedGroundedPopulationLedgerReader:
         if (
             not manifest_result.get("success")
             or manifest_result.get("truncated")
-            or _text(manifest_result.get("sha256"))
-            != _text(receipt.get("queryManifestSha256"))
-            or _text(manifest_result.get("contentAddress"))
-            != _text(receipt.get("manifestContentAddress"))
+            or _text(manifest_result.get("sha256")) != _text(receipt.get("queryManifestSha256"))
+            or _text(manifest_result.get("contentAddress")) != _text(receipt.get("manifestContentAddress"))
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_MANIFEST_IMMUTABLE_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_MANIFEST_IMMUTABLE_INVALID")
         try:
             manifest = json.loads(_text(manifest_result.get("content")))
         except json.JSONDecodeError as exc:
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_MANIFEST_INVALID"
-            ) from exc
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_MANIFEST_INVALID") from exc
         if not isinstance(manifest, dict):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_MANIFEST_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_MANIFEST_INVALID")
         scalar_bindings = (
             ("schemaVersion", 2),
             ("artifactKind", "GROUNDED_QUERY_RESULT"),
@@ -1565,15 +1485,11 @@ class PublishedGroundedPopulationLedgerReader:
             ),
             (
                 "semanticActivationFingerprint",
-                publication_snapshot.get(
-                    "semanticActivationFingerprint"
-                ),
+                publication_snapshot.get("semanticActivationFingerprint"),
             ),
         )
         if any(manifest.get(key) != expected for key, expected in scalar_bindings):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_MANIFEST_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_MANIFEST_BINDING_INVALID")
         verified_payload = artifact.verified_evidence.model_dump(
             by_alias=True,
             mode="json",
@@ -1581,18 +1497,13 @@ class PublishedGroundedPopulationLedgerReader:
         verified_sha256 = _stable_fingerprint(verified_payload)
         if (
             manifest.get("verifiedEvidence") != verified_payload
-            or _text(manifest.get("verifiedEvidenceSha256"))
-            != verified_sha256
-            or _text(receipt.get("verifiedEvidenceSha256"))
-            != verified_sha256
+            or _text(manifest.get("verifiedEvidenceSha256")) != verified_sha256
+            or _text(receipt.get("verifiedEvidenceSha256")) != verified_sha256
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_VERIFIED_EVIDENCE_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_VERIFIED_EVIDENCE_BINDING_INVALID")
         if (
             manifest.get("dataSnapshot") != dict(publication_snapshot)
-            or _stable_fingerprint(manifest.get("dataSnapshot"))
-            != _text(receipt.get("dataSnapshotFingerprint"))
+            or _stable_fingerprint(manifest.get("dataSnapshot")) != _text(receipt.get("dataSnapshotFingerprint"))
             or not isinstance(manifest.get("resultIsTruncated"), bool)
             or not isinstance(manifest.get("storedRowCount"), int)
             or isinstance(manifest.get("storedRowCount"), bool)
@@ -1600,49 +1511,31 @@ class PublishedGroundedPopulationLedgerReader:
             or not isinstance(manifest.get("exactResultRowCount"), int)
             or isinstance(manifest.get("exactResultRowCount"), bool)
             or int(manifest.get("exactResultRowCount")) < 0
-            or manifest.get("resultCoverage")
-            != receipt.get("resultCoverage")
-            or manifest.get("resultIsTruncated")
-            != receipt.get("resultIsTruncated")
-            or manifest.get("storedRowCount")
-            != receipt.get("storedRowCount")
-            or manifest.get("exactResultRowCount")
-            != receipt.get("exactResultRowCount")
+            or manifest.get("resultCoverage") != receipt.get("resultCoverage")
+            or manifest.get("resultIsTruncated") != receipt.get("resultIsTruncated")
+            or manifest.get("storedRowCount") != receipt.get("storedRowCount")
+            or manifest.get("exactResultRowCount") != receipt.get("exactResultRowCount")
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_MANIFEST_RESULT_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_MANIFEST_RESULT_BINDING_INVALID")
         rows_reference = manifest.get("rowsArtifact")
         if not isinstance(rows_reference, Mapping):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_ROWS_REFERENCE_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_ROWS_REFERENCE_INVALID")
         sql_reference = manifest.get("sqlArtifact")
         if (
             not isinstance(sql_reference, Mapping)
             or _safe_relative_path(sql_reference.get("relativePath"))
             != _safe_relative_path(receipt.get("sqlRelativePath"))
-            or _text(sql_reference.get("sha256"))
-            != _text(receipt.get("sqlSha256"))
-            or _text(sql_reference.get("contentAddress"))
-            != _text(receipt.get("sqlContentAddress"))
+            or _text(sql_reference.get("sha256")) != _text(receipt.get("sqlSha256"))
+            or _text(sql_reference.get("contentAddress")) != _text(receipt.get("sqlContentAddress"))
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_SQL_METADATA_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_SQL_METADATA_BINDING_INVALID")
         rows_path = _safe_relative_path(rows_reference.get("relativePath"))
         if (
-            rows_path != _safe_relative_path(
-                receipt.get("rowsRelativePath")
-            )
-            or _text(rows_reference.get("sha256"))
-            != _text(receipt.get("rowsSha256"))
-            or _text(rows_reference.get("contentAddress"))
-            != _text(receipt.get("rowsContentAddress"))
+            rows_path != _safe_relative_path(receipt.get("rowsRelativePath"))
+            or _text(rows_reference.get("sha256")) != _text(receipt.get("rowsSha256"))
+            or _text(rows_reference.get("contentAddress")) != _text(receipt.get("rowsContentAddress"))
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_ROWS_BINDING_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_ROWS_BINDING_INVALID")
         rows_result = self.artifact_store.read(
             rows_path,
             offset=0,
@@ -1651,14 +1544,10 @@ class PublishedGroundedPopulationLedgerReader:
         )
         if (
             not rows_result.get("success")
-            or _text(rows_result.get("sha256"))
-            != _text(receipt.get("rowsSha256"))
-            or _text(rows_result.get("contentAddress"))
-            != _text(receipt.get("rowsContentAddress"))
+            or _text(rows_result.get("sha256")) != _text(receipt.get("rowsSha256"))
+            or _text(rows_result.get("contentAddress")) != _text(receipt.get("rowsContentAddress"))
         ):
-            raise PopulationOnlineLedgerError(
-                "POPULATION_LEDGER_ROWS_IMMUTABLE_INVALID"
-            )
+            raise PopulationOnlineLedgerError("POPULATION_LEDGER_ROWS_IMMUTABLE_INVALID")
         return manifest
 
 
@@ -1694,9 +1583,7 @@ class PopulationOnlineGateFacade:
         gate_id: str,
         expected_revision: int,
         exact_question: str,
-        goal_contract: OriginalQuestionGoalContract
-        | Mapping[str, Any]
-        | str,
+        goal_contract: OriginalQuestionGoalContract | Mapping[str, Any] | str,
     ) -> PopulationOnlineGateCallResult:
         try:
             parsed = parse_original_question_goal_contract(goal_contract)
@@ -1709,9 +1596,7 @@ class PopulationOnlineGateFacade:
         review = self.semantic_reviewer.review(
             effective_question=exact_question,
             contract=parsed,
-            declaration_author_fingerprint=(
-                self.declaration_author_fingerprint
-            ),
+            declaration_author_fingerprint=(self.declaration_author_fingerprint),
         )
         if not review.passed or review.review is None:
             return PopulationOnlineGateCallResult(
@@ -1724,27 +1609,17 @@ class PopulationOnlineGateFacade:
         gate_input = goal_declaration_population_input_from_review(
             parsed,
             review,
-            declaration_author_fingerprint=(
-                self.declaration_author_fingerprint
-            ),
-            trusted_semantic_verifier_fingerprints=(
-                self.coordinator.trusted_semantic_verifier_fingerprints
-            ),
+            declaration_author_fingerprint=(self.declaration_author_fingerprint),
+            trusted_semantic_verifier_fingerprints=(self.coordinator.trusted_semantic_verifier_fingerprints),
         )
         transition = self.coordinator.commit_goal_declaration(
             PopulationGoalDeclarationCommand(
                 gate_id=_text(gate_id),
                 expected_revision=int(expected_revision),
-                goal_contract_fingerprint=(
-                    gate_input.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(gate_input.goal_contract_fingerprint),
                 question_fingerprint=gate_input.question_fingerprint,
-                goal_skeleton_fingerprint=(
-                    gate_input.goal_skeleton_fingerprint
-                ),
-                declaration_author_fingerprint=(
-                    self.declaration_author_fingerprint
-                ),
+                goal_skeleton_fingerprint=(gate_input.goal_skeleton_fingerprint),
+                declaration_author_fingerprint=(self.declaration_author_fingerprint),
                 semantic_review=gate_input.semantic_review,
                 declarations=gate_input.declarations,
             )
@@ -1774,9 +1649,7 @@ class PopulationOnlineGateFacade:
             PopulationPreExecutionCommand(
                 gate_id=state.gate_id,
                 expected_revision=int(expected_revision),
-                goal_contract_fingerprint=(
-                    state.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(state.goal_contract_fingerprint),
                 graph_binding=graph_binding,
                 claims=tuple(claims),
             )
@@ -1798,13 +1671,7 @@ class PopulationOnlineGateFacade:
                 "The population Goal attestation is unavailable.",
             )
         transition = self.coordinator.authorize_node_pre_execution(
-            command.model_copy(
-                update={
-                    "goal_contract_fingerprint": (
-                        state.goal_contract_fingerprint
-                    )
-                }
-            )
+            command.model_copy(update={"goal_contract_fingerprint": (state.goal_contract_fingerprint)})
         )
         return self._transition_result(
             PopulationVerificationStage.PRE_EXECUTION,
@@ -1829,9 +1696,7 @@ class PopulationOnlineGateFacade:
             PopulationPostResultCommand(
                 gate_id=state.gate_id,
                 expected_revision=int(expected_revision),
-                goal_contract_fingerprint=(
-                    state.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(state.goal_contract_fingerprint),
                 graph_fingerprint=state.graph_fingerprint,
                 selections=tuple(selections),
             )
@@ -1853,13 +1718,7 @@ class PopulationOnlineGateFacade:
                 "The node PRE attestation is unavailable.",
             )
         transition = self.coordinator.commit_node_post_result(
-            command.model_copy(
-                update={
-                    "goal_contract_fingerprint": (
-                        state.goal_contract_fingerprint
-                    )
-                }
-            )
+            command.model_copy(update={"goal_contract_fingerprint": (state.goal_contract_fingerprint)})
         )
         return self._transition_result(
             PopulationVerificationStage.POST_RESULT,

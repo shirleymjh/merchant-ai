@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
+
+from merchant_ai.services.language_policy import load_language_policy
 
 
 def answer_numeric_value(value: Any) -> float | None:
@@ -57,20 +58,41 @@ def _format_number(value: float, decimal_places: int) -> str:
 
 
 def extract_question_time_phrase(question: str) -> str:
-    text = str(question or "")
-    for pattern in [
-        r"最近\s*\d+\s*[天日周月]",
-        r"近\s*\d+\s*[天日周月]",
-        r"过去\s*\d+\s*[天日周月]",
-        r"昨天",
-        r"今日",
-        r"今天",
-        r"本周",
-        r"本月",
-    ]:
-        match = re.search(pattern, text)
-        if match:
-            return re.sub(r"\s+", "", match.group(0))
+    text = "".join(str(question or "").split())
+    policy = load_language_policy().temporal
+    fixed_phrases = tuple(
+        phrase
+        for phrase, semantic in policy.named_window_semantics.items()
+        if semantic in {"previous_day", "current_day", "current_week", "current_month"}
+    )
+    observed = [
+        (text.find(phrase), phrase)
+        for phrase in fixed_phrases
+        if text.find(phrase) >= 0
+    ]
+    for start in range(len(text)):
+        for prefix in policy.rolling_month_prefixes:
+            if not text.startswith(prefix, start):
+                continue
+            cursor = start + len(prefix)
+            number_start = cursor
+            while cursor < len(text) and text[cursor].isascii() and text[cursor].isdigit():
+                cursor += 1
+            if cursor == number_start:
+                continue
+            unit = next(
+                (
+                    candidate
+                    for candidate in sorted(policy.units, key=len, reverse=True)
+                    if text.startswith(candidate, cursor)
+                ),
+                "",
+            )
+            if not unit:
+                continue
+            observed.append((start, text[start : cursor + len(unit)]))
+    if observed:
+        return min(observed, key=lambda item: item[0])[1]
     return ""
 
 

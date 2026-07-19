@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Tuple
 
 from merchant_ai.graph.message_history import append_context_section
 from merchant_ai.models import ChatContext, RouteSlots, RouteTimeWindow
+from merchant_ai.services.time_semantics import has_explicit_time_expression, resolve_time_range
 
 
 class ClarificationResolutionService:
@@ -56,6 +56,13 @@ class ClarificationResolutionService:
             # records the user's answer for the resumed planning turn without
             # reinterpreting that business choice.
             resolution["clarificationResolved"] = True
+        elif pending_type == "skill_confirm" and selected_index >= 0:
+            resolution.update(
+                {
+                    "confirmationDecision": "accepted" if selected_index == 0 else "declined",
+                    "clarificationResolved": True,
+                }
+            )
         if not resolution.get("clarificationResolved"):
             return {}
         self.apply_to_context(context, resolution)
@@ -111,29 +118,27 @@ class ClarificationResolutionService:
 
     def parse_time_window(self, answer: str) -> tuple[int, str]:
         text = str(answer or "")
-        explicit = re.search(r"(?:近|最近)?\s*(\d{1,3})\s*天", text)
-        if explicit:
-            days = max(1, min(365, int(explicit.group(1))))
-            return days, "近%d天" % days
-        if re.search(r"昨天|昨日", text):
-            return 1, "昨天"
-        if "近7天" in text or "最近7天" in text:
-            return 7, "近7天"
-        if "近30天" in text or "最近30天" in text:
-            return 30, "近30天"
-        if "本周" in text:
-            return 7, "本周"
-        if "本月" in text:
-            return 30, "本月"
-        return 0, ""
+        if not has_explicit_time_expression(text):
+            return 0, ""
+        resolved = resolve_time_range(text)
+        days = int(resolved.days or 0)
+        if days <= 0:
+            return 0, ""
+        return days, str(resolved.label or text).strip()
 
     def resolve_option(self, options: List[str], answer: str) -> tuple[str, int]:
         text = str(answer or "").strip()
-        match = re.fullmatch(r"(?:选|第)?\s*(\d{1,2})\s*(?:个|项)?", text)
-        if not match:
-            return text, -1
-        index = int(match.group(1)) - 1
         normalized_options = [str(item or "").strip() for item in options or []]
+        if text in normalized_options:
+            return text, normalized_options.index(text)
+        candidate = "".join(text.split())
+        if candidate.startswith(("选", "第")):
+            candidate = candidate[1:]
+        if candidate.endswith(("个", "项")):
+            candidate = candidate[:-1]
+        if not (1 <= len(candidate) <= 2 and candidate.isascii() and candidate.isdigit()):
+            return text, -1
+        index = int(candidate) - 1
         if index < 0 or index >= len(normalized_options) or not normalized_options[index]:
             return text, -1
         return normalized_options[index], index

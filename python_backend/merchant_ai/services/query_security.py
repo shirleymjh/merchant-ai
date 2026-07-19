@@ -4,6 +4,7 @@ import hashlib
 from typing import Any, Dict, List, Set, Tuple
 
 from merchant_ai.models import NodePlanContract, PlanningAssetPack
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.services.assets import (
     normalize_column_display_policy,
     normalize_masking_policy,
@@ -11,7 +12,7 @@ from merchant_ai.services.assets import (
 )
 
 
-DEFAULT_ACCESS_ROLE = "merchant_analyst"
+DEFAULT_ACCESS_ROLE = load_authorization_policy().default_access_role
 
 
 def table_asset_metadata(asset_pack: PlanningAssetPack, table: str) -> Dict[str, Any]:

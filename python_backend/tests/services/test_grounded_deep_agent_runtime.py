@@ -128,12 +128,8 @@ def _publish_skill_test_artifact(
     assert contract is not None
     contract_fingerprint = grounded_query_contract_fingerprint(contract)
     sql_fingerprint = hashlib.sha256(b"skill-test-sql-evidence").hexdigest()
-    semantic_fingerprint = hashlib.sha256(
-        b"skill-test-semantic-activation"
-    ).hexdigest()
-    datasource_fingerprint = hashlib.sha256(
-        b"skill-test-datasource"
-    ).hexdigest()
+    semantic_fingerprint = hashlib.sha256(b"skill-test-semantic-activation").hexdigest()
+    datasource_fingerprint = hashlib.sha256(b"skill-test-datasource").hexdigest()
     verified = runtime.answer_verified_evidence
     assert verified is not None and verified.passed
     verified_payload = verified.model_dump(by_alias=True, mode="json")
@@ -147,16 +143,12 @@ def _publish_skill_test_artifact(
         captured_at="2026-07-19T00:00:00Z",
         unsupported_reason="TEST_DATASOURCE_SNAPSHOT_UNAVAILABLE",
     )
-    runtime.answer_run_result.merged_query_bundle.data_snapshot = (
-        snapshot_contract.model_copy(deep=True)
-    )
+    runtime.answer_run_result.merged_query_bundle.data_snapshot = snapshot_contract.model_copy(deep=True)
     data_snapshot = snapshot_contract.model_dump(
         by_alias=True,
         mode="json",
     )
-    artifact_fingerprint = hashlib.sha256(
-        ("%s:%s" % (thread_id, run_id)).encode("utf-8")
-    ).hexdigest()
+    artifact_fingerprint = hashlib.sha256(("%s:%s" % (thread_id, run_id)).encode("utf-8")).hexdigest()
     manifest_payload = {
         "schemaVersion": 2,
         "artifactKind": "GROUNDED_QUERY_RESULT",
@@ -223,9 +215,7 @@ def _publish_skill_test_artifact(
         "resultCoverage": "ALL_ROWS",
         "resultIsTruncated": False,
         "executionGeneration": generation,
-        "attemptFingerprint": hashlib.sha256(
-            attempt_id.encode("utf-8")
-        ).hexdigest(),
+        "attemptFingerprint": hashlib.sha256(attempt_id.encode("utf-8")).hexdigest(),
         "contractFingerprint": contract_fingerprint,
         "sqlEvidenceFingerprint": sql_fingerprint,
         "contextOwnerFingerprint": workspace.owner_fingerprint,
@@ -246,18 +236,9 @@ def _publish_skill_test_artifact(
         verified_evidence=verified.model_copy(deep=True),
         publication_status="PUBLISHED",
         result_artifact_receipts=[receipt],
-        output_columns=[
-            str(key)
-            for row in rows
-            for key in row
-            if not str(key).startswith("__")
-        ],
+        output_columns=[str(key) for row in rows for key in row if not str(key).startswith("__")],
     )
-    published_artifact.ledger_fingerprint = (
-        verified_query_artifact_integrity_fingerprint(
-            published_artifact
-        )
-    )
+    published_artifact.ledger_fingerprint = verified_query_artifact_integrity_fingerprint(published_artifact)
     runtime.verified_query_ledger = [published_artifact]
     runtime.answer_artifact_ids = [artifact_id]
     return workspace
@@ -355,7 +336,9 @@ class FakeKernel:
         session.recall = bundle
         return bundle
 
-    def propose_contract(self, session: GroundedRuntimeSession, evidence: list[dict[str, Any]], hints: dict[str, Any], **kwargs: Any) -> GroundedRuntimeAttempt:
+    def propose_contract(
+        self, session: GroundedRuntimeSession, evidence: list[dict[str, Any]], hints: dict[str, Any], **kwargs: Any
+    ) -> GroundedRuntimeAttempt:
         self.propose_calls += 1
         assert evidence[0]["refId"] == "semantic:客服工单:tickets:detail"
         attempt = GroundedRuntimeAttempt(
@@ -374,9 +357,7 @@ class FakeKernel:
         self.compile_calls += 1
         attempt = session.attempts[-1]
         is_core_sql = attempt.execution_mode == "CORE_SQL_REQUIRED"
-        attempt.compile_status = (
-            "NOT_APPLICABLE_CORE_SQL_REQUIRED" if is_core_sql else "VALID"
-        )
+        attempt.compile_status = "NOT_APPLICABLE_CORE_SQL_REQUIRED" if is_core_sql else "VALID"
         attempt.activation_status = "ACTIVATED"
         if is_core_sql:
             attempt.next_action = "SUBMIT_GROUNDED_SQL_CANDIDATE"
@@ -486,9 +467,7 @@ class ClarifyingConversationAuthority:
             status="SEMANTIC_REVIEW_UNAVAILABLE",
             source="TEST_STRUCTURED_CONVERSATION_REVIEW",
             clarification_question="请明确是否沿用上一轮结果。",
-            clarification_type=(
-                "CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE"
-            ),
+            clarification_type=("CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE"),
         )
 
 
@@ -527,9 +506,11 @@ def declare_single_metric_goal(
 
 
 def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
-    source = Path(
-        "python_backend/merchant_ai/services/grounded_deep_agent_runtime.py"
-    ).read_text(encoding="utf-8")
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / "merchant_ai/services/grounded_deep_agent_runtime.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
     for forbidden in (
         "MerchantQaWorkflow",
         "V2AgentPolicy",
@@ -551,6 +532,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "declare_original_question_goals",
         "propose_grounded_execution_graph",
         "reopen_grounded_execution_graph_discovery",
+        "revise_grounded_execution_graph",
         "retrieve_knowledge",
         "publish_verified_rule_evidence",
         "compose_verified_rule_answer",
@@ -591,14 +573,8 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     visible_names = {item.name for item in visible}
     assert "propose_grounded_execution_graph" in visible_names
     assert "declare_grounded_query_branches" not in visible_names
-    assert "declare_grounded_query_branches" not in {
-        item.name for item in factory.kwargs["tools"]
-    }
-    contract_tool = next(
-        item
-        for item in factory.kwargs["tools"]
-        if item.name == "propose_grounded_contract"
-    )
+    assert "declare_grounded_query_branches" not in {item.name for item in factory.kwargs["tools"]}
+    contract_tool = next(item for item in factory.kwargs["tools"] if item.name == "propose_grounded_contract")
     contract_schema = json.dumps(
         contract_tool.tool_call_schema.model_json_schema(),
         ensure_ascii=False,
@@ -606,11 +582,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "tableRefs" in contract_schema
     assert "metricRefs" in contract_schema
     assert "timeExpression" in contract_schema
-    compose_tool = next(
-        item
-        for item in factory.kwargs["tools"]
-        if item.name == "compose_verified_answer"
-    )
+    compose_tool = next(item for item in factory.kwargs["tools"] if item.name == "compose_verified_answer")
     assert compose_tool.return_direct is True
     assert factory.kwargs["backend"] is not None
     assert [item.name for item in factory.kwargs["middleware"]] == [
@@ -630,9 +602,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         factory.kwargs["middleware"][2],
         GroundedCoreToolBoundaryMiddleware,
     )
-    assert [item["name"] for item in factory.kwargs["subagents"]] == [
-        "general-purpose"
-    ]
+    assert [item["name"] for item in factory.kwargs["subagents"]] == ["general-purpose"]
     assert factory.kwargs["subagents"][0]["tools"] == []
     assert factory.kwargs["subagents"][0]["skills"] is None
     assert factory.kwargs["skills"] is None
@@ -646,9 +616,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "DETERMINISTIC_ENTITY_LOOKUP",
     ):
         assert deterministic_mode in factory.kwargs["system_prompt"]
-    assert "never plan goals or impose an execution order" in factory.kwargs[
-        "system_prompt"
-    ]
+    assert "never plan goals or impose an execution order" in factory.kwargs["system_prompt"]
 
 
 def test_discovery_read_control_never_uses_fixed_leaf_counts_to_freeze() -> None:
@@ -687,9 +655,7 @@ def test_discovery_read_control_never_uses_fixed_leaf_counts_to_freeze() -> None
 
     assert control["status"] == "DISCOVERY_OPEN"
     assert control["retrievalClosed"] is False
-    assert control["nextAction"] == (
-        "CONTINUE_DISCOVERY_OR_PROPOSE_CONTRACT_OR_GRAPH"
-    )
+    assert control["nextAction"] == ("CONTINUE_DISCOVERY_OR_PROPOSE_CONTRACT_OR_GRAPH")
 
 
 def test_discovery_evidence_is_never_silently_fifo_evicted() -> None:
@@ -716,9 +682,7 @@ def test_discovery_evidence_is_never_silently_fifo_evicted() -> None:
         )
 
     assert len(session.core_semantic_evidence) == 70
-    assert session.core_semantic_evidence[0]["refId"] == (
-        "semantic:topic:table:field:0"
-    )
+    assert session.core_semantic_evidence[0]["refId"] == ("semantic:topic:table:field:0")
 
 
 def test_upstream_entity_values_are_hidden_from_parent_core_contract_response() -> None:
@@ -779,9 +743,9 @@ def test_upstream_entity_values_are_hidden_from_parent_core_contract_response() 
     assert "secret-spu-1" not in encoded
     assert "secret-spu-2" not in encoded
     assert payload["sqlObligations"]["entityFilters"][0]["runtimeInjected"] is True
-    assert payload["sqlObligations"]["entityFilters"][0]["entitySetArtifactId"] == (
-        "entity_set_1"
-    )
+    assert payload["sqlObligations"]["entityFilters"][0]["entitySetArtifactId"] == ("entity_set_1")
+
+
 def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> None:
     factory = CapturingFactory()
     kernel = FakeKernel()
@@ -799,12 +763,8 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
     assert first["topicL0Manifests"][0]["topic"] == "客服工单"
     assert first["thinRecallCandidates"][0]["refId"] == "semantic:客服工单:tickets:detail"
     goal_policy = first["originalQuestionGoalPolicy"]
-    assert goal_policy["queryTopologyDecision"] == (
-        "LATE_BOUND_AFTER_FORMAL_EVIDENCE"
-    )
-    assert goal_policy["executionGraphFreezePoint"] == (
-        "IMMEDIATELY_BEFORE_QUERY_PREPARATION"
-    )
+    assert goal_policy["queryTopologyDecision"] == ("LATE_BOUND_AFTER_FORMAL_EVIDENCE")
+    assert goal_policy["executionGraphFreezePoint"] == ("IMMEDIATELY_BEFORE_QUERY_PREPARATION")
     assert "branchDeclarationRequiredBeforeRetrieval" not in goal_policy
     assert "Do not freeze query branches" in first["instructions"]
     assert "availableSkillHeaders" not in first
@@ -825,9 +785,7 @@ def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
     factory = CapturingFactory()
     kernel = FakeKernel()
     outer = runtime(factory, kernel)
-    outer.conversation_online_authority = (
-        ClarifyingConversationAuthority()
-    )
+    outer.conversation_online_authority = ClarifyingConversationAuthority()
 
     response = outer.run("这里面退款最多的三单", "m-1")
 
@@ -835,9 +793,7 @@ def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
     assert kernel.recall_queries == []
     assert factory.graph.invocations == []
     assert response.clarification is not None
-    assert response.clarification.type == (
-        "CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE"
-    )
+    assert response.clarification.type == ("CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE")
 
 
 def test_provider_timeout_is_returned_as_controlled_operational_failure() -> None:
@@ -895,8 +851,9 @@ def test_plain_core_answer_cannot_bypass_return_direct_compose_attestation() -> 
             context.session.runtime.answer = "我直接声称这是最终答案。"
 
     outer.deep_agent_graph = PlainAnswerGraph()
-    with pytest.raises(RuntimeError, match="without a matching answer-coverage"):
+    with pytest.raises(RuntimeError) as exc_info:
         outer.run("工单量", "m-1")
+    assert "without a matching answer-coverage" in str(exc_info.value)
 
 
 def test_semantic_backend_records_only_complete_exact_reads() -> None:
@@ -977,9 +934,7 @@ def test_topic_expansion_is_driven_by_structured_search_scope_not_gap_code() -> 
                             message="endpoint is outside current workspace",
                             topic="alpha",
                             resolution="REVISE_BINDINGS",
-                            search_scope=(
-                                "READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX"
-                            ),
+                            search_scope=("READ_BINDINGS_THEN_TABLE_MANIFEST_THEN_TOPIC_INDEX"),
                             required_capability={
                                 "relationshipRef": relationship_ref,
                                 "endpointTable": "beta_detail",
@@ -1044,9 +999,7 @@ def test_root_core_read_middleware_records_exact_complete_file() -> None:
     )
 
     assert result.status == "success"
-    assert [item["refId"] for item in session.core_semantic_evidence] == [
-        "semantic:客服工单:tickets:detail"
-    ]
+    assert [item["refId"] for item in session.core_semantic_evidence] == ["semantic:客服工单:tickets:detail"]
 
 
 def test_core_read_uses_same_successful_catalog_receipt_without_second_read() -> None:
@@ -1109,9 +1062,7 @@ def test_core_read_uses_same_successful_catalog_receipt_without_second_read() ->
 
     assert result.status == "success"
     assert catalog.calls == 1
-    assert [item["refId"] for item in session.core_semantic_evidence] == [
-        "semantic:客服工单:tickets:detail"
-    ]
+    assert [item["refId"] for item in session.core_semantic_evidence] == ["semantic:客服工单:tickets:detail"]
 
 
 def test_duplicate_complete_semantic_read_returns_receipt_without_backend_call() -> None:
@@ -1193,9 +1144,7 @@ def test_ready_contract_closes_semantic_read_boundary() -> None:
         tool_call={
             "id": "call-after-ready",
             "name": "read_file",
-            "args": {
-                "file_path": "/knowledge/topics/客服工单/tables/tickets/detail.json"
-            },
+            "args": {"file_path": "/knowledge/topics/客服工单/tables/tickets/detail.json"},
         },
         runtime=SimpleNamespace(
             context=GroundedDeepAgentRunContext(
@@ -1226,10 +1175,7 @@ def test_large_semantic_read_is_offloaded_but_full_evidence_is_retained() -> Non
             "topic": "客服工单",
             "tableName": "tickets",
             "section": "columns",
-            "items": [
-                {"key": "field_%04d" % index, "description": "x" * 80}
-                for index in range(300)
-            ],
+            "items": [{"key": "field_%04d" % index, "description": "x" * 80} for index in range(300)],
         },
         ensure_ascii=False,
     )
@@ -1516,9 +1462,7 @@ def test_context_middleware_exposes_only_goal_transaction_on_first_model_turn() 
 
 
 def test_task_dispatch_is_blocked_before_subagent_execution() -> None:
-    middleware = GroundedCoreToolBoundaryMiddleware(
-        GroundedSemanticBackend(FakeSemanticCatalog())
-    )
+    middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     called = {"handler": False}
     request = SimpleNamespace(
         tool_call={"id": "call-task", "name": "task", "args": {}},
@@ -1681,9 +1625,7 @@ def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() 
     assert contract_result["activated"] is True
     assert contract_result["activationStatus"] == "ACTIVATED"
     assert contract_result["executionMode"] == "DETERMINISTIC_METRIC"
-    assert contract_result["executionReasonCodes"] == [
-        "SINGLE_METRIC_FAST_PATH_ELIGIBLE"
-    ]
+    assert contract_result["executionReasonCodes"] == ["SINGLE_METRIC_FAST_PATH_ELIGIBLE"]
     assert contract_result["fastPathEligible"] is True
     assert contract_result["fastPathReasonCodes"] == []
     assert contract_result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
@@ -1734,13 +1676,16 @@ def test_semantic_goal_dependency_does_not_force_query_serialization() -> None:
     assert declared["status"] == "ACCEPTED"
 
     assert deep_session.question_goal_contract is not None
-    assert _parallel_goal_dependency_issues(
-        deep_session.question_goal_contract,
-        {
-            "top-products": ["metric.top_products"],
-            "refunds": ["metric.refunds"],
-        },
-    ) == []
+    assert (
+        _parallel_goal_dependency_issues(
+            deep_session.question_goal_contract,
+            {
+                "top-products": ["metric.top_products"],
+                "refunds": ["metric.refunds"],
+            },
+        )
+        == []
+    )
 
 
 def test_parallel_batch_rejects_dependency_goal_endpoints() -> None:
@@ -1857,13 +1802,16 @@ def test_transitive_semantic_goal_dependencies_do_not_create_artifact_waits() ->
     assert declared["status"] == "ACCEPTED"
 
     assert deep_session.question_goal_contract is not None
-    assert _parallel_goal_dependency_issues(
-        deep_session.question_goal_contract,
-        {
-            "upstream-c": ["metric.c"],
-            "downstream-a": ["metric.a"],
-        },
-    ) == []
+    assert (
+        _parallel_goal_dependency_issues(
+            deep_session.question_goal_contract,
+            {
+                "upstream-c": ["metric.c"],
+                "downstream-a": ["metric.a"],
+            },
+        )
+        == []
+    )
 
 
 def test_artifact_dependency_does_not_spread_through_semantic_only_edges() -> None:
@@ -1905,13 +1853,16 @@ def test_artifact_dependency_does_not_spread_through_semantic_only_edges() -> No
     assert declared["status"] == "ACCEPTED"
 
     assert deep_session.question_goal_contract is not None
-    assert _parallel_goal_dependency_issues(
-        deep_session.question_goal_contract,
-        {
-            "upstream-c": ["metric.c"],
-            "downstream-a": ["metric.a"],
-        },
-    ) == []
+    assert (
+        _parallel_goal_dependency_issues(
+            deep_session.question_goal_contract,
+            {
+                "upstream-c": ["metric.c"],
+                "downstream-a": ["metric.a"],
+            },
+        )
+        == []
+    )
     assert deep_session.parallel_branches == {}
 
 
@@ -2097,9 +2048,7 @@ def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
                 GroundedVerifiedQueryArtifact(
                     artifact_id="query_artifact_core_sql",
                     generation=1,
-                    contract_fingerprint=grounded_query_contract_fingerprint(
-                        contract
-                    ),
+                    contract_fingerprint=grounded_query_contract_fingerprint(contract),
                     sql_fingerprint="a" * 64,
                     contract=contract,
                     plan=QueryPlan(),
@@ -2114,11 +2063,7 @@ def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
         def latest_verified_query_artifact(
             session: GroundedRuntimeSession,
         ) -> GroundedVerifiedQueryArtifact | None:
-            return (
-                session.verified_query_ledger[-1]
-                if session.verified_query_ledger
-                else None
-            )
+            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
 
     factory = CapturingFactory(action="none")
     kernel = TransactionalCoreSqlKernel()
@@ -2180,16 +2125,18 @@ def test_internal_runtime_failure_cannot_be_disguised_as_user_clarification() ->
 
 
 def test_initialization_failure_is_fail_closed() -> None:
-    with pytest.raises(RuntimeError, match="Grounded DeepAgent initialization failed"):
+    with pytest.raises(RuntimeError) as factory_exc_info:
         runtime(CapturingFactory(fail=True))
+    assert "Grounded DeepAgent initialization failed" in str(factory_exc_info.value)
 
-    with pytest.raises(RuntimeError, match="model is not configured"):
+    with pytest.raises(RuntimeError) as model_exc_info:
         GroundedDeepAgentRuntime(
             FakeKernel(),
             lead_model=None,
             semantic_catalog=FakeSemanticCatalog(),
             agent_factory=CapturingFactory(),
         )
+    assert "model is not configured" in str(model_exc_info.value)
 
 
 def test_checkpoint_config_factory_is_used_without_rewriting_namespace() -> None:
@@ -2309,9 +2256,7 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
                 GroundedVerifiedQueryArtifact(
                     artifact_id="query_artifact_1",
                     generation=1,
-                    contract_fingerprint=grounded_query_contract_fingerprint(
-                        contract
-                    ),
+                    contract_fingerprint=grounded_query_contract_fingerprint(contract),
                     sql_fingerprint="f" * 64,
                     contract=contract,
                     plan=QueryPlan(),
@@ -2325,11 +2270,7 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
         def latest_verified_query_artifact(
             session: GroundedRuntimeSession,
         ) -> GroundedVerifiedQueryArtifact | None:
-            return (
-                session.verified_query_ledger[-1]
-                if session.verified_query_ledger
-                else None
-            )
+            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
 
         @staticmethod
         def verify_portfolio(
@@ -2407,14 +2348,8 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
     assert finalized["status"] == "EVIDENCE_COLLECTION_SEALED"
     assert deep_session.analysis_skill_headers_disclosed is True
     assert deep_session.data_collection_sealed is True
-    assert any(
-        item["name"] == "refund-rate-diagnosis"
-        for item in finalized["availableAnalysisSkillHeaders"]
-    )
-    assert all(
-        item["lifecyclePhase"] == "post_query_analysis"
-        for item in finalized["availableAnalysisSkillHeaders"]
-    )
+    assert any(item["name"] == "refund-rate-diagnosis" for item in finalized["availableAnalysisSkillHeaders"])
+    assert all(item["lifecyclePhase"] == "post_query_analysis" for item in finalized["availableAnalysisSkillHeaders"])
 
 
 def test_skill_output_contract_rejects_governed_formula_drift() -> None:
@@ -2458,9 +2393,7 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
 ) -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
-    settings = Settings(
-        harness_workspace_path=str(tmp_path / "runtime")
-    )
+    settings = Settings(harness_workspace_path=str(tmp_path / "runtime"))
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),
@@ -2543,9 +2476,7 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
         thread_id="thread-skill",
         run_id="run-parent",
         session=session,
-        listener=lambda event_type, node, payload: events.append(
-            (event_type, node, payload)
-        ),
+        listener=lambda event_type, node, payload: events.append((event_type, node, payload)),
     )
     tools = {item.name: item for item in outer.tools}
 
@@ -2561,14 +2492,10 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert result["executionConfidence"] == 0.88
     assert "artifact" not in result
     assert "workspace" not in result
-    skill_workspaces = list(
-        workspace.subagents_root.glob("skill/*")
-    )
+    skill_workspaces = list(workspace.subagents_root.glob("skill/*"))
     assert len(skill_workspaces) == 1
     assert (skill_workspaces[0] / "result.json").is_file()
-    skill_input = json.loads(
-        (skill_workspaces[0] / "input.json").read_text(encoding="utf-8")
-    )
+    skill_input = json.loads((skill_workspaces[0] / "input.json").read_text(encoding="utf-8"))
     assert "dataRows" not in skill_input
     assert skill_input["verifiedArtifactAccess"]["inlineRows"] is False
     assert "sqlArtifact" not in json.dumps(
@@ -2586,9 +2513,7 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert [item[0] for item in events] == ["skill.progress"] * len(events)
     assert any(item[2]["stage"] == "subagent_step" for item in events)
     assert kernel_session.answer == "基于已验证证据完成风险分析。"
-    assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == (
-        "core_llm_skill_header"
-    )
+    assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == ("core_llm_skill_header")
 
 
 def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() -> None:
@@ -2609,9 +2534,7 @@ def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() 
             self.job = job
             assignment = job.user_payload["invocation"]["assignment"]
             assignment_id = assignment["assignmentId"]
-            assert assignment["objective"] == (
-                "Explore competing explanations from verified evidence."
-            )
+            assert assignment["objective"] == ("Explore competing explanations from verified evidence.")
             population = assignment["populationScopeFingerprint"]
             time_scope = assignment["timeScopeFingerprint"]
             source_fingerprints = assignment["sourceArtifactFingerprints"]
@@ -2627,22 +2550,14 @@ def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() 
                         "hypotheses": [
                             {
                                 "hypothesisId": "hypothesis.test",
-                                "falsifiableStatement": (
-                                    "The verified change is concentrated in one comparison."
-                                ),
+                                "falsifiableStatement": ("The verified change is concentrated in one comparison."),
                                 "premises": ["The verified input is comparable."],
-                                "expectedObservations": [
-                                    "A comparison differs from its reference."
-                                ],
-                                "falsifyingObservations": [
-                                    "The comparison does not differ."
-                                ],
+                                "expectedObservations": ["A comparison differs from its reference."],
+                                "falsifyingObservations": ["The comparison does not differ."],
                                 "goalIds": ["analysis.primary"],
                                 "populationScopeFingerprint": population,
                                 "timeScopeFingerprint": time_scope,
-                                "competingExplanations": [
-                                    "The change is distributed across comparisons."
-                                ],
+                                "competingExplanations": ["The change is distributed across comparisons."],
                             }
                         ],
                         "evidenceRequests": [
@@ -2734,9 +2649,7 @@ def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() 
         session=deep_session,
     )
     visible, _ = _phase_visible_tools(deep_session, outer.tools)
-    assert "delegate_grounded_exploration" in {
-        item.name for item in visible
-    }
+    assert "delegate_grounded_exploration" in {item.name for item in visible}
 
     tools = {item.name: item for item in outer.tools}
     result = json.loads(
@@ -2769,9 +2682,7 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
 ) -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
-    settings = Settings(
-        harness_workspace_path=str(tmp_path / "runtime")
-    )
+    settings = Settings(harness_workspace_path=str(tmp_path / "runtime"))
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),
@@ -2889,9 +2800,7 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
 
     factory = CapturingFactory(action="none")
     kernel = FallbackKernel()
-    settings = Settings(
-        harness_workspace_path=str(tmp_path / "runtime")
-    )
+    settings = Settings(harness_workspace_path=str(tmp_path / "runtime"))
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),

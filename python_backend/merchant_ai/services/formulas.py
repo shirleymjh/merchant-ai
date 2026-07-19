@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 import sqlglot
 from sqlglot import exp
@@ -67,8 +66,7 @@ def formula_columns(formula: str, known_columns: Set[str] | set) -> List[str]:
     if not formula:
         return []
     found: List[str] = []
-    for token in re.findall(r"`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b", formula):
-        name = token[0] or token[1]
+    for _, _, name in _formula_identifier_spans(formula):
         if name.upper() in FORMULA_ALLOWED_TOKENS:
             continue
         if name in known_columns and name not in found:
@@ -132,9 +130,9 @@ def reconcile_metric_formula_for_schema(
 
 
 def equivalent_formula_text(left: str, right: str) -> bool:
-    return re.sub(r"\s+", " ", (left or "").replace("`", "")).strip().lower() == re.sub(
-        r"\s+", " ", (right or "").replace("`", "")
-    ).strip().lower()
+    return " ".join((left or "").replace("`", "").split()).lower() == " ".join(
+        (right or "").replace("`", "").split()
+    ).lower()
 
 
 def _compile_metric_formula_for_schema(text: str, columns: Set[str]) -> _FormulaCompilation:
@@ -221,8 +219,10 @@ def _simple_alternative_column(node: exp.Expression) -> str:
 
 def _semantic_field_family(column: str) -> str:
     text = str(column or "").strip().lower()
-    match = re.fullmatch(r"(.+)_(?:code|name|label|text)$", text)
-    return str(match.group(1) or "") if match else ""
+    for suffix in ("_code", "_name", "_label", "_text"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)]
+    return ""
 
 
 def _project_boolean_condition(node: exp.Expression, columns: Set[str]) -> Tuple[Optional[exp.Expression], bool]:
@@ -292,27 +292,19 @@ def _compile_formula_text(text: str, columns: Set[str]) -> str:
         return ""
     if not _formula_text_is_safe(text):
         return ""
-    segments = re.split(r"('(?:''|[^'])*')", text)
+    spans = list(_formula_identifier_spans(text))
     compiled_segments: List[str] = []
-    for index, segment in enumerate(segments):
-        if index % 2 == 1:
-            compiled_segments.append(segment)
-            continue
-        tokens = re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", segment)
-        for token in tokens:
-            if token in columns:
-                continue
-            if token.upper() in FORMULA_ALLOWED_TOKENS:
-                continue
+    cursor = 0
+    for start, end, token in spans:
+        compiled_segments.append(text[cursor:start])
+        if token in columns:
+            compiled_segments.append("`%s`" % token)
+        elif token.upper() in FORMULA_ALLOWED_TOKENS:
+            compiled_segments.append(text[start:end])
+        else:
             return ""
-
-        def replace_identifier(match: re.Match[str]) -> str:
-            token = match.group(1)
-            if token in columns:
-                return "`%s`" % token
-            return token
-
-        compiled_segments.append(re.sub(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", replace_identifier, segment))
+        cursor = end
+    compiled_segments.append(text[cursor:])
     compiled = "".join(compiled_segments)
     try:
         parsed = sqlglot.parse_one("SELECT %s AS metric_value FROM x" % compiled, read="doris")
@@ -322,3 +314,56 @@ def _compile_formula_text(text: str, columns: Set[str]) -> str:
     if not parsed_columns.issubset(columns):
         return ""
     return compiled
+
+
+def _formula_identifier_spans(
+    value: str,
+) -> Iterator[tuple[int, int, str]]:
+    """Yield SQL identifier tokens while ignoring quoted string literals."""
+
+    text = str(value or "")
+    cursor = 0
+    while cursor < len(text):
+        character = text[cursor]
+        if character == "'":
+            cursor += 1
+            while cursor < len(text):
+                if text[cursor] != "'":
+                    cursor += 1
+                    continue
+                if cursor + 1 < len(text) and text[cursor + 1] == "'":
+                    cursor += 2
+                    continue
+                cursor += 1
+                break
+            continue
+        if character == "`":
+            start = cursor
+            cursor += 1
+            name_start = cursor
+            while cursor < len(text) and text[cursor] != "`":
+                cursor += 1
+            if cursor >= len(text):
+                return
+            token = text[name_start:cursor]
+            cursor += 1
+            if token:
+                yield start, cursor, token
+            continue
+        if not (
+            character.isascii()
+            and (character.isalpha() or character == "_")
+        ):
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text):
+            candidate = text[cursor]
+            if not (
+                candidate.isascii()
+                and (candidate.isalnum() or candidate == "_")
+            ):
+                break
+            cursor += 1
+        yield start, cursor, text[start:cursor]

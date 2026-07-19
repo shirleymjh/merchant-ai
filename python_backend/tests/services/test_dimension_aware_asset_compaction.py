@@ -180,7 +180,7 @@ def recalled_fact_dimension_relationship() -> RecallBundle:
     )
 
 
-def test_exact_summary_seed_keeps_recalled_relationship_and_uses_dimension_closure() -> None:
+def test_explicit_metric_and_relationship_leaf_reads_enable_dimension_closure() -> None:
     builder = generic_builder()
     table_topic = {
         "rollup_measure": "summary_topic",
@@ -188,13 +188,20 @@ def test_exact_summary_seed_keeps_recalled_relationship_and_uses_dimension_closu
         "dim_subject": "dimension_topic",
     }
 
-    tables, traces = builder._targeted_seed_tables(
-        "目标金额最高的前7个分析对象",
-        recalled_fact_dimension_relationship(),
-        ["summary_topic", "fact_topic", "dimension_topic"],
-        table_topic,
+    tables, traces = builder._dimension_aware_seed_tables(
+        question="目标金额最高的前7个分析对象",
         planning_hints=generic_hints(),
+        precise_seed_tables={"rollup_measure"},
+        precise_metric_seed_traces=[
+            "precise_metric_seed:rollup_measure:measure_rollup:目标金额"
+        ],
+        recalled_relationship_tables={"event_fact", "dim_subject"},
+        recalled_relationship_refs={
+            "semantic:dimension_topic:relationship:fact_to_subject"
+        },
+        table_topic=table_topic,
         all_relationships=generic_relationships(),
+        allow_profile=False,
     )
 
     assert tables == {"event_fact", "dim_subject"}
@@ -217,12 +224,13 @@ def test_simple_exact_metric_without_dimension_does_not_expand_relationships() -
         recalled_fact_dimension_relationship(),
         ["summary_topic"],
         table_topic,
+        explicit_tables={"rollup_measure"},
         planning_hints={"metricPhrases": ["目标金额"]},
         all_relationships=generic_relationships(),
     )
 
     assert tables == {"rollup_measure"}
-    assert any(item == "precise_metric_seed:rollup_measure:measure_rollup:目标金额" for item in traces)
+    assert "targeted_seed_source=explicit_tables" in traces
     assert not any(item.startswith("dimension_relationship_path:") for item in traces)
 
 
@@ -267,13 +275,18 @@ def test_missing_dimension_path_is_attached_to_planner_graph_as_typed_relationsh
         "event_fact": "fact_topic",
         "dim_subject": "dimension_topic",
     }
-    tables, traces = builder._targeted_seed_tables(
-        "目标金额最高的前7个分析对象",
-        RecallBundle(),
-        ["summary_topic", "fact_topic", "dimension_topic"],
-        table_topic,
+    tables, traces = builder._dimension_aware_seed_tables(
+        question="目标金额最高的前7个分析对象",
         planning_hints=generic_hints(),
+        precise_seed_tables={"rollup_measure"},
+        precise_metric_seed_traces=[
+            "precise_metric_seed:rollup_measure:measure_rollup:目标金额"
+        ],
+        recalled_relationship_tables={"event_fact", "dim_subject"},
+        recalled_relationship_refs=set(),
+        table_topic=table_topic,
         all_relationships=generic_relationships()[:1],
+        allow_profile=False,
     )
     gap = next(item for item in planning_gaps_from_asset_traces(traces) if item["code"] == "RELATIONSHIP_PATH_REQUIRED")
     assert tables == {"event_fact", "dim_subject"}
@@ -456,8 +469,8 @@ def test_topic_route_broadens_through_asset_declared_detail_metric_lineage() -> 
         for item in (pack.table_manifest or {}).get("tables") or []
     }
     assert {"dwm_cs_ticket_detail_di", "dwm_goods_detail_df"} <= manifest_tables
-    assert {"dwm_cs_ticket_detail_di", "dwm_goods_detail_df"} <= set(pack.known_tables())
-    assert {item.key for item in pack.metrics} >= {"ticket_cnt"}
+    assert pack.known_tables() == []
+    assert pack.metrics == []
 
 
 def test_metric_label_span_does_not_become_a_false_grouping_dimension() -> None:

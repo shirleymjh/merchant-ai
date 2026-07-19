@@ -169,7 +169,7 @@ def test_branch_context_report_exposes_local_scope_and_budget_only() -> None:
     assert report["status"] == "WAITING_VERIFIED_ENTITY_SET"
 
 
-def test_branch_budget_clock_starts_at_first_active_operation() -> None:
+def test_branch_budget_charges_only_active_work_not_declaration_or_queue_wait() -> None:
     clock = _ManualClock()
     branch = GroundedBranchBudget(
         "orders",
@@ -187,9 +187,13 @@ def test_branch_budget_clock_starts_at_first_active_operation() -> None:
 
     with branch.stage("semantic_retrieval"):
         clock.advance(0.04)
+
+    clock.advance(65)
+
+    assert branch.report()["elapsedMs"] == 40
     branch.consume_doris_query()
 
     report = branch.report()
     assert report["elapsedMs"] == 40
-    assert report["wallElapsedMs"] == 40
+    assert report["wallElapsedMs"] == 65_040
     assert report["usage"]["dorisQueries"] == 1

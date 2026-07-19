@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 1,
+  "policyId": "zh-merchant-analysis-language",
+  "revision": "2026-07-19",
+  "temporal": {
+    "prefixes": ["最近", "过去", "近", "前"],
+    "units": {
+      "个月": "month",
+      "星期": "week",
+      "礼拜": "week",
+      "天": "day",
+      "日": "day",
+      "周": "week",
+      "月": "month"
+    },
+    "namedWindows": {
+      "上个月": "month",
+      "这个月": "month",
+      "昨天": "day",
+      "昨日": "day",
+      "今天": "day",
+      "今日": "day",
+      "前天": "day",
+      "上星期": "week",
+      "上月": "month",
+      "上周": "week",
+      "本周": "week",
+      "这周": "week",
+      "本月": "month"
+    },
+    "namedWindowSemantics": {
+      "上个月": "previous_month",
+      "这个月": "current_month",
+      "昨天": "previous_day",
+      "昨日": "previous_day",
+      "今天": "current_day",
+      "今日": "current_day",
+      "前天": "two_days_ago",
+      "上星期": "previous_week",
+      "上月": "previous_month",
+      "上周": "previous_week",
+      "本周": "current_week",
+      "这周": "current_week",
+      "本月": "current_month"
+    },
+    "comparisonNamedSemantics": ["previous_month", "previous_week", "two_days_ago"],
+    "comparisonMarkers": ["相比", "对比", "比较", "变化", "环比", "较", "比", "上升", "下降", "增长", "减少", "升高", "降低"],
+    "yearOverYearMarkers": ["去年同期", "同比"],
+    "periodOverPeriodMarkers": ["环比", "上期"],
+    "previousPeriodMarkers": ["上一周期", "上一期", "上期"],
+    "naturalMonthMarkers": ["自然月"],
+    "rollingMonthPrefixes": ["最近", "过去", "近"],
+    "labels": {
+      "default_rolling_days": "最近{days}天",
+      "year_over_year": "去年同期",
+      "previous_month": "上月",
+      "previous_week": "上周",
+      "previous_day": "前一天",
+      "previous_days": "前{days}天"
+    },
+    "dailyGrainMarkers": ["每天", "每日", "按天", "逐日", "日趋势", "每天的", "按日", "走势", "趋势"],
+    "timeSeriesMarkers": ["波动", "同步上升", "同步下降", "持续上升", "持续下降", "上升", "下降", "增长", "减少", "变化", "异常", "走势", "趋势"],
+    "coordinatedSeparatorCharacters": ",，、和与及跟同以及还有",
+    "comparisonSeparatorCharacters": ",，、比较相比对比和与"
+  },
+  "routing": {
+    "actionMarkers": ["为什么", "原因", "影响", "分析", "对比", "环比", "同比", "同时", "分别", "并且", "综合", "关联", "对应", "趋势", "走势", "变化", "同步", "上升", "下降", "波动", "异常", "风险", "建议", "优化", "改善", "怎么办", "排查", "明细", "详情", "最高", "最低", "最多", "最少"],
+    "rankingOrdinalPrefixes": ["前"],
+    "rankingTopPrefixes": ["top"],
+    "rankingOperators": {
+      "最高": "desc",
+      "最低": "asc",
+      "最多": "desc",
+      "最少": "asc",
+      "排名": "desc",
+      "排行": "desc"
+    },
+    "rankingDefaultOrder": "desc",
+    "rankingLinkParticles": ["的"],
+    "groupingPrefixes": ["按", "每"],
+    "detailMarkers": ["明细", "详情", "列表", "记录", "单号", "流水", "逐笔", "分组", "拆分"],
+    "causalMarkers": ["为什么", "为何", "原因", "归因", "怎么导致", "异常根因"],
+    "negationPrefixes": ["不要看", "不包含", "不考虑", "不看", "排除", "忽略", "去掉"],
+    "greetingPhrases": ["你好", "您好", "hi", "hello", "hey", "在吗", "嗨", "哈喽", "早上好", "下午好", "晚上好"],
+    "greetingSuffixCharacters": "!！。,.，",
+    "assistantChatPhrases": ["你是谁", "你能做什么", "你可以做什么", "你会什么", "怎么用", "如何使用"],
+    "writeMarkers": ["删除", "修改", "更新", "创建", "重建", "写入", "导入", "新增", "truncate", "drop", "insert", "update", "delete"],
+    "riskMarkers": ["规则", "敏感"],
+    "followUpPrefixes": ["那么", "然后", "还有", "这些", "它们", "同样", "改成", "换成", "继续", "那", "再", "这个", "它", "按", "呢"],
+    "followUpPhrases": ["按天看", "按周看", "细分一下", "继续下钻", "换个维度"],
+    "scopeLockMarkers": ["只看", "仅看", "只分析", "仅分析", "限定在", "仅限", "单独看", "只查"],
+    "correctionMarkers": ["不对", "不是", "改为", "改成", "纠正", "口径应该"],
+    "entityAssignmentOperators": ["等于", "为", "=", ":", "："],
+    "timeClarificationOptions": ["最近7天", "最近30天", "最近90天"],
+    "memoryAuthoringMarkers": ["请记住", "记住", "以后", "默认", "长期", "固定"]
+  },
+  "answer": {
+    "definitionMarkers": ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"],
+    "diagnosisMarkers": ["为什么", "为何", "原因", "归因", "怎么导致", "异常根因", "怎么回事", "分析", "建议", "怎么办", "策略", "优化", "风险", "异常"],
+    "formulaExplanationHeadings": ["统计说明", "计算说明", "口径", "公式"],
+    "negatedAssertionMarkers": ["不能确认", "无法确认", "无法判断", "不能判断", "未能证明", "不代表"],
+    "missingEvidencePrefixes": ["没有", "缺少"],
+    "evidenceNoun": "证据",
+    "ruleEvidenceHeadings": ["规则依据"],
+    "trendDirectionMarkers": {
+      "up": ["上升", "增加", "提升", "上涨"],
+      "down": ["下降", "减少", "降低", "下滑"],
+      "flat": ["持平", "不变"]
+    },
+    "previousDayComparisonMarkers": ["较前日", "较前天", "较前一日", "较前一天", "较前1日", "较前1天"],
+    "thresholdMarkers": ["超过", "高于", "低于", "不少于", "不超过", "阈值"],
+    "principalMarkers": ["merchant_id", "merchantId", "商家ID"],
+    "rankingCounterCharacters": "个名条项笔天",
+    "positionColumnLabels": ["排名", "排行", "名次", "序号", "行号", "rank", "ranking", "no", "number", "index"],
+    "directValueExclusionMarkers": [
+      "变化", "变动", "差值", "差额", "增量", "减少", "增加", "上升", "下降", "提升", "降低", "波动",
+      "环比", "同比", "涨幅", "跌幅", "少了", "多了", "change", "delta", "diff", "increase", "decrease"
+    ],
+    "directValueMarkers": ["为", "是", "达到", "等于", "合计", "总计", "当前", "本次", "查询范围内", ":", "："]
+  }
+}

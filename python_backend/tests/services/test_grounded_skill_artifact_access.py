@@ -353,36 +353,34 @@ def test_skill_access_rejects_unpublished_unsealed_and_mixed_activation(
         semantic_seed="semantic-v2",
     )
 
-    with pytest.raises(
-        GroundedSkillArtifactAccessError,
-        match="SKILL_SELECTED_ARTIFACT_NOT_PUBLISHED",
-    ):
+    with pytest.raises(GroundedSkillArtifactAccessError) as unpublished_error:
         _build_access(
             settings,
             workspace,
             [unpublished],
             [unpublished.artifact_id],
         )
-    with pytest.raises(
-        GroundedSkillArtifactAccessError,
-        match="SKILL_SELECTED_ARTIFACT_LEDGER_INTEGRITY_INVALID",
-    ):
+    assert "SKILL_SELECTED_ARTIFACT_NOT_PUBLISHED" in str(unpublished_error.value)
+    with pytest.raises(GroundedSkillArtifactAccessError) as integrity_error:
         _build_access(
             settings,
             workspace,
             [invalid_seal],
             [invalid_seal.artifact_id],
         )
-    with pytest.raises(
-        GroundedSkillArtifactAccessError,
-        match="SKILL_ARTIFACT_SEMANTIC_ACTIVATION_CONFLICT",
-    ):
+    assert "SKILL_SELECTED_ARTIFACT_LEDGER_INTEGRITY_INVALID" in str(
+        integrity_error.value
+    )
+    with pytest.raises(GroundedSkillArtifactAccessError) as activation_error:
         _build_access(
             settings,
             workspace,
             [first, second],
             [first.artifact_id, second.artifact_id],
         )
+    assert "SKILL_ARTIFACT_SEMANTIC_ACTIVATION_CONFLICT" in str(
+        activation_error.value
+    )
 
 
 def test_core_dynamic_artifact_authority_denies_orphans_sql_and_stale_ledger(

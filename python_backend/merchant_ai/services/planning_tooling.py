@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-import re
 from typing import Any, Dict, List
 
 from merchant_ai.models import GraphValidationGap, QueryPlan, ToolCallRequest
@@ -342,21 +341,60 @@ def parse_json_object(text: str) -> Dict[str, Any]:
     if not raw:
         return {}
     if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw).strip()
+        first_line_end = raw.find("\n")
+        if first_line_end < 0:
+            return {}
+        raw = raw[first_line_end + 1 :].strip()
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         pass
-    match = re.search(r"\{.*\}", raw, flags=re.S)
-    if not match:
-        return {}
-    try:
-        parsed = json.loads(match.group(0))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
+    for candidate in json_object_candidates(raw):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def json_object_candidates(value: str) -> List[str]:
+    """Return balanced JSON-object slices while respecting quoted braces."""
+
+    text = str(value or "")
+    candidates: List[str] = []
+    start = -1
+    depth = 0
+    quoted = False
+    escaped = False
+    for index, character in enumerate(text):
+        if start < 0:
+            if character == "{":
+                start = index
+                depth = 1
+            continue
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                candidates.append(text[start : index + 1])
+                start = -1
+    return candidates
 
 
 def compact_tool_result_for_prompt(result: Dict[str, Any], max_chars: int) -> Dict[str, Any]:

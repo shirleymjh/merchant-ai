@@ -12,6 +12,7 @@ from merchant_ai.services.grounded_goal_contract import (
     ComparisonQuestionGoal,
     DetailQuestionGoal,
     DependencyQuestionGoal,
+    DimensionQuestionGoal,
     GoalContractIssue,
     GoalContractValidationError,
     GoalCoverageBlocked,
@@ -23,6 +24,7 @@ from merchant_ai.services.grounded_goal_contract import (
     TimeWindowQuestionGoal,
     VerifiedArtifactGoalCoverage,
     declare_verified_artifact_goal_coverage,
+    goal_dependency_closure,
     inspect_question_structure,
     original_question_goal_contract_fingerprint,
     parse_original_question_goal_contract,
@@ -822,8 +824,9 @@ def test_declaration_helper_reads_kernel_verification_instead_of_trusting_caller
     assert declared.covered_goal_ids == ["metric.alpha"]
     assert declared.verification_passed is True
     assert declared.goal_contract_fingerprint == original_question_goal_contract_fingerprint(contract)
-    with pytest.raises(ValueError, match="verified query artifact"):
+    with pytest.raises(ValueError) as exc_info:
         declare_verified_artifact_goal_coverage(contract, failed_artifact, ["metric.alpha"])
+    assert "verified query artifact" in str(exc_info.value)
 
 
 def test_verifier_can_read_coverage_fields_directly_from_kernel_artifact_shape() -> None:
@@ -1200,3 +1203,61 @@ def test_ranking_inputs_must_reference_metric_and_dimension_goal_kinds() -> None
 
     assert result.valid is False
     assert "RANKING_DIMENSION_GOAL_KIND_INVALID" in {issue.code for issue in result.issues}
+
+
+def test_goal_dependency_closure_covers_complex_bi_lineage_transitively() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="rank, compare, then analyze",
+        goals=[
+            MetricQuestionGoal(
+                goal_id="metric.raw",
+                label="raw metric",
+            ),
+            MetricQuestionGoal(
+                goal_id="metric.primary",
+                label="primary metric",
+                depends_on_goal_ids=["metric.raw"],
+            ),
+            MetricQuestionGoal(
+                goal_id="metric.baseline",
+                label="baseline metric",
+            ),
+            DimensionQuestionGoal(
+                goal_id="dimension.entity",
+                label="entity",
+            ),
+            RankingQuestionGoal(
+                goal_id="ranking.top",
+                label="top entities",
+                population_scope="SAME_AS_GOAL",
+                population_goal_ids=["metric.primary"],
+                metric_goal_ids=["metric.primary"],
+                dimension_goal_ids=["dimension.entity"],
+                limit=3,
+            ),
+            ComparisonQuestionGoal(
+                goal_id="comparison.delta",
+                label="ranking versus baseline",
+                left_goal_ids=["ranking.top"],
+                right_goal_ids=["metric.baseline"],
+            ),
+            AnalysisQuestionGoal(
+                goal_id="analysis.diagnosis",
+                label="diagnosis",
+                input_goal_ids=["comparison.delta"],
+                baseline_goal_ids=["metric.baseline"],
+            ),
+        ],
+    )
+
+    assert goal_dependency_closure(
+        contract,
+        ["analysis.diagnosis"],
+    ) == {
+        "comparison.delta",
+        "ranking.top",
+        "metric.primary",
+        "metric.raw",
+        "metric.baseline",
+        "dimension.entity",
+    }

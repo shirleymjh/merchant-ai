@@ -81,6 +81,7 @@ def test_partial_es_lane_failure_is_structured_instead_of_silently_swallowed(mon
                 content="asset evidence",
                 source_type="SEMANTIC_TABLE_ASSET",
                 fusion_score=1.0,
+                metadata={"assetStatus": "PUBLISHED"},
             )
         ],
     )

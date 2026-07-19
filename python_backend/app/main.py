@@ -8,10 +8,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.services.runtime_factory import create_runtime
+from merchant_ai.services.runtime_factory import GroundedOnlineRuntimeUnavailable
 from merchant_ai.models import (
     ChatRequest,
     FeedbackRequest,
@@ -55,6 +56,7 @@ from merchant_ai.services.security import (
     identity_scope_hash,
     merchant_principal,
     ops_principal,
+    principal_from_authenticated_identity,
     resolve_authenticated_identity,
 )
 from merchant_ai.services.skill_drafts import SkillDraftService
@@ -189,7 +191,7 @@ def require_merchant_access(
     explicitly disabled for local development.
     """
 
-    target = str(merchant_id or settings.merchant_id).strip()
+    requested_target = str(merchant_id or "").strip()
     should_resolve_identity = bool(
         settings.identity_auth_required
         or str(authorization or "").strip()
@@ -200,9 +202,11 @@ def require_merchant_access(
         else None
     )
     if identity is not None:
+        target = requested_target or str(identity.merchant_id or "").strip()
         return authorize_authenticated_merchant_access(settings, identity, target, permission)
     if settings.identity_auth_required:
         raise HTTPException(status_code=401, detail="authenticated merchant identity is required")
+    target = requested_target or str(settings.merchant_id or "").strip()
     return authorize_merchant_access(settings, merchant_principal(target), target, permission)
 
 
@@ -217,8 +221,7 @@ def require_memory_write_identity(merchant_id: str, authorization: Optional[str]
     target = str(merchant_id or settings.merchant_id).strip()
     if identity.merchant_id and identity.merchant_id != target:
         raise HTTPException(status_code=403, detail="authenticated identity cannot write requested merchant memory")
-    permissions = {str(item) for item in identity.permissions}
-    if Permission.MEMORY_WRITE.value not in permissions and identity.role not in {"merchant_owner", "platform_operator"}:
+    if not principal_from_authenticated_identity(identity).has_permission(Permission.MEMORY_WRITE):
         raise HTTPException(status_code=403, detail="permission denied: memory.write")
     return identity
 
@@ -288,6 +291,23 @@ def require_ops_thread_run_access(thread_id: str, run_id: str) -> Any:
 def create_app(runtime_settings: Optional[Settings] = None) -> FastAPI:
     _init_services(runtime_settings)
     application = FastAPI(title="yshopping Merchant AI Python", version="0.1.0")
+    application.state.runtime = runtime
+
+    @application.exception_handler(GroundedOnlineRuntimeUnavailable)
+    async def grounded_runtime_unavailable(
+        _request: Request,
+        exc: GroundedOnlineRuntimeUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": {
+                    "code": exc.code,
+                    "message": exc.reason,
+                }
+            },
+        )
+
     application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -874,6 +894,19 @@ def daily_report(
     return daily_report_service.report(effective_merchant_id).model_dump(by_alias=True)
 
 
+@router.get("/api/merchant-profile")
+def get_current_merchant_profile(
+    merchant_id: Optional[str] = Query(default=None, alias="merchantId"),
+    include_expired: bool = Query(default=False),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    effective_merchant_id = require_merchant_access(
+        merchant_id or "",
+        authorization=authorization,
+    )
+    return _merchant_profile_payload(effective_merchant_id, include_expired)
+
+
 @router.get("/api/merchant-profile/{merchant_id}")
 def get_merchant_profile(
     merchant_id: str,
@@ -884,10 +917,14 @@ def get_merchant_profile(
         merchant_id,
         authorization=authorization,
     )
+    return _merchant_profile_payload(effective_merchant_id, include_expired)
+
+
+def _merchant_profile_payload(merchant_id: str, include_expired: bool) -> Dict[str, Any]:
     return {
         "success": True,
         "profile": runtime.services.merchant_profile_store.get_profile(
-            effective_merchant_id,
+            merchant_id,
             include_expired=include_expired,
         ),
     }

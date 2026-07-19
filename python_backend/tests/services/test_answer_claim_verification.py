@@ -6,6 +6,7 @@ from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
     AnswerMode,
+    EvidenceGap,
     MerchantInfo,
     NodePlanContract,
     QueryBundle,
@@ -944,6 +945,38 @@ def test_finalize_answer_recovers_verified_facts_when_supplied_fallback_also_fai
         "unsupported_extra_value:999" in claim.get("reasons", [])
         for claim in service.last_answer_claim_trace["rejectedClaims"]
     )
+
+
+def test_finalize_answer_never_revives_values_from_blocked_evidence():
+    service = AnswerComposeService(ClaimAnswerLlm(""))
+    plan = metric_plan()
+    run = metric_run(188.0)
+    gap = EvidenceGap(
+        code="UNVERIFIED_EVIDENCE",
+        reason="查询结果尚未通过证据校验",
+        severity="blocking",
+    )
+    run.evidence_gaps = [gap]
+    run.verified_evidence = VerifiedEvidence(
+        passed=False,
+        gaps=[gap],
+        blocking_gaps=[gap],
+        answer_guard_required=True,
+        partial_answer_reason="查询结果尚未通过证据校验",
+    )
+
+    answer = service._finalize_answer(
+        "最近7天GMV为 188元。",
+        "最近7天GMV是多少？",
+        plan,
+        run,
+        fallback_answer="最近7天GMV为 188元。",
+    )
+
+    assert "不能给出完整结论" in answer
+    assert "188" not in answer
+    assert service.last_answer_claim_trace["passed"] is True
+    assert service.last_answer_claim_trace["fallbackReason"] == "blocking_evidence_fail_closed"
 
 
 def test_rate_request_is_a_named_missing_requirement_instead_of_empty_block():

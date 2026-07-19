@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 from dataclasses import dataclass
 from functools import lru_cache
@@ -91,7 +90,7 @@ class Settings(BaseSettings):
     company_name: str = Field("yshopping", validation_alias="YSHOPPING_COMPANY_NAME")
     business_timezone: str = Field("Asia/Shanghai", validation_alias="YSHOPPING_BUSINESS_TIMEZONE")
     calendar_time_semantics_enabled: bool = Field(True, validation_alias="YSHOPPING_CALENDAR_TIME_SEMANTICS_ENABLED")
-    merchant_id: str = Field("100", validation_alias="YSHOPPING_MERCHANT_ID")
+    merchant_id: str = Field("", validation_alias="YSHOPPING_MERCHANT_ID")
     allowed_merchant_ids: str = Field("", validation_alias="YSHOPPING_ALLOWED_MERCHANT_IDS")
     ops_token: str = Field("", validation_alias="YSHOPPING_OPS_TOKEN")
     identity_auth_required: bool = Field(False, validation_alias="YSHOPPING_IDENTITY_AUTH_REQUIRED")
@@ -400,6 +399,12 @@ class Settings(BaseSettings):
         2,
         validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_RETRY_ATTEMPTS",
     )
+    grounded_execution_graph_max_revisions: int = Field(
+        2,
+        validation_alias=(
+            "YSHOPPING_GROUNDED_EXECUTION_GRAPH_MAX_REVISIONS"
+        ),
+    )
     grounded_branch_max_semantic_reads: int = Field(16, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_READS")
     grounded_branch_max_semantic_chars: int = Field(
         200000, validation_alias="YSHOPPING_GROUNDED_BRANCH_MAX_SEMANTIC_CHARS"
@@ -536,14 +541,20 @@ class Settings(BaseSettings):
 
     @property
     def openai_api_key(self) -> str:
+        if "openai_api_key" in self.__dict__:
+            return str(self.__dict__.get("openai_api_key") or "")
         return os.getenv("OPENAI_API_KEY") or self.llm_api_key
 
     @property
     def openai_base_url(self) -> str:
+        if "openai_base_url" in self.__dict__:
+            return str(self.__dict__.get("openai_base_url") or "")
         return os.getenv("OPENAI_BASE_URL") or self.llm_base_url
 
     @property
     def openai_model(self) -> str:
+        if "openai_model" in self.__dict__:
+            return str(self.__dict__.get("openai_model") or "")
         return os.getenv("OPENAI_MODEL") or self.llm_model
 
     @property
@@ -554,12 +565,13 @@ class Settings(BaseSettings):
     @property
     def allowed_merchants(self) -> set[str]:
         values = {item.strip() for item in str(self.allowed_merchant_ids or "").split(",") if item.strip()}
-        return values or {self.merchant_id}
+        configured_default = str(self.merchant_id or "").strip()
+        return values or ({configured_default} if configured_default else set())
 
     def merchant_allowed(self, merchant_id: str) -> bool:
         target = str(merchant_id or self.merchant_id).strip()
         allowed = self.allowed_merchants
-        return "*" in allowed or target in allowed
+        return bool(target) and ("*" in allowed or target in allowed)
 
     @property
     def security(self) -> SecuritySettings:
@@ -728,8 +740,14 @@ def resolve_placeholder(value: Any, default: str = "") -> str:
     if value is None:
         return default
     text = str(value).strip()
-    match = re.fullmatch(r"\$\{([^:}]+):?([^}]*)\}", text)
-    if not match:
+    if len(text) < 4 or not text.startswith("${") or not text.endswith("}"):
         return text
-    env_name, fallback = match.groups()
+    body = text[2:-1]
+    if not body or "{" in body or "}" in body:
+        return text
+    env_name, separator, fallback = body.partition(":")
+    if not env_name or any(character.isspace() for character in env_name):
+        return text
+    if not separator:
+        fallback = ""
     return os.getenv(env_name, fallback or default)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, Iterable, List, Literal, Mapping, Optional, Sequence, Set, Tuple
 
 from merchant_ai.models import PlanningAssetPack, RelationshipEntry
+from merchant_ai.services.text_parsing import compact_ascii_alphanumeric
 
 
 JoinUsage = Literal["detail", "filter_scope", "aggregate"]
@@ -561,8 +561,9 @@ def _normalize_type_family(value: Any) -> str:
         nested = _direct_metadata_values(value, {"datatype", "physicaltype", "type"})
         return _normalize_type_family(nested[0]) if len(nested) == 1 else ""
     normalized = str(value or "").strip().casefold()
-    normalized = re.sub(r"\s+", "", normalized)
-    normalized = re.sub(r"\(.*\)$", "", normalized)
+    normalized = "".join(normalized.split())
+    if normalized.endswith(")") and "(" in normalized:
+        normalized = normalized.partition("(")[0]
     if normalized.startswith("decimal"):
         normalized = "decimal"
     elif normalized.startswith("varchar"):
@@ -574,15 +575,6 @@ def _normalize_type_family(value: Any) -> str:
     return _TYPE_FAMILIES.get(normalized, "")
 
 
-_TENANT_ROLES = {
-    "tenant",
-    "tenantkey",
-    "tenantscope",
-    "tenantscopekey",
-    "rowscopekey",
-    "rowaccesskey",
-    "securityscopekey",
-}
 _GLOBAL_SCOPE_TYPES = {"global", "public", "shared", "unscoped", "none"}
 
 
@@ -680,33 +672,6 @@ def _table_scope_contract(
             elif parsed is False:
                 scope_candidates.add("global")
                 evidence.append("tenantScoped:false")
-
-        for descriptor in _walk_mappings(entry.metadata):
-            roles = _direct_metadata_values(descriptor, {"semanticrole", "role"})
-            normalized_roles = {_normalize_metadata_key(role) for role in roles}
-            if not (normalized_roles & _TENANT_ROLES):
-                continue
-            identities = _direct_metadata_values(
-                descriptor,
-                {"column", "columnname", "field", "fieldname", "physicalcolumn", "name"},
-            )
-            tenant_columns.update(str(identity) for identity in identities if str(identity))
-            scope_candidates.add("tenant")
-            evidence.append("semanticRole:tenant_scope")
-
-    for field in (*asset_pack.fields, *asset_pack.entity_keys):
-        if field.table != table:
-            continue
-        roles = {
-            _normalize_metadata_key(value)
-            for key in ("semanticrole", "role")
-            for value in _metadata_values(field.metadata, key)
-        }
-        if not (roles & _TENANT_ROLES):
-            continue
-        tenant_columns.update(field.columns or ([field.key] if field.key else []))
-        scope_candidates.add("tenant")
-        evidence.append("semanticRole:tenant_scope")
 
     if "tenant" in scope_candidates:
         return "tenant", tenant_columns, ",".join(sorted(set(evidence)))
@@ -1187,7 +1152,7 @@ def _metadata_values(payload: Mapping[str, Any], normalized_key: str) -> List[An
 
 
 def _normalize_metadata_key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return compact_ascii_alphanumeric(value)
 
 
 def _directional_fanout_declaration(

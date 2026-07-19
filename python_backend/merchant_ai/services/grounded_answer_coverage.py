@@ -732,16 +732,9 @@ def _artifact_answer_span(
     answer = str(answer_markdown or "").strip()
     rows = _artifact_rows(artifact)
     if not rows:
-        no_data_markers = (
-            "未返回数据",
-            "暂无数据",
-            "没有数据",
-            "无符合",
-            "no data",
-            "empty result",
-        )
-        normalized = answer.lower()
-        return answer if any(marker in normalized for marker in no_data_markers) else ""
+        # Empty-result coverage is rendered from the verified artifact below;
+        # arbitrary prose is never classified as proof by wording heuristics.
+        return ""
 
     first_row = rows[0]
     values = [

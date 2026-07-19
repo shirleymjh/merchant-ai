@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import uuid
 from typing import Any, Dict, Iterable, Optional
 
@@ -12,7 +11,9 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.cache import TTLCache
 from merchant_ai.services.formulas import compile_metric_formula
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.text_parsing import contains_any_literal, is_ascii_identifier
 from merchant_ai.services.time_semantics import (
     CALENDAR_ANCHOR_POLICY,
     latest_as_of_partition_predicate_sql,
@@ -24,18 +25,16 @@ from merchant_ai.services.time_semantics import (
     time_window_contract_payload,
 )
 
-
-COMPLEX_TERMS = ["明细", "详情", "列表", "记录", "对应", "关联", "拆解", "归因"]
-ANALYSIS_TERMS = ["为什么", "原因", "分析", "归因", "诊断", "异常", "建议"]
-DEFINITION_TERMS = ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"]
-SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIME_DIMENSION_KEY = "time_dimension"
 QUICK_RESPONSE_CACHE = TTLCache("quick_metric_response", max_entries=512, ttl_seconds=30)
 
 
 def is_metric_definition_question(question: str) -> bool:
-    text = str(question or "")
-    return any(term in text for term in DEFINITION_TERMS)
+    return contains_any_literal(
+        question,
+        load_language_policy().answer.definition_markers,
+        case_sensitive=False,
+    )
 
 
 def quick_metric_response(
@@ -45,28 +44,33 @@ def quick_metric_response(
     extracted_keywords: Any = None,
     semantic_metrics: Optional[list[Dict[str, Any]]] = None,
     timezone_name: str = "Asia/Shanghai",
+    artifact_refs: Optional[Iterable[Any]] = None,
 ) -> Optional[ChatResponse]:
     # Fast answers are deliberately a one-metric capability.  The caller must
     # provide contracts compiled from the published semantic layer; an empty,
     # ambiguous, or multi-metric match always falls back to QueryGraph.
-    if not semantic_metrics:
+    if not semantic_metrics or extracted_keywords is None:
+        return None
+    if list(artifact_refs or []):
         return None
     metric_phrases = list(getattr(extracted_keywords, "metric_keywords", None) or [])
-    matched_metrics = resolve_metrics(question, semantic_metrics or [], metric_phrases)
+    matched_metrics = resolve_metrics(
+        question,
+        semantic_metrics or [],
+        metric_phrases,
+        getattr(extracted_keywords, "mentions", None),
+    )
     if len(matched_metrics) != 1:
         return None
-    if structured_keywords_require_planner(extracted_keywords, matched_metrics) or "[用户附件上下文]" in question:
-        return None
-    if is_metric_definition_question(question):
-        return quick_metric_definition_response(question, merchant_id, matched_metrics)
-    if any(term in question for term in ANALYSIS_TERMS):
-        return None
-    if any(term in question for term in COMPLEX_TERMS):
-        return None
-    if not any(
-        term in question.lower() for term in ["多少", "总", "趋势", "走势", "变化", "最近", "近", "为什么", "原因"]
+    request_kind = structured_quick_metric_request_kind(question, extracted_keywords)
+    if structured_keywords_require_planner(
+        extracted_keywords,
+        matched_metrics,
+        request_kind=request_kind,
     ):
         return None
+    if request_kind == "definition":
+        return quick_metric_definition_response(question, merchant_id, matched_metrics)
     time_range = resolve_time_range(question, timezone_name)
     temporal_contract = resolve_time_window_contract(question, timezone_name)
     temporal_mode = quick_metric_temporal_mode(time_range, temporal_contract)
@@ -649,14 +653,79 @@ def answer_contains_number(answer: str, expected: Any) -> bool:
 
 
 def numeric_token_pairs(text: str) -> list[tuple[str, float]]:
-    scrubbed = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", " ", str(text or ""))
+    scrubbed = _scrub_calendar_dates(str(text or ""))
     pairs: list[tuple[str, float]] = []
-    for match in re.finditer(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?", scrubbed):
-        raw = match.group(0)
+    for raw in _numeric_tokens(scrubbed):
         value = numeric_token_value(raw)
         if value is not None:
             pairs.append((raw, value))
     return pairs
+
+
+def _numeric_tokens(value: str) -> Iterable[str]:
+    text = str(value or "")
+    cursor = 0
+    ascii_word = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    while cursor < len(text):
+        start = cursor
+        if text[cursor] in {"+", "-"}:
+            cursor += 1
+        if cursor >= len(text) or not (
+            text[cursor].isascii() and text[cursor].isdigit()
+        ):
+            cursor = start + 1
+            continue
+        if start > 0 and text[start - 1] in ascii_word:
+            cursor = start + 1
+            continue
+        while cursor < len(text) and (
+            (text[cursor].isascii() and text[cursor].isdigit())
+            or text[cursor] == ","
+        ):
+            cursor += 1
+        if cursor < len(text) and text[cursor] == ".":
+            decimal_cursor = cursor + 1
+            while decimal_cursor < len(text) and (
+                text[decimal_cursor].isascii()
+                and text[decimal_cursor].isdigit()
+            ):
+                decimal_cursor += 1
+            if decimal_cursor > cursor + 1:
+                cursor = decimal_cursor
+        if cursor < len(text) and text[cursor] == "%":
+            cursor += 1
+        yield text[start:cursor]
+
+
+def _scrub_calendar_dates(value: str) -> str:
+    text = str(value or "")
+    output = list(text)
+    cursor = 0
+    while cursor + 7 < len(text):
+        if not (
+            text[cursor : cursor + 4].isascii()
+            and text[cursor : cursor + 4].isdigit()
+            and text[cursor + 4] in {"-", "/"}
+        ):
+            cursor += 1
+            continue
+        end = cursor + 5
+        month_start = end
+        while end < len(text) and end - month_start < 2 and text[end].isascii() and text[end].isdigit():
+            end += 1
+        if end == month_start or end >= len(text) or text[end] not in {"-", "/"}:
+            cursor += 1
+            continue
+        end += 1
+        day_start = end
+        while end < len(text) and end - day_start < 2 and text[end].isascii() and text[end].isdigit():
+            end += 1
+        if end == day_start:
+            cursor += 1
+            continue
+        output[cursor:end] = [" "] * (end - cursor)
+        cursor = end
+    return "".join(output)
 
 
 def numeric_token_value(value: Any) -> float | None:
@@ -743,10 +812,22 @@ def metric_definition_suggestions(metrics: list[Dict[str, Any]]) -> list[str]:
         str(metric.get("label") or metric.get("key") or "").strip() for metric in metrics
     )
     label = "、".join(labels) or "该指标"
+    language = load_language_policy()
+    windows = language.routing.time_clarification_options
+    primary_window = windows[0]
+    comparison_window = windows[1] if len(windows) > 1 else primary_window
+    previous_day = next(
+        (
+            phrase
+            for phrase, semantic in language.temporal.named_window_semantics.items()
+            if semantic == "previous_day"
+        ),
+        language.temporal.labels["previous_day"],
+    )
     return [
-        "最近7天%s趋势" % label,
-        "昨天%s是多少？" % label,
-        "最近30天%s按天走势" % label,
+        "%s%s趋势" % (primary_window, label),
+        "%s%s是多少？" % (previous_day, label),
+        "%s%s按天走势" % (comparison_window, label),
     ]
 
 
@@ -756,22 +837,56 @@ def metric_definition_advice(question: str, metrics: list[Dict[str, Any]]) -> li
     return ["后续分析请沿用“%s”的已发布语义口径。" % label, "把来源表、公式和单位一起展示，避免不同报表口径混用。"]
 
 
-def structured_keywords_require_planner(keywords: Any, matched_metrics: Optional[list[Dict[str, Any]]] = None) -> bool:
+def structured_quick_metric_request_kind(question: str, keywords: Any) -> str:
+    declared = str(getattr(keywords, "analysis_intent", "") or "").strip().casefold()
+    normalized = str(getattr(keywords, "normalized_question", "") or question or "")
+    if declared == "definition" or is_metric_definition_question(normalized):
+        return "definition"
+    if declared == "unresolved":
+        temporal = load_language_policy().temporal
+        safe_actions = {
+            *temporal.daily_grain_markers,
+            *temporal.time_series_markers,
+        }
+        actions = {
+            str(item or "").strip()
+            for item in (getattr(keywords, "action_keywords", None) or [])
+            if str(item or "").strip()
+        }
+        if actions and actions <= safe_actions:
+            return "lookup"
+    return declared or "lookup"
+
+
+def structured_keywords_require_planner(
+    keywords: Any,
+    matched_metrics: Optional[list[Dict[str, Any]]] = None,
+    *,
+    request_kind: str = "",
+) -> bool:
     if keywords is None:
         return False
+    policy = load_language_policy().routing
     if getattr(keywords, "ranking_keywords", None):
         return True
     if getattr(keywords, "unresolved_phrases", None):
         return True
     structured_metrics = list(getattr(keywords, "metric_keywords", None) or [])
-    analysis_intent = str(getattr(keywords, "analysis_intent", "") or "")
-    if analysis_intent in {"attribution", "ranking", "detail", "advice"}:
+    analysis_intent = request_kind or str(getattr(keywords, "analysis_intent", "") or "")
+    if analysis_intent not in {"", "lookup", "definition", "ratio", "trend", "comparison"}:
         return True
     if analysis_intent == "ratio" and not (
         matched_metrics is not None and len(matched_metrics) == 1 and len(structured_metrics) <= 1
     ):
         return True
     if matched_metrics is not None and len(structured_metrics) > len(matched_metrics):
+        return True
+    normalized_question = str(getattr(keywords, "normalized_question", "") or "")
+    if analysis_intent != "definition" and contains_any_literal(
+        normalized_question,
+        (*policy.detail_markers, *policy.causal_markers),
+        case_sensitive=False,
+    ):
         return True
     metric_candidates: Dict[str, set[str]] = {}
     for item in getattr(keywords, "mentions", None) or []:
@@ -814,7 +929,10 @@ def published_semantic_quick_metrics(
             table = str(manifest.get("tableName") or "").strip()
             time_column = str(manifest.get("timeColumn") or "").strip()
             tenant_column = str(manifest.get("merchantFilterColumn") or "").strip()
-            if not all(SAFE_IDENTIFIER.fullmatch(item or "") for item in [table, time_column, tenant_column]):
+            if not all(
+                is_ascii_identifier(item or "")
+                for item in [table, time_column, tenant_column]
+            ):
                 continue
             for metric in topic_assets.load_table_metrics(topic, table):
                 contract = compile_semantic_quick_metric(metric, topic, table, time_column, tenant_column)
@@ -836,14 +954,16 @@ def compile_semantic_quick_metric(
     tenant_column: str,
 ) -> Optional[Dict[str, Any]]:
     effective_time_column = str(metric.get("timeColumn") or time_column or "").strip()
-    if not SAFE_IDENTIFIER.fullmatch(effective_time_column):
+    if not is_ascii_identifier(effective_time_column):
         return None
     time_semantics = metric.get("timeSemantics") or {}
     if not isinstance(time_semantics, dict):
         return None
     formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
     source_columns = [str(item or "").strip() for item in metric.get("sourceColumns") or [] if str(item or "").strip()]
-    if not source_columns or not all(SAFE_IDENTIFIER.fullmatch(column) for column in source_columns):
+    if not source_columns or not all(
+        is_ascii_identifier(column) for column in source_columns
+    ):
         return None
     compiled_formula = compile_metric_formula(formula, set(source_columns))
     if not compiled_formula:
@@ -852,7 +972,15 @@ def compile_semantic_quick_metric(
     if not metric_key:
         return None
     label = str(metric.get("displayName") or metric.get("businessName") or metric_key).strip()
-    aliases = [label, metric_key, *source_columns, *(metric.get("aliases") or [])]
+    aliases = [
+        label,
+        metric_key,
+        *source_columns,
+        *(metric.get("aliases") or []),
+        metric.get("naturalName"),
+        metric.get("originalBusinessName"),
+        metric.get("naturalAlias"),
+    ]
     terms = list(dict.fromkeys(str(item or "").strip() for item in aliases if str(item or "").strip()))
     if not terms:
         return None
@@ -860,6 +988,10 @@ def compile_semantic_quick_metric(
         "key": metric_key,
         "label": label,
         "unit": str(metric.get("unit") or "").strip(),
+        "value_format": str(metric.get("valueFormat") or metric.get("value_format") or "").strip(),
+        "summary_predicate": str(
+            metric.get("summaryPredicate") or metric.get("summary_predicate") or ""
+        ).strip(),
         "formula": formula,
         "compiled_formula": compiled_formula,
         "source_columns": source_columns,
@@ -873,7 +1005,19 @@ def compile_semantic_quick_metric(
         "natural_name": str(metric.get("naturalName") or "").strip(),
         "metric_grain": str(metric.get("metricGrain") or "").strip(),
         "metric_intent": str(metric.get("metricIntent") or "").strip(),
+        "detail_metric_ref": str(metric.get("detailMetricRef") or "").strip(),
+        "summary_metric_ref": str(metric.get("summaryMetricRef") or "").strip(),
         "selection_guidance": str(metric.get("selectionGuidance") or "").strip(),
+        "preferred_use_cases": [
+            str(item or "").strip()
+            for item in metric.get("preferredUseCases") or []
+            if str(item or "").strip()
+        ],
+        "not_preferred_use_cases": [
+            str(item or "").strip()
+            for item in metric.get("notPreferredUseCases") or []
+            if str(item or "").strip()
+        ],
         "aggregation_policy": str(metric.get("aggregationPolicy") or "").strip(),
         "applicable_time_grain": metric.get("applicableTimeGrain"),
         "time_semantics": time_semantics,
@@ -903,6 +1047,10 @@ def semantic_metric_identity(metric: Dict[str, Any]) -> Dict[str, Any]:
         "zeroValueMeaning": str(metric.get("zero_value_meaning") or metric.get("zeroValueMeaning") or ""),
         "temporalVariants": metric.get("temporal_variants") or metric.get("temporalVariants") or {},
         "linkedVariantOf": str(metric.get("linked_variant_of") or metric.get("linkedVariantOf") or ""),
+        "metricIntent": str(metric.get("metric_intent") or metric.get("metricIntent") or ""),
+        "metricGrain": str(metric.get("metric_grain") or metric.get("metricGrain") or ""),
+        "detailMetricRef": str(metric.get("detail_metric_ref") or metric.get("detailMetricRef") or ""),
+        "summaryMetricRef": str(metric.get("summary_metric_ref") or metric.get("summaryMetricRef") or ""),
         "semanticRefId": semantic_metric_ref_id(metric),
         "governanceStatus": "published",
     }
@@ -942,7 +1090,11 @@ def resolve_metrics(
     question: str,
     semantic_metrics: list[Dict[str, Any]],
     metric_phrases: Optional[list[str]] = None,
+    metric_mentions: Optional[Iterable[Any]] = None,
 ) -> list[Dict[str, Any]]:
+    governed = resolve_governed_metric_mentions(semantic_metrics, metric_mentions)
+    if governed is not None:
+        return governed
     text = question.lower()
     phrases = [str(item or "").strip() for item in (metric_phrases or []) if str(item or "").strip()]
     if not phrases:
@@ -974,6 +1126,50 @@ def resolve_metrics(
     return result
 
 
+def resolve_governed_metric_mentions(
+    semantic_metrics: list[Dict[str, Any]],
+    metric_mentions: Optional[Iterable[Any]],
+) -> Optional[list[Dict[str, Any]]]:
+    """Resolve typed routing mentions without repeating lexical matching.
+
+    ``None`` means that no governed metric mention was supplied and the caller
+    may use the legacy phrase-only contract.  An empty list means mentions were
+    supplied but could not be resolved unambiguously, so the fast path must
+    hand control to QueryGraph.
+    """
+
+    mentions = [item for item in (metric_mentions or []) if str(getattr(item, "kind", "")) == "metric"]
+    if not mentions:
+        return None
+    by_identity: Dict[tuple[str, str], Dict[str, Any]] = {
+        (str(metric.get("table") or ""), str(metric.get("key") or "")): metric
+        for metric in semantic_metrics
+    }
+    resolved_by_phrase: Dict[str, set[tuple[str, str]]] = {}
+    phrase_order: list[str] = []
+    for mention in mentions:
+        phrase = str(getattr(mention, "phrase", "") or "").strip()
+        metric_key = str(getattr(mention, "canonical_key", "") or "").strip()
+        owner_table = str(getattr(mention, "owner_table", "") or "").strip()
+        if not phrase or not metric_key:
+            return []
+        if phrase not in resolved_by_phrase:
+            resolved_by_phrase[phrase] = set()
+            phrase_order.append(phrase)
+        candidates = [
+            identity
+            for identity in by_identity
+            if identity[1] == metric_key and (not owner_table or identity[0] == owner_table)
+        ]
+        if len(candidates) != 1:
+            return []
+        resolved_by_phrase[phrase].add(candidates[0])
+    if any(len(identities) != 1 for identities in resolved_by_phrase.values()):
+        return []
+    ordered_identities = [next(iter(resolved_by_phrase[phrase])) for phrase in phrase_order]
+    return [by_identity[identity] for identity in dict.fromkeys(ordered_identities)]
+
+
 def unresolved_cross_table_metric_candidates(scored: list[tuple[int, Dict[str, Any]]]) -> bool:
     candidates = [(score, metric) for score, metric in scored if score >= 100]
     if len({(metric["table"], metric["key"]) for _score, metric in candidates}) < 2:
@@ -1002,10 +1198,14 @@ def semantic_phrase_score(metric: Dict[str, Any], phrase: str) -> int:
 
 
 def time_range_label(question: str, days: int) -> str:
-    if "昨天" in question or "昨日" in question:
-        return "昨天"
-    if "今天" in question or "今日" in question:
-        return "今天"
+    temporal = load_language_policy().temporal
+    observed = [
+        (str(question or "").find(phrase), phrase)
+        for phrase, semantic in temporal.named_window_semantics.items()
+        if semantic in {"previous_day", "current_day"} and str(question or "").find(phrase) >= 0
+    ]
+    if observed:
+        return min(observed, key=lambda item: item[0])[1]
     return "最近%d天" % days
 
 
@@ -1014,7 +1214,7 @@ def metric_category_name(metric: Dict[str, Any]) -> str:
 
 
 def normalize_question(question: str) -> str:
-    return re.sub(r"\s+", "", str(question or "").lower()).replace("？", "?")
+    return "".join(str(question or "").lower().split()).replace("？", "?")
 
 
 def fresh_cached_response(payload: Dict[str, Any]) -> ChatResponse:
@@ -1037,13 +1237,15 @@ def format_value(value: float, metric: Dict[str, Any]) -> str:
 
 
 def summary_predicate(metric: Dict[str, Any]) -> str:
-    label = str(metric.get("label") or "")
-    key = str(metric.get("key") or "").lower()
+    governed = str(metric.get("summary_predicate") or metric.get("summaryPredicate") or "").strip()
+    if governed:
+        return governed
     formula = str(metric.get("formula") or "").strip().upper()
     unit = str(metric.get("unit") or "")
-    if unit == "%" or "rate" in key or "率" in label or "比例" in label:
+    value_format = str(metric.get("value_format") or metric.get("valueFormat") or "").casefold()
+    if unit == "%" or value_format in {"percent", "percentage", "ratio", "rate"}:
         return "为"
-    if formula.startswith("AVG(") or key.startswith("avg_") or "平均" in label or "score" in key or "duration" in key:
+    if formula.startswith("AVG("):
         return "平均为"
     return "合计为"
 

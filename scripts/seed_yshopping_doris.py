@@ -2,7 +2,6 @@
 
 import json
 import random
-import re
 import subprocess
 import sys
 import time
@@ -190,8 +189,11 @@ def column_names(columns: list[dict[str, str]]) -> set[str]:
 
 
 def trailing_number(value) -> int:
-    match = re.search(r"(\d+)$", str(value))
-    return int(match.group(1)) if match else 0
+    text = str(value or "")
+    cursor = len(text)
+    while cursor > 0 and text[cursor - 1].isdigit():
+        cursor -= 1
+    return int(text[cursor:]) if cursor < len(text) else 0
 
 
 def coerce_for_column(value, column: dict[str, str]):

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Set
+
+import sqlglot
+from sqlglot import exp
 
 from merchant_ai.models import AgentRunResult, AnswerMode, EvidenceGap, QueryPlan, VerifiedEvidence
 from merchant_ai.services.entity_contracts import (
@@ -13,6 +15,11 @@ from merchant_ai.services.query import (
     semantic_filter_contract_hash,
     semantic_filter_execution_hash,
     semantic_filter_value_hash,
+)
+from merchant_ai.services.text_parsing import (
+    is_ascii_identifier,
+    leading_iso_date_parts,
+    literal_spans,
 )
 
 
@@ -607,11 +614,15 @@ def explicit_evidence_reference(evidence_text: str, reference: Any) -> bool:
         return False
     if evidence_text == normalized_reference:
         return True
-    if re.fullmatch(r"[a-z_][a-z0-9_]*", normalized_reference):
+    if (
+        is_ascii_identifier(normalized_reference)
+        and normalized_reference == normalized_reference.lower()
+    ):
         return bool(
-            re.search(
-                r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(normalized_reference),
+            literal_spans(
                 evidence_text,
+                (normalized_reference,),
+                ascii_word_boundary=True,
             )
         )
     # Non-identifier labels are deliberately exact.  Their aliases belong in
@@ -662,19 +673,25 @@ def formula_columns(formula: str) -> List[str]:
         "IS",
         "NULL",
     }
-    columns: List[str] = []
-    for token in re.findall(r"`?([A-Za-z_][A-Za-z0-9_]*)`?", formula or ""):
-        if token.upper() in keywords:
-            continue
-        if token not in columns:
-            columns.append(token)
-    return columns
+    try:
+        parsed = sqlglot.parse_one(str(formula or ""), read="doris")
+    except Exception:
+        return []
+    return list(
+        dict.fromkeys(
+            column.name
+            for column in parsed.find_all(exp.Column)
+            if column.name and column.name.upper() not in keywords
+        )
+    )
 
 
 def canonical_formula(value: Any) -> str:
     """Normalize formatting only; keep the published calculation semantics."""
 
-    return re.sub(r"\s+", "", str(value or "").replace("`", "")).lower()
+    return "".join(
+        str(value or "").replace("`", "").split()
+    ).lower()
 
 
 def normalize_semantic_aliases(value: Any) -> Dict[str, Set[str]]:
@@ -964,11 +981,12 @@ def snapshot_source_expected_range(source: Any) -> str:
 
 def snapshot_time_display(value: Any) -> str:
     text = str(value or "").strip()
-    if re.fullmatch(r"\d{8}", text):
+    if len(text) == 8 and text.isascii() and text.isdigit():
         return "%s-%s-%s" % (text[:4], text[4:6], text[6:8])
-    match = re.match(r"(\d{4}-\d{1,2}-\d{1,2})", text)
-    if match:
-        return match.group(1)
+    date_parts = leading_iso_date_parts(text)
+    if date_parts is not None:
+        year, month, day = date_parts
+        return "%s-%s-%s" % (year, month, day)
     return text[:40]
 
 
@@ -1299,14 +1317,46 @@ def suggested_action_for_gap(gap: EvidenceGap) -> str:
 
 def missing_metric_for_gap(gap: EvidenceGap) -> str:
     text = " ".join([gap.evidence or "", gap.reason or ""])
-    match = re.search(r"(metric|指标)[:=： ]+([A-Za-z0-9_\\.\\-\\u4e00-\\u9fff]+)", text)
-    return match.group(2) if match else ""
+    return _value_after_markers(text, ("metric", "指标"))
 
 
 def missing_dimension_for_gap(gap: EvidenceGap) -> str:
     text = " ".join([gap.evidence or "", gap.reason or ""])
-    match = re.search(r"(dimension|维度|字段)[:=： ]+([A-Za-z0-9_\\.\\-\\u4e00-\\u9fff]+)", text)
-    return match.group(2) if match else ""
+    return _value_after_markers(text, ("dimension", "维度", "字段"))
+
+
+def _value_after_markers(text: str, markers: tuple[str, ...]) -> str:
+    spans = literal_spans(
+        text,
+        markers,
+        case_sensitive=False,
+    )
+    for _, end, _ in spans:
+        cursor = end
+        separator_seen = False
+        while cursor < len(text) and (
+            text[cursor].isspace() or text[cursor] in {":", "：", "="}
+        ):
+            separator_seen = True
+            cursor += 1
+        if not separator_seen:
+            continue
+        start = cursor
+        while cursor < len(text):
+            character = text[cursor]
+            allowed = (
+                character.isascii()
+                and (
+                    character.isalnum()
+                    or character in {"_", ".", "-"}
+                )
+            ) or "\u4e00" <= character <= "\u9fff"
+            if not allowed:
+                break
+            cursor += 1
+        if cursor > start:
+            return text[start:cursor]
+    return ""
 
 
 def missing_time_range_for_gap(gap: EvidenceGap) -> str:

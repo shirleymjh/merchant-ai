@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from merchant_ai.config import Settings
 from merchant_ai.models import UserIdentity
+from merchant_ai.services.authorization_policy import load_authorization_policy
 
 
 def identity_scope_payload(identity: Any = None, merchant_id: str = "") -> Dict[str, Any]:
@@ -27,7 +28,7 @@ def identity_scope_payload(identity: Any = None, merchant_id: str = "") -> Dict[
     return {
         "merchantId": str(payload.get("merchantId") or payload.get("merchant_id") or merchant_id or "").strip(),
         "userId": str(payload.get("userId") or payload.get("user_id") or "").strip(),
-        "role": str(payload.get("role") or "merchant_operator").strip(),
+        "role": str(payload.get("role") or load_authorization_policy().default_identity_role).strip(),
         "storeIds": sorted(
             {
                 str(item).strip()
@@ -62,31 +63,16 @@ class Permission(str, Enum):
     OPS_WRITE = "ops.write"
 
 
+_ACTIVE_AUTHORIZATION_POLICY = load_authorization_policy()
 ROLE_PERMISSIONS = {
-    "merchant_analyst": {
-        Permission.CHAT_RUN,
-        Permission.RUN_READ,
-        Permission.MEMORY_READ,
-    },
-    "merchant_admin": {
-        Permission.CHAT_RUN,
-        Permission.RUN_READ,
-        Permission.RUN_CANCEL,
-        Permission.MEMORY_READ,
-        Permission.MEMORY_WRITE,
-    },
-    "ops_admin": set(Permission),
+    role: (
+        set(Permission)
+        if "*" in permissions
+        else {Permission(value) for value in permissions}
+    )
+    for role, permissions in _ACTIVE_AUTHORIZATION_POLICY.access_role_permissions.items()
 }
-
-IDENTITY_ROLES = {
-    "merchant_owner",
-    "merchant_operator",
-    "merchant_finance",
-    "merchant_customer_service",
-    "merchant_goods",
-    "merchant_fulfillment",
-    "platform_operator",
-}
+IDENTITY_ROLES = set(_ACTIVE_AUTHORIZATION_POLICY.identity_roles)
 
 
 def resolve_authenticated_identity(
@@ -108,7 +94,7 @@ def resolve_authenticated_identity(
     if requested_identity is None:
         return None
     # Local development remains convenient, but never accepts arbitrary role names.
-    role = requested_identity.role if requested_identity.role in IDENTITY_ROLES else "merchant_operator"
+    role = _ACTIVE_AUTHORIZATION_POLICY.normalize_identity_role(requested_identity.role)
     return requested_identity.model_copy(update={"role": role})
 
 
@@ -155,7 +141,7 @@ def decode_jwt_segment(value: str) -> Dict[str, Any]:
 
 
 def identity_from_claims(claims: Dict[str, Any]) -> UserIdentity:
-    role = str(claims.get("role") or "merchant_operator")
+    role = str(claims.get("role") or _ACTIVE_AUTHORIZATION_POLICY.default_identity_role)
     if role not in IDENTITY_ROLES:
         raise HTTPException(status_code=403, detail="identity role is not allowed")
     store_ids = claims.get("storeIds") or claims.get("store_ids") or []
@@ -175,7 +161,7 @@ def identity_from_claims(claims: Dict[str, Any]) -> UserIdentity:
 @dataclass(frozen=True)
 class Principal:
     merchant_id: str = ""
-    roles: Set[str] = field(default_factory=lambda: {"merchant_analyst"})
+    roles: Set[str] = field(default_factory=lambda: {_ACTIVE_AUTHORIZATION_POLICY.default_access_role})
     permissions: Set[Permission] = field(default_factory=set)
     is_ops: bool = False
 
@@ -188,12 +174,19 @@ class Principal:
 
 
 def merchant_principal(merchant_id: str, roles: Iterable[str] | None = None) -> Principal:
-    normalized_roles = {str(role or "").strip() for role in (roles or ["merchant_analyst"]) if str(role or "").strip()}
-    return Principal(merchant_id=str(merchant_id or "").strip(), roles=normalized_roles or {"merchant_analyst"})
+    normalized_roles = {
+        str(role or "").strip()
+        for role in (roles or [_ACTIVE_AUTHORIZATION_POLICY.default_access_role])
+        if str(role or "").strip()
+    }
+    return Principal(
+        merchant_id=str(merchant_id or "").strip(),
+        roles=normalized_roles or {_ACTIVE_AUTHORIZATION_POLICY.default_access_role},
+    )
 
 
 def ops_principal() -> Principal:
-    return Principal(roles={"ops_admin"}, is_ops=True)
+    return Principal(roles={_ACTIVE_AUTHORIZATION_POLICY.ops_principal_role}, is_ops=True)
 
 
 def principal_from_authenticated_identity(identity: UserIdentity) -> Principal:
@@ -204,13 +197,13 @@ def principal_from_authenticated_identity(identity: UserIdentity) -> Principal:
     platform operators remain the sole cross-merchant identity role.
     """
 
-    role = str(identity.role or "merchant_operator").strip()
-    if role == "platform_operator":
-        return ops_principal()
+    role = str(identity.role or _ACTIVE_AUTHORIZATION_POLICY.default_identity_role).strip()
+    role_policy = _ACTIVE_AUTHORIZATION_POLICY.identity_role_policy(role, strict=True)
+    if role_policy.is_ops:
+        return Principal(roles=set(role_policy.principal_roles), is_ops=True)
     merchant_id = str(identity.merchant_id or "").strip()
     if not merchant_id:
         raise HTTPException(status_code=403, detail="authenticated identity has no merchant scope")
-    principal_role = "merchant_admin" if role == "merchant_owner" else "merchant_analyst"
     explicit_permissions: Set[Permission] = set()
     for value in identity.permissions:
         try:
@@ -219,7 +212,7 @@ def principal_from_authenticated_identity(identity: UserIdentity) -> Principal:
             continue
     return Principal(
         merchant_id=merchant_id,
-        roles={principal_role},
+        roles=set(role_policy.principal_roles),
         permissions=explicit_permissions,
     )
 

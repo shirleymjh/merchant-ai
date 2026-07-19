@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+
+from merchant_ai.services.text_parsing import ASCII_DIGITS
 
 
 @dataclass(frozen=True)
@@ -35,15 +36,32 @@ def classify_llm_failure(error: str) -> LlmFailureClassification:
         "bad gateway",
         "temporarily unavailable",
     )
-    if bool(re.search(r"\b5\d{2}\b", lowered)) or any(marker in lowered for marker in transient_markers):
+    if _contains_status_code(lowered, 500, 599) or any(marker in lowered for marker in transient_markers):
         return LlmFailureClassification("PROVIDER_ERROR", True)
     if (
         "provider_error" in lowered
-        or bool(re.search(r"\b4\d{2}\b", lowered))
+        or _contains_status_code(lowered, 400, 499)
         or any(marker in lowered for marker in ("forbidden", "unauthorized", "invalid api key"))
     ):
         return LlmFailureClassification("PROVIDER_ERROR", False)
     return LlmFailureClassification("FAILED", False)
+
+
+def _contains_status_code(text: str, minimum: int, maximum: int) -> bool:
+    source = str(text or "")
+    cursor = 0
+    while cursor < len(source):
+        if source[cursor] not in ASCII_DIGITS:
+            cursor += 1
+            continue
+        end = cursor + 1
+        while end < len(source) and source[end] in ASCII_DIGITS:
+            end += 1
+        token = source[cursor:end]
+        if len(token) == 3 and minimum <= int(token) <= maximum:
+            return True
+        cursor = end
+    return False
 
 
 def bounded_single_retry_count(configured_retries: int) -> int:

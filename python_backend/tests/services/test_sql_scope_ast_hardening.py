@@ -16,6 +16,7 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.evidence import semantic_filter_evidence_gaps
 from merchant_ai.services.query import (
+    NodeExecutionContractValidator,
     NodeWorkerExecutor,
     build_semantic_filter_verification_proof,
     compile_semantic_filter_sql,
@@ -252,13 +253,85 @@ def test_time_window_requires_exact_mandatory_positive_boundaries() -> None:
         "timeSelectionPolicy": "period_window",
     }
     valid = "SELECT * FROM orders WHERE tenant_id='T-1' AND status='paid' AND pt BETWEEN '2026-07-04' AND '2026-07-10'"
+    unbounded = "SELECT * FROM orders WHERE tenant_id='T-1' AND status='paid'"
     reversed_window = valid.replace("'2026-07-04' AND '2026-07-10'", "'2026-07-10' AND '2026-07-04'")
     or_bypass = "SELECT * FROM orders WHERE tenant_id='T-1' AND status='paid' OR pt BETWEEN '2026-07-04' AND '2026-07-10'"
 
     assert time_window_sql_contract_error(valid, contract) == ("", "")
+    assert time_window_sql_contract_error(unbounded, contract)[0] == "MISSING_PARTITION_FILTER"
     assert time_window_sql_contract_error(reversed_window, contract)[0] == "RUNTIME_TIME_ALIGNMENT_MISMATCH"
     assert time_window_sql_contract_error(or_bypass, contract)[0] == "RUNTIME_TIME_ALIGNMENT_MISMATCH"
     assert build_semantic_filter_verification_proof(contract, valid).verified
+
+
+def test_days_obligation_requires_a_formally_bound_time_window_contract() -> None:
+    missing = NodePlanContract(
+        task_id="detail",
+        preferred_table="orders",
+        allowed_columns=["tenant_id", "order_id", "event_day"],
+        visible_columns=["order_id", "event_day"],
+        required_columns=["order_id"],
+        answer_mode=AnswerMode.DETAIL.value,
+        days=7,
+    )
+    bound = missing.model_copy(
+        update={
+            "time_window_contract": {
+                "kind": "rolling",
+                "days": 7,
+                "partitionColumn": "event_day",
+                "table": "orders",
+            }
+        }
+    )
+
+    rejected = NodeExecutionContractValidator().review(missing)
+    accepted = NodeExecutionContractValidator().review(bound)
+
+    assert not rejected.valid
+    assert rejected.code == "INVALID_TIME_WINDOW_CONTRACT"
+    assert "no sealed timeWindowContract" in rejected.message
+    assert accepted.valid
+
+
+def test_time_window_contract_rejects_unbound_or_cross_table_partition_binding() -> None:
+    base = NodePlanContract(
+        task_id="detail",
+        preferred_table="orders",
+        allowed_columns=["tenant_id", "order_id", "event_day"],
+        visible_columns=["order_id", "event_day"],
+        required_columns=["order_id"],
+        answer_mode=AnswerMode.DETAIL.value,
+        days=7,
+    )
+    unknown_column = base.model_copy(
+        update={
+            "time_window_contract": {
+                "days": 7,
+                "partitionColumn": "undeclared_day",
+                "table": "orders",
+            }
+        }
+    )
+    cross_table = base.model_copy(
+        update={
+            "time_window_contract": {
+                "days": 7,
+                "partitionColumn": "event_day",
+                "table": "other_orders",
+            }
+        }
+    )
+
+    unknown_result = NodeExecutionContractValidator().review(unknown_column)
+    cross_table_result = NodeExecutionContractValidator().review(cross_table)
+
+    assert not unknown_result.valid
+    assert unknown_result.code == "INVALID_TIME_WINDOW_CONTRACT"
+    assert "outside the node schema" in unknown_result.message
+    assert not cross_table_result.valid
+    assert cross_table_result.code == "INVALID_TIME_WINDOW_CONTRACT"
+    assert "differs from preferredTable" in cross_table_result.message
 
 
 def test_semantic_explicit_date_filter_must_equal_runtime_window_and_is_emitted_once() -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from contextvars import ContextVar
 from datetime import date
 from decimal import Decimal
@@ -46,10 +45,402 @@ from merchant_ai.services.evidence import (
     snapshot_time_display,
 )
 from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudget
+from merchant_ai.services.language_policy import load_language_policy
+from merchant_ai.services.text_parsing import (
+    ASCII_DIGITS,
+    ASCII_LETTERS,
+    ASCII_WORD,
+    collapse_whitespace,
+    contains_any_literal,
+    is_ascii_identifier,
+    literal_spans,
+    safe_ascii_component,
+    split_on_characters,
+)
 from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
 TIME_DIMENSION_KEY = "time_dimension"
+
+
+def _compact_without_whitespace(value: Any) -> str:
+    return "".join(str(value or "").split())
+
+
+def _contains_phrases_in_order(
+    value: Any,
+    leading: tuple[str, ...] | List[str],
+    trailing: tuple[str, ...] | List[str],
+    *,
+    maximum_gap: int | None = None,
+    case_sensitive: bool = True,
+) -> bool:
+    text = str(value or "")
+    if not case_sensitive:
+        text = text.casefold()
+        leading = tuple(item.casefold() for item in leading)
+        trailing = tuple(item.casefold() for item in trailing)
+    for first in leading:
+        cursor = 0
+        while first and (start := text.find(first, cursor)) >= 0:
+            after = start + len(first)
+            for second in trailing:
+                second_start = text.find(second, after)
+                if second_start < 0:
+                    continue
+                if maximum_gap is None or second_start - after <= maximum_gap:
+                    return True
+            cursor = start + 1
+    return False
+
+
+def _exact_heading(value: Any, names: tuple[str, ...] | List[str]) -> bool:
+    text = str(value or "").strip()
+    if text.endswith((":", "：")):
+        text = text[:-1].strip()
+    return text in names
+
+
+def _starts_with_heading(value: Any, names: tuple[str, ...] | List[str]) -> bool:
+    text = str(value or "").strip()
+    lowered = text.casefold()
+    for name in names:
+        candidate = str(name or "")
+        folded = candidate.casefold()
+        if lowered.startswith(folded + ":") or lowered.startswith(folded + "："):
+            return True
+    return False
+
+
+def _remove_optional_bullet(value: Any) -> str:
+    text = str(value or "").lstrip()
+    if text.startswith(("-", "*")):
+        return text[1:].lstrip()
+    return text
+
+
+def _strip_list_marker(value: Any) -> str:
+    text = _remove_optional_bullet(value)
+    cursor = 0
+    while cursor < len(text) and (text[cursor].isspace() or text[cursor] in ASCII_DIGITS):
+        cursor += 1
+    if cursor and cursor < len(text) and text[cursor] in {".", "、"}:
+        cursor += 1
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        return text[cursor:]
+    return text
+
+
+def _contains_cjk(value: Any) -> bool:
+    return any("\u3400" <= character <= "\u9fff" for character in str(value or ""))
+
+
+def _is_plain_decimal(value: Any) -> bool:
+    text = str(value or "").strip()
+    if text.startswith("-"):
+        text = text[1:]
+    if not text:
+        return False
+    integer, separator, fractional = text.partition(".")
+    return (
+        bool(integer)
+        and all(character in ASCII_DIGITS for character in integer)
+        and (not separator or bool(fractional) and all(character in ASCII_DIGITS for character in fractional))
+    )
+
+
+def _ascii_word_tokens(value: Any) -> List[str]:
+    text = str(value or "")
+    tokens: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in ASCII_LETTERS | {"_"}:
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        tokens.append(text[start:cursor])
+    return tokens
+
+
+def _ascii_chunks(value: Any) -> List[str]:
+    text = str(value or "")
+    chunks: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in ASCII_WORD:
+            cursor += 1
+            continue
+        start = cursor
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        chunks.append(text[start:cursor])
+    return chunks
+
+
+def _strip_relative_time_windows(value: Any) -> str:
+    text = str(value or "")
+    policy = load_language_policy().temporal
+    prefixes = tuple(sorted(policy.prefixes, key=len, reverse=True))
+    units = tuple(sorted((*policy.units.keys(), "年"), key=len, reverse=True))
+    output: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        matched_end = -1
+        for prefix in prefixes:
+            if not text.startswith(prefix, cursor):
+                continue
+            probe = cursor + len(prefix)
+            while probe < len(text) and text[probe].isspace():
+                probe += 1
+            digit_start = probe
+            while probe < len(text) and text[probe] in ASCII_DIGITS:
+                probe += 1
+            if probe == digit_start:
+                continue
+            while probe < len(text) and text[probe].isspace():
+                probe += 1
+            unit = next((item for item in units if text.startswith(item, probe)), "")
+            if unit:
+                matched_end = probe + len(unit)
+                break
+        if matched_end >= 0:
+            cursor = matched_end
+            continue
+        output.append(text[cursor])
+        cursor += 1
+    return "".join(output)
+
+
+def _strip_repeated_leading_literals(value: Any, literals: tuple[str, ...]) -> str:
+    text = str(value or "")
+    ordered = tuple(sorted(literals, key=len, reverse=True))
+    changed = True
+    while changed and text:
+        changed = False
+        for literal in ordered:
+            if text.startswith(literal):
+                text = text[len(literal) :]
+                changed = True
+                break
+    return text
+
+
+def _question_has_ranking_language(value: Any) -> bool:
+    text = str(value or "")
+    policy = load_language_policy().routing
+    if contains_any_literal(text, policy.ranking_operators.keys()):
+        return True
+    folded = text.casefold()
+    if contains_any_literal(folded, policy.ranking_top_prefixes, case_sensitive=False):
+        return True
+    for prefix in policy.ranking_ordinal_prefixes:
+        cursor = 0
+        while prefix and (start := text.find(prefix, cursor)) >= 0:
+            probe = start + len(prefix)
+            while probe < len(text) and text[probe].isspace():
+                probe += 1
+            if probe < len(text) and text[probe] in ASCII_DIGITS:
+                return True
+            cursor = start + 1
+    return False
+
+
+def _replace_ascii_bounded_literal(value: str, source: str, replacement: str) -> str:
+    if not source:
+        return value
+    spans = literal_spans(value, [source], ascii_word_boundary=True)
+    if not spans:
+        return value
+    output: List[str] = []
+    cursor = 0
+    for start, end, _ in spans:
+        output.extend((value[cursor:start], replacement))
+        cursor = end
+    output.append(value[cursor:])
+    return "".join(output)
+
+
+def _collapse_blank_lines(value: Any) -> str:
+    output: List[str] = []
+    blank = False
+    for line in str(value or "").strip().splitlines():
+        if not line.strip():
+            if output and not blank:
+                output.append("")
+            blank = True
+            continue
+        output.append(line)
+        blank = False
+    return "\n".join(output).strip()
+
+
+def _first_json_value(value: Any) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(text):
+            if character not in {"{", "["}:
+                continue
+            try:
+                payload, _ = decoder.raw_decode(text[index:])
+            except ValueError:
+                continue
+            return payload
+    return None
+
+
+def _redact_return_count(value: Any) -> str:
+    text = str(value or "")
+    marker = "：返回"
+    start = text.rfind(marker)
+    if start < 0:
+        return text
+    cursor = start + len(marker)
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    digit_start = cursor
+    while cursor < len(text) and text[cursor] in ASCII_DIGITS:
+        cursor += 1
+    if cursor == digit_start:
+        return text
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if cursor >= len(text) or text[cursor] != "条":
+        return text
+    cursor += 1
+    if cursor < len(text) and text[cursor] == "。":
+        cursor += 1
+    if text[cursor:].strip():
+        return text
+    return text[:start] + "：已有返回结果。"
+
+
+def _remove_ascii_function_calls(value: Any, function_names: tuple[str, ...]) -> str:
+    text = str(value or "")
+    folded_names = {item.casefold() for item in function_names}
+    output: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in ASCII_LETTERS:
+            output.append(text[cursor])
+            cursor += 1
+            continue
+        start = cursor
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        token = text[start:cursor]
+        probe = cursor
+        while probe < len(text) and text[probe].isspace():
+            probe += 1
+        if token.casefold() not in folded_names or probe >= len(text) or text[probe] != "(":
+            output.append(text[start:cursor])
+            continue
+        depth = 0
+        quote = ""
+        end = probe
+        while end < len(text):
+            character = text[end]
+            if quote:
+                if character == quote:
+                    quote = ""
+                end += 1
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        cursor = end if depth == 0 else probe
+    return "".join(output)
+
+
+def _remove_ascii_tokens(value: Any, predicate: Any) -> str:
+    text = str(value or "")
+    output: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in ASCII_LETTERS | {"_"}:
+            output.append(text[cursor])
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        token = text[start:cursor]
+        if not predicate(token):
+            output.append(token)
+    return "".join(output)
+
+
+def _replace_ascii_tokens(value: Any, replacer: Any) -> str:
+    text = str(value or "")
+    output: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in ASCII_LETTERS | {"_"}:
+            output.append(text[cursor])
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        token = text[start:cursor]
+        output.append(str(replacer(token)))
+    return "".join(output)
+
+
+def _replace_collapsed_literal(value: Any, source: str, replacement: str) -> str:
+    text = str(value or "")
+    compact_source = _compact_without_whitespace(source)
+    if not compact_source:
+        return text
+    output: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        probe = cursor
+        matched = 0
+        while probe < len(text) and matched < len(compact_source):
+            if text[probe].isspace():
+                probe += 1
+                continue
+            if text[probe] != compact_source[matched]:
+                break
+            probe += 1
+            matched += 1
+        if matched == len(compact_source):
+            output.append(replacement)
+            cursor = probe
+            continue
+        output.append(text[cursor])
+        cursor += 1
+    return "".join(output)
+
+
+def _strip_upper_code_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    cursor = 0
+    while cursor < len(text) and (text[cursor] in ASCII_LETTERS or text[cursor] == "_"):
+        if text[cursor] in ASCII_LETTERS and not text[cursor].isupper():
+            return text
+        cursor += 1
+    if cursor and cursor < len(text) and text[cursor] in {":", "："}:
+        return text[cursor + 1 :].lstrip()
+    return text
 
 
 def answer_context_policy() -> str:
@@ -653,8 +1044,8 @@ class AnswerComposeService:
             return skeleton
         if not answer:
             return skeleton
-        compact_answer = re.sub(r"\s+", "", answer)
-        compact_skeleton = re.sub(r"\s+", "", skeleton)
+        compact_answer = _compact_without_whitespace(answer)
+        compact_skeleton = _compact_without_whitespace(skeleton)
         if compact_answer and compact_answer in compact_skeleton:
             return skeleton
         answer = self._ensure_multi_trend_answer_coverage(answer, question, plan, run_result)
@@ -678,8 +1069,8 @@ class AnswerComposeService:
     ) -> bool:
         if not answer or not skeleton:
             return False
-        compact_answer = re.sub(r"\s+", "", answer)
-        compact_skeleton = re.sub(r"\s+", "", skeleton)
+        compact_answer = _compact_without_whitespace(answer)
+        compact_skeleton = _compact_without_whitespace(skeleton)
         if compact_skeleton and compact_skeleton in compact_answer:
             return True
         if run_result:
@@ -710,7 +1101,7 @@ class AnswerComposeService:
                     return False
             if trend_tasks:
                 return True
-        skeleton_numbers = [item for item in re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?%?", skeleton) if item not in {"0", "1"}]
+        skeleton_numbers = [item for item, _ in answer_numeric_token_pairs(skeleton) if item not in {"0", "1"}]
         return all(item in answer for item in skeleton_numbers[:8])
 
     def propose_answer_skill(
@@ -842,8 +1233,22 @@ class AnswerComposeService:
             self.last_analysis_skill_trace = trace
             return ""
 
+        from merchant_ai.services.skill_worker import (
+            SkillWorkerExecutor,
+            normalize_skill_package_id,
+        )
+
+        selected_skill_id = normalize_skill_package_id(selected_skill)
         headers = answer_skill_headers(self.llm.settings.resources_root / "runtime" / "agent_skills")
-        metadata = next((item for item in headers if str(item.get("name") or "") == selected_skill), None)
+        metadata = next(
+            (
+                item
+                for item in headers
+                if normalize_skill_package_id(str(item.get("name") or ""))
+                == selected_skill_id
+            ),
+            None,
+        )
         if metadata is None:
             self.last_analysis_skill_trace = {
                 **dict(self.last_analysis_skill_trace or {}),
@@ -854,8 +1259,6 @@ class AnswerComposeService:
                 "progress": ["matched", "failed:unknown runtime skill"],
             }
             return ""
-
-        from merchant_ai.services.skill_worker import SkillWorkerExecutor
 
         result = SkillWorkerExecutor(self.llm).execute_answer_skill(
             question,
@@ -999,7 +1402,12 @@ class AnswerComposeService:
     def _correct_metric_total_misread(self, answer: str, question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
         if not answer or not run_result or run_result.evidence_gaps:
             return answer
-        if not re.search(r"(不能|无法|不(?:能|可)直接|不能准确).{0,24}(确认|判断|得到)", answer):
+        if not _contains_phrases_in_order(
+            answer,
+            ("不能", "无法", "不能直接", "不可直接", "不能准确"),
+            ("确认", "判断", "得到"),
+            maximum_gap=24,
+        ):
             return answer
         sentence = multi_summary_metric_sentence(question, plan, run_result)
         if sentence:
@@ -1034,7 +1442,10 @@ class AnswerComposeService:
         if not sentence:
             return answer
         stripped = answer.strip()
-        if re.match(r"^分析结论[:：]\s*$", stripped.splitlines()[0].strip() if stripped.splitlines() else ""):
+        if _exact_heading(
+            stripped.splitlines()[0].strip() if stripped.splitlines() else "",
+            ("分析结论",),
+        ):
             return sentence + "\n\n" + stripped
         return sentence + "\n\n" + stripped
 
@@ -1084,11 +1495,28 @@ class AnswerComposeService:
         cleaned_lines: List[str] = []
         for line in answer.splitlines():
             text = line.strip()
-            if re.search(r"(其余|其他).{0,8}(日期|天).{0,16}(没有|未|暂无).{0,12}(看到|分日|明细|数据)", text):
+            if _contains_phrases_in_order(
+                text,
+                ("其余", "其他"),
+                ("日期", "天"),
+                maximum_gap=8,
+            ) and _contains_phrases_in_order(
+                text,
+                ("日期", "天"),
+                ("没有", "未", "暂无"),
+                maximum_gap=16,
+            ) and _contains_phrases_in_order(
+                text,
+                ("没有", "未", "暂无"),
+                ("看到", "分日", "明细", "数据"),
+                maximum_gap=12,
+            ):
                 continue
-            if re.search(r"(只|仅).{0,4}覆盖.{0,12}\d+.{0,4}(个)?(自然日|天)", text):
+            if _contains_phrases_in_order(text, ("只", "仅"), ("覆盖",), maximum_gap=4) and any(
+                item in ASCII_DIGITS for item in text[text.find("覆盖") + len("覆盖") : text.find("覆盖") + len("覆盖") + 13]
+            ) and contains_any_literal(text, ("自然日", "天")):
                 continue
-            if re.search(r"未带日期.{0,16}(记录|数据)", text):
+            if _contains_phrases_in_order(text, ("未带日期",), ("记录", "数据"), maximum_gap=16):
                 continue
             cleaned_lines.append(line)
         cleaned = "\n".join(cleaned_lines).strip()
@@ -1190,6 +1618,21 @@ class AnswerComposeService:
         if alignment_incomplete:
             answer = incomplete_snapshot_alignment_answer(run_result)
             fallback_answer = answer
+        blocking_answer = blocking_evidence_partial_answer(question, plan, run_result)
+        if blocking_answer and not alignment_incomplete:
+            # A blocking evidence decision is terminal for business claims.
+            # Claim-recovery fallbacks are allowed to repair unsupported prose
+            # only after evidence has been accepted; they must never revive a
+            # value from an unverified task result.
+            guarded = self._apply_answer_guard(blocking_answer, run_result)
+            verification = AnswerClaimVerification(
+                passed=True,
+                fact_count=0,
+                fallback_used=bool(str(answer or "").strip() != guarded),
+                fallback_reason="blocking_evidence_fail_closed",
+            )
+            self._record_lightweight_answer_verification(run_result, verification)
+            return guarded
         if run_result is not None:
             run_result.verified_facts = build_verified_facts(plan, run_result)
         guarded = self._apply_answer_guard(answer or fallback_answer, run_result)
@@ -1527,7 +1970,11 @@ def gap_aware_partial_answer(question: str, plan: QueryPlan, run_result: AgentRu
         return ""
     gap_text = " ".join("%s %s %s" % (getattr(gap, "code", ""), getattr(gap, "evidence", ""), getattr(gap, "reason", "")) for gap in blocking)
     asks_ratio = bool(question_requested_ratio_phrases(question))
-    derived_gap = bool(re.search(r"(DERIVED|share|ratio|rate|占比|比例|率)", gap_text, flags=re.I))
+    derived_gap = contains_any_literal(
+        gap_text,
+        ("derived", "share", "ratio", "rate", "占比", "比例", "率"),
+        case_sensitive=False,
+    )
     if not asks_ratio and not derived_gap:
         return ""
     lines = ["这题目前不能给出完整占比结论。"]
@@ -1558,7 +2005,7 @@ def gap_aware_partial_answer(question: str, plan: QueryPlan, run_result: AgentRu
     if evidence_lines:
         lines.append("")
         lines.append("已拿到的证据：")
-        lines.extend(re.sub(r"：返回\s*\d+\s*条。?$", "：已有返回结果。", item) for item in evidence_lines[:5])
+        lines.extend(_redact_return_count(item) for item in evidence_lines[:5])
     lines.append("")
     lines.append("建议先补齐上述缺失指标及其关联证据，再按已发布公式计算目标比例。")
     return "\n".join(lines)
@@ -1594,7 +2041,7 @@ def blocking_evidence_partial_answer(question: str, plan: QueryPlan, run_result:
     if evidence_lines:
         lines.append("")
         lines.append("已拿到的证据：")
-        lines.extend(re.sub(r"：返回\s*\d+\s*条。?$", "：已有返回结果。", item) for item in evidence_lines[:5])
+        lines.extend(_redact_return_count(item) for item in evidence_lines[:5])
     lines.append("")
     lines.append("上面缺口补齐前，只能把本轮结果作为部分证据，不能当作完整业务判断。")
     return "\n".join(lines)
@@ -1622,7 +2069,10 @@ def answer_coverage_partial_answer(question: str, plan: QueryPlan, run_result: A
 
 
 def answer_acknowledges_incomplete_evidence(answer: str) -> bool:
-    return bool(re.search(r"(不能|无法|暂不能|缺少|未完整|未补齐|证据不足|不完整|不能直接)", str(answer or "")))
+    return contains_any_literal(
+        answer,
+        ("不能", "无法", "暂不能", "缺少", "未完整", "未补齐", "证据不足", "不完整", "不能直接"),
+    )
 
 
 def answer_requirement_coverage(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> Dict[str, Any]:
@@ -1769,18 +2219,46 @@ def question_requested_ratio_phrases(question: str) -> List[str]:
     if not text:
         return []
     phrases: List[str] = []
-    segments = re.split(r"[、,，；;。！？?]|[和及与]", text)
+    segments = split_on_characters(text, "、,，；;。！？?和及与")
+    ratio_markers = ("占比", "比例", "率")
+    leading_markers = (
+        "请",
+        "帮我",
+        "帮忙",
+        "查询",
+        "查看",
+        "看看",
+        "看下",
+        "统计",
+        "分析",
+        "最近",
+        "当前",
+        "本期",
+        "同期",
+    )
     for segment in segments:
-        cleaned = re.sub(r"(?:最近|近|过去|前)\s*\d+\s*(?:天|日|周|个月|月|年)", "", segment)
-        for suffix in re.finditer(r"占比|比例|率", cleaned):
-            prefix = cleaned[: suffix.end()]
-            match = re.search(r"([A-Za-z0-9_\u4e00-\u9fff]{1,12}(?:占比|比例|率))$", prefix)
-            phrase = str(match.group(1) if match else suffix.group(0)).strip()
-            phrase = re.sub(r"^(?:请|帮我|帮忙|查询|查看|看看|看下|统计|分析|最近|当前|本期|同期)+", "", phrase)
+        cleaned = _strip_relative_time_windows(segment)
+        for start, end, marker in literal_spans(cleaned, ratio_markers):
+            prefix_start = start
+            while (
+                prefix_start > 0
+                and start - prefix_start < 12
+                and (
+                    cleaned[prefix_start - 1] in ASCII_WORD
+                    or _contains_cjk(cleaned[prefix_start - 1])
+                )
+            ):
+                prefix_start -= 1
+            phrase = cleaned[prefix_start:end].strip() or marker
+            phrase = _strip_repeated_leading_literals(phrase, leading_markers).strip()
             if phrase:
                 phrases.append(phrase)
-        phrases.extend(match.group(0) for match in re.finditer(r"\b[A-Za-z0-9_]*(?:rate|ratio|share)\b", cleaned, flags=re.I))
-    if not phrases and re.search(r"(占多少|分别占多少)", text):
+        phrases.extend(
+            token
+            for token in _ascii_chunks(cleaned)
+            if token.casefold().endswith(("rate", "ratio", "share"))
+        )
+    if not phrases and contains_any_literal(text, ("占多少", "分别占多少")):
         phrases.append("占比结果")
     return dedupe_strings(phrases)
 
@@ -1793,7 +2271,11 @@ def answer_requirement_is_ratio(requirement: Dict[str, Any]) -> bool:
             *[str(item) for item in requirement.get("aliases") or []],
         ]
     )
-    return bool(re.search(r"(rate|ratio|share|占比|比例|率)", text, flags=re.I))
+    return contains_any_literal(
+        text,
+        ("rate", "ratio", "share", "占比", "比例", "率"),
+        case_sensitive=False,
+    )
 
 
 def answer_requirement_matches_ratio_phrase(requirement: Dict[str, Any], phrase: str) -> bool:
@@ -2661,14 +3143,71 @@ def answer_numeric_tokens(text: str) -> List[float]:
 
 def answer_numeric_token_pairs(text: str) -> List[Tuple[str, float]]:
     pairs: List[Tuple[str, float]] = []
-    scrubbed = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", " ", str(text or ""))
-    for match in re.finditer(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?", scrubbed):
-        raw = match.group(0)
+    scrubbed = _scrub_answer_calendar_dates(str(text or ""))
+    for raw in _answer_number_tokens(scrubbed):
         value = numeric_token_value(raw)
         if value is None:
             continue
         pairs.append((raw, value))
     return pairs
+
+
+def _answer_number_tokens(value: Any) -> List[str]:
+    text = str(value or "")
+    tokens: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        start = cursor
+        if text[cursor] in {"+", "-"}:
+            cursor += 1
+        if cursor >= len(text) or text[cursor] not in ASCII_DIGITS:
+            cursor = start + 1
+            continue
+        if start > 0 and text[start - 1] in ASCII_WORD:
+            cursor = start + 1
+            continue
+        while cursor < len(text) and (text[cursor] in ASCII_DIGITS or text[cursor] == ","):
+            cursor += 1
+        if cursor < len(text) and text[cursor] == ".":
+            decimal_cursor = cursor + 1
+            while decimal_cursor < len(text) and text[decimal_cursor] in ASCII_DIGITS:
+                decimal_cursor += 1
+            if decimal_cursor > cursor + 1:
+                cursor = decimal_cursor
+        if cursor < len(text) and text[cursor] == "%":
+            cursor += 1
+        tokens.append(text[start:cursor])
+    return tokens
+
+
+def _scrub_answer_calendar_dates(value: Any) -> str:
+    text = str(value or "")
+    output = list(text)
+    cursor = 0
+    while cursor + 7 < len(text):
+        if not (
+            all(character in ASCII_DIGITS for character in text[cursor : cursor + 4])
+            and text[cursor + 4] in {"-", "/"}
+        ):
+            cursor += 1
+            continue
+        end = cursor + 5
+        month_start = end
+        while end < len(text) and end - month_start < 2 and text[end] in ASCII_DIGITS:
+            end += 1
+        if end == month_start or end >= len(text) or text[end] not in {"-", "/"}:
+            cursor += 1
+            continue
+        end += 1
+        day_start = end
+        while end < len(text) and end - day_start < 2 and text[end] in ASCII_DIGITS:
+            end += 1
+        if end == day_start:
+            cursor += 1
+            continue
+        output[cursor:end] = [" "] * (end - cursor)
+        cursor = end
+    return "".join(output)
 
 
 def numeric_token_value(value: Any) -> float | None:
@@ -2691,7 +3230,11 @@ def float_close(left: float, right: float) -> bool:
 
 
 def normalize_answer_value_text(value: Any) -> str:
-    return re.sub(r"[\s,，元%]+", "", str(value or "").strip().lower())
+    return "".join(
+        character
+        for character in str(value or "").strip().lower()
+        if not character.isspace() and character not in {",", "，", "元", "%"}
+    )
 
 
 def multi_summary_metric_sentence(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
@@ -2965,9 +3508,10 @@ def trend_sync_judgement(question: str, groups: List[Dict[str, Any]]) -> str:
     if "同步" not in text or len(groups) < 2:
         return ""
     target = "any"
-    if re.search(r"同步(上升|增长|上涨)", text):
+    synchronized_phrase = text[text.find("同步") :]
+    if contains_any_literal(synchronized_phrase, ("同步上升", "同步增长", "同步上涨")):
         target = "up"
-    elif re.search(r"同步(下降|减少|下滑)", text):
+    elif contains_any_literal(synchronized_phrase, ("同步下降", "同步减少", "同步下滑")):
         target = "down"
     analysis = aligned_trend_sync_analysis(groups, target)
     target_label = "同步上升" if target == "up" else "同步下降" if target == "down" else "同步变化"
@@ -3118,7 +3662,7 @@ def primary_answer_metric_column(plan: QueryPlan, row: Dict[str, Any]) -> str:
         text = str(column or "")
         if identifier_like_column(text):
             continue
-        if isinstance(value, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(value or "")):
+        if isinstance(value, (int, float)) or _is_plain_decimal(value):
             return text
     return ""
 
@@ -3202,7 +3746,7 @@ def answer_time_prefix(question: str) -> str:
 
 
 def question_requests_diagnosis(question: str) -> bool:
-    return bool(re.search(r"(为什么|原因|归因|怎么回事|分析|建议|怎么办|策略|优化|风险|异常)", str(question or "")))
+    return contains_any_literal(question, load_language_policy().answer.diagnosis_markers)
 
 
 def append_snapshot_alignment_disclosures(answer: str, run_result: AgentRunResult | None) -> str:
@@ -3245,7 +3789,7 @@ def answer_without_snapshot_alignment_disclosures(answer: str, run_result: Agent
         kept.append(line)
     while kept and not kept[-1].strip():
         kept.pop()
-    if kept and re.fullmatch(r"说明\s*[:：]", kept[-1].strip()):
+    if kept and _exact_heading(kept[-1], ("说明",)):
         kept.pop()
     return "\n".join(kept).strip()
 
@@ -3439,8 +3983,7 @@ def deterministic_cross_task_detail_answer(
 
 
 def deterministic_ranking_preferred_before_llm(question: str) -> bool:
-    text = str(question or "")
-    return bool(re.search(r"(top|前\s*\d+|排行|排名|最高.{0,8}(哪些|几个|列表)|最多.{0,8}(哪些|几个|列表))", text, flags=re.I))
+    return _question_has_ranking_language(question)
 
 
 def merge_deterministic_ranking_with_llm_answer(ranking_answer: str, llm_answer: str) -> str:
@@ -3469,7 +4012,11 @@ def format_answer_cell(
     metadata: Dict[str, Any] | None = None,
 ) -> str:
     text = str(column or "").strip().lower()
-    if identifier_like_column(text) or re.search(r"(name|title|time|date|日期|时间|名称)", text):
+    if identifier_like_column(text) or contains_any_literal(
+        text,
+        ("name", "title", "time", "date", "日期", "时间", "名称"),
+        case_sensitive=False,
+    ):
         return format_cell(value)
     if answer_numeric_value(value) is not None:
         return format_metric_value_for_answer(value, column, label, metadata)
@@ -3526,7 +4073,11 @@ def metric_columns_for_rows(plan: QueryPlan, rows: List[Dict[str, Any]], columns
         lower = text.lower()
         if identifier_like_column(lower) or text in dimension_columns:
             continue
-        if re.search(r"(name|title|time|date|日期|时间|名称)", lower):
+        if contains_any_literal(
+            lower,
+            ("name", "title", "time", "date", "日期", "时间", "名称"),
+            case_sensitive=False,
+        ):
             continue
         if any(answer_numeric_value(row.get(text)) is not None for row in rows[:8]):
             result.append(text)
@@ -3910,7 +4461,7 @@ def business_summary_table(plan: QueryPlan, run_result: AgentRunResult) -> str:
 
 
 def deterministic_ranking_answer(question: str, plan: QueryPlan, run_result: AgentRunResult | None) -> str:
-    if not run_result or not re.search(r"top|前\s*\d+|最高|最多|排行|排名", str(question or ""), flags=re.I):
+    if not run_result or not _question_has_ranking_language(question):
         return ""
     if not any(intent.answer_mode in {AnswerMode.TOPN, AnswerMode.DERIVED, AnswerMode.GROUP_AGG} for intent in plan.intents):
         return ""
@@ -4008,7 +4559,7 @@ def merge_conflict_column_name(item: Any, column: str) -> str:
     text = str(column or "").strip()
     tables = {str(table or "") for table in getattr(item.query_bundle, "tables", [])}
     table = next(iter(sorted(tables)), "")
-    prefix = re.sub(r"[^A-Za-z0-9_]+", "_", table).strip("_")
+    prefix = safe_ascii_component(table)
     return "%s__%s" % (prefix, text) if prefix and text else ""
 
 
@@ -4136,7 +4687,7 @@ def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
         display = str(resolution.get("displayName") or "").strip()
         if metric and display:
             labels[metric] = display
-            table = re.sub(r"[^A-Za-z0-9_]+", "_", str(intent.preferred_table or "")).strip("_")
+            table = safe_ascii_component(intent.preferred_table)
             if table:
                 labels["%s__%s" % (table, metric)] = display
         source_labels = resolution.get("sourceColumnLabels") or resolution.get("source_column_labels") or {}
@@ -4154,14 +4705,14 @@ def answer_column_labels(plan: QueryPlan) -> Dict[str, str]:
                 text = str(candidate or "").strip()
                 if text and spec_label:
                     labels[text] = spec_label
-                    table = re.sub(r"[^A-Za-z0-9_]+", "_", str(intent.preferred_table or "")).strip("_")
+                    table = safe_ascii_component(intent.preferred_table)
                     if table:
                         labels["%s__%s" % (table, text)] = spec_label
         if intent.group_by_column and intent.group_by_name:
             labels[intent.group_by_column] = intent.group_by_name
         for column in [intent.group_by_column, intent.filter_column, *intent.output_keys, *intent.required_evidence]:
             text = str(column or "").strip()
-            if text and re.search(r"[\u3400-\u9fff]", text):
+            if text and _contains_cjk(text):
                 labels.setdefault(text, text)
             default = default_answer_column_label(text)
             if text and default:
@@ -4345,7 +4896,11 @@ def should_hide_alternate_metric(plan: QueryPlan, intent: QuestionIntent | None)
 
 
 def normalized_metric_phrase(value: Any) -> str:
-    return re.sub(r"[\s_\-]+", "", str(value or "")).strip().lower()
+    return "".join(
+        character
+        for character in str(value or "").strip().lower()
+        if not character.isspace() and character not in {"_", "-"}
+    )
 
 
 def intent_metric_key(intent: QuestionIntent | None) -> str:
@@ -4633,9 +5188,8 @@ def plan_requires_rule_evidence(plan: QueryPlan) -> bool:
     for item in understanding.get("requiredEvidenceIntents") or understanding.get("required_evidence_intents") or []:
         if not isinstance(item, dict):
             continue
-        label = str(item.get("semanticLabel") or item.get("semantic_label") or "").lower()
         domains = {str(domain or "").lower() for domain in item.get("suggestedDomains") or item.get("suggested_domains") or []}
-        if "rule" in label or "规则" in label or domains & {"rule", "rules", "governance", "platform_rule"}:
+        if domains & {"rule", "rules", "governance", "platform_rule"}:
             return True
     return False
 
@@ -4884,7 +5438,7 @@ def compact_rule_evidence(question: str, rule_context: str, max_items: int = 5) 
         return []
     candidates: List[str] = []
     for raw_line in context.splitlines():
-        line = re.sub(r"\s+", " ", raw_line.strip())
+        line = collapse_whitespace(raw_line)
         if not line:
             continue
         if line.startswith(("{", "[", "}")):
@@ -4893,7 +5447,7 @@ def compact_rule_evidence(question: str, rule_context: str, max_items: int = 5) 
             continue
         if line.startswith("#") or line.startswith("召回规则片段"):
             continue
-        line = re.sub(r"^[-*]\s*", "", line)
+        line = _remove_optional_bullet(line)
         if len(line) < 8 or "常见测试问法" in line:
             continue
         candidates.append(line)
@@ -4915,7 +5469,7 @@ def compact_rule_evidence(question: str, rule_context: str, max_items: int = 5) 
 
 
 def _rule_line_score(question: str, line: str) -> int:
-    normalized = re.sub(r"\s+", "", question or "")
+    normalized = _compact_without_whitespace(question)
     grams: set[str] = set()
     for size in (2, 3, 4):
         grams.update(normalized[index : index + size] for index in range(max(0, len(normalized) - size + 1)))
@@ -5058,7 +5612,12 @@ def merchant_friendly_note_phrase(description: str) -> str:
         text = text.split(":", 1)[1].strip(" 。；")
     if text.startswith("按") and text.endswith("的比例"):
         return "%s统计" % text
-    if text and not text.startswith(("按", "以", "基于")) and re.search(r"(占|按).{0,20}(统计|比例|占比)", text):
+    if text and not text.startswith(("按", "以", "基于")) and _contains_phrases_in_order(
+        text,
+        ("占", "按"),
+        ("统计", "比例", "占比"),
+        maximum_gap=20,
+    ):
         if text.startswith(("店铺", "跨天", "指定周期")) and "按" in text:
             text = text[text.index("按") :]
         elif text.endswith("的比例"):
@@ -5068,7 +5627,11 @@ def merchant_friendly_note_phrase(description: str) -> str:
 
 def merchant_friendly_formula_phrase(item: Dict[str, Any]) -> str:
     text = str(item.get("formula") or "")
-    columns = [column.lower() for column in re.findall(r"`?([a-z][a-z0-9]+(?:_[a-z0-9]+)+)`?", text, flags=re.I)]
+    columns = [
+        token.casefold()
+        for token in _ascii_word_tokens(text)
+        if token[0] in ASCII_LETTERS and "_" in token
+    ]
     source_labels = item.get("sourceColumnLabels") or {}
     column_labels = (
         {str(key).lower(): str(value) for key, value in source_labels.items() if str(key) and str(value)}
@@ -5088,23 +5651,48 @@ def strip_internal_metric_description(description: str) -> str:
     if not text:
         return ""
     text = text.replace("`", "")
-    text = re.sub(r"(?:^|[。；;，,]\s*)(?:公式|计算公式|语义公式)(?:为|是|[:：])\s*[^。；;]+[。；;]?", "。", text, flags=re.I)
-    text = re.sub(r"\b(?:SUM|COUNT|AVG|MAX|MIN|NULLIF|CASE|WHEN|THEN|ELSE|END)\s*\([^)]*\)", "", text, flags=re.I)
-    text = re.sub(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", "", text, flags=re.I)
-    text = re.sub(r"\s*/\s*", " / ", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[，,；;]\s*(?:和|与)?\s*(?:不同|相同|一致)?\s*$", "", text)
-    text = re.sub(r"。{2,}", "。", text)
+    retained_clauses: List[str] = []
+    for raw_clause in split_on_characters(text, "。；;"):
+        clause = raw_clause.strip(" ：:，,")
+        if not clause:
+            continue
+        formula_prefix = next(
+            (prefix for prefix in ("计算公式", "语义公式", "公式") if clause.startswith(prefix)),
+            "",
+        )
+        if formula_prefix:
+            remainder = clause[len(formula_prefix) :].lstrip()
+            if remainder.startswith(("为", "是", ":", "：")):
+                continue
+        retained_clauses.append(clause)
+    text = "；".join(retained_clauses)
+    text = _remove_ascii_function_calls(
+        text,
+        ("SUM", "COUNT", "AVG", "MAX", "MIN", "NULLIF", "CASE", "WHEN", "THEN", "ELSE", "END"),
+    )
+    text = _remove_ascii_tokens(
+        text,
+        lambda token: token[0].casefold() in "abcdefghijklmnopqrstuvwxyz" and token.count("_") >= 2,
+    )
+    text = " / ".join(part.strip() for part in text.split("/"))
+    text = collapse_whitespace(text)
+    text = text.rstrip("，,；; ")
+    for suffix in ("和不同", "与不同", "不同", "和相同", "与相同", "相同", "和一致", "与一致", "一致"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].rstrip("，,；; ")
+            break
+    while "。。" in text:
+        text = text.replace("。。", "。")
     parts = []
-    for raw_part in re.split(r"[。；;]", text):
+    for raw_part in split_on_characters(text, "。；;"):
         part = raw_part.strip(" ：:，,。")
         if not part:
             continue
         if is_internal_answer_line(part):
             continue
-        if re.search(r"使用\s*作为(?:分子|分母)", part):
+        if _contains_phrases_in_order(part, ("使用",), ("作为分子", "作为分母")):
             continue
-        if re.search(r"\b[A-Za-z][A-Za-z0-9_]*\b", part) and "_" in part:
+        if any("_" in token for token in _ascii_word_tokens(part)):
             continue
         parts.append(part)
     return "；".join(dedupe_strings(parts[:2])).strip("。；")
@@ -5159,28 +5747,48 @@ def sanitize_business_answer_text(answer: str, question: str, plan: QueryPlan, r
     for raw, label in sorted(labels.items(), key=lambda item: len(item[0]), reverse=True):
         if not raw or not label or raw == label:
             continue
-        text = re.sub(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(raw), label, text)
+        text = _replace_ascii_bounded_literal(text, raw, label)
     text = text.replace("verified evidence", "当前数据").replace("Verified evidence", "当前数据")
     if not question_asks_metric_disclosure(question):
         text = remove_metric_disclosure_block(text)
-    text = re.sub(r"(?m)^\s*分析结论[:：]\s*$\n?", "", text)
-    text = re.sub(r"(?m)^\s*关键证据[:：]\s*$\n?", "", text)
-    text = re.sub(r"(?m)^\s*(限制|证据缺口|证据门禁)[:：]", "说明：", text)
-    text = re.sub(r"(?m)^\s*证据[:：]\s*$\n?", "", text)
-    text = re.sub(r"当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "这几天有波动，建议结合下方趋势和关联指标一起看。", text)
-    text = re.sub(r"当前数据看存在可解释的波动点，不能简单判断为业务为 0 或无异常。", "这几天有波动，建议结合下方趋势和关联指标一起看。", text)
-    text = re.sub(r"已看到的点位显示[:：]?", "", text)
-    text = re.sub(r"当前证据显示", "当前数据看", text)
-    text = re.sub(r"证据显示", "数据看", text)
-    text = re.sub(r"已验证查询结果", "当前查询结果", text)
-    text = re.sub(r"语义层指标口径", "当前指标口径", text)
-    text = re.sub(r"业务为\s*0\s*或无异常", "没有异常", text)
-    text = re.sub(r"(?m)^\s*-\s*(当前)?可用行数较少，异常判断可信度有限。", "- 可用数据点较少，异常判断可信度有限。", text)
+    normalized_lines: List[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if _exact_heading(stripped, ("分析结论", "关键证据", "证据")):
+            continue
+        if _starts_with_heading(stripped, ("限制", "证据缺口", "证据门禁")):
+            separator_index = min(
+                (index for index in (stripped.find(":"), stripped.find("：")) if index >= 0),
+                default=len(stripped),
+            )
+            stripped = "说明：" + stripped[separator_index + 1 :].lstrip()
+            raw_line = stripped
+        if stripped in {
+            "- 可用行数较少，异常判断可信度有限。",
+            "- 当前可用行数较少，异常判断可信度有限。",
+        }:
+            raw_line = "- 可用数据点较少，异常判断可信度有限。"
+        normalized_lines.append(raw_line)
+    text = "\n".join(normalized_lines)
+    replacements = {
+        "当前证据显示存在可解释的波动点，不能简单判断为业务为 0 或无异常。": "这几天有波动，建议结合下方趋势和关联指标一起看。",
+        "当前数据看存在可解释的波动点，不能简单判断为业务为 0 或无异常。": "这几天有波动，建议结合下方趋势和关联指标一起看。",
+        "已看到的点位显示：": "",
+        "已看到的点位显示:": "",
+        "已看到的点位显示": "",
+        "当前证据显示": "当前数据看",
+        "证据显示": "数据看",
+        "已验证查询结果": "当前查询结果",
+        "语义层指标口径": "当前指标口径",
+    }
+    for source, replacement in replacements.items():
+        text = text.replace(source, replacement)
+    text = _replace_collapsed_literal(text, "业务为0或无异常", "没有异常")
     text = remove_hidden_alternate_metric_lines(text, plan)
     if not question_asks_metric_disclosure(question):
         text = remove_internal_answer_lines(text)
     text = normalize_answer_headings(text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    return _collapse_blank_lines(text)
 
 
 def normalize_answer_headings(text: str) -> str:
@@ -5195,9 +5803,9 @@ def normalize_answer_headings(text: str) -> str:
             previous_blank = True
             continue
         previous_blank = False
-        if re.match(r"^(分析结论|关键证据)[:：]?$", stripped):
+        if _exact_heading(stripped, ("分析结论", "关键证据")):
             continue
-        if re.match(r"^(限制|证据缺口|证据门禁)[:：]?$", stripped):
+        if _exact_heading(stripped, ("限制", "证据缺口", "证据门禁")):
             lines.append("说明：")
             continue
         lines.append(line)
@@ -5213,11 +5821,14 @@ def remove_internal_answer_lines(text: str) -> str:
             skip_until_blank = False
             kept.append(raw_line)
             continue
-        if re.match(r"^(口径|指标口径|字段口径|计算口径|使用表|来源表|SQL|字段名)[:：]", stripped, flags=re.I):
+        if _starts_with_heading(
+            stripped,
+            ("口径", "指标口径", "字段口径", "计算口径", "使用表", "来源表", "SQL", "字段名"),
+        ):
             skip_until_blank = True
             continue
         if skip_until_blank:
-            if re.match(r"^(建议|说明)[:：]", stripped):
+            if _starts_with_heading(stripped, ("建议", "说明")):
                 skip_until_blank = False
                 kept.append(raw_line)
             continue
@@ -5228,22 +5839,34 @@ def remove_internal_answer_lines(text: str) -> str:
 
 
 def is_internal_answer_line(line: str) -> bool:
-    if re.search(r"\b(SQL|Doris|QueryGraph|SELECT|FROM|WHERE|GROUP BY|HAVING|JOIN)\b", line, flags=re.I):
+    tokens = [token.casefold() for token in _ascii_word_tokens(line)]
+    token_set = set(tokens)
+    if token_set & {"sql", "doris", "querygraph", "select", "from", "where", "having", "join"}:
         return True
-    if re.search(r"\b(?:ads|dwm|dwd|dim)_[a-z0-9_]+\b", line, flags=re.I):
+    if any(left == "group" and right == "by" for left, right in zip(tokens, tokens[1:])):
         return True
-    if re.search(r"\b(?:SUM|COUNT|AVG|MAX|MIN)\s*\(", line, flags=re.I):
+    if any(token.startswith(("ads_", "dwm_", "dwd_", "dim_")) for token in tokens):
         return True
-    if re.search(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", line) and re.search(r"[:：=(),]", line):
+    if _remove_ascii_function_calls(line, ("SUM", "COUNT", "AVG", "MAX", "MIN")) != line:
         return True
-    if re.search(r"(查到|查询到)\s*\d+\s*行|使用表|字段名|表名|执行失败|节点|EVIDENCE_GAP", line, flags=re.I):
+    if any(token.count("_") >= 2 for token in tokens) and contains_any_literal(line, (":", "：", "=", "(", ")", ",")):
+        return True
+    row_count_disclosure = (
+        contains_any_literal(line, ("查到", "查询到"))
+        and any(character in ASCII_DIGITS for character in line)
+        and "行" in line
+    )
+    if row_count_disclosure or contains_any_literal(
+        line,
+        ("使用表", "字段名", "表名", "执行失败", "节点", "EVIDENCE_GAP"),
+        case_sensitive=False,
+    ):
         return True
     return False
 
 
 def merchant_facing_gap_note(value: str) -> str:
-    text = str(value or "").strip()
-    text = re.sub(r"^[A-Z_]+[:：]\s*", "", text)
+    text = _strip_upper_code_prefix(value)
     if "统一时间窗口" in text and ("不可用" in text or "未完整覆盖" in text or "未完成" in text):
         return "部分数据来源未完整覆盖统一时间窗口，相关结果不可用，不能把缺失解释为 0。"
     if "SQL 成功但返回 0 行" in text or "执行成功但返回 0 行" in text:
@@ -5266,10 +5889,22 @@ def merchant_facing_gap_note(value: str) -> str:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
-    text = re.sub(r"\b(?:ads|dwm|dwd|dim)_[a-z0-9_]+\b", "相关数据", text, flags=re.I)
-    text = re.sub(r"相关数据\.[A-Za-z0-9_]+", "当前已确认口径", text)
-    text = re.sub(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+){2,}\b", "相关指标", text)
-    text = re.sub(r"\s+", " ", text).strip(" ：:-")
+    text = _replace_ascii_tokens(
+        text,
+        lambda token: "相关数据"
+        if token.casefold().startswith(("ads_", "dwm_", "dwd_", "dim_"))
+        else "相关指标"
+        if token[0].casefold() in "abcdefghijklmnopqrstuvwxyz" and token.count("_") >= 2
+        else token,
+    )
+    marker = "相关数据."
+    while marker in text:
+        start = text.find(marker)
+        cursor = start + len(marker)
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        text = text[:start] + "当前已确认口径" + text[cursor:]
+    text = collapse_whitespace(text).strip(" ：:-")
     if not text:
         return ""
     if len(text) > 80:
@@ -5329,18 +5964,22 @@ def remove_hidden_alternate_metric_lines(text: str, plan: QueryPlan) -> str:
 
 
 def question_asks_metric_disclosure(question: str) -> bool:
-    return bool(re.search(r"(口径|怎么算|计算方式|字段|来源表|SQL|sql)", str(question or ""), flags=re.I))
+    return contains_any_literal(
+        question,
+        ("口径", "怎么算", "计算方式", "字段", "来源表", "sql"),
+        case_sensitive=False,
+    )
 
 
 def question_asks_metric_reconciliation(question: str) -> bool:
-    return bool(
-        re.search(
-            r"(后台|看板|生意参谋|数据中心|报表).{0,12}(不一致|不一样|对不上|不对|差|少|多)"
-            r"|(?:不一致|不一样|对不上|数不对|差很多|少了|多了).{0,12}(后台|看板|报表)"
-            r"|(?:核对|对账).{0,12}(口径|数据|指标)",
-            str(question or ""),
-            flags=re.I,
-        )
+    text = str(question or "")
+    sources = ("后台", "看板", "生意参谋", "数据中心", "报表")
+    differences = ("不一致", "不一样", "对不上", "不对", "差", "少", "多")
+    explicit_differences = ("不一致", "不一样", "对不上", "数不对", "差很多", "少了", "多了")
+    return (
+        _contains_phrases_in_order(text, sources, differences, maximum_gap=12)
+        or _contains_phrases_in_order(text, explicit_differences, ("后台", "看板", "报表"), maximum_gap=12)
+        or _contains_phrases_in_order(text, ("核对", "对账"), ("口径", "数据", "指标"), maximum_gap=12)
     )
 
 
@@ -5350,14 +5989,14 @@ def remove_metric_disclosure_block(text: str) -> str:
     skipping = False
     for line in lines:
         stripped = line.strip()
-        if re.match(r"^(口径|指标口径|字段口径|计算口径)[:：]\s*$", stripped):
+        if _exact_heading(stripped, ("口径", "指标口径", "字段口径", "计算口径")):
             skipping = True
             continue
         if skipping:
             if not stripped:
                 skipping = False
                 continue
-            if re.match(r"^(建议|说明|限制|分析结论|关键证据)[:：]", stripped):
+            if _starts_with_heading(stripped, ("建议", "说明", "限制", "分析结论", "关键证据")):
                 skipping = False
                 cleaned.append(line)
             continue
@@ -5406,7 +6045,7 @@ def render_structured_skill_answer(renderer_name: str, payload: Dict[str, Any]) 
 
 
 def has_business_advice_section(answer: str) -> bool:
-    return bool(re.search(r"(^|\n)\s*建议[:：]", str(answer or "")))
+    return any(_starts_with_heading(line, ("建议",)) for line in str(answer or "").splitlines())
 
 
 def normalize_inline_business_advice(answer: str) -> str:
@@ -5415,31 +6054,30 @@ def normalize_inline_business_advice(answer: str) -> str:
     in_advice = False
     for line in str(answer or "").splitlines():
         stripped = line.strip()
-        if re.match(r"^建议[:：]\s*$", stripped):
+        if _exact_heading(stripped, ("建议",)):
             in_advice = True
             continue
-        if re.match(r"^建议(?:[:：]|\S)", stripped):
+        if stripped.startswith("建议") and len(stripped) > len("建议"):
             in_advice = True
-            item = re.sub(r"^建议[:：]?\s*", "", stripped).strip()
+            item = stripped[len("建议") :].lstrip(":： ").strip()
             if item:
-                advice_items.append(re.sub(r"^[-*\d.、\s]+", "", item).strip())
+                advice_items.append(_strip_list_marker(item).strip())
             continue
         if in_advice:
             if not stripped:
                 continue
-            if re.match(r"^(说明|参考|备注|数据|结论)[:：]\s*$", stripped):
+            if _exact_heading(stripped, ("说明", "参考", "备注", "数据", "结论")):
                 in_advice = False
                 body_lines.append(line)
                 continue
-            item = re.sub(r"^[-*]?\s*\d+[.、]\s*", "", stripped).strip()
-            item = re.sub(r"^[-*]\s*", "", item).strip()
+            item = _strip_list_marker(stripped).strip()
             if item:
                 advice_items.append(item)
             continue
         body_lines.append(line)
     if not advice_items:
         return answer
-    cleaned_items = [re.sub(r"^[-*\d.、\s]+", "", item).strip() for item in advice_items if item.strip()]
+    cleaned_items = [_strip_list_marker(item).strip() for item in advice_items if item.strip()]
     body = "\n".join(body_lines).rstrip()
     return body + "\n\n建议：\n" + "\n".join("- %s" % item for item in cleaned_items[:2])
 
@@ -5448,16 +6086,7 @@ def parse_llm_suggestions(raw: str) -> List[str]:
     text = str(raw or "").strip()
     if not text:
         return []
-    payload: Any = None
-    try:
-        payload = json.loads(text)
-    except Exception:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if match:
-            try:
-                payload = json.loads(match.group(0))
-            except Exception:
-                payload = None
+    payload = _first_json_value(text)
     suggestions: List[str] = []
     if isinstance(payload, dict):
         raw_items = payload.get("suggestions") or payload.get("建议") or []
@@ -5466,12 +6095,12 @@ def parse_llm_suggestions(raw: str) -> List[str]:
     else:
         raw_items = []
     for item in raw_items:
-        value = re.sub(r"^[-*\d.、\s]+", "", str(item or "").strip())
+        value = _strip_list_marker(item).strip()
         if not value:
             continue
-        if re.search(r"(继续追问|如需|如果需要|可以再问|我可以)", value):
+        if contains_any_literal(value, ("继续追问", "如需", "如果需要", "可以再问", "我可以")):
             continue
-        if re.search(r"(SQL|sql|字段|表名|QueryGraph|Doris)", value):
+        if contains_any_literal(value, ("sql", "字段", "表名", "querygraph", "doris"), case_sensitive=False):
             continue
         if value not in suggestions:
             suggestions.append(value[:90])
@@ -5762,7 +6391,8 @@ def merchant_clarification_hints(plan: QueryPlan) -> List[str]:
         return ["请补充查询时间范围。", "也可以补充要看的业务对象或指标。"]
     primary = plan.intents[0]
     if not primary.days:
-        hints.append("如果没有指定时间，系统会优先按近期常用时间窗或最近7天理解。")
+        default_window = load_language_policy().routing.time_clarification_options[0]
+        hints.append("如果没有指定时间，系统会优先按近期常用时间窗或%s理解。" % default_window)
     if primary.category == QuestionCategory.UNKNOWN:
         hints.append("业务范围不明确时，需要先确认查询对象。")
     if not primary.metric_name and primary.answer_mode not in {AnswerMode.RULE, AnswerMode.CHAT}:
@@ -5780,7 +6410,11 @@ def normalize_question_category(value: Any) -> QuestionCategory:
 
 
 def normalize_suggestion_text(value: str) -> str:
-    return re.sub(r"[\s？?。！!，,、]+", "", str(value or "").strip().lower())
+    return "".join(
+        character
+        for character in str(value or "").strip().lower()
+        if not character.isspace() and character not in {"？", "?", "。", "！", "!", "，", ",", "、"}
+    )
 
 
 def answer_business_context(
@@ -5810,7 +6444,7 @@ def answer_business_context(
 
 
 def compact_answer_context_text(value: str, max_chars: int) -> str:
-    text = re.sub(r"\n{3,}", "\n\n", str(value or "").strip())
+    text = _collapse_blank_lines(value)
     return text[:max_chars]
 
 
@@ -6030,21 +6664,8 @@ def _markdown_section_lines(body: str, section: str, limit_lines: int) -> List[s
 
 
 def parse_skill_match_payload(raw: str) -> Dict[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        return {}
-    try:
-        payload = json.loads(text)
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not match:
-            return {}
-        try:
-            payload = json.loads(match.group(0))
-            return payload if isinstance(payload, dict) else {}
-        except Exception:
-            return {}
+    payload = _first_json_value(raw)
+    return payload if isinstance(payload, dict) else {}
 
 
 SKILL_NO_MATCH_STATUSES = {
@@ -6221,7 +6842,7 @@ class DailyReportService:
 
 
 def safe_report_identifier(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(value or "")))
+    return is_ascii_identifier(value)
 
 
 def daily_report_alerts(profile: Dict[str, Any], metrics: List[Dict[str, Any]], role_values: Dict[str, Any]) -> List[Dict[str, Any]]:

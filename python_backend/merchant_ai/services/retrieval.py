@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -26,8 +25,11 @@ from merchant_ai.services.assets import (
     compact_metric_for_recall,
     semantic_metric_path,
 )
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.semantic_request import semantic_request_cache_key
+from merchant_ai.services.text_parsing import collapse_whitespace, safe_ascii_component
 from merchant_ai.services.time_semantics import resolve_time_range
 
 
@@ -1353,29 +1355,25 @@ def classify_query_type(
 ) -> str:
     out = reasons if reasons is not None else []
     metric_count = len(metric_candidates)
-    relationship_tokens = ["关联", "对应", "join", "同时看", "再看", "并看"]
-    analysis_tokens = ["趋势", "分析", "波动", "判断", "风险", "最高", "最低", "top", "前", "对比"]
-    detail_tokens = ["明细", "详情", "记录", "id"]
-    has_relationship = any(token in query for token in relationship_tokens)
-    has_analysis = any(token in query for token in analysis_tokens)
-    has_detail = any(token in query for token in detail_tokens)
-    if include_rules and (has_analysis or len(topics) >= 2):
+    if include_rules and metric_count:
         out.append("mixed_rule_data")
         return "mixed_rule_data"
     if include_rules:
         out.append("rule_qa")
         return "rule_qa"
-    if has_detail:
-        out.append("detail_lookup")
-        return "detail_lookup"
-    if has_relationship or len(topics) >= 2 or (metric_count >= 2 and has_analysis):
+    if len(topics) >= 2:
         out.append("multi_hop_analysis")
         return "multi_hop_analysis"
     if metric_count >= 2:
         out.append("multi_metric")
         return "multi_metric"
-    out.append("simple_metric")
-    return "simple_metric"
+    fallback = (
+        "simple_metric"
+        if len(topics) <= 1 and metric_count <= 1
+        else "multi_hop_analysis"
+    )
+    out.append(fallback)
+    return fallback
 
 
 def estimate_query_complexity(
@@ -1390,8 +1388,6 @@ def estimate_query_complexity(
     if len(topics) >= 2:
         score += 1
     if len(metric_candidates) >= 2:
-        score += 1
-    if any(token in query for token in ["同时", "并且", "关联", "分别", "趋势", "最高", "最低", "top", "前", "分析", "对比"]):
         score += 1
     if include_rules:
         score += 1
@@ -1600,8 +1596,10 @@ def source_type_top_k_policy(
                 "SEMANTIC_TABLE_ASSET": 6,
                 "GOVERNED_RULE": 6 if include_rules else 3,
             }
-    query = str(query_text or "")
-    relationship_heavy = any(token in query for token in ["关联", "对应", "join", "同时看", "再看", "并看"])
+    relationship_heavy = str(profile.get("queryType") or "") in {
+        "mixed_rule_data",
+        "multi_hop_analysis",
+    }
     metric_heavy = bool(metric_candidates)
     if relationship_heavy:
         policy["SEMANTIC_RELATIONSHIP"] = min(policy["SEMANTIC_RELATIONSHIP"] + 2, 12)
@@ -1756,21 +1754,19 @@ def unique_source_refs(items: list[RecallItem]) -> list[str]:
     return refs
 
 
-FOLLOW_UP_QUERY_RE = re.compile(r"^(那|那么|再|然后|还有|这个|这些|它|它们|同样|按|改成|换成|呢|继续)")
-
-
 def rewrite_retrieval_query(request: KnowledgeRetrievalRequest) -> str:
     """Turn a context-dependent follow-up into a standalone retrieval query.
 
     This is intentionally deterministic: it only inherits the previous user
     question when the current turn contains an explicit follow-up signal.
     """
-    current = re.sub(r"\s+", " ", str(request.query or "")).strip()
-    previous = re.sub(r"\s+", " ", str(request.previous_user_question or "")).strip()
+    current = collapse_whitespace(request.query)
+    previous = collapse_whitespace(request.previous_user_question)
     if not current or not previous or current == previous:
         return current
-    follow_up = bool(FOLLOW_UP_QUERY_RE.search(current)) or any(
-        token in current for token in ["按天看", "按周看", "细分一下", "继续下钻", "换个维度"]
+    language = load_language_policy().routing
+    follow_up = current.startswith(language.follow_up_prefixes) or any(
+        phrase in current for phrase in language.follow_up_phrases
     )
     if not follow_up:
         return current
@@ -1877,21 +1873,23 @@ def recall_governance_block_reason(item: RecallItem, request: KnowledgeRetrieval
     allowed_roles = metadata.get("allowedRoles") or visibility.get("allowedRoles") or []
     if isinstance(allowed_roles, str):
         allowed_roles = [allowed_roles]
-    role = str(request.access_role or "merchant_operator").strip().lower()
+    authorization = load_authorization_policy()
+    role = str(request.access_role or authorization.default_access_role).strip()
+    global_access = "*" in authorization.permissions_for_access_role(role)
     normalized_roles = {str(value).strip().lower() for value in allowed_roles if str(value).strip()}
-    if normalized_roles and role not in normalized_roles and role not in {"merchant_admin", "admin"}:
+    if normalized_roles and role.lower() not in normalized_roles and not global_access:
         return "role"
     asset_roles = metadata.get("assetAllowedRoles") or []
     if isinstance(asset_roles, str):
         asset_roles = [asset_roles]
     normalized_asset_roles = {str(value).strip().lower() for value in asset_roles if str(value).strip()}
-    if normalized_asset_roles and role not in normalized_asset_roles and role not in {"merchant_admin", "admin"}:
+    if normalized_asset_roles and role.lower() not in normalized_asset_roles and not global_access:
         return "role"
     visibility_level = str(visibility.get("level") or metadata.get("visibility") or "").strip().lower()
-    if visibility_level == "restricted" and not normalized_roles and role not in {"merchant_admin", "admin"}:
+    if visibility_level == "restricted" and not normalized_roles and not global_access:
         return "role"
     asset_visibility = metadata.get("assetVisibilityPolicy") if isinstance(metadata.get("assetVisibilityPolicy"), dict) else {}
-    if str(asset_visibility.get("level") or "").strip().lower() == "restricted" and not normalized_asset_roles and role not in {"merchant_admin", "admin"}:
+    if str(asset_visibility.get("level") or "").strip().lower() == "restricted" and not normalized_asset_roles and not global_access:
         return "role"
 
     required_permissions = metadata.get("requiredPermissions") or []
@@ -2097,7 +2095,12 @@ def topic_categories_support_knowledge_capability(
 ) -> bool:
     """Resolve retrieval lanes from published topic roles, never topic IDs."""
 
-    expected = re.sub(r"[^A-Z0-9]+", "_", str(capability or "").upper()).strip("_")
+    expected = safe_ascii_component(
+        capability,
+        extras=("_",),
+        uppercase=True,
+        strip="_",
+    )
     if not expected:
         return False
     for topic in topic_assets.topic_names_for_categories(categories):
@@ -2118,7 +2121,12 @@ def topic_categories_support_knowledge_capability(
                 value = source.get(key)
                 declared_values.extend(value if isinstance(value, list) else [value])
         for value in declared_values:
-            normalized = re.sub(r"[^A-Z0-9]+", "_", str(value or "").upper()).strip("_")
+            normalized = safe_ascii_component(
+                value,
+                extras=("_",),
+                uppercase=True,
+                strip="_",
+            )
             tokens = [token for token in normalized.split("_") if token]
             if normalized == expected or expected in tokens:
                 return True

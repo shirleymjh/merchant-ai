@@ -424,16 +424,16 @@ def test_workspace_store_cannot_replace_a_prior_attestation(
         )
     )
 
-    with pytest.raises(
-        PopulationOnlineGateStorageError,
-        match="POPULATION_GATE_IMMUTABLE_BINDING_CHANGED",
-    ):
+    with pytest.raises(PopulationOnlineGateStorageError) as exc_info:
         store.compare_and_swap_population_gate(
             gate_id=state.gate_id,
             expected_revision=1,
             expected_state_fingerprint=state.state_fingerprint,
             next_state=forged,
         )
+    assert "POPULATION_GATE_IMMUTABLE_BINDING_CHANGED" in str(
+        exc_info.value
+    )
 
     assert store.load_population_gate(state.gate_id) == state
 
@@ -452,11 +452,9 @@ def test_workspace_store_rejects_tampered_revision_and_symlinked_checkpoint(
     state_file.chmod(0o600)
     state_file.write_text('{"tampered":true}', encoding="utf-8")
 
-    with pytest.raises(
-        PopulationOnlineGateStorageError,
-        match="POPULATION_GATE_IMMUTABLE_HASH_MISMATCH",
-    ):
+    with pytest.raises(PopulationOnlineGateStorageError) as exc_info:
         store.load_population_gate(state.gate_id)
+    assert "POPULATION_GATE_IMMUTABLE_HASH_MISMATCH" in str(exc_info.value)
 
     other_settings = _settings(tmp_path / "symlink-case")
     other_workspace = _workspace(other_settings)
@@ -480,16 +478,16 @@ def test_workspace_store_does_not_reset_when_head_is_missing(
     assert store.create_population_gate(state)
     (store.gate_checkpoint_path(state.gate_id) / "head.json").unlink()
 
-    with pytest.raises(
-        PopulationOnlineGateStorageError,
-        match="POPULATION_GATE_HEAD_MISSING_WITH_HISTORY",
-    ):
+    with pytest.raises(PopulationOnlineGateStorageError) as load_exc_info:
         store.load_population_gate(state.gate_id)
-    with pytest.raises(
-        PopulationOnlineGateStorageError,
-        match="POPULATION_GATE_HEAD_MISSING_WITH_HISTORY",
-    ):
+    assert "POPULATION_GATE_HEAD_MISSING_WITH_HISTORY" in str(
+        load_exc_info.value
+    )
+    with pytest.raises(PopulationOnlineGateStorageError) as create_exc_info:
         store.create_population_gate(state)
+    assert "POPULATION_GATE_HEAD_MISSING_WITH_HISTORY" in str(
+        create_exc_info.value
+    )
 
 
 def _published_query_artifact(
@@ -977,10 +975,7 @@ def test_ledger_rejects_nested_artifact_tampering_before_projection(
         hashlib.sha256(b"tampered-ledger-receipt").hexdigest()
     )
 
-    with pytest.raises(
-        PopulationOnlineLedgerError,
-        match="POPULATION_LEDGER_ARTIFACT_INTEGRITY_INVALID",
-    ):
+    with pytest.raises(PopulationOnlineLedgerError) as exc_info:
         environment["reader"].snapshot_population_artifacts(
             gate_id=environment["gateId"],
             goal_contract_fingerprint=(
@@ -990,6 +985,9 @@ def test_ledger_rejects_nested_artifact_tampering_before_projection(
             ),
             graph_fingerprint=environment["graphFingerprint"],
         )
+    assert "POPULATION_LEDGER_ARTIFACT_INTEGRITY_INVALID" in str(
+        exc_info.value
+    )
 
 
 def test_preview_cannot_finalize_population_gate(tmp_path: Path) -> None:
@@ -1063,8 +1061,9 @@ def test_cross_node_result_replay_is_rejected(tmp_path: Path) -> None:
 
 
 def test_online_gate_source_has_no_regex_or_process_local_authority() -> None:
-    source_path = Path(
-        "python_backend/merchant_ai/services/grounded_population_online_gate.py"
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / "merchant_ai/services/grounded_population_online_gate.py"
     )
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source)

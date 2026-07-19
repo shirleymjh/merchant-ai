@@ -22,6 +22,9 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentSession,
     GroundedRuntimeBudgetMiddleware,
 )
+from merchant_ai.services.grounded_conversation_state import (
+    GroundedConversationResolution,
+)
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
     GroundedRuntimeBudgetExceeded,
@@ -124,9 +127,11 @@ class _BudgetGraph:
         self.action = action
         self.tools = {item.name: item for item in tools}
         self.budget_middleware = next(item for item in middleware if isinstance(item, GroundedRuntimeBudgetMiddleware))
+        self.last_context: Any = None
 
     def invoke(self, payload: dict[str, Any], *, config: Any, context: Any) -> None:
         del payload, config
+        self.last_context = context
         runtime = SimpleNamespace(context=context)
         if self.action == "model":
             request = SimpleNamespace(runtime=runtime)
@@ -165,6 +170,18 @@ class _BudgetFactory:
         return self.graph
 
 
+class _StandaloneConversationAuthority:
+    @staticmethod
+    def resolve(question: str, **_: Any) -> GroundedConversationResolution:
+        normalized = str(question or "").strip()
+        return GroundedConversationResolution(
+            original_question=normalized,
+            effective_question=normalized,
+            status="STANDALONE",
+            source="TEST_STRUCTURED_SEMANTIC_REVIEW",
+        )
+
+
 def _limits(**updates: Any) -> GroundedRuntimeBudgetLimits:
     values = {
         "max_duration_seconds": 30,
@@ -190,6 +207,7 @@ def _runtime(action: str, kernel: _BudgetKernel) -> GroundedDeepAgentRuntime:
         settings=settings,
         agent_factory=_BudgetFactory(action),
         backend=object(),
+        conversation_online_authority=_StandaloneConversationAuthority(),
     )
 
 
@@ -217,6 +235,11 @@ def test_run_converts_count_budget_exhaustion_to_operational_failure(
     assert harness["runtimeBudget"]["status"] == "finished"
     assert response.data_rows == []
     assert "未完成或未验证的结果" in response.answer
+    assert runtime.deep_agent_graph.last_context is not None
+    assert (
+        runtime.deep_agent_graph.last_context.session.execution_graph_replan_evidence
+        == {}
+    )
     if action == "doris":
         assert kernel.execute_calls == 0
 
@@ -382,8 +405,9 @@ def test_core_model_does_not_retry_non_timeout_provider_error() -> None:
         calls += 1
         raise RuntimeError("provider rejected request")
 
-    with pytest.raises(RuntimeError, match="provider rejected request"):
+    with pytest.raises(RuntimeError) as exc_info:
         middleware.wrap_model_call(request, handler)
+    assert "provider rejected request" in str(exc_info.value)
 
     assert calls == 1
     assert budget.report()["usage"]["llmCalls"] == 1

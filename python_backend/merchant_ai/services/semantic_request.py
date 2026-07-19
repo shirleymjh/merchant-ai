@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from typing import Any, Dict, Iterable, List
 
 from merchant_ai.services.cache import stable_cache_key
+from merchant_ai.services.text_parsing import collapse_whitespace, is_ascii_hex
 
 
 def semantic_request_payload(
@@ -65,7 +65,7 @@ def explicit_semantic_request_fingerprint(user_prompt: str) -> str:
         or payload.get("semantic_request_fingerprint")
         or ""
     ).strip()
-    if re.fullmatch(r"[a-fA-F0-9]{32,128}", fingerprint):
+    if is_ascii_hex(fingerprint, minimum=32, maximum=128):
         return fingerprint.lower()
     semantic_request = payload.get("semanticRequest") or payload.get("semantic_request")
     if not isinstance(semantic_request, dict):
@@ -86,7 +86,7 @@ def _canonical_strings(values: Iterable[Any]) -> List[str]:
     for value in values or []:
         if hasattr(value, "value"):
             value = value.value
-        text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        text = collapse_whitespace(value).lower()
         if text:
             result.append(text)
     return result
@@ -140,5 +140,5 @@ def _canonical_value(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return _canonical_items(value)
     if isinstance(value, str):
-        return re.sub(r"\s+", " ", value.strip()).lower()
+        return collapse_whitespace(value).lower()
     return value

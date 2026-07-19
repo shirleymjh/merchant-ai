@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 from pydantic import Field
 
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.models import (
     APIModel,
     AgentRunResult,
@@ -34,6 +35,8 @@ from merchant_ai.models import (
     TopicRoutingDecision,
     VerifiedEvidence,
 )
+
+
 from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
     GroundedContractGap,
@@ -85,6 +88,8 @@ if TYPE_CHECKING:
     )
 else:
     PopulationPreExecutionReference = Any
+
+DEFAULT_ACCESS_ROLE = load_authorization_policy().default_access_role
 
 
 class GroundedRuntimeAttempt(APIModel):
@@ -208,7 +213,7 @@ class GroundedRuntimeSession(APIModel):
     question: str
     merchant_id: str
     merchant: MerchantInfo = Field(default_factory=MerchantInfo)
-    access_role: str = "merchant_analyst"
+    access_role: str = DEFAULT_ACCESS_ROLE
     user_scope: dict[str, Any] = Field(default_factory=dict)
     reference_scope: GroundedReferenceScopeBinding = Field(
         default_factory=GroundedReferenceScopeBinding
@@ -347,7 +352,7 @@ class GroundedRuntimeKernel:
         merchant_id: str,
         *,
         merchant: MerchantInfo | None = None,
-        access_role: str = "merchant_analyst",
+        access_role: str = DEFAULT_ACCESS_ROLE,
         user_scope: dict[str, Any] | None = None,
         reference_scope: GroundedReferenceScopeBinding | dict[str, Any] | None = None,
         session_id: str = "",
@@ -365,7 +370,7 @@ class GroundedRuntimeKernel:
             merchant=(merchant or MerchantInfo(merchant_id=normalized_merchant_id)).model_copy(
                 update={"merchant_id": normalized_merchant_id}
             ),
-            access_role=access_role or "merchant_analyst",
+            access_role=access_role or DEFAULT_ACCESS_ROLE,
             user_scope=dict(user_scope or {}),
             reference_scope=(
                 reference_scope.model_copy(deep=True)
@@ -498,6 +503,16 @@ class GroundedRuntimeKernel:
         self,
         session: GroundedRuntimeSession,
         branches: Sequence[GroundedRuntimeSession],
+        *,
+        pre_adoption_authorizer: Optional[
+            Callable[
+                [
+                    GroundedRuntimeSession,
+                    Sequence[GroundedVerifiedQueryArtifact],
+                ],
+                bool,
+            ]
+        ] = None,
     ) -> list[GroundedVerifiedQueryArtifact]:
         """Atomically merge successful independent branches into the parent.
 
@@ -709,6 +724,25 @@ class GroundedRuntimeKernel:
                     "VERIFIED_BRANCH_ARTIFACT_PUBLICATION_FAILED:%s:%s"
                     % (type(exc).__name__, str(exc)[:300])
                 ) from exc
+
+        if pre_adoption_authorizer is not None:
+            authorized_batches: list[dict[str, Any]] = []
+            for batch in publication_batches:
+                authorized = pre_adoption_authorizer(
+                    batch["branch"],
+                    tuple(
+                        artifact.model_copy(deep=True)
+                        for artifact in batch["parentLedger"]
+                    ),
+                )
+                if authorized:
+                    authorized_batches.append(batch)
+            publication_batches = authorized_batches
+            verified_branches = [
+                batch["branch"] for batch in publication_batches
+            ]
+            if not publication_batches:
+                return []
 
         with self._lock:
             if (
@@ -2361,7 +2395,14 @@ class GroundedRuntimeKernel:
             )
         return core_run_result
 
-    def verify_active(self, session: GroundedRuntimeSession) -> VerifiedEvidence:
+    def verify_active(
+        self,
+        session: GroundedRuntimeSession,
+        *,
+        pre_ledger_authorizer: Optional[
+            Callable[[GroundedVerifiedQueryArtifact], bool]
+        ] = None,
+    ) -> VerifiedEvidence:
         if self.verifier is None:
             raise RuntimeError(
                 "grounded evidence verifier is not configured; refusing unverified answering"
@@ -2490,7 +2531,7 @@ class GroundedRuntimeKernel:
                     private_run_result.verified_evidence = (
                         verified.model_copy(deep=True)
                     )
-                self._record_verified_query_artifact(
+                verified_artifact = self._record_verified_query_artifact(
                     session,
                     generation=generation,
                     plan=plan,
@@ -2505,7 +2546,69 @@ class GroundedRuntimeKernel:
                         else "VERIFIED_IN_MEMORY"
                     ),
                     result_artifact_receipts=published_receipts,
+                    append_to_ledger=(
+                        pre_ledger_authorizer is None
+                    ),
                 )
+                if pre_ledger_authorizer is not None:
+                    try:
+                        authorized = bool(
+                            pre_ledger_authorizer(
+                                verified_artifact.model_copy(
+                                    deep=True
+                                )
+                            )
+                        )
+                    except Exception:
+                        self._scrub_pending_publication_receipts(
+                            session,
+                            generation,
+                        )
+                        for pending in session.pending_query_publications:
+                            if pending.generation == generation:
+                                pending.status = (
+                                    "POST_AUTHORIZATION_REJECTED"
+                                )
+                        session.verified_evidence = None
+                        session.run_result = None
+                        self._clear_answer_snapshot(session)
+                        session.publication_authority_run_result = None
+                        session.publication_authority_fingerprint = ""
+                        session.phase = (
+                            "VERIFIED_ARTIFACT_ADOPTION_REJECTED"
+                        )
+                        session.revision += 1
+                        raise
+                    if not authorized:
+                        self._scrub_pending_publication_receipts(
+                            session,
+                            generation,
+                        )
+                        for pending in session.pending_query_publications:
+                            if pending.generation == generation:
+                                pending.status = (
+                                    "POST_AUTHORIZATION_REJECTED"
+                                )
+                        session.verified_evidence = None
+                        session.run_result = None
+                        self._clear_answer_snapshot(session)
+                        session.publication_authority_run_result = None
+                        session.publication_authority_fingerprint = ""
+                        session.phase = (
+                            "VERIFIED_ARTIFACT_ADOPTION_REJECTED"
+                        )
+                        session.revision += 1
+                        raise RuntimeError(
+                            "VERIFIED_QUERY_ARTIFACT_ADOPTION_REJECTED"
+                        )
+                    if all(
+                        item.artifact_id
+                        != verified_artifact.artifact_id
+                        for item in session.verified_query_ledger
+                    ):
+                        session.verified_query_ledger.append(
+                            verified_artifact
+                        )
             elif publication_error:
                 for pending in session.pending_query_publications:
                     if pending.generation == generation:
@@ -3254,6 +3357,7 @@ class GroundedRuntimeKernel:
         verified: VerifiedEvidence,
         publication_status: str = "VERIFIED_IN_MEMORY",
         result_artifact_receipts: Sequence[dict[str, Any]] = (),
+        append_to_ledger: bool = True,
     ) -> GroundedVerifiedQueryArtifact:
         if session.active_contract is None:
             raise RuntimeError("verified query has no active grounded Contract")
@@ -3402,7 +3506,8 @@ class GroundedRuntimeKernel:
         artifact.ledger_fingerprint = (
             verified_query_artifact_integrity_fingerprint(artifact)
         )
-        session.verified_query_ledger.append(artifact)
+        if append_to_ledger:
+            session.verified_query_ledger.append(artifact)
         return artifact
 
     @staticmethod

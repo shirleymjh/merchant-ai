@@ -45,6 +45,9 @@ def write_topic_asset(
                 "columnName": "event_ref",
                 "businessName": "事件引用",
                 "role": "KEY",
+                "canonicalEntityRef": "entity:event",
+                "isUniqueEntityKey": True,
+                "filterOperators": ["EQ", "IN"],
                 "aliases": ["event_ref"],
             }
         ],

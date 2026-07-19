@@ -10,10 +10,12 @@ from typing import Any
 import pytest
 
 from merchant_ai.models import (
+    AgentTaskResult,
     AgentRunResult,
     DataSnapshotContract,
     QueryBundle,
     QueryPlan,
+    SqlValidationResult,
     VerifiedEvidence,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
@@ -63,6 +65,7 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         self,
         *,
         failed_query_ids: set[str] | None = None,
+        internal_failed_query_ids: set[str] | None = None,
         require_overlap: bool = True,
         data_snapshot: DataSnapshotContract | None = None,
         returned_snapshot_by_query_id: dict[str, DataSnapshotContract] | None = None,
@@ -73,6 +76,9 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
             topic_router=object(),
         )
         self.failed_query_ids = set(failed_query_ids or set())
+        self.internal_failed_query_ids = set(
+            internal_failed_query_ids or set()
+        )
         self.require_overlap = require_overlap
         self.data_snapshot = data_snapshot
         self.returned_snapshot_by_query_id = dict(
@@ -112,8 +118,30 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
                 raise AssertionError("parallel branch workers did not overlap")
             # Keep the overlap observable even on a fast CI worker.
             time.sleep(0.03)
-            if query_id in self.failed_query_ids:
+            if query_id in self.internal_failed_query_ids:
                 raise RuntimeError("planned branch failure: %s" % query_id)
+            if query_id in self.failed_query_ids:
+                failed_bundle = QueryBundle(
+                    failed=True,
+                    error="DORIS_ERROR: planned branch failure",
+                )
+                return AgentRunResult(
+                    task_results=[
+                        AgentTaskResult(
+                            task_id=query_id,
+                            success=False,
+                            query_bundle=failed_bundle,
+                            validation_results=[
+                                SqlValidationResult(
+                                    valid=False,
+                                    error_code="DORIS_ERROR",
+                                    message="planned branch failure",
+                                )
+                            ],
+                        )
+                    ],
+                    merged_query_bundle=failed_bundle,
+                )
             session.active_generation += int(
                 session.user_scope.get("generationDelta", 0)
             )
@@ -333,9 +361,13 @@ def _freeze_test_graph(
 
 
 def test_parallel_batch_overlaps_workers_and_adopts_only_verified_success() -> None:
-    kernel = ConcurrentBranchKernel(failed_query_ids={"second"})
+    kernel = ConcurrentBranchKernel(
+        failed_query_ids={"second"},
+        data_snapshot=_snapshot("OBSERVED_EPOCH"),
+    )
     runtime = _runtime(kernel)
     context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=False)
 
     result = _execute_batch(runtime, context)
 
@@ -343,11 +375,15 @@ def test_parallel_batch_overlaps_workers_and_adopts_only_verified_success() -> N
     assert set(kernel.execute_query_ids) == {"first", "second"}
     assert kernel.verify_query_ids == ["first"]
     assert result["status"] == "PARTIAL"
+    assert result["replanRequired"] is True
+    assert result["nextAction"] == "REOPEN_GRAPH_FOR_RECOVERY"
+    assert len(result["replanEvidenceSet"]) == 1
+    assert result["replanEvidenceSetFingerprint"]
     assert result["executedInParallel"] is True
     assert result["adoptedArtifactIds"] == ["artifact_first"]
     assert [item["status"] for item in result["queries"]] == [
         "VERIFIED",
-        "FAILED",
+        "REPLAN_REQUIRED",
     ]
     assert [item.artifact_id for item in parent.verified_query_ledger] == [
         "artifact_first"
@@ -355,6 +391,26 @@ def test_parallel_batch_overlaps_workers_and_adopts_only_verified_success() -> N
     assert context.session.artifact_goal_ids == {
         "artifact_first": ["goal.first"]
     }
+
+
+def test_internal_parallel_failure_is_terminal_without_partial_adoption() -> None:
+    kernel = ConcurrentBranchKernel(
+        internal_failed_query_ids={"second"}
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "OPERATIONAL_FAILURE"
+    assert parent.verified_query_ledger == []
+    assert context.session.execution_graph_replan_evidence == {}
+    failed = next(
+        item for item in result["queries"]
+        if item["queryId"] == "second"
+    )
+    assert failed["failureDisposition"] == "OPERATIONAL_TERMINAL"
+    assert failed["replanEvidence"] == {}
 
 
 def test_contract_scope_batch_is_blocked_before_doris_without_atomic_snapshot() -> None:

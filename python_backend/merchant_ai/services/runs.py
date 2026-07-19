@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import hashlib
 import inspect
-import re
 import shutil
 import time
 import uuid
@@ -30,20 +29,24 @@ from merchant_ai.services.context_filesystem import merchant_uri_for_artifact
 from merchant_ai.services.checkpoints import checkpoint_ref_for_run, prune_completed_sqlite_checkpoints
 from merchant_ai.services.runtime_state import create_runtime_state_store
 from merchant_ai.services.security import identity_scope_hash, identity_scope_payload
+from merchant_ai.services.text_parsing import is_ascii_hex
 
 
 ANSWER_DELTA_CHARS = 80
-THREAD_ID_PATTERN = re.compile(r"^thread_[0-9a-f]{32}$")
-RUN_ID_PATTERN = re.compile(r"^run_[0-9a-f]{32}$")
 SERVER_THREAD_HISTORY_RUNS = 8
 
 
 def valid_thread_id(thread_id: str) -> bool:
-    return bool(THREAD_ID_PATTERN.fullmatch(str(thread_id or "")))
+    return _valid_runtime_id(thread_id, "thread_")
 
 
 def valid_run_id(run_id: str) -> bool:
-    return bool(RUN_ID_PATTERN.fullmatch(str(run_id or "")))
+    return _valid_runtime_id(run_id, "run_")
+
+
+def _valid_runtime_id(value: str, prefix: str) -> bool:
+    text = str(value or "")
+    return text.startswith(prefix) and is_ascii_hex(text[len(prefix) :], minimum=32, maximum=32)
 
 
 def call_run_chat(

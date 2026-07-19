@@ -21,6 +21,23 @@ def _clean_list(values: Any, limit: int = 8) -> List[str]:
     return result
 
 
+def _focus_labels(values: Any, keys: List[str], limit: int = 8) -> List[str]:
+    labels: List[str] = []
+    for value in values or []:
+        if isinstance(value, dict):
+            text = next(
+                (str(value.get(key) or "").strip() for key in keys if str(value.get(key) or "").strip()),
+                "",
+            )
+        else:
+            text = str(value or "").strip()
+        if text and text not in labels:
+            labels.append(text)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
 def _model_dict(value: Any) -> Dict[str, Any]:
     if value is None:
         return {}
@@ -47,7 +64,11 @@ class MerchantProfileSummaryService:
     ) -> Dict[str, Any]:
         core_memory = memory_injection.get("coreMemory") if isinstance(memory_injection, dict) else {}
         core_memory = core_memory if isinstance(core_memory, dict) else {}
-        recent_focus = core_memory.get("recentFocus") if isinstance(core_memory.get("recentFocus"), dict) else {}
+        recent_focus = memory_injection.get("recentFocus") if isinstance(memory_injection, dict) else {}
+        if not isinstance(recent_focus, dict):
+            recent_focus = {}
+        if not recent_focus and isinstance(core_memory.get("recentFocus"), dict):
+            recent_focus = core_memory["recentFocus"]
         route_payload = _model_dict(route_slots)
         fast_payload = _model_dict(fast_understanding)
         time_window = route_payload.get("timeWindow") or route_payload.get("time_window") or {}
@@ -74,7 +95,11 @@ class MerchantProfileSummaryService:
             limit=10,
         )
         if not preferred_metrics:
-            preferred_metrics = _clean_list(recent_focus.get("topMetrics"), limit=10)
+            preferred_metrics = _focus_labels(
+                recent_focus.get("topMetrics"),
+                ["metric", "key", "value"],
+                limit=10,
+            )
         topic_candidates = route_payload.get("topicCandidates") or route_payload.get("topic_candidates") or []
         candidate_topics = [
             str((item or {}).get("topic") or "")
@@ -83,7 +108,11 @@ class MerchantProfileSummaryService:
         ]
         focus_categories = _clean_list(route_payload.get("categories") or fast_payload.get("businessCategories") or candidate_topics, limit=8)
         if not focus_categories:
-            focus_categories = _clean_list(recent_focus.get("topCategories"), limit=8)
+            focus_categories = _focus_labels(
+                recent_focus.get("topCategories") or recent_focus.get("topTopics"),
+                ["category", "topic", "key", "value"],
+                limit=8,
+            )
         confirmed_rules = []
         for item in required_constraints[:6]:
             confirmed_rules.append(

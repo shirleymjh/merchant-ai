@@ -34,6 +34,12 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
 )
 from merchant_ai.services.grounded_execution_graph import (
     GroundedExecutionGraphReceipt,
+    build_grounded_execution_graph_replan_evidence,
+)
+from merchant_ai.services.grounded_population_gate_coordinator import (
+    PopulationDynamicGraphNode,
+    PopulationDynamicGraphReceipt,
+    seal_population_dynamic_graph_receipt,
 )
 from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
@@ -111,9 +117,7 @@ def _query_artifact() -> GroundedVerifiedQueryArtifact:
         execution_mode="CORE_SQL_REQUIRED",
         output_columns=["value"],
     )
-    artifact.ledger_fingerprint = (
-        verified_query_artifact_integrity_fingerprint(artifact)
-    )
+    artifact.ledger_fingerprint = verified_query_artifact_integrity_fingerprint(artifact)
     return artifact
 
 
@@ -220,11 +224,7 @@ def test_context_below_token_watermark_is_not_compacted(tmp_path: Path) -> None:
     assert report["compactionTriggered"] is False
     assert report["decision"] == "KEEP_FULL_CONTEXT_BELOW_WATERMARK"
     assert report["beforeUsageRatio"] == 0.849
-    assert not list(
-        session.context_workspace.core_scratch_root.glob(
-            "context/recovery_*.json"
-        )
-    )
+    assert not list(session.context_workspace.core_scratch_root.glob("context/recovery_*.json"))
 
 
 def test_context_at_watermark_persists_recovery_and_compacts_to_target(
@@ -264,13 +264,10 @@ def test_context_at_watermark_persists_recovery_and_compacts_to_target(
     assert report["tokenCount"]["authority"] == "PROVIDER_MODEL"
     assert report["rawCheckpointPreserved"] is True
     assert [message.content for message in messages] == original_contents
-    assert summary_payload["recoveryArtifactRef"].startswith(
-        "/workspace/context/recovery_"
-    )
+    assert summary_payload["recoveryArtifactRef"].startswith("/workspace/context/recovery_")
 
-    recovery_path = (
-        session.context_workspace.core_scratch_root
-        / summary_payload["recoveryArtifactRef"].removeprefix("/workspace/")
+    recovery_path = session.context_workspace.core_scratch_root / summary_payload["recoveryArtifactRef"].removeprefix(
+        "/workspace/"
     )
     recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
     rebuilt = build_grounded_recovery_payload(
@@ -279,21 +276,11 @@ def test_context_at_watermark_persists_recovery_and_compacts_to_target(
         run_id="run-context",
     )
     assert rebuilt["recoveryFingerprint"] == recovery["recoveryFingerprint"]
-    assert recovery["identityBinding"]["ownerFingerprint"] == (
-        session.context_workspace.owner_fingerprint
-    )
-    assert recovery["goalContract"]["contract"]["goals"][0]["goalId"] == (
-        "metric.context"
-    )
-    assert recovery["semanticReceipts"][0]["refId"] == (
-        "semantic:topic:table:metric:value"
-    )
-    assert recovery["executionGraph"]["receipt"]["graphId"] == (
-        "graph-context"
-    )
-    assert recovery["queryArtifactReceipts"][0]["queryArtifactId"] == (
-        "query-artifact-context"
-    )
+    assert recovery["identityBinding"]["ownerFingerprint"] == (session.context_workspace.owner_fingerprint)
+    assert recovery["goalContract"]["contract"]["goals"][0]["goalId"] == ("metric.context")
+    assert recovery["semanticReceipts"][0]["refId"] == ("semantic:topic:table:metric:value")
+    assert recovery["executionGraph"]["receipt"]["graphId"] == ("graph-context")
+    assert recovery["queryArtifactReceipts"][0]["queryArtifactId"] == ("query-artifact-context")
     assert recovery["phase"]["runtimePhase"] == "ACTIVE_COMPILED"
 
     immutable_read = WorkspaceArtifactStore(
@@ -304,6 +291,53 @@ def test_context_at_watermark_persists_recovery_and_compacts_to_target(
         require_immutable=True,
     )
     assert immutable_read["success"] is True
+
+
+def test_recovery_artifact_keeps_graph_revision_and_population_authority(
+    tmp_path: Path,
+) -> None:
+    session = _session(_settings(tmp_path))
+    receipt = session.execution_graph_receipt
+    assert receipt is not None
+    trigger = build_grounded_execution_graph_replan_evidence(
+        trigger_kind="TABLE_DELAY",
+        source_stage="DATASOURCE",
+        source_query_node_id="query-node",
+        code="TABLE_FRESHNESS_COVERAGE_INCOMPLETE",
+        graph_receipt=receipt,
+        details={"freshnessStatus": "COVERAGE_INCOMPLETE"},
+    )
+    session.execution_graph_replan_evidence[trigger.evidence_id] = trigger
+    session.execution_graph_revision_count = 1
+    session.execution_graph_max_revision_count = 2
+    session.execution_graph_used_replan_fingerprints = ["used-trigger-fingerprint"]
+    session.population_graph_receipt = seal_population_dynamic_graph_receipt(
+        PopulationDynamicGraphReceipt(
+            graph_id=receipt.graph_id,
+            graph_version=receipt.version,
+            graph_fingerprint=receipt.fingerprint,
+            nodes=(
+                PopulationDynamicGraphNode(
+                    query_node_id="query-node",
+                    consumer_goal_ids=("metric.context",),
+                ),
+            ),
+        )
+    )
+
+    payload = build_grounded_recovery_payload(
+        session,
+        thread_id="thread-context",
+        run_id="run-context",
+    )
+    graph = payload["executionGraph"]
+
+    assert graph["revisionCount"] == 1
+    assert graph["maximumRevisionCount"] == 2
+    assert graph["replanEvidence"][0]["evidenceId"] == (trigger.evidence_id)
+    assert graph["replanEvidence"][0]["evidenceFingerprint"] == (trigger.evidence_fingerprint)
+    assert graph["usedReplanEvidenceFingerprints"] == ["used-trigger-fingerprint"]
+    assert graph["populationReceipt"]["receiptFingerprint"] == (session.population_graph_receipt.receipt_fingerprint)
 
 
 def test_token_counter_prefers_current_model_counter_and_labels_fallback() -> None:
@@ -358,16 +392,10 @@ def test_recovery_never_turns_unpublished_runtime_events_into_authority(
     assert unpublished["publicationStatus"] == "VERIFIED_IN_MEMORY"
     assert unpublished["resultArtifacts"] == []
 
-    committed_receipt = dict(
-        artifact.run_result.merged_query_bundle.runtime_events[0][
-            "resultArtifact"
-        ]
-    )
+    committed_receipt = dict(artifact.run_result.merged_query_bundle.runtime_events[0]["resultArtifact"])
     artifact.publication_status = "PUBLISHED"
     artifact.result_artifact_receipts = [committed_receipt]
-    artifact.ledger_fingerprint = (
-        verified_query_artifact_integrity_fingerprint(artifact)
-    )
+    artifact.ledger_fingerprint = verified_query_artifact_integrity_fingerprint(artifact)
     published = build_grounded_recovery_payload(
         session,
         thread_id="thread-context",
@@ -400,9 +428,7 @@ def test_frozen_graph_reopens_only_artifact_filesystem_after_verified_query(
     session = _session(_settings(tmp_path))
     session.runtime.phase = "EXECUTED"
     session.runtime.active_contract = None
-    session.query_branch_contexts = {
-        "node": SimpleNamespace(status="EXECUTED")
-    }
+    session.query_branch_contexts = {"node": SimpleNamespace(status="EXECUTED")}
     tools = [
         SimpleNamespace(name=name)
         for name in (
@@ -455,10 +481,7 @@ def test_governed_response_returns_configured_preview_and_safe_artifact_refs(
     assert response.data_sections[0].result_coverage == coverage
     assert response.data_sections[0].has_more is True
     assert response.data_sections[0].offloaded_files
-    assert all(
-        item.startswith("merchant://")
-        for item in response.data_sections[0].offloaded_files
-    )
+    assert all(item.startswith("merchant://") for item in response.data_sections[0].offloaded_files)
     serialized = response.model_dump_json(by_alias=True)
     assert "/private/runtime/query-result.json" not in serialized
 
@@ -481,17 +504,13 @@ def test_artifact_backend_pages_only_verified_immutable_files(
         root_kind="artifacts",
         read_only=True,
         settings=settings,
-        allowed_artifact_digests={
-            artifact["relativePath"]: artifact["sha256"]
-        },
+        allowed_artifact_digests={artifact["relativePath"]: artifact["sha256"]},
     )
     scope = GroundedSemanticBackend(object())
 
     with scope.scope(session):
         listing = backend.ls("/artifacts/query_results")
-        assert [item.path for item in listing.entries] == [
-            "/query_results/large.txt"
-        ]
+        assert [item.path for item in listing.entries] == ["/query_results/large.txt"]
         assert not backend.glob(
             "*/unverified.txt",
             "/artifacts",
@@ -500,9 +519,7 @@ def test_artifact_backend_pages_only_verified_immutable_files(
             "must remain hidden",
             "/artifacts",
         ).matches
-        assert backend.read(
-            "/artifacts/query_results/unverified.txt"
-        ).error == "GROUNDED_CONTEXT_FILE_NOT_ALLOWED"
+        assert backend.read("/artifacts/query_results/unverified.txt").error == "GROUNDED_CONTEXT_FILE_NOT_ALLOWED"
 
         first = backend.read(
             "/artifacts/%s" % artifact["relativePath"],

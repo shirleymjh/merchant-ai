@@ -2345,28 +2345,25 @@ class ToolRuntimeService:
         started = time.monotonic()
         heartbeat_interval = max(0.1, float(getattr(self.settings, "tool_heartbeat_interval_seconds", 5.0) or 5.0))
         next_heartbeat_at = started + heartbeat_interval
-        try:
-            while True:
-                if bool(getattr(execution_cancel_event, "is_set", lambda: False)()):
-                    raise RuntimeError("tool execution canceled")
-                remaining = timeout - (time.monotonic() - started)
-                if remaining <= 0:
-                    raise TimeoutError("tool execution timed out")
-                wait_for = min(remaining, max(0.05, next_heartbeat_at - time.monotonic()))
-                try:
-                    status, value = result_queue.get(timeout=wait_for)
-                    if status == "error":
-                        raise value
-                    return value
-                except queue.Empty:
-                    now = time.monotonic()
-                    if heartbeat and now >= next_heartbeat_at:
-                        heartbeat(int((now - started) * 1000), timeout)
-                        next_heartbeat_at = now + heartbeat_interval
-        except TimeoutError as exc:
-            if hasattr(execution_cancel_event, "set"):
-                execution_cancel_event.set()
-            raise TimeoutError("tool execution timed out") from exc
+        while True:
+            if bool(getattr(execution_cancel_event, "is_set", lambda: False)()):
+                raise RuntimeError("tool execution canceled")
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                if hasattr(execution_cancel_event, "set"):
+                    execution_cancel_event.set()
+                raise TimeoutError("tool execution timed out")
+            wait_for = min(remaining, max(0.05, next_heartbeat_at - time.monotonic()))
+            try:
+                status, value = result_queue.get(timeout=wait_for)
+                if status == "error":
+                    raise value
+                return value
+            except queue.Empty:
+                now = time.monotonic()
+                if heartbeat and now >= next_heartbeat_at:
+                    heartbeat(int((now - started) * 1000), timeout)
+                    next_heartbeat_at = now + heartbeat_interval
 
     def _tool_kind(self, tool_name: str) -> str:
         if tool_name in {"draft_llm_sql", "repair_sql", "emit_question_understanding", "draft_sql", "llm_chat", "llm_tool_chat"}:

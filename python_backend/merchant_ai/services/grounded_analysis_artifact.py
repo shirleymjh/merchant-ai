@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -27,6 +26,7 @@ from merchant_ai.services.grounded_goal_contract import (
     parse_original_question_goal_contract,
     required_goal_ids,
 )
+from merchant_ai.services.text_parsing import safe_ascii_component
 
 
 MIN_CORRELATION_SAMPLES = 5
@@ -1435,11 +1435,11 @@ def _decimal_text(value: Decimal | None) -> str:
 
 
 def _canonical_token(value: Any) -> str:
-    return re.sub(
-        r"[^A-Z0-9]+",
-        "_",
-        str(value or "").strip().upper(),
-    ).strip("_")
+    return safe_ascii_component(
+        value,
+        extras=("_",),
+        uppercase=True,
+    )
 
 
 def _stable_json(value: Any) -> str:

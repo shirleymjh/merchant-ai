@@ -1516,6 +1516,32 @@ def _goal_dependency_graph(contract: OriginalQuestionGoalContract) -> dict[str, 
     return graph
 
 
+def goal_dependency_closure(
+    contract: OriginalQuestionGoalContract,
+    target_goal_ids: Sequence[str],
+) -> set[str]:
+    """Return every typed direct or transitive input of target Goals."""
+
+    graph = _goal_dependency_graph(contract)
+    targets = {
+        str(goal_id or "").strip()
+        for goal_id in target_goal_ids
+        if str(goal_id or "").strip()
+    }
+    pending = list(targets)
+    dependencies: set[str] = set()
+    cursor = 0
+    while cursor < len(pending):
+        current = pending[cursor]
+        cursor += 1
+        for dependency in graph.get(current, set()):
+            if dependency in dependencies or dependency in targets:
+                continue
+            dependencies.add(dependency)
+            pending.append(dependency)
+    return dependencies
+
+
 def _all_goal_references(goal: QuestionGoal) -> list[str]:
     references = list(goal.depends_on_goal_ids)
     if isinstance(goal, TimeWindowQuestionGoal):

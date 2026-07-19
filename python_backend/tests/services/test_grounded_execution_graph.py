@@ -7,10 +7,14 @@ import pytest
 from merchant_ai.services.grounded_execution_graph import (
     GroundedExecutionEdgeSpec,
     GroundedExecutionGraphProposal,
+    GroundedExecutionGraphRevisionProposal,
+    GroundedExecutionGraphNodeRuntimeState,
     GroundedExecutionNodeSpec,
+    build_grounded_execution_graph_replan_evidence,
     build_grounded_execution_graph_receipt,
     discovery_evidence_snapshot_fingerprint,
     validate_grounded_execution_graph,
+    validate_grounded_execution_graph_revision,
 )
 from merchant_ai.services.grounded_goal_contract import (
     OriginalQuestionGoalContract,
@@ -118,12 +122,8 @@ def _proposal(
     active_evidence = evidence or _evidence()
     return GroundedExecutionGraphProposal(
         base_version=base_version,
-        goal_contract_fingerprint=original_question_goal_contract_fingerprint(
-            active_contract
-        ),
-        discovery_snapshot_fingerprint=discovery_evidence_snapshot_fingerprint(
-            active_evidence
-        ),
+        goal_contract_fingerprint=original_question_goal_contract_fingerprint(active_contract),
+        discovery_snapshot_fingerprint=discovery_evidence_snapshot_fingerprint(active_evidence),
         nodes=nodes
         or [
             _node(
@@ -177,15 +177,580 @@ def test_valid_graph_is_accepted_and_receipt_has_stable_node_ids() -> None:
     assert set(receipt.node_ids) == {"orders", "refunds"}
     assert set(receipt.parallel_frontier) == set(receipt.node_ids.values())
     assert receipt.waiting_artifact_nodes == []
-    assert receipt.discovery_snapshot_fingerprint == (
-        proposal.discovery_snapshot_fingerprint
+    assert receipt.discovery_snapshot_fingerprint == (proposal.discovery_snapshot_fingerprint)
+
+
+def _revision_validation(
+    *,
+    active: GroundedExecutionGraphProposal,
+    revised: GroundedExecutionGraphProposal,
+    evidence: list[dict[str, str]],
+    states: list[GroundedExecutionGraphNodeRuntimeState],
+    trigger_query_key: str,
+    trigger_kind: str = "DATA_GAP",
+    replace_keys: list[str] | None = None,
+    used_trigger_fingerprints: list[str] | None = None,
+    completed_revision_count: int = 0,
+    contract: OriginalQuestionGoalContract | None = None,
+):
+    active_receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
     )
+    trigger = build_grounded_execution_graph_replan_evidence(
+        trigger_kind=trigger_kind,
+        source_stage=(
+            "CONTRACT" if trigger_kind == "DATA_GAP" else "DATASOURCE" if trigger_kind == "TABLE_DELAY" else "EXECUTION"
+        ),
+        source_query_node_id=active_receipt.node_ids[trigger_query_key],
+        code="STRUCTURED_TEST_TRIGGER",
+        graph_receipt=active_receipt,
+        details={"gapCodes": ["STRUCTURED_GAP"]},
+    )
+    revision = GroundedExecutionGraphRevisionProposal(
+        base_graph_id=active_receipt.graph_id,
+        base_version=active_receipt.version,
+        base_fingerprint=active_receipt.fingerprint,
+        trigger_evidence_id=trigger.evidence_id,
+        trigger_evidence_fingerprint=trigger.evidence_fingerprint,
+        replace_unexecuted_client_keys=replace_keys or [],
+        graph=revised,
+    )
+    validation = validate_grounded_execution_graph_revision(
+        revision,
+        active_proposal=active,
+        active_receipt=active_receipt,
+        trigger_evidence=trigger,
+        node_states=states,
+        goal_contract=contract or _goal_contract(),
+        discovery_evidence=evidence,
+        routed_topics=["orders", "refunds"],
+        used_trigger_fingerprints=(used_trigger_fingerprints or []),
+        completed_revision_count=completed_revision_count,
+        max_revision_count=2,
+    )
+    return validation, active_receipt, trigger, revision
+
+
+def test_revision_appends_node_and_preserves_published_node_identity() -> None:
+    active = _proposal(base_version=2)
+    revised = _proposal(
+        base_version=3,
+        nodes=[
+            *active.nodes,
+            _node(
+                "recovery",
+                "metric.refund_amount",
+                "refunds",
+                "semantic:refunds:metric",
+            ),
+        ],
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key="orders",
+            query_node_id=build_grounded_execution_graph_receipt(
+                active,
+                version=3,
+            ).node_ids["orders"],
+            lifecycle="PUBLISHED",
+        ),
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key="refunds",
+            query_node_id=build_grounded_execution_graph_receipt(
+                active,
+                version=3,
+            ).node_ids["refunds"],
+            lifecycle="UNEXECUTED",
+        ),
+    ]
+
+    validation, active_receipt, trigger, revision = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+    )
+
+    assert validation.valid is True
+    assert validation.added_client_keys == ["recovery"]
+    receipt = build_grounded_execution_graph_receipt(
+        revision.graph,
+        version=4,
+        parent_receipt=active_receipt,
+        replan_evidence_fingerprint=trigger.evidence_fingerprint,
+        preserved_node_ids={key: active_receipt.node_ids[key] for key in validation.carried_forward_client_keys},
+    )
+    assert receipt.node_ids["orders"] == active_receipt.node_ids["orders"]
+    assert receipt.node_ids["refunds"] == active_receipt.node_ids["refunds"]
+    assert receipt.node_ids["recovery"] not in set(active_receipt.node_ids.values())
+    assert receipt.parent_version == 3
+    assert receipt.replan_evidence_fingerprint == (trigger.evidence_fingerprint)
+    assert receipt.revision_fingerprint
+
+
+def test_revision_cannot_mutate_published_node_or_its_input_lineage() -> None:
+    edge = GroundedExecutionEdgeSpec(
+        source_client_key="orders",
+        target_client_key="refunds",
+        dependency_mode="CONTRACT_SCOPE",
+    )
+    active = _proposal(base_version=2, edges=[edge])
+    mutated_orders = active.nodes[0].model_copy(update={"objective": "changed published objective"})
+    revised = _proposal(
+        base_version=3,
+        nodes=[mutated_orders, active.nodes[1]],
+        edges=[],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_id,
+            lifecycle=("PUBLISHED" if key == "orders" else "UNEXECUTED"),
+        )
+        for key, query_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+    )
+
+    assert validation.valid is False
+    assert "EXECUTION_GRAPH_NODE_MUTATION_FORBIDDEN" in _codes(validation)
+    assert "EXECUTION_GRAPH_INPUT_LINEAGE_MUTATION_FORBIDDEN" in _codes(validation)
+
+
+def test_revision_cannot_add_unrelated_published_lineage_to_recovery_node() -> None:
+    active = _proposal(base_version=2)
+    recovery = _node(
+        "refunds-recovery",
+        ["ranking.refunds", "metric.refund_amount"],
+        "refunds",
+        "semantic:refunds:metric",
+    )
+    revised = _proposal(
+        base_version=3,
+        nodes=[*active.nodes, recovery],
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds-recovery",
+                dependency_mode="CONTRACT_SCOPE",
+            )
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_node_id,
+            lifecycle=(
+                "PUBLISHED"
+                if key == "orders"
+                else "UNEXECUTED"
+            ),
+        )
+        for key, query_node_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+    )
+
+    assert validation.valid is False
+    assert (
+        "EXECUTION_GRAPH_ADDED_NODE_LINEAGE_OUTSIDE_TRIGGER_SCOPE"
+        in _codes(validation)
+    )
+
+
+def test_revision_rejects_mixed_authorized_and_unrelated_source_lineage() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "Rank scoped orders without unrelated revenue lineage",
+            "goals": [
+                {
+                    "goalId": "detail.orders",
+                    "kind": "DETAIL",
+                    "label": "scoped orders",
+                },
+                {
+                    "goalId": "metric.refund_amount",
+                    "kind": "METRIC",
+                    "label": "refund amount",
+                },
+                {
+                    "goalId": "metric.unrelated_revenue",
+                    "kind": "METRIC",
+                    "label": "unrelated revenue",
+                },
+                {
+                    "goalId": "ranking.refunds",
+                    "kind": "RANKING",
+                    "label": "refund ranking within scoped orders",
+                    "metricGoalIds": ["metric.refund_amount"],
+                    "limit": 3,
+                    "populationScope": "SAME_AS_GOAL",
+                    "populationGoalIds": ["detail.orders"],
+                },
+            ],
+        }
+    )
+    active = _proposal(
+        contract=contract,
+        base_version=2,
+        nodes=[
+            _node(
+                "orders",
+                ["detail.orders", "metric.unrelated_revenue"],
+                "orders",
+                "semantic:orders:table",
+            ),
+            _node(
+                "refunds",
+                ["ranking.refunds", "metric.refund_amount"],
+                "refunds",
+                "semantic:refunds:metric",
+            ),
+        ],
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds",
+                dependency_mode="VERIFIED_ARTIFACT",
+                artifact_kind="VERIFIED_ENTITY_SET",
+                target_binding_ref="semantic:refunds:population-binding",
+            )
+        ],
+    )
+    recovery = _node(
+        "refunds-recovery",
+        ["ranking.refunds", "metric.refund_amount"],
+        "refunds",
+        "semantic:refunds:metric",
+    )
+    revised = _proposal(
+        contract=contract,
+        base_version=3,
+        nodes=[active.nodes[0], recovery],
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds-recovery",
+                dependency_mode="VERIFIED_ARTIFACT",
+                artifact_kind="VERIFIED_ENTITY_SET",
+                target_binding_ref="semantic:refunds:population-binding",
+            )
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_node_id,
+            lifecycle=(
+                "PUBLISHED"
+                if key == "orders"
+                else "EXECUTION_FAILED"
+            ),
+        )
+        for key, query_node_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+        trigger_kind="EXECUTION_ERROR",
+        contract=contract,
+    )
+
+    assert validation.valid is False
+    assert (
+        "EXECUTION_GRAPH_ADDED_NODE_LINEAGE_OUTSIDE_TRIGGER_SCOPE"
+        in _codes(validation)
+    )
+
+
+def test_revision_can_reconnect_goal_authorized_population_lineage_to_recovery() -> None:
+    contract = _population_goal_contract()
+    active = _proposal(
+        contract=contract,
+        base_version=2,
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds",
+                dependency_mode="VERIFIED_ARTIFACT",
+                artifact_kind="VERIFIED_ENTITY_SET",
+                target_binding_ref="semantic:refunds:population-binding",
+            )
+        ],
+    )
+    recovery = _node(
+        "refunds-recovery",
+        ["ranking.refunds", "metric.refund_amount"],
+        "refunds",
+        "semantic:refunds:metric",
+    )
+    revised = _proposal(
+        contract=contract,
+        base_version=3,
+        nodes=[active.nodes[0], recovery],
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds-recovery",
+                dependency_mode="VERIFIED_ARTIFACT",
+                artifact_kind="VERIFIED_ENTITY_SET",
+                target_binding_ref="semantic:refunds:population-binding",
+            )
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_node_id,
+            lifecycle=(
+                "PUBLISHED"
+                if key == "orders"
+                else "EXECUTION_FAILED"
+            ),
+        )
+        for key, query_node_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+        trigger_kind="EXECUTION_ERROR",
+        contract=contract,
+    )
+
+    assert validation.valid is True
+    assert validation.retired_failed_client_keys == ["refunds"]
+    assert validation.added_client_keys == ["refunds-recovery"]
+
+
+def test_revision_replaces_only_bound_unexecuted_downstream() -> None:
+    extra_evidence = [
+        *_evidence(),
+        {
+            "refId": "semantic:refunds:fallback",
+            "contentHash": "refund-fallback-hash",
+            "topic": "refunds",
+        },
+    ]
+    active = _proposal(
+        evidence=extra_evidence,
+        base_version=2,
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds",
+                dependency_mode="CONTRACT_SCOPE",
+            )
+        ],
+    )
+    replacement = _node(
+        "refunds",
+        ["ranking.refunds", "metric.refund_amount"],
+        "refunds",
+        "semantic:refunds:fallback",
+    )
+    revised = _proposal(
+        evidence=extra_evidence,
+        base_version=3,
+        nodes=[active.nodes[0], replacement],
+        edges=[
+            GroundedExecutionEdgeSpec(
+                source_client_key="orders",
+                target_client_key="refunds",
+                dependency_mode="CONTRACT_SCOPE",
+            )
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_id,
+            lifecycle=("PUBLISHED" if key == "orders" else "UNEXECUTED"),
+        )
+        for key, query_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=extra_evidence,
+        states=states,
+        trigger_query_key="refunds",
+        replace_keys=["refunds"],
+    )
+
+    assert validation.valid is True
+    assert validation.replaced_client_keys == ["refunds"]
+    assert validation.carried_forward_client_keys == ["orders"]
+
+
+def test_revision_rejects_trigger_replay_budget_and_executed_replacement() -> None:
+    active = _proposal(base_version=2)
+    revised = _proposal(
+        base_version=3,
+        nodes=[
+            active.nodes[0],
+            active.nodes[1].model_copy(update={"objective": "changed"}),
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_id,
+            lifecycle="PUBLISHED",
+        )
+        for key, query_id in receipt.node_ids.items()
+    ]
+    _, _, trigger, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+        replace_keys=["refunds"],
+    )
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+        replace_keys=["refunds"],
+        used_trigger_fingerprints=[trigger.evidence_fingerprint],
+        completed_revision_count=2,
+    )
+
+    assert validation.valid is False
+    assert {
+        "EXECUTION_GRAPH_EXECUTED_NODE_REPLACEMENT_FORBIDDEN",
+        "EXECUTION_GRAPH_REPLAN_BUDGET_EXHAUSTED",
+        "EXECUTION_GRAPH_REPLAN_TRIGGER_REPLAYED",
+    }.issubset(_codes(validation))
+
+
+@pytest.mark.parametrize(
+    "trigger_kind",
+    ["TABLE_DELAY", "EXECUTION_ERROR"],
+)
+def test_failed_executed_node_is_historical_and_requires_appended_recovery(
+    trigger_kind: str,
+) -> None:
+    active = _proposal(base_version=2)
+    revised = _proposal(
+        base_version=3,
+        nodes=[
+            active.nodes[0],
+            _node(
+                "refunds-recovery",
+                ["ranking.refunds", "metric.refund_amount"],
+                "refunds",
+                "semantic:refunds:metric",
+            ),
+        ],
+    )
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_id,
+            lifecycle=("EXECUTION_FAILED" if key == "refunds" else "PUBLISHED"),
+        )
+        for key, query_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+        trigger_kind=trigger_kind,
+    )
+
+    assert validation.valid is True
+    assert validation.retired_failed_client_keys == ["refunds"]
+    assert validation.added_client_keys == ["refunds-recovery"]
+
+
+def test_revision_rejects_metadata_only_no_op() -> None:
+    active = _proposal(base_version=2)
+    revised = active.model_copy(update={"base_version": 3})
+    receipt = build_grounded_execution_graph_receipt(
+        active,
+        version=3,
+    )
+    states = [
+        GroundedExecutionGraphNodeRuntimeState(
+            client_key=key,
+            query_node_id=query_id,
+            lifecycle="UNEXECUTED",
+        )
+        for key, query_id in receipt.node_ids.items()
+    ]
+
+    validation, _, _, _ = _revision_validation(
+        active=active,
+        revised=revised,
+        evidence=_evidence(),
+        states=states,
+        trigger_query_key="refunds",
+    )
+
+    assert validation.valid is False
+    assert "EXECUTION_GRAPH_REPLAN_NO_CHANGE" in _codes(validation)
 
 
 def test_goal_contract_fingerprint_mismatch_fails_closed() -> None:
-    proposal = _proposal().model_copy(
-        update={"goal_contract_fingerprint": "wrong-goal-fingerprint"}
-    )
+    proposal = _proposal().model_copy(update={"goal_contract_fingerprint": "wrong-goal-fingerprint"})
 
     result = _validate(proposal)
 
@@ -194,9 +759,7 @@ def test_goal_contract_fingerprint_mismatch_fails_closed() -> None:
 
 
 def test_discovery_snapshot_staleness_fails_closed() -> None:
-    proposal = _proposal().model_copy(
-        update={"discovery_snapshot_fingerprint": "stale-discovery-snapshot"}
-    )
+    proposal = _proposal().model_copy(update={"discovery_snapshot_fingerprint": "stale-discovery-snapshot"})
 
     result = _validate(proposal)
 
@@ -256,11 +819,7 @@ def test_unknown_goal_and_required_goal_omission_are_both_reported() -> None:
         "EXECUTION_GRAPH_GOAL_UNKNOWN",
         "EXECUTION_GRAPH_REQUIRED_GOALS_UNASSIGNED",
     }
-    missing = next(
-        issue
-        for issue in result.issues
-        if issue.code == "EXECUTION_GRAPH_REQUIRED_GOALS_UNASSIGNED"
-    )
+    missing = next(issue for issue in result.issues if issue.code == "EXECUTION_GRAPH_REQUIRED_GOALS_UNASSIGNED")
     assert missing.details["goalIds"] == ["detail.orders"]
 
 

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List
 
 from merchant_ai.config import Settings
+from merchant_ai.services.text_parsing import is_ascii_identifier
 
-
-SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class SemanticRuntimeBindingRegistry:
@@ -52,4 +50,4 @@ class SemanticRuntimeBindingRegistry:
 
 
 def safe_identifier(value: str) -> bool:
-    return bool(SAFE_IDENTIFIER.fullmatch(str(value or "")))
+    return is_ascii_identifier(value)

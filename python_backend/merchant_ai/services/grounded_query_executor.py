@@ -18,6 +18,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
 from merchant_ai.config import Settings
+from merchant_ai.services.authorization_policy import load_authorization_policy
 from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.models import (
     AgentRunResult,
@@ -101,6 +102,8 @@ from merchant_ai.services.time_semantics import (
     latest_as_of_partition_predicate_sql,
     latest_partition_window_predicate,
 )
+
+DEFAULT_ACCESS_ROLE = load_authorization_policy().default_access_role
 
 
 @dataclass(frozen=True)
@@ -194,7 +197,7 @@ class GroundedQueryExecutionKernel:
         run_id: str = "",
         artifact_root: str = "",
         context_owner_fingerprint: str = "",
-        access_role: str = "merchant_analyst",
+        access_role: str = DEFAULT_ACCESS_ROLE,
         user_scope: dict[str, Any] | None = None,
         execution_reference_scope: Any = None,
         execution_goal_contract_fingerprint: str = "",
@@ -1224,7 +1227,7 @@ class GroundedQueryExecutionKernel:
             authorized_store_ids=store_ids,
             region_filter_column=region_column,
             store_filter_column=store_column,
-            access_role=access_role or "merchant_analyst",
+            access_role=access_role or DEFAULT_ACCESS_ROLE,
             row_scope_policy=normalize_row_access_policy(
                 table_metadata.get("rowAccessPolicy")
                 or default_row_access_policy(merchant_column)
@@ -1455,7 +1458,7 @@ class GroundedQueryExecutionKernel:
                     authorized_store_ids=store_ids,
                     region_filter_column=region_column,
                     store_filter_column=store_column,
-                    access_role=access_role or "merchant_analyst",
+                    access_role=access_role or DEFAULT_ACCESS_ROLE,
                     row_scope_policy=normalize_row_access_policy(
                         metadata.get("rowAccessPolicy")
                         or default_row_access_policy(merchant_column)
@@ -2067,7 +2070,7 @@ class GroundedQueryExecutionKernel:
                     effective_user_id=str(
                         user_scope.get("userId") or user_scope.get("user_id") or ""
                     ),
-                    access_role=access_role or "merchant_analyst",
+                    access_role=access_role or DEFAULT_ACCESS_ROLE,
                     row_scope_policy=normalize_row_access_policy(
                         metadata.get("rowAccessPolicy")
                         or default_row_access_policy(binding.merchant_filter_column)

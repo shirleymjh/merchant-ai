@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
-import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
+
+import sqlglot
+from sqlglot import exp
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.query_graph_contract import semantic_query_execution_contract
@@ -61,6 +64,7 @@ from merchant_ai.services.formulas import (
 )
 from merchant_ai.services.entity_contracts import canonical_entity_values, entity_comparison_policy
 from merchant_ai.services.llm import LlmClient
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.llm_recovery import (
     LlmFailureClassification,
     bounded_single_retry_count,
@@ -95,11 +99,20 @@ from merchant_ai.services.planning_tooling import (
     planner_tool_results_for_prompt,
 )
 from merchant_ai.services.planning_layers import GraphContractValidator, PlanCompiler, PlanRepairer, UnderstandingExtractor
-from merchant_ai.services.routing import extract_days
+from merchant_ai.services.routing import extract_days, extract_ranking_spans
 from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution, semantic_metric_contract_issue
 from merchant_ai.services.time_semantics import (
     has_explicit_time_expression,
     time_window_contract_validation_gaps,
+)
+from merchant_ai.services.text_parsing import (
+    ASCII_DIGITS,
+    ASCII_LETTERS,
+    ASCII_WORD,
+    collapse_whitespace,
+    contains_any_literal,
+    literal_spans,
+    split_on_characters,
 )
 from merchant_ai.services.context_filesystem import add_context_uri
 from merchant_ai.services.tool_runtime import ToolCallExecutor, ToolFailureRegistry, ToolRuntimePolicyRegistry, ToolRuntimeService
@@ -113,6 +126,9 @@ from merchant_ai.services.tools import (
     source_condition_coverage_tool,
     tool_schema_catalog,
 )
+
+
+_PLANNING_LANGUAGE = load_language_policy()
 
 
 @dataclass
@@ -997,7 +1013,7 @@ def semantic_metric_label_present(metric: Any, text: str) -> bool:
         normalized = normalize_metric_match_text(label)
         if strong_metric_label_text_match(normalized, normalized_text):
             return True
-        for token in re.findall(r"[A-Za-z0-9_]{3,}", str(text or "").lower()):
+        for token in ascii_word_runs(str(text or "").lower(), minimum=3, allow_digit_start=True):
             if token and token in normalized:
                 return True
     return False
@@ -1148,7 +1164,7 @@ def calculation_intent_mentions_metric(table: str, metric_key: str, understandin
 def explicit_metric_label_text_match(normalized_label: str, normalized_text: str) -> bool:
     if not normalized_label or not normalized_text:
         return False
-    if re.search(r"[a-z0-9]", normalized_label):
+    if any(character in ASCII_LETTERS | ASCII_DIGITS for character in normalized_label):
         return len(normalized_label) >= 3 and normalized_label in normalized_text
     return len(normalized_label) >= 2 and normalized_label in normalized_text
 
@@ -1156,7 +1172,7 @@ def explicit_metric_label_text_match(normalized_label: str, normalized_text: str
 def strong_metric_label_text_match(normalized_label: str, normalized_text: str) -> bool:
     if not normalized_label or not normalized_text:
         return False
-    if re.search(r"[a-z0-9]", normalized_label):
+    if any(character in ASCII_LETTERS | ASCII_DIGITS for character in normalized_label):
         return len(normalized_label) >= 3 and normalized_label in normalized_text
     if len(normalized_label) >= 4 and normalized_label in normalized_text:
         return True
@@ -2250,7 +2266,7 @@ class QueryGraphPlanner:
                 if len(term) < 3 or term not in normalized_question:
                     continue
                 ratio = len(term) / max(1, len(normalized))
-                if ratio >= 0.45 or re.search(r"[a-zA-Z]", term):
+                if ratio >= 0.45 or any(character in ASCII_LETTERS for character in term):
                     scored.append((100 + len(term) + int(ratio * 20), term))
         if not scored:
             return ""
@@ -2282,7 +2298,7 @@ class QueryGraphPlanner:
         normalized_phrases = [(phrase, normalize_semantic_text(phrase)) for phrase in phrases if normalize_semantic_text(phrase)]
         kept: List[str] = []
         for phrase, normalized in normalized_phrases:
-            starts = [match.start() for match in re.finditer(re.escape(normalized), normalized_question)]
+            starts = literal_start_positions(normalized_question, normalized)
             if starts:
                 covered = True
                 for start in starts:
@@ -2291,8 +2307,8 @@ class QueryGraphPlanner:
                     for other_phrase, other in normalized_phrases:
                         if other == normalized or len(other) <= len(normalized) or normalized not in other:
                             continue
-                        for other_match in re.finditer(re.escape(other), normalized_question):
-                            if other_match.start() <= start and end <= other_match.end():
+                        for other_start in literal_start_positions(normalized_question, other):
+                            if other_start <= start and end <= other_start + len(other):
                                 container_found = True
                                 break
                         if container_found:
@@ -9010,14 +9026,8 @@ def understanding_requests_ratio(question: str, understanding: Dict[str, Any]) -
         operation = str(item.get("operation") or "").lower()
         if operation in {"ratio", "percentage", "proportion"}:
             return True
-    text = " ".join(
-        [
-            question,
-            str((understanding.get("rankingObjective") or {}).get("sourcePhrase") or ""),
-            " ".join(str(item.get("sourcePhrase") or "") for item in understanding.get("requestedMeasures") or [] if isinstance(item, dict)),
-        ]
-    ).lower()
-    return any(token in text for token in ["ratio", "proportion", "percentage", "percent", "占比", "占多少", "比例"])
+    del question
+    return False
 
 
 def scope_ratio_numerator_metric(
@@ -9099,7 +9109,7 @@ def metric_is_event_or_subset_metric(metric: Any) -> bool:
     if any(metadata.get(key) for key in ["populationScope", "population_scope", "scopeFilter", "scope_filter", "filterPredicate", "filter_predicate", "where"]):
         return True
     formula = metric_formula_for_entry(metric).lower()
-    return bool(re.search(r"\b(case\s+when|where|if\s*\()", formula, flags=re.IGNORECASE))
+    return formula_has_conditional_scope(formula)
 
 
 def scope_ratio_numerator_knowledge_request(question: str, understanding: Dict[str, Any], reason: str) -> KnowledgeRequest:
@@ -10382,24 +10392,17 @@ def resolve_entity_reference(question: str, asset_pack: PlanningAssetPack) -> En
         column = str(entry.key or "")
         if not column:
             continue
-        match = re.search(
-            r"(?<![A-Za-z0-9_])(?P<value>%s(?:[_-][A-Za-z0-9][A-Za-z0-9_.-]*)+)(?![A-Za-z0-9_])"
-            % re.escape(column),
-            text,
-            flags=re.I,
-        )
-        if match:
+        values = explicit_prefixed_entity_values(text, column)
+        if values:
             return build_entity_reference(
                 question=text,
                 raw_label=column,
-                raw_value=match.group("value"),
+                raw_value=values[0],
                 matching_entries=[item for item in entries if item.key == column],
                 source="explicit_prefixed_value",
             )
 
-    for match in entity_assignment_matches(text):
-        raw_label = match.group("label").strip()
-        raw_value = match.group("value").strip()
+    for raw_label, raw_value in entity_assignment_matches(text):
         matching_entries = entity_entries_for_label(raw_label, entries)
         if matching_entries:
             return build_entity_reference(text, raw_label, raw_value, matching_entries, "explicit_assignment")
@@ -10477,14 +10480,102 @@ def entity_filter_candidate_entries(asset_pack: PlanningAssetPack) -> List[Plann
     return sorted(entries, key=lambda item: (-len(str(item.key or "")), str(item.key or ""), str(item.table or "")))
 
 
-def entity_assignment_matches(text: str) -> Iterable[re.Match[str]]:
-    pattern = re.compile(
-        r"(?P<label>[A-Za-z_][A-Za-z0-9_\- ]{0,48}|[\u4e00-\u9fffA-Za-z0-9_]{1,32}?)"
-        r"\s*(?:=|:|：|为|等于)\s*"
-        r"(?P<value>[\"'][^\"'\r\n]+[\"']|[A-Za-z0-9_./:@+\-]+(?:\s*[,，]\s*[A-Za-z0-9_./:@+\-]+)*)",
-        flags=re.I,
-    )
-    return pattern.finditer(text)
+def entity_assignment_matches(text: str) -> Iterable[Tuple[str, str]]:
+    value = str(text or "")
+    operators = _PLANNING_LANGUAGE.routing.entity_assignment_operators
+    boundary_characters = frozenset("\r\n,，;；!?！？")
+    for start, end, _operator in literal_spans(value, operators, case_sensitive=False):
+        label_end = start
+        while label_end > 0 and value[label_end - 1].isspace():
+            label_end -= 1
+        label_start = label_end
+        while (
+            label_start > 0
+            and label_end - label_start < 48
+            and value[label_start - 1] not in boundary_characters
+        ):
+            label_start -= 1
+        label = value[label_start:label_end].strip()
+        if not label or not all(entity_label_character(character) for character in label):
+            continue
+        value_start = end
+        while value_start < len(value) and value[value_start].isspace():
+            value_start += 1
+        value_end = entity_assignment_value_end(value, value_start)
+        raw_value = value[value_start:value_end].strip()
+        if raw_value:
+            yield label, raw_value
+
+
+def entity_label_character(character: str) -> bool:
+    return character.isalnum() or character in {"_", "-", " ", "\t", "`", "（", "）", "(", ")"}
+
+
+def entity_assignment_value_end(value: str, start: int) -> int:
+    if start >= len(value):
+        return start
+    if value[start] in {"'", '"'}:
+        quote = value[start]
+        cursor = start + 1
+        while cursor < len(value) and value[cursor] not in {quote, "\r", "\n"}:
+            cursor += 1
+        return min(len(value), cursor + 1) if cursor < len(value) and value[cursor] == quote else cursor
+    cursor = start
+    while cursor < len(value):
+        character = value[cursor]
+        if entity_unquoted_reference_value_character(character) or character in {",", "，"} or character.isspace():
+            cursor += 1
+            continue
+        break
+    return cursor
+
+
+def explicit_prefixed_entity_values(value: str, column: str) -> List[str]:
+    text = str(value or "")
+    label = str(column or "")
+    if not text or not label:
+        return []
+    lowered = text.lower()
+    needle = label.lower()
+    results: List[str] = []
+    for start in literal_start_positions(lowered, needle):
+        end = start + len(label)
+        if start > 0 and text[start - 1] in ASCII_WORD:
+            continue
+        if end >= len(text) or text[end] not in {"_", "-"}:
+            continue
+        cursor = end + 1
+        if cursor >= len(text) or text[cursor] not in ASCII_LETTERS | ASCII_DIGITS:
+            continue
+        while cursor < len(text) and text[cursor] in ASCII_WORD | {".", "-"}:
+            cursor += 1
+        if cursor < len(text) and text[cursor] in ASCII_WORD:
+            continue
+        results.append(text[start:cursor])
+    return dedupe_strings(results)
+
+
+def explicit_entity_reference_tokens(value: str, column: str) -> List[str]:
+    text = str(value or "")
+    label = str(column or "")
+    if not text or not label:
+        return []
+    lowered = text.lower()
+    needle = label.lower()
+    results: List[str] = []
+    for start in literal_start_positions(lowered, needle):
+        if start > 0 and text[start - 1] in ASCII_WORD:
+            continue
+        cursor = start + len(label)
+        while cursor < len(text) and text[cursor] in {"_", ":", "=", "：", "-"}:
+            cursor += 1
+        value_start = cursor
+        while cursor < len(text) and text[cursor] in ASCII_WORD | {"-"}:
+            cursor += 1
+        if cursor == value_start or (cursor < len(text) and text[cursor] in ASCII_WORD):
+            continue
+        results.append(text[start:cursor].strip(":=：-"))
+    return dedupe_strings(results)
 
 
 def entity_entries_for_label(label: str, entries: List[PlanningAssetEntry]) -> List[PlanningAssetEntry]:
@@ -10514,9 +10605,12 @@ def entity_entries_for_label(label: str, entries: List[PlanningAssetEntry]) -> L
 
 
 def normalize_entity_label(value: Any) -> str:
-    text = re.sub(r"[\s_`：:（）()\-]+", "", str(value or "").strip().casefold())
-    text = re.sub(r"(?:编号|号码|号|id)$", "id", text, flags=re.I)
-    return text
+    ignored = frozenset("_`：:（）()-")
+    return "".join(
+        character
+        for character in str(value or "").strip().casefold()
+        if not character.isspace() and character not in ignored
+    )
 
 
 def build_entity_reference(
@@ -10532,7 +10626,7 @@ def build_entity_reference(
         [entity_candidate_identity(entry) for entry in matching_entries if entity_candidate_identity(entry)]
     )
     values, valid = parse_entity_reference_values(raw_value)
-    placeholder = any(entity_value_is_placeholder(item) for item in values)
+    placeholder = any(entity_value_is_placeholder(item, matching_entries) for item in values)
     value_type = entity_reference_value_type(matching_entries)
     if valid and values:
         valid = all(entity_reference_value_is_valid(item, value_type) for item in values)
@@ -10592,21 +10686,62 @@ def parse_entity_reference_values(raw_value: Any) -> Tuple[List[str], bool]:
     text = str(raw_value or "").strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
         text = text[1:-1].strip()
-    values = dedupe_strings(item.strip().strip("'\"") for item in re.split(r"[,，]", text) if item.strip())
-    valid = bool(values) and all(bool(re.fullmatch(r"[\w./:@+\-]+", item, flags=re.UNICODE)) for item in values)
+    values = dedupe_strings(
+        item.strip().strip("'\"")
+        for item in split_on_characters(text, {",", "，"})
+        if item.strip()
+    )
+    valid = bool(values) and all(
+        bool(item) and all(entity_reference_value_character(character) for character in item)
+        for item in values
+    )
     return values, valid
 
 
-def entity_value_is_placeholder(value: Any) -> bool:
+def entity_reference_value_character(character: str) -> bool:
+    return character.isalnum() or character in {"_", ".", "/", ":", "@", "+", "-"}
+
+
+def entity_unquoted_reference_value_character(character: str) -> bool:
+    return character in ASCII_WORD or character in {".", "/", ":", "@", "+", "-"}
+
+
+def entity_value_is_placeholder(value: Any, entries: Iterable[PlanningAssetEntry] = ()) -> bool:
     text = str(value or "").strip().casefold()
     if not text:
         return True
-    compact = re.sub(r"[\s_.\-]+", "", text)
-    return bool(
-        re.fullmatch(r"x{2,}", compact)
-        or compact in {"id", "某某", "某个", "示例id", "exampleid", "yourid", "placeholder"}
-        or re.fullmatch(r"[<{\[][^>}\]]*(?:id|编号)[^>}\]]*[>}\]]", text, flags=re.I)
+    declared = {
+        str(item or "").strip().casefold()
+        for entry in entries
+        for item in declared_entity_placeholder_values(entry)
+        if str(item or "").strip()
+    }
+    if text in declared:
+        return True
+    if len(text) >= 2 and (text[0], text[-1]) in {("<", ">"), ("{", "}"), ("[", "]")}:
+        return True
+    compact = "".join(
+        character
+        for character in text
+        if not character.isspace() and character not in {"_", ".", "-"}
     )
+    return (
+        len(compact) >= 2
+        and all(character in ASCII_LETTERS for character in compact)
+        and len(set(compact)) == 1
+    )
+
+
+def declared_entity_placeholder_values(entry: PlanningAssetEntry) -> List[Any]:
+    metadata = entry.metadata or {}
+    semantic = metadata.get("semantic") if isinstance(metadata.get("semantic"), dict) else {}
+    schema = metadata.get("schema") if isinstance(metadata.get("schema"), dict) else {}
+    values: List[Any] = []
+    for source in (metadata, semantic, schema):
+        raw = source.get("placeholderValues") or source.get("placeholder_values") or []
+        if isinstance(raw, (list, tuple, set)):
+            values.extend(raw)
+    return values
 
 
 def entity_reference_value_type(entries: List[PlanningAssetEntry]) -> str:
@@ -10616,9 +10751,9 @@ def entity_reference_value_type(entries: List[PlanningAssetEntry]) -> str:
         raw = str(schema.get("dataType") or schema.get("type") or "").strip().lower()
         if raw:
             types.append(raw)
-    if types and all(re.match(r"^(?:tinyint|smallint|int|integer|bigint)\b", item) for item in types):
+    if types and all(canonical_declared_data_type(item) == "integer" for item in types):
         return "integer"
-    if types and all(re.match(r"^(?:decimal|numeric|float|double|real)\b", item) for item in types):
+    if types and all(canonical_declared_data_type(item) == "number" for item in types):
         return "number"
     return "string"
 
@@ -10651,7 +10786,7 @@ def entity_reference_comparison_policy(
 
 def entity_reference_value_is_valid(value: str, value_type: str) -> bool:
     if value_type == "integer":
-        return bool(re.fullmatch(r"[-+]?\d+", str(value or "")))
+        return is_signed_ascii_integer(value)
     if value_type == "number":
         try:
             number = Decimal(str(value or ""))
@@ -10662,7 +10797,7 @@ def entity_reference_value_is_valid(value: str, value_type: str) -> bool:
 
 
 def coerce_entity_reference_value(value: str, value_type: str) -> Any:
-    if value_type == "integer" and re.fullmatch(r"[-+]?\d+", value):
+    if value_type == "integer" and is_signed_ascii_integer(value):
         return int(value)
     if value_type == "number":
         return Decimal(value)
@@ -10787,9 +10922,7 @@ def explicit_object_refs_from_question(question: str, asset_pack: PlanningAssetP
     refs: List[Tuple[str, str]] = []
     seen: set[Tuple[str, str]] = set()
     for column in candidates:
-        pattern = re.compile(r"\b%s[_:=：-]*[A-Za-z0-9_-]+\b" % re.escape(column), re.IGNORECASE)
-        for match in pattern.finditer(text):
-            value = match.group(0).strip(":=：-")
+        for value in explicit_entity_reference_tokens(text, column):
             key = (column, normalize_entity_filter_value(value))
             if key in seen:
                 continue
@@ -10799,7 +10932,12 @@ def explicit_object_refs_from_question(question: str, asset_pack: PlanningAssetP
 
 
 def normalize_entity_filter_value(value: str) -> str:
-    return re.sub(r"[\s`'\"，,]+", "", str(value or "").lower())
+    ignored = frozenset("`'\"，,")
+    return "".join(
+        character
+        for character in str(value or "").lower()
+        if not character.isspace() and character not in ignored
+    )
 
 
 def filter_value_contains_entity(actual: str, expected: str) -> bool:
@@ -10809,7 +10947,10 @@ def filter_value_contains_entity(actual: str, expected: str) -> bool:
         return False
     if actual_norm == expected_norm:
         return True
-    parts = [normalize_entity_filter_value(part) for part in re.split(r"[,，]", str(actual or ""))]
+    parts = [
+        normalize_entity_filter_value(part)
+        for part in split_on_characters(str(actual or ""), {",", "，"})
+    ]
     return expected_norm in parts
 
 
@@ -11168,9 +11309,14 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
     """
 
     text = normalize_text(question)
-    if not any(term in text for term in ["最高", "最低", "最多", "最少", "前", "top"]):
+    ranking_spans = extract_ranking_spans(question)
+    if not ranking_spans:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_not_ranking"])
-    if any(term in text for term in ["明细", "详情", "记录"]) or entity_filter_from_question(question, asset_pack)[0]:
+    if contains_any_literal(
+        text,
+        _PLANNING_LANGUAGE.routing.detail_markers,
+        case_sensitive=False,
+    ) or entity_filter_from_question(question, asset_pack)[0]:
         return QueryPlan(agent_trace=["planner.semantic_fast_path.skipped_detail"])
     explicit_metrics = semantic_fast_path_explicit_metrics(question, asset_pack)
     if not explicit_metrics:
@@ -11208,7 +11354,12 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
         }
         for metric in requested_metrics
     ]
-    requires_explanation = any(term in text for term in ["风险", "异常", "判断", "分析"])
+    explanation_markers = (
+        *_PLANNING_LANGUAGE.routing.causal_markers,
+        *_PLANNING_LANGUAGE.routing.risk_markers,
+        *_PLANNING_LANGUAGE.temporal.time_series_markers,
+    )
+    requires_explanation = contains_any_literal(text, explanation_markers, case_sensitive=False)
     required_evidence = semantic_fast_path_required_evidence(question, asset_pack)
     if requires_explanation:
         required_evidence.append(
@@ -11228,7 +11379,7 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
         )
     understanding = {
         "analysisGrain": semantic_fast_path_grain(question, group_by, asset_pack, ranking_metric.table),
-        "analysisIntent": "risk_ranking" if any(term in text for term in ["风险", "异常", "判断"]) else "none",
+        "analysisIntent": "diagnosis" if requires_explanation else "none",
         "requiresExplanation": requires_explanation,
         "requiredEvidenceIntents": required_evidence,
         "rankingObjective": {
@@ -11242,7 +11393,14 @@ def compile_semantic_topn_metric_fast_graph(question: str, asset_pack: PlanningA
             "metricGovernanceMode": "published_semantic" if published_semantic_metric_ref(ranking_metric) else "compiled_local",
             "objectiveType": "topn_metric",
             "groupByColumn": group_by,
-            "order": "asc" if any(term in text for term in ["最低", "最少"]) else "desc",
+            "order": next(
+                (
+                    str(_PLANNING_LANGUAGE.routing.ranking_operators.get(span.text) or "")
+                    for span in ranking_spans
+                    if _PLANNING_LANGUAGE.routing.ranking_operators.get(span.text)
+                ),
+                _PLANNING_LANGUAGE.routing.ranking_default_order,
+            ),
             "limit": infer_limit(question),
         },
         "requestedMeasures": requested,
@@ -11422,16 +11580,16 @@ def semantic_asset_label_matches_question(label: str, normalized_question: str) 
     if explicit_metric_label_text_match(normalized_label, normalized_question):
         return True
 
-    label_cjk = "".join(re.findall(r"[\u4e00-\u9fff]+", normalized_label))
-    question_cjk = "".join(re.findall(r"[\u4e00-\u9fff]+", normalized_question))
+    label_cjk = "".join(character for character in normalized_label if is_cjk_character(character))
+    question_cjk = "".join(character for character in normalized_question if is_cjk_character(character))
     if len(label_cjk) >= 2 and len(question_cjk) >= 2:
         overlap = longest_shared_text_span(label_cjk, question_cjk, max_size=8)
         prefix_requested = label_cjk[:2] in question_cjk
         if overlap >= 4 or prefix_requested or (overlap >= 2 and overlap * 5 >= len(label_cjk) * 3):
             return True
 
-    question_tokens = set(re.findall(r"[a-z][a-z0-9]*", normalized_question))
-    label_tokens = re.findall(r"[a-z][a-z0-9]*", str(label or "").lower())
+    question_tokens = set(ascii_word_runs(normalized_question, minimum=1))
+    label_tokens = ascii_word_runs(str(label or "").lower(), minimum=1)
     return any(len(token) >= 4 and token in question_tokens for token in label_tokens)
 
 
@@ -12149,11 +12307,10 @@ def semantic_fast_path_requested_metric_support_score(
 def semantic_fast_path_ranking_metric(question: str, metrics: List[Any], asset_pack: PlanningAssetPack | None = None) -> Any:
     text = normalize_text(question)
     ranking_window = text
-    for marker in ["最高", "最低", "最多", "最少"]:
-        idx = text.find(marker)
-        if idx > 0:
-            ranking_window = text[max(0, idx - 18) : idx + len(marker) + 8]
-            break
+    operator_spans = literal_spans(text, _PLANNING_LANGUAGE.routing.ranking_operators)
+    if operator_spans:
+        start, end, _marker = operator_spans[0]
+        ranking_window = text[max(0, start - 18) : end + 8]
     ranking_positions = semantic_ranking_signal_positions(question)
     ranked = sorted(
         metrics,
@@ -12170,11 +12327,12 @@ def semantic_fast_path_ranking_metric(question: str, metrics: List[Any], asset_p
 
 
 def semantic_ranking_signal_positions(question: str) -> List[int]:
-    text = normalize_metric_match_text(question)
-    positions: List[int] = []
-    for pattern in [r"前\d+", r"top\d*", r"最高", r"最低", r"最多", r"最少"]:
-        positions.extend(match.start() for match in re.finditer(pattern, text))
-    return sorted(set(positions))
+    return sorted(
+        {
+            len(normalize_metric_match_text(str(question or "")[: int(span.start)]))
+            for span in extract_ranking_spans(question)
+        }
+    )
 
 
 def semantic_metric_label_spans(metric: Any, question: str) -> List[Tuple[int, int, str]]:
@@ -12343,14 +12501,12 @@ def semantic_fast_path_required_evidence(question: str, asset_pack: PlanningAsse
 
 
 def diagnostic_metric_fallback_safe(question: str) -> bool:
-    text = normalize_text(question)
-    return bool(
-        re.search(
-            r"为什么|原因|归因|诊断|下降|下滑|降低|减少|异常|波动|趋势|走势|变化|是否正常",
-            text,
-            flags=re.IGNORECASE,
-        )
+    markers = (
+        *_PLANNING_LANGUAGE.routing.causal_markers,
+        *_PLANNING_LANGUAGE.routing.risk_markers,
+        *_PLANNING_LANGUAGE.temporal.time_series_markers,
     )
+    return contains_any_literal(normalize_text(question), markers, case_sensitive=False)
 
 
 def canonical_recalled_metric_evidence_for_question(
@@ -13137,7 +13293,11 @@ def semantic_metric_fallback_safe(question: str, asset_pack: PlanningAssetPack, 
     text = normalize_text(question)
     if entity_filter_from_question(question, asset_pack)[0]:
         return False
-    if any(term in text for term in ["明细", "详情", "关联", "对应", "状态", "列表", "记录"]):
+    if contains_any_literal(
+        text,
+        _PLANNING_LANGUAGE.routing.detail_markers,
+        case_sensitive=False,
+    ):
         return False
     return True
 
@@ -13563,7 +13723,7 @@ def metric_declares_population_scope(metric_ref: str, owner_table: str, asset_pa
         if metadata.get(key):
             return True
     formula = str(metadata.get("formula") or metadata.get("metricFormula") or metric_formula_for_entry(metric) or "")
-    return bool(re.search(r"\b(case\s+when|where|if\s*\()", formula, flags=re.IGNORECASE))
+    return formula_has_conditional_scope(formula)
 
 
 def scope_contract_compiled_as_population(scope: ScopeContract, intent: QuestionIntent) -> bool:
@@ -14000,7 +14160,7 @@ def table_is_detail_asset(entry: PlanningAssetEntry) -> bool:
             "data_grain",
         ]
     ).lower()
-    return "detail" in declared or "明细" in declared or "流水" in declared
+    return "detail" in declared
 
 
 def table_semantic_labels(entry: PlanningAssetEntry) -> List[str]:
@@ -14018,15 +14178,19 @@ def table_semantic_labels(entry: PlanningAssetEntry) -> List[str]:
 
 
 def normalize_semantic_text(value: Any) -> str:
-    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").lower())
+    return "".join(
+        character
+        for character in str(value or "").lower()
+        if character.isalnum() or character == "_"
+    )
 
 
 def semantic_phrase_terms(normalized_phrase: str) -> List[str]:
     terms: List[str] = []
-    for token in re.findall(r"[a-zA-Z][a-zA-Z0-9]*|\d+", normalized_phrase):
+    for token in ascii_and_digit_runs(normalized_phrase):
         if len(token) >= 2 and token not in terms:
             terms.append(token)
-    for seq in re.findall(r"[\u4e00-\u9fff]{2,}", normalized_phrase):
+    for seq in cjk_runs(normalized_phrase, minimum=2):
         for size in range(2, min(5, len(seq)) + 1):
             for index in range(0, len(seq) - size + 1):
                 gram = seq[index : index + size]
@@ -14322,34 +14486,30 @@ def recall_item_requires_rule_evidence(item: Any) -> bool:
             return getattr(item, key, default)
 
         metadata = getattr(item, "metadata", {}) or {}
-    text = normalize_metric_match_text(
-        " ".join(
-            [
-                str(getter("source_type", "") or getter("sourceType", "") or ""),
-                str(getter("answer_mode", "") or getter("answerMode", "") or ""),
-                str(getter("topic", "") or ""),
-                str(getter("title", "") or ""),
-                str(getter("doc_id", "") or getter("docId", "") or ""),
-                str(metadata.get("refType") or ""),
-            ]
-        )
-    )
-    return "rule" in text or "platformrule" in text or "businessrule" in text
+    declared = {
+        normalize_metric_match_text(value)
+        for value in [
+            getter("source_type", "") or getter("sourceType", ""),
+            getter("answer_mode", "") or getter("answerMode", ""),
+            metadata.get("refType"),
+            metadata.get("evidenceType"),
+            metadata.get("semanticKind"),
+        ]
+        if str(value or "").strip()
+    }
+    return bool(declared & {"rule", "platformrule", "businessrule"})
 
 
 def evidence_item_requires_rule(item: Dict[str, Any]) -> bool:
     if not isinstance(item, dict):
         return False
-    label = normalize_metric_match_text(item.get("semanticLabel") or item.get("semantic_label") or "")
     domains = {
         normalize_metric_match_text(domain)
         for domain in item.get("suggestedDomains") or item.get("suggested_domains") or []
         if str(domain or "").strip()
     }
-    raw_label = str(item.get("semanticLabel") or item.get("semantic_label") or "")
-    raw_reason = str(item.get("reason") or "")
     evidence_type = normalize_metric_match_text(item.get("evidenceType") or item.get("evidence_type") or "")
-    return evidence_type in {"rule", "platformrule", "businessrule"} or "rule" in label or "platformrule" in label or "businessrule" in label or "规则" in raw_label or "规则" in raw_reason or bool(
+    return evidence_type in {"rule", "platformrule", "businessrule"} or bool(
         domains & {"rule", "rules", "governance", "platformrule", "businessrule"}
     )
 
@@ -14709,18 +14869,9 @@ def semantic_filter_data_type(entry: PlanningAssetEntry, member_kind: str) -> st
         or schema.get("type")
         or ""
     ).strip().lower()
-    if re.match(r"^(?:tinyint|smallint|int|integer|bigint)\b", raw):
-        return "integer"
-    if re.match(r"^(?:decimal|numeric|float|double|real|number)\b", raw):
-        return "number"
-    if re.match(r"^(?:bool|boolean)\b", raw):
-        return "boolean"
-    if re.match(r"^(?:timestamp|datetime)\b", raw):
-        return "datetime"
-    if re.match(r"^date\b", raw):
-        return "date"
-    if re.match(r"^(?:char|varchar|string|text|binary)\b", raw):
-        return "string"
+    canonical = canonical_declared_data_type(raw)
+    if canonical != "unknown":
+        return canonical
     if member_kind == "measure" and (
         metadata.get("formula")
         or metadata.get("metricFormula")
@@ -14762,13 +14913,13 @@ def semantic_filter_enum_contract(entry: PlanningAssetEntry) -> Tuple[bool, List
 
 
 def normalize_semantic_filter_value(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value if value is not None else "").strip()).casefold()
+    return collapse_whitespace(value if value is not None else "").casefold()
 
 
 def coerce_semantic_filter_scalar(value: Any, data_type: str) -> Tuple[bool, Any]:
     if data_type == "integer":
         text = str(value if value is not None else "").strip()
-        if not re.fullmatch(r"[-+]?\d+", text):
+        if not is_signed_ascii_integer(text):
             return False, value
         return True, int(text)
     if data_type == "number":
@@ -14786,10 +14937,21 @@ def coerce_semantic_filter_scalar(value: Any, data_type: str) -> Tuple[bool, Any
         return False, value
     if data_type == "date":
         text = str(value or "").strip()
-        return (bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", text)), text)
+        try:
+            parsed = date.fromisoformat(text)
+        except ValueError:
+            return False, text
+        return parsed.isoformat() == text, text
     if data_type == "datetime":
         text = str(value or "").strip()
-        return (bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", text)), text)
+        if len(text) <= 10 or text[10] not in {"T", " "}:
+            return False, text
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            datetime.fromisoformat(normalized)
+        except ValueError:
+            return False, text
+        return True, text
     if data_type == "string":
         return (value is not None and str(value) != "", str(value))
     return False, value
@@ -14904,7 +15066,7 @@ def bind_semantic_filter_predicate(
     member_kind = semantic_filter_member_kind(entry, asset_pack)
     data_type = semantic_filter_data_type(entry, member_kind)
     legacy_comparison_syntax = any(
-        isinstance(value, str) and re.match(r"^\s*(?:>=|<=|!=|<>|>|<)", value)
+        isinstance(value, str) and starts_with_comparison_operator(value)
         for value in raw_values
     )
     if legacy_compatibility and (operator != "eq" or legacy_comparison_syntax):
@@ -16182,7 +16344,16 @@ class SemanticMetricResolution:
                 "knowledgeRequests": [item.model_dump(by_alias=True) for item in self.knowledge_requests],
             }
         metadata = dict(getattr(metric, "metadata", {}) or {})
-        source_columns = [str(item) for item in metadata.get("sourceColumns") or metadata.get("source_columns") or getattr(metric, "columns", []) or [] if item]
+        dependency_refs = declared_metric_dependency_refs(metric)
+        dependency_ref_set = set(dependency_refs)
+        source_columns = [
+            str(item)
+            for item in metadata.get("sourceColumns")
+            or metadata.get("source_columns")
+            or getattr(metric, "columns", [])
+            or []
+            if item and str(item) not in dependency_ref_set
+        ]
         formula = str(metadata.get("formula") or metadata.get("metricFormula") or metric_formula_for_entry(metric) or "")
         time_semantics = metadata.get("timeSemantics") or metadata.get("time_semantics") or {}
         if not isinstance(time_semantics, dict):
@@ -16207,7 +16378,7 @@ class SemanticMetricResolution:
             "metricKey": metric.key,
             "ownerTable": metric.table,
             "sourceColumns": source_columns,
-            "sourceMetricRefs": [],
+            "sourceMetricRefs": dependency_refs,
             "formula": formula,
             "unit": str(metadata.get("unit") or ""),
             "description": str(metadata.get("description") or ""),
@@ -16572,7 +16743,7 @@ class SemanticMetricResolver:
         source_phrase: str,
         reason: str,
     ) -> KnowledgeRequest:
-        query_parts = [source_phrase or metric_ref or question, "语义指标口径 公式 来源字段"]
+        query_parts = [source_phrase or metric_ref or question]
         return KnowledgeRequest(
             type=KnowledgeRequestType.METRIC,
             query=" ".join(str(part) for part in query_parts if part),
@@ -18832,7 +19003,7 @@ def expand_candidate_ids(values: Iterable[str], alias_index: Dict[str, set[str]]
 
 
 def normalize_candidate_id(value: str) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip().lower())
+    return "".join(character for character in str(value or "").strip().lower() if not character.isspace())
 
 
 def metric_resolution_ambiguity_issue(intent: QuestionIntent, asset_pack: PlanningAssetPack | None = None) -> Dict[str, Any]:
@@ -19062,32 +19233,10 @@ def asset_backed_metric_intent_valid(intent: QuestionIntent, asset_pack: Plannin
 
 
 def formula_identifier_refs(formula: str) -> set[str]:
-    ignored = {
-        "sum",
-        "count",
-        "distinct",
-        "avg",
-        "min",
-        "max",
-        "case",
-        "when",
-        "then",
-        "else",
-        "end",
-        "null",
-        "if",
-        "coalesce",
-        "cast",
-        "as",
-        "and",
-        "or",
-        "not",
-    }
-    return {
-        token
-        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(formula or ""))
-        if token.lower() not in ignored and not token.isdigit()
-    }
+    parsed = parse_formula_expression(formula)
+    if parsed is None:
+        return set()
+    return {column.name for column in parsed.find_all(exp.Column) if column.name}
 
 
 def local_metric_column_can_back_metric(metric_key: str, column: str) -> bool:
@@ -19180,7 +19329,12 @@ def requested_measure_covered_by_resolution(plan: QueryPlan, metric_ref: str, so
 
 
 def normalize_metric_phrase(value: Any) -> str:
-    return re.sub(r"[\s`'\"，。、“”‘’：:；;,.\-_/]+", "", str(value or "").lower())
+    ignored = frozenset("`'\"，。、“”‘’：:；;,.-_/")
+    return "".join(
+        character
+        for character in str(value or "").lower()
+        if not character.isspace() and character not in ignored
+    )
 
 
 def planned_metric_refs(plan: QueryPlan) -> set[Any]:
@@ -19509,6 +19663,28 @@ def metric_source_columns_for_entry(metric: Any) -> List[str]:
     return [str(item) for item in metadata.get("sourceColumns") or metadata.get("source_columns") or getattr(metric, "columns", []) or [] if item]
 
 
+def declared_metric_dependency_refs(metric: Any) -> List[str]:
+    """Read metric lineage only from published dependency declarations."""
+
+    metadata = getattr(metric, "metadata", {}) or {}
+    result: List[str] = []
+    for key in ("requiresMetrics", "metricDependencies", "externalMetricRefs"):
+        for item in metadata.get(key) or []:
+            if isinstance(item, dict):
+                ref = str(item.get("metricRef") or item.get("metricKey") or "").strip()
+            else:
+                ref = str(item or "").strip()
+            if ref and ref not in result:
+                result.append(ref)
+    for item in metadata.get("sourceReferences") or []:
+        if not isinstance(item, dict) or str(item.get("referenceType") or "").upper() != "METRIC":
+            continue
+        ref = str(item.get("reference") or item.get("metricRef") or item.get("metricKey") or "").strip()
+        if ref and ref not in result:
+            result.append(ref)
+    return result
+
+
 def reconciled_metric_resolution_payload(payload: Dict[str, Any], reconciliation: Any) -> Dict[str, Any]:
     if not payload:
         payload = {}
@@ -19664,7 +19840,8 @@ def governed_derived_metric_resolution_payload(metric: Any, existing: Dict[str, 
 
 
 def metric_dependency_refs(metric: Any) -> List[str]:
-    return dedupe_strings(metric_source_columns_for_entry(metric))
+    declared = declared_metric_dependency_refs(metric)
+    return declared or dedupe_strings(metric_source_columns_for_entry(metric))
 
 
 def materialized_metric_column(metric: Any, asset_pack: PlanningAssetPack) -> str:
@@ -20349,13 +20526,10 @@ def answer_mode_for_node(node: Dict[str, Any]) -> AnswerMode:
 
 
 def infer_limit(question: str) -> int:
-    text = question or ""
-    for marker in ["前", "top", "Top", "TOP"]:
-        if marker not in text:
-            continue
-        for size in [20, 10, 5, 3]:
-            if str(size) in text:
-                return size
+    for span in extract_ranking_spans(question):
+        digits = "".join(character for character in span.text if character in ASCII_DIGITS)
+        if digits and int(digits) > 0:
+            return int(digits)
     return 20
 
 
@@ -20531,7 +20705,7 @@ def semantic_namespace_from_metadata(metadata: Dict[str, Any], topic: str = "") 
 
 
 def normalize_semantic_namespace(value: Any) -> str:
-    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "_", str(value or "").strip().lower()).strip("_")
+    normalized = safe_unicode_component(value)
     return normalized or "unknown"
 
 
@@ -20589,6 +20763,161 @@ def requested_metric_items_from_understanding(understanding: Dict[str, Any], inc
     if isinstance(measures, list):
         items.extend(item for item in measures if isinstance(item, dict))
     return items
+
+
+def literal_start_positions(value: str, literal: str) -> List[int]:
+    text = str(value or "")
+    needle = str(literal or "")
+    if not needle:
+        return []
+    positions: List[int] = []
+    cursor = 0
+    while cursor <= len(text) - len(needle):
+        index = text.find(needle, cursor)
+        if index < 0:
+            break
+        positions.append(index)
+        cursor = index + 1
+    return positions
+
+
+def ascii_word_runs(
+    value: str,
+    *,
+    minimum: int = 1,
+    allow_digit_start: bool = False,
+) -> List[str]:
+    text = str(value or "")
+    starts = ASCII_LETTERS | ({*ASCII_DIGITS, "_"} if allow_digit_start else {"_"})
+    tokens: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in starts:
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor] in ASCII_WORD:
+            cursor += 1
+        token = text[start:cursor]
+        if len(token) >= minimum:
+            tokens.append(token)
+    return tokens
+
+
+def ascii_and_digit_runs(value: str, *, allow_underscore: bool = False) -> List[str]:
+    text = str(value or "")
+    tokens: List[str] = []
+    cursor = 0
+    word_characters = ASCII_LETTERS | ASCII_DIGITS | ({"_"} if allow_underscore else set())
+    while cursor < len(text):
+        if text[cursor] in ASCII_LETTERS:
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and text[cursor] in word_characters:
+                cursor += 1
+            tokens.append(text[start:cursor])
+            continue
+        if text[cursor] in ASCII_DIGITS:
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and text[cursor] in ASCII_DIGITS:
+                cursor += 1
+            tokens.append(text[start:cursor])
+            continue
+        cursor += 1
+    return tokens
+
+
+def is_cjk_character(character: str) -> bool:
+    return bool(character) and (
+        "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
+    )
+
+
+def cjk_runs(value: str, *, minimum: int = 1) -> List[str]:
+    text = str(value or "")
+    runs: List[str] = []
+    cursor = 0
+    while cursor < len(text):
+        if not is_cjk_character(text[cursor]):
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and is_cjk_character(text[cursor]):
+            cursor += 1
+        token = text[start:cursor]
+        if len(token) >= minimum:
+            runs.append(token)
+    return runs
+
+
+def canonical_declared_data_type(value: str) -> str:
+    text = str(value or "").strip().lower()
+    token_chars: List[str] = []
+    for character in text:
+        if character.isspace() or character == "(":
+            break
+        token_chars.append(character)
+    token = "".join(token_chars)
+    if token in {"tinyint", "smallint", "int", "integer", "bigint"}:
+        return "integer"
+    if token in {"decimal", "numeric", "float", "double", "real", "number"}:
+        return "number"
+    if token in {"bool", "boolean"}:
+        return "boolean"
+    if token in {"timestamp", "datetime"}:
+        return "datetime"
+    if token == "date":
+        return "date"
+    if token in {"char", "varchar", "string", "text", "binary"}:
+        return "string"
+    return "unknown"
+
+
+def is_signed_ascii_integer(value: Any) -> bool:
+    text = str(value or "")
+    if text[:1] in {"-", "+"}:
+        text = text[1:]
+    return bool(text) and all(character in ASCII_DIGITS for character in text)
+
+
+def starts_with_comparison_operator(value: str) -> bool:
+    return str(value or "").lstrip().startswith((">=", "<=", "!=", "<>", ">", "<"))
+
+
+def parse_formula_expression(formula: str) -> exp.Expression | None:
+    text = str(formula or "").strip()
+    if not text:
+        return None
+    for candidate in (text, "SELECT %s" % text):
+        try:
+            return sqlglot.parse_one(candidate, read="doris")
+        except Exception:
+            continue
+    return None
+
+
+def formula_has_conditional_scope(formula: str) -> bool:
+    parsed = parse_formula_expression(formula)
+    if parsed is None:
+        return False
+    conditional_types = (exp.Case, exp.If, exp.Where, exp.Filter)
+    return any(isinstance(node, conditional_types) for node in parsed.walk())
+
+
+def safe_unicode_component(value: Any) -> str:
+    output: List[str] = []
+    replacing = False
+    for character in str(value or "").strip().lower():
+        if character.isalnum() or character == "_":
+            output.append(character)
+            replacing = False
+        elif not replacing:
+            output.append("_")
+            replacing = True
+    return "".join(output).strip("_")
 
 
 def dedupe_strings(values: List[str]) -> List[str]:
@@ -20650,12 +20979,8 @@ def dedupe_knowledge_refs(refs: List[KnowledgeRef]) -> List[KnowledgeRef]:
 
 
 def extract_entity_value(question: str, column: str) -> str:
-    text = question or ""
-    normalized_column = (column or "").lower()
-    if not normalized_column:
-        return ""
-    match = re.search(r"\b%s[_:=：-]*[A-Za-z0-9_-]*\b" % re.escape(normalized_column), text, re.IGNORECASE)
-    return match.group(0).strip(":=：-") if match else ""
+    values = explicit_entity_reference_tokens(question, column)
+    return values[0] if values else ""
 
 
 def normalize_output_evidence(payload: Dict[str, Any]) -> List[str]:
@@ -21009,11 +21334,11 @@ def extract_question_terms(question: str) -> List[str]:
 
 def re_split_terms(text: str) -> List[str]:
     terms: List[str] = []
-    for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]*|\d+", text):
+    for token in ascii_and_digit_runs(text, allow_underscore=True):
         normalized_token = token.lower()
         if normalized_token and normalized_token not in terms:
             terms.append(normalized_token)
-    for sequence in re.findall(r"[\u4e00-\u9fff]+", text):
+    for sequence in cjk_runs(text):
         for size in range(min(8, len(sequence)), 1, -1):
             for index in range(0, len(sequence) - size + 1):
                 token = sequence[index : index + size]

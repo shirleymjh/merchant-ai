@@ -4,13 +4,13 @@ import asyncio
 import hashlib
 import json
 import queue
-import re
 import threading
 import time
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings
+from merchant_ai.services.text_parsing import ASCII_LETTERS, ASCII_WORD
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 from merchant_ai.services.semantic_request import explicit_semantic_request_fingerprint
 
@@ -400,15 +400,21 @@ class LlmClient:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.S)
-            if not match:
-                self.record_error("json_parse_error: %s" % text[:300])
-                return {}
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError as exc:
-                self.record_error("json_parse_error: %s" % str(exc)[:300])
-                return {}
+            decoder = json.JSONDecoder()
+            last_error: Optional[json.JSONDecodeError] = None
+            for index, character in enumerate(str(text or "")):
+                if character != "{":
+                    continue
+                try:
+                    value, _end = decoder.raw_decode(text[index:])
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+                    continue
+                if isinstance(value, dict):
+                    return value
+            detail = str(last_error)[:300] if last_error else str(text or "")[:300]
+            self.record_error("json_parse_error: %s" % detail)
+            return {}
 
     def _cache_key(
         self,
@@ -494,11 +500,7 @@ def tool_call_fingerprint(item: Dict[str, Any]) -> str:
 
 def prompt_cache_metadata(system_prompt: str) -> Dict[str, str]:
     text = str(system_prompt or "")
-    match = re.search(r'<prompt\s+([^>]*)>', text)
-    attrs: Dict[str, str] = {}
-    if match:
-        for key, value in re.findall(r'([A-Za-z][A-Za-z0-9_]*)="([^"]*)"', match.group(1)):
-            attrs[key] = value
+    attrs = _prompt_tag_attributes(text)
     return {
         "promptId": attrs.get("id", ""),
         "promptVersion": attrs.get("version", ""),
@@ -506,3 +508,49 @@ def prompt_cache_metadata(system_prompt: str) -> Dict[str, str]:
         "templateFingerprint": attrs.get("templateFingerprint", ""),
         "systemPromptFingerprint": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16] if text else "",
     }
+
+
+def _prompt_tag_attributes(text: str) -> Dict[str, str]:
+    opening = "<prompt"
+    start = str(text or "").find(opening)
+    if start < 0:
+        return {}
+    cursor = start + len(opening)
+    if cursor >= len(text) or not text[cursor].isspace():
+        return {}
+    end = text.find(">", cursor)
+    if end < 0:
+        return {}
+    header = text[cursor:end]
+    attrs: Dict[str, str] = {}
+    cursor = 0
+    while cursor < len(header):
+        while cursor < len(header) and header[cursor].isspace():
+            cursor += 1
+        if cursor >= len(header):
+            break
+        key_start = cursor
+        if header[cursor] not in ASCII_LETTERS:
+            return {}
+        cursor += 1
+        while cursor < len(header) and header[cursor] in ASCII_WORD:
+            cursor += 1
+        key = header[key_start:cursor]
+        while cursor < len(header) and header[cursor].isspace():
+            cursor += 1
+        if cursor >= len(header) or header[cursor] != "=":
+            return {}
+        cursor += 1
+        while cursor < len(header) and header[cursor].isspace():
+            cursor += 1
+        if cursor >= len(header) or header[cursor] != '"':
+            return {}
+        cursor += 1
+        value_start = cursor
+        while cursor < len(header) and header[cursor] != '"':
+            cursor += 1
+        if cursor >= len(header):
+            return {}
+        attrs[key] = header[value_start:cursor]
+        cursor += 1
+    return attrs

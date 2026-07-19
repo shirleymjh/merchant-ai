@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field as dataclass_field
@@ -23,72 +22,56 @@ from merchant_ai.models import (
     TopicRoutingDecision,
 )
 from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudgetExceeded
+from merchant_ai.services.language_policy import load_language_policy
+from merchant_ai.services.text_parsing import (
+    collapse_whitespace,
+    contains_any_literal,
+    is_ascii_identifier,
+    is_ascii_word_phrase,
+    iter_ascii_digit_spans,
+    literal_spans,
+    parse_prefixed_reference,
+    split_on_characters,
+)
 from merchant_ai.services.time_semantics import extract_temporal_lexical_spans, resolve_time_range
 
 
-ACTION_KEYWORDS = [
-    "为什么",
-    "原因",
-    "影响",
-    "分析",
-    "对比",
-    "环比",
-    "同比",
-    "同时",
-    "分别",
-    "并且",
-    "综合",
-    "关联",
-    "对应",
-    "趋势",
-    "走势",
-    "变化",
-    "同步",
-    "上升",
-    "下降",
-    "波动",
-    "异常",
-    "风险",
-    "建议",
-    "优化",
-    "改善",
-    "怎么办",
-    "排查",
-    "明细",
-    "详情",
-    "最高",
-    "最低",
-    "最多",
-    "最少",
-]
-RANKING_SPAN_PATTERNS = [
-    ("ordinal_prefix", re.compile(r"前\s*\d+")),
-    ("top_n", re.compile(r"top\s*\d+", re.I)),
-    ("ranking_operator", re.compile(r"最高|最低|最多|最少|排名|排行")),
-]
+_ROUTING_LANGUAGE = load_language_policy().routing
+ACTION_KEYWORDS = list(_ROUTING_LANGUAGE.action_markers)
 
 
 def route_span_overlaps(left: RouteLexicalSpan, right: RouteLexicalSpan) -> bool:
     return int(left.start) < int(right.end) and int(right.start) < int(left.end)
 
 
-def extract_pattern_spans(
-    text: str,
-    span_type: RouteSpanType,
-    patterns: List[tuple[str, re.Pattern[str]]],
-) -> List[RouteLexicalSpan]:
+def extract_ranking_spans(text: str) -> List[RouteLexicalSpan]:
+    value = str(text or "")
     candidates: List[RouteLexicalSpan] = []
-    for source, pattern in patterns:
-        for match in pattern.finditer(str(text or "")):
-            candidates.append(
-                RouteLexicalSpan(
-                    span_type=span_type,
-                    start=match.start(),
-                    end=match.end(),
-                    text=match.group(0).strip(),
-                    source=source,
+    for source, prefixes, case_sensitive in (
+        ("ordinal_prefix", _ROUTING_LANGUAGE.ranking_ordinal_prefixes, True),
+        ("top_n", _ROUTING_LANGUAGE.ranking_top_prefixes, False),
+    ):
+        for prefix in prefixes:
+            for start, end in _prefixed_number_spans(value, prefix, case_sensitive=case_sensitive):
+                candidates.append(
+                    RouteLexicalSpan(
+                        span_type=RouteSpanType.RANKING,
+                        start=start,
+                        end=end,
+                        text=value[start:end].strip(),
+                        source=source,
+                    )
                 )
+    for start, end, operator in literal_spans(value, _ROUTING_LANGUAGE.ranking_operators):
+        candidates.append(
+            RouteLexicalSpan(
+                span_type=RouteSpanType.RANKING,
+                start=start,
+                end=end,
+                text=operator.strip(),
+                source="ranking_operator",
             )
+        )
     candidates.sort(key=lambda item: (item.start, -(item.end - item.start), item.source))
     accepted: List[RouteLexicalSpan] = []
     for candidate in candidates:
@@ -96,6 +79,29 @@ def extract_pattern_spans(
             continue
         accepted.append(candidate)
     return accepted
+
+
+def _prefixed_number_spans(value: str, prefix: str, *, case_sensitive: bool) -> List[tuple[int, int]]:
+    haystack = value if case_sensitive else value.casefold()
+    needle = prefix if case_sensitive else prefix.casefold()
+    spans: List[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(value):
+        start = haystack.find(needle, cursor)
+        if start < 0:
+            break
+        number_start = start + len(prefix)
+        while number_start < len(value) and value[number_start].isspace():
+            number_start += 1
+        number_end = number_start
+        while number_end < len(value) and value[number_end].isascii() and value[number_end].isdigit():
+            number_end += 1
+        if number_end > number_start:
+            spans.append((start, number_end))
+            cursor = number_end
+        else:
+            cursor = start + max(1, len(prefix))
+    return spans
 
 
 def extract_route_lexical_spans(text: str) -> List[RouteLexicalSpan]:
@@ -107,7 +113,7 @@ def extract_route_lexical_spans(text: str) -> List[RouteLexicalSpan]:
     """
 
     temporal = extract_temporal_lexical_spans(text)
-    ranking_candidates = extract_pattern_spans(text, RouteSpanType.RANKING, RANKING_SPAN_PATTERNS)
+    ranking_candidates = extract_ranking_spans(text)
     ranking = [
         candidate
         for candidate in ranking_candidates
@@ -170,16 +176,13 @@ def planning_hints_from_extracted_keywords(
         operator = ""
         for span in ranking_spans:
             if span.source in {"ordinal_prefix", "top_n"} and not limit:
-                match = re.search(r"\d+", span.text)
-                limit = int(match.group(0)) if match else 0
+                digit_span = next(iter_ascii_digit_spans(span.text), None)
+                limit = int(digit_span[2]) if digit_span else 0
             if span.source == "ranking_operator":
                 operator = span.text
-                if span.text in {"最低", "最少"}:
-                    order = "asc"
-                elif span.text in {"最高", "最多", "排名", "排行"}:
-                    order = "desc"
+                order = str(_ROUTING_LANGUAGE.ranking_operators.get(span.text) or "")
         if limit and not order:
-            order = "desc"
+            order = _ROUTING_LANGUAGE.ranking_default_order
         anchor_phrase = nearest_metric_phrase_to_ranking(normalized, metric_phrases, ranking_spans)
         anchor_candidates = dedupe_ordered(
             [item.canonical_key for item in metric_mentions if item.phrase == anchor_phrase and item.canonical_key]
@@ -474,9 +477,7 @@ class KeywordExtractService:
         not blindly open the profile, dimension-master, and detail Topics.
         """
 
-        causal_detail_requested = bool(
-            re.search(r"(?:为什么|为何|原因|归因|怎么导致|异常根因)", normalized)
-        )
+        causal_detail_requested = contains_any_literal(normalized, _ROUTING_LANGUAGE.causal_markers)
         if not dimension_mentions and not causal_detail_requested:
             return []
         mentions: List[KeywordMention] = []
@@ -792,7 +793,7 @@ class KeywordExtractService:
                     if not column:
                         continue
                     role = str(field.get("role") or "").upper()
-                    if role not in {"KEY", "DIMENSION", "TIME"}:
+                    if str(field.get("metricFormula") or "").strip() or field.get("aggregationPolicy"):
                         continue
                     labels = [
                         str(field.get("businessName") or ""),
@@ -820,7 +821,7 @@ class KeywordExtractService:
 
 def normalize_keyword_text(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
-    return re.sub(r"\s+", " ", text)
+    return collapse_whitespace(text)
 
 
 def metric_detail_grouping_dimensions(
@@ -829,30 +830,22 @@ def metric_detail_grouping_dimensions(
 ) -> List[KeywordMention]:
     """Keep the grouping dimension as the detail-lineage requirement.
 
-    In ``工单量最高的商品，同时看商品发布时间`` the ticket fact must
-    cover ``商品`` to rank it, while ``商品发布时间`` is a separate enrichment
-    that may legitimately require the goods Topic.  Requiring every enrichment
-    on the fact table would discard a valid detail lineage altogether.
+    The ranking dimension must be covered by the serving fact, while a separate
+    enrichment dimension may legitimately live in another Topic. Requiring
+    every enrichment on the fact table would discard a valid lineage.
     """
 
     if not dimension_mentions:
         return []
-    ranking_terms = "最高|最低|最多|最少|top\\s*\\d*|前\\s*\\d+"
+    ranking_spans = extract_ranking_spans(normalized_question)
     grouping_phrases = {
         normalize_keyword_text(item.phrase)
         for item in dimension_mentions
         if item.phrase
-        and (
-            re.search(
-                r"(?:%s)(?:的)?%s" % (ranking_terms, re.escape(normalize_keyword_text(item.phrase))),
-                normalized_question,
-                flags=re.IGNORECASE,
-            )
-            or re.search(
-                r"(?:按|每)%s" % re.escape(normalize_keyword_text(item.phrase)),
-                normalized_question,
-                flags=re.IGNORECASE,
-            )
+        and _dimension_is_grouping_target(
+            normalized_question,
+            normalize_keyword_text(item.phrase),
+            ranking_spans,
         )
     }
     if not grouping_phrases:
@@ -864,11 +857,33 @@ def metric_detail_grouping_dimensions(
     ]
 
 
+def _dimension_is_grouping_target(
+    question: str,
+    phrase: str,
+    ranking_spans: List[RouteLexicalSpan],
+) -> bool:
+    for start, _end in phrase_spans(question, phrase):
+        if any(question[:start].endswith(prefix) for prefix in _ROUTING_LANGUAGE.grouping_prefixes):
+            return True
+        for ranking in ranking_spans:
+            if ranking.end > start:
+                continue
+            between = question[ranking.end:start].strip()
+            if not between or between in _ROUTING_LANGUAGE.ranking_link_particles:
+                return True
+    return False
+
+
 def semantic_metric_reference_identity(ref_id: str) -> Optional[tuple[str, str, str]]:
-    match = re.fullmatch(r"semantic:([^:]+):([^:]+):metric:(.+)", str(ref_id or "").strip())
-    if not match:
+    parts = parse_prefixed_reference(
+        ref_id,
+        prefix="semantic:",
+        separator=":",
+        part_count=4,
+    )
+    if not parts or parts[2] != "metric":
         return None
-    topic, table, metric_key = (str(item).strip() for item in match.groups())
+    topic, table, _kind, metric_key = (str(item).strip() for item in parts)
     return (topic, table, metric_key) if topic and table and metric_key else None
 
 
@@ -913,7 +928,7 @@ class PhraseMatcher:
 
 
 def valid_phrase_boundary(text: str, start: int, end: int, phrase: str) -> bool:
-    if not re.fullmatch(r"[a-z0-9_ -]+", phrase):
+    if not is_ascii_word_phrase(phrase, extras=(" ", "-")):
         return True
     before = text[start - 1] if start > 0 else ""
     after = text[end] if end < len(text) else ""
@@ -971,10 +986,16 @@ def phrase_spans(text: str, phrase: str) -> List[tuple[int, int]]:
         return []
     if len(normalized_phrase) == 1 and normalized_phrase != text.strip():
         return []
-    if re.fullmatch(r"[a-z0-9_ -]+", normalized_phrase):
-        pattern = re.compile(r"(?<![a-z0-9_])%s(?![a-z0-9_])" % re.escape(normalized_phrase), re.I)
-        return [(match.start(), match.end()) for match in pattern.finditer(text)]
-    return [(match.start(), match.end()) for match in re.finditer(re.escape(normalized_phrase), text)]
+    word_boundary = is_ascii_word_phrase(normalized_phrase, extras=(" ", "-"))
+    return [
+        (start, end)
+        for start, end, _matched in literal_spans(
+            text,
+            [normalized_phrase],
+            case_sensitive=False,
+            ascii_word_boundary=word_boundary,
+        )
+    ]
 
 
 def independent_dimension_mentions(
@@ -1053,9 +1074,12 @@ def keyword_topic_value(topic: Any) -> str:
 
 def extract_negated_segments(text: str) -> List[str]:
     segments: List[str] = []
-    pattern = re.compile(r"(?:不看|不要看|排除|不包含|不考虑|忽略|去掉)([^，。；,;]+)")
-    for match in pattern.finditer(text):
-        value = str(match.group(1) or "").strip()
+    terminators = frozenset("，。；,;")
+    for start, end, _prefix in literal_spans(text, _ROUTING_LANGUAGE.negation_prefixes):
+        cursor = end
+        while cursor < len(text) and text[cursor] not in terminators:
+            cursor += 1
+        value = text[end:cursor].strip()
         if value:
             segments.append(value)
     return segments
@@ -1120,6 +1144,68 @@ def ambiguous_metric_phrases(items: List[KeywordMention]) -> List[str]:
     return [phrase for phrase, identities in candidates.items() if phrase and len(identities) > 1]
 
 
+def _is_governed_greeting(value: str) -> bool:
+    text = str(value or "").strip().casefold()
+    for phrase in _ROUTING_LANGUAGE.greeting_phrases:
+        normalized_phrase = phrase.casefold()
+        if not text.startswith(normalized_phrase):
+            continue
+        suffix = text[len(normalized_phrase) :]
+        if all(
+            character.isspace() or character in _ROUTING_LANGUAGE.greeting_suffix_characters
+            for character in suffix
+        ):
+            return True
+    return False
+
+
+def _object_reference_spans(text: str, column: str) -> List[tuple[int, int, str]]:
+    value = str(text or "")
+    haystack = value.casefold()
+    needle = str(column or "").casefold()
+    if not needle:
+        return []
+    spans: List[tuple[int, int, str]] = []
+    cursor = 0
+    separators = frozenset(":=：-")
+    while cursor < len(value):
+        start = haystack.find(needle, cursor)
+        if start < 0:
+            break
+        if start > 0 and value[start - 1].isascii() and (
+            value[start - 1].isalnum() or value[start - 1] == "_"
+        ):
+            cursor = start + 1
+            continue
+        separator_cursor = start + len(needle)
+        while separator_cursor < len(value) and value[separator_cursor].isspace():
+            separator_cursor += 1
+        if separator_cursor >= len(value):
+            break
+        if value[separator_cursor] == "_":
+            value_start = separator_cursor + 1
+        elif value[separator_cursor] in separators:
+            value_start = separator_cursor + 1
+            while value_start < len(value) and value[value_start].isspace():
+                value_start += 1
+        else:
+            cursor = start + 1
+            continue
+        if value_start >= len(value) or not (
+            value[value_start].isascii() and value[value_start].isalnum()
+        ):
+            cursor = start + 1
+            continue
+        end = value_start + 1
+        while end < len(value) and value[end].isascii() and (
+            value[end].isalnum() or value[end] in {"_", "-"}
+        ):
+            end += 1
+        spans.append((start, end, value[start:end]))
+        cursor = end
+    return spans
+
+
 class QuestionRoutingService:
     def __init__(self, topic_assets: Any = None):
         self.topic_assets = topic_assets or default_topic_assets()
@@ -1129,14 +1215,14 @@ class QuestionRoutingService:
         normalized = (question or "").strip().lower()
         if not normalized:
             return RoutingDecision(route=QuestionRoute.INVALID, reason="空问题")
-        if re.match(r"^(你好|您好|hi|hello|hey|在吗|嗨|哈喽|早上好|下午好|晚上好)[!！。,.，\s]*$", normalized, re.I):
+        if _is_governed_greeting(normalized):
             return RoutingDecision(route=QuestionRoute.GREETING, reason="寒暄问题")
         if self._is_ambiguous_question(normalized, keywords, recall_bundle):
             return RoutingDecision(route=QuestionRoute.INVALID, reason="问题表达不明确，建议补充业务对象或查询目标")
         simple_detail = self._is_simple_detail_lookup(normalized, keywords, recall_bundle)
         complex_question = (not simple_detail) and (
             len(normalized) >= 24
-            or any(word in normalized for word in ACTION_KEYWORDS)
+            or contains_any_literal(normalized, _ROUTING_LANGUAGE.action_markers)
             or self._has_multiple_time_ranges(normalized)
             or self._matched_domain_count(normalized, keywords) >= 2
             or (recall_bundle and len(recall_bundle.items) >= 3 and not recall_bundle.has_strong_match() and len(normalized) >= 24)
@@ -1166,16 +1252,19 @@ class QuestionRoutingService:
         return bool(extract_temporal_lexical_spans(question))
 
     def _is_simple_detail_lookup(self, question: str, keywords: ExtractedKeywords, recall_bundle: RecallBundle) -> bool:
-        if not any(word in question for word in ["明细", "详情", "列表", "记录", "单号", "流水"]):
+        if not contains_any_literal(question, _ROUTING_LANGUAGE.detail_markers):
             return False
         has_object_ref = self._slot_extractor.has_object_ref(question)
         if (not self._has_any_time_range(question) and not has_object_ref) or self._has_multiple_time_ranges(question):
             return False
-        if any(word in question for word in ACTION_KEYWORDS):
+        non_detail_actions = [
+            marker
+            for marker in _ROUTING_LANGUAGE.action_markers
+            if marker not in _ROUTING_LANGUAGE.detail_markers
+        ]
+        if contains_any_literal(question, non_detail_actions):
             return False
         if self._matched_domain_count(question, keywords) >= 2:
-            return False
-        if keywords and any(any(flag in action for flag in ["分析", "对比", "优化", "判断", "解释", "排查"]) for action in keywords.action_keywords):
             return False
         return not recall_bundle or not recall_bundle.items or all((item.answer_mode or "").upper() == "DETAIL" for item in recall_bundle.items)
 
@@ -1493,14 +1582,11 @@ class PreflightUnderstandingService:
         has_object_ref = self.slot_extractor.has_object_ref(text)
         lexical_spans = extract_route_lexical_spans(text)
         has_typed_ranking = any(span.span_type == RouteSpanType.RANKING for span in lexical_spans)
-        write_operation = bool(any(term.lower() in lowered for term in RouteSlotExtractor.WRITE_TERMS))
-        greeting = bool(re.match(r"^(你好|您好|hi|hello|hey|在吗|嗨|哈喽|早上好|下午好|晚上好)[!！。,.，\s]*$", lowered, re.I))
-        assistant_chat_phrase = bool(
-            any(term in text for term in ["你是谁", "你能做什么", "你可以做什么", "你会什么", "怎么用", "如何使用"])
-        )
+        write_operation = contains_any_literal(lowered, _ROUTING_LANGUAGE.write_markers, case_sensitive=False)
+        greeting = _is_governed_greeting(lowered)
+        assistant_chat_phrase = contains_any_literal(text, _ROUTING_LANGUAGE.assistant_chat_phrases)
         business_metric_like = bool(business_surface.get("hasPublishedMetricPhrase"))
-        generic_metric_like = bool(re.search(r"(金额|数量|率|趋势|排行|top|最高|最低|最多|最少|多少)", lowered, re.I))
-        metric_like = bool(business_metric_like or (generic_metric_like and business_surface.get("hasBusinessDomainPhrase")))
+        metric_like = business_metric_like
         assistant_chat = bool(
             assistant_chat_phrase
             and not (
@@ -1533,7 +1619,7 @@ class PreflightUnderstandingService:
             "hasTypedRankingSpan": has_typed_ranking,
             "hasMetricLikePhrase": metric_like,
             "hasBusinessMetricLikePhrase": business_metric_like,
-            "hasGenericMetricLikePhrase": generic_metric_like,
+            "hasGenericMetricLikePhrase": False,
             "hasAnalysisIntent": has_analysis_intent,
             **business_surface,
             "confidence": confidence,
@@ -1559,7 +1645,16 @@ class PreflightUnderstandingService:
     ) -> RoutingDecision:
         if rule_route.reason in {"空问题", "检测到写操作请求，当前只支持只读查询和分析", "寒暄问题"}:
             return rule_route
-        has_business_surface = bool(signals.get("hasObjectRef") or signals.get("hasMetricLikePhrase") or signals.get("hasAnalysisIntent"))
+        # A phrase resolved from the published semantic directory is already a
+        # governed business-surface fact.  When the small model is unavailable
+        # (or misreads the turn), preserve that fact and let Topic/Planner own
+        # the later interpretation instead of rejecting the request here.
+        has_business_surface = bool(
+            signals.get("hasBusinessDomainPhrase")
+            or signals.get("hasObjectRef")
+            or signals.get("hasMetricLikePhrase")
+            or signals.get("hasAnalysisIntent")
+        )
         has_business_task_surface = bool(
             has_business_surface
             or (
@@ -1603,21 +1698,21 @@ def enum_route(value: Any) -> str:
 
 
 class RouteSlotExtractor:
-    WRITE_TERMS = ["删除", "修改", "更新", "创建", "重建", "写入", "导入", "新增", "truncate", "drop", "insert", "update", "delete"]
-    RISK_TERMS = ["规则", "敏感"]
+    WRITE_TERMS = _ROUTING_LANGUAGE.write_markers
+    RISK_TERMS = _ROUTING_LANGUAGE.risk_markers
 
     def __init__(self, topic_assets: Any = None):
         self.topic_assets = topic_assets or default_topic_assets()
         self._object_patterns, self._object_topics = self._build_object_contracts(self.topic_assets)
 
     def has_object_ref(self, text: str) -> bool:
-        return any(pattern.search(str(text or "")) for _ref_type, pattern in self._object_patterns)
+        return any(_object_reference_spans(str(text or ""), ref_type) for ref_type in self._object_patterns)
 
     def _build_object_contracts(
         self,
         topic_assets: Any,
-    ) -> tuple[List[tuple[str, re.Pattern[str]]], Dict[str, List[QuestionCategory]]]:
-        """Compile explicit object references from asset-declared KEY columns."""
+    ) -> tuple[List[str], Dict[str, List[QuestionCategory]]]:
+        """Compile object references only from formally declared entity contracts."""
 
         if topic_assets is None:
             return [], {}
@@ -1641,31 +1736,28 @@ class RouteSlotExtractor:
                 except Exception:
                     fields = []
                 for field in fields:
-                    if not isinstance(field, dict) or str(field.get("role") or "").upper() != "KEY":
+                    if not isinstance(field, dict) or not (
+                        str(field.get("canonicalEntityRef") or "").strip()
+                        or field.get("isUniqueEntityKey") is True
+                    ):
                         continue
                     column = str(field.get("columnName") or "").strip()
-                    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", column):
+                    if not is_ascii_identifier(column):
                         continue
                     if category not in topics[column]:
                         topics[column].append(category)
-        patterns = [
-            (
-                column,
-                re.compile(
-                    r"(?<![A-Za-z0-9_])%s(?:\s*[:=：-]\s*|_)[A-Za-z0-9][A-Za-z0-9_-]*"
-                    % re.escape(column),
-                    re.I,
-                ),
-            )
-            for column in sorted(topics, key=lambda value: (-len(value), value))
-        ]
+        patterns = sorted(topics, key=lambda value: (-len(value), value))
         return patterns, dict(topics)
 
     def extract(self, question: str, keywords: ExtractedKeywords) -> RouteSlots:
         text = question or ""
         object_refs = self._object_refs(text)
         time_window = self._time_window(text, keywords)
-        operation = "write_requested" if any(term.lower() in text.lower() for term in self.WRITE_TERMS) else "read"
+        operation = (
+            "write_requested"
+            if contains_any_literal(text, self.WRITE_TERMS, case_sensitive=False)
+            else "read"
+        )
         analysis_signals = self._analysis_signals(keywords)
         topic_candidates = self._topic_candidates(text, object_refs, keywords)
         warnings: List[str] = []
@@ -1693,9 +1785,8 @@ class RouteSlotExtractor:
     def _object_refs(self, text: str) -> List[RouteObjectRef]:
         refs: List[RouteObjectRef] = []
         seen: Set[tuple[str, str]] = set()
-        for ref_type, pattern in self._object_patterns:
-            for match in pattern.finditer(text):
-                raw = match.group(0)
+        for ref_type in self._object_patterns:
+            for _start, _end, raw in _object_reference_spans(text, ref_type):
                 value = raw.replace("：", "_").replace(":", "_").replace("=", "_").replace("-", "_")
                 identity = (ref_type, value.lower())
                 if identity in seen:
@@ -1765,7 +1856,7 @@ class RouteSlotExtractor:
     def _risk_level(self, text: str, operation: str) -> str:
         if operation == "write_requested":
             return "high_risk"
-        if any(term in text for term in self.RISK_TERMS):
+        if contains_any_literal(text, self.RISK_TERMS):
             return "rule_sensitive"
         return "normal"
 
@@ -2054,18 +2145,7 @@ class SemanticTopicRouterService:
             return invoke()
 
     def _use_tool_json(self) -> bool:
-        if not hasattr(self.llm, "tool_json_chat"):
-            return False
-        model_name = str(getattr(self.llm, "model_name", "") or "").lower()
-        base_url = str(getattr(self.llm, "base_url", "") or "").lower()
-        # Kimi Coding's forced tool path is materially slower for this tiny
-        # classification even when thinking is disabled.  JSON prompting plus
-        # Kernel validation is both faster and still fails closed on bad Topic
-        # names, without spending an unreported fallback provider call.
-        return not (
-            model_name.startswith("kimi-for-coding")
-            and "api.kimi.com/coding" in base_url
-        )
+        return hasattr(self.llm, "tool_json_chat")
 
     def _system_prompt(self, topic_names: List[str]) -> str:
         examples = self._few_shot_examples(topic_names)
@@ -2085,55 +2165,13 @@ class SemanticTopicRouterService:
 
     @staticmethod
     def _few_shot_examples(topic_names: List[str]) -> List[str]:
-        available = set(topic_names)
-        examples: List[str] = []
-        if {"电商交易", "商品管理"} <= available:
-            examples.extend(
-                [
-                    "问题：最近10天卖得最多的商品是哪个？品牌和货号是多少？\n"
-                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商交易\",\"商品管理\"],\"confidence\":0.96}",
-                    "问题：最近7天订单量是多少？\n"
-                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商交易\"],\"confidence\":0.98}",
-                    "问题：货号 A123 属于哪个品牌？\n"
-                    "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"商品管理\"],\"confidence\":0.98}",
-                ]
-            )
-        if {"电商退货", "商品管理"} <= available:
-            examples.append(
-                "问题：最近退款最多的是哪个商品？\n"
-                "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"电商退货\",\"商品管理\"],\"confidence\":0.95}"
-            )
-        if {"供应链", "商品管理"} <= available:
-            examples.append(
-                "问题：当前库存最多的是哪个商品？\n"
-                "输出：{\"status\":\"RESOLVED\",\"relevantTopics\":[\"供应链\",\"商品管理\"],\"confidence\":0.94}"
-            )
-        ambiguous_topics = [
-            item
-            for item in ["电商交易", "电商退货", "供应链", "客服工单", "商品管理"]
-            if item in available
+        if not topic_names:
+            return ["目录为空时输出 UNSUPPORTED，不得创造 Topic。"]
+        return [
+            "当一个问题需要目录中多个已发布能力时，返回覆盖这些能力的全部 Topic；"
+            "不要指定主次，也不要规划查询。",
+            "当证据不足以在候选 Topic 间消歧时返回 AMBIGUOUS，并仅列出目录中的候选。",
         ]
-        if len(ambiguous_topics) >= 2:
-            examples.append(
-                "问题：哪个商品最多？\n"
-                "输出：%s"
-                % json.dumps(
-                    {
-                        "status": "AMBIGUOUS",
-                        "relevantTopics": ambiguous_topics,
-                        "confidence": 0.55,
-                        "ambiguityReason": "没有说明是销量、退款、库存还是工单数量",
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-        if not examples:
-            examples.append(
-                "问题：一个问题同时需要业务事实和对象属性。\n"
-                "输出：选择目录中覆盖这两类信息的全部 Topic；不要指定主次，也不要规划查询。"
-            )
-        return examples
 
     @staticmethod
     def _selection_tool(topic_names: List[str]) -> Dict[str, Any]:
@@ -2324,7 +2362,7 @@ class TopicRouterService:
         selection_evidence = self.selection_evidence(question, keywords)
         inherited_topics = dedupe_topics(list(context_topics or []))
         if not inherited_topics and context_topic:
-            for item in re.split(r"[、,，|/]", context_topic):
+            for item in split_on_characters(context_topic, "、,，|/"):
                 category = resolve_asset_topic_category(self.topic_assets, item.strip())
                 if category and category not in inherited_topics:
                     inherited_topics.append(category)
@@ -2342,6 +2380,29 @@ class TopicRouterService:
                 except Exception:
                     continue
                 scores[category] = max(scores.get(category, 0.0), float(candidate.score or 0.0))
+        if selection_evidence.get("queryShape") == "detail_or_breakdown":
+            # The published detailMetricRef is formal lineage, not a lexical
+            # guess.  Promote its business owner into the seed workspace and
+            # avoid retaining an aggregate serving Topic when its only signal
+            # came from the metric mention that was just redirected to detail.
+            lineage_score = max([float(value or 0.0) for value in scores.values()] or [1.0])
+            business_categories: List[QuestionCategory] = []
+            for topic_name in selection_evidence.get("businessTopics") or []:
+                category = resolve_asset_topic_category(self.topic_assets, topic_name)
+                if category == QuestionCategory.UNKNOWN:
+                    continue
+                business_categories.append(category)
+                scores[category] = max(scores.get(category, 0.0), lineage_score)
+            for topic_name in selection_evidence.get("servingTopics") or []:
+                category = resolve_asset_topic_category(self.topic_assets, topic_name)
+                if category in business_categories:
+                    continue
+                non_metric_evidence = any(
+                    item.kind != "metric" and item.topic == category
+                    for item in list(getattr(keywords, "mentions", None) or [])
+                )
+                if not non_metric_evidence:
+                    scores.pop(category, None)
         candidates = self._explicit_topics(scores)
         if inherited_topics and (context_locked or not candidates):
             # Merchant users do not pre-select an internal Topic.  The previous
@@ -2440,7 +2501,8 @@ class TopicRouterService:
         normalized = normalize_keyword_text(question or "")
         detail_requested = bool(
             (keywords and (keywords.dimension_keywords or keywords.ranking_keywords))
-            or re.search(r"(?:为什么|为何|原因|归因|明细|逐笔|按.+(?:分组|拆分|排行|排名))", normalized)
+            or contains_any_literal(normalized, _ROUTING_LANGUAGE.detail_markers)
+            or contains_any_literal(normalized, _ROUTING_LANGUAGE.causal_markers)
         )
         shape = "detail_or_breakdown" if detail_requested else "summary_or_total"
         metric_evidence: List[Dict[str, Any]] = []
@@ -2557,4 +2619,6 @@ def route_primary_topic(candidates: List[QuestionCategory]) -> QuestionCategory:
 
 def extract_days(question: str, default: int = 7) -> int:
     resolved = resolve_time_range(question, default_days=default)
+    if int(default or 0) <= 0 and str(getattr(resolved, "source", "") or "") == "default_days":
+        return 0
     return max(1, int(resolved.days or default or 1))

@@ -1,31 +1,13 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, Iterable, List, Sequence, Set
 
 from merchant_ai.models import EvidenceGap, GraphValidationGap, QueryPlan
+from merchant_ai.services.text_parsing import ASCII_LETTERS, ASCII_WORD
 
 
 REQUIRED_MEMORY_CONSTRAINT_TYPES = {"metric_correction", "business_correction"}
 CONSTRAINT_APPROVED_STATUSES = {"", "active", "approved", "reviewed", "published", "indexed"}
-STOP_TERMS = {
-    "最近",
-    "这些",
-    "这个",
-    "那个",
-    "以后",
-    "不是",
-    "应该",
-    "当前",
-    "问题",
-    "多少",
-    "怎么",
-    "看看",
-    "分析",
-}
-FOCUS_TERMS = {"售后", "风险", "口径", "偏好", "关注", "纠正", "默认", "习惯"}
-
-
 def build_memory_constraints(memory_injection: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Turn selected memory payloads into auditable, semantic-layer-bounded hints."""
 
@@ -267,7 +249,7 @@ def memory_constraint_applies(question: str, plan: QueryPlan, constraint: Dict[s
     if constraint_topics & plan_topic_tokens(plan):
         return True
     overlap = significant_term_overlap(question, str(constraint.get("instruction") or ""))
-    if overlap & FOCUS_TERMS or len(overlap) >= 2:
+    if len(overlap) >= 2:
         return True
     # An empty/incomplete graph is not evidence that every merchant memory is
     # relevant. Applying all required memories here creates cross-domain
@@ -385,21 +367,55 @@ def significant_term_overlap(left: str, right: str) -> Set[str]:
 def significant_terms(text: str) -> Set[str]:
     terms: Set[str] = set()
     value = str(text or "")
-    for raw in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", value):
-        if raw in STOP_TERMS:
-            continue
+    for raw, is_cjk in lexical_runs(value):
         terms.add(raw)
-        if re.fullmatch(r"[\u4e00-\u9fff]{2,}", raw):
+        if is_cjk:
             for size in [2, 3, 4]:
                 for index in range(0, max(0, len(raw) - size + 1)):
-                    part = raw[index : index + size]
-                    if part not in STOP_TERMS:
-                        terms.add(part)
+                    terms.add(raw[index : index + size])
     return terms
 
 
 def normalize_token(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]+", "", str(value or "").strip().lower())
+    return "".join(
+        character
+        for character in str(value or "").strip().lower()
+        if character in ASCII_WORD or is_cjk_character(character)
+    )
+
+
+def lexical_runs(value: str) -> List[tuple[str, bool]]:
+    runs: List[tuple[str, bool]] = []
+    text = str(value or "")
+    cursor = 0
+    while cursor < len(text):
+        character = text[cursor]
+        if character in ASCII_LETTERS | {"_"}:
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and text[cursor] in ASCII_WORD:
+                cursor += 1
+            token = text[start:cursor]
+            if len(token) >= 3:
+                runs.append((token, False))
+            continue
+        if is_cjk_character(character):
+            start = cursor
+            cursor += 1
+            while cursor < len(text) and is_cjk_character(text[cursor]):
+                cursor += 1
+            token = text[start:cursor]
+            if len(token) >= 2:
+                runs.append((token, True))
+            continue
+        cursor += 1
+    return runs
+
+
+def is_cjk_character(character: str) -> bool:
+    return bool(character) and (
+        "\u3400" <= character <= "\u9fff" or "\uf900" <= character <= "\ufaff"
+    )
 
 
 def dedupe_constraints(constraints: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:

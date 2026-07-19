@@ -50,6 +50,7 @@ from merchant_ai.services.assets import (
 )
 from merchant_ai.services.context_filesystem import ContextPathOutsideRootError, resolve_context_path
 from merchant_ai.services.grounded_query_contract import semantic_evidence_calculation_capabilities
+from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.tool_runtime import tool_runtime_scope
 
 
@@ -1621,7 +1622,7 @@ When run_diana_action returns terminal=true, stop immediately. The API returns t
                 "这类排行需要明确时间范围，请问要查询最近多久？",
                 "QUERY_PLAN",
                 "time_window",
-                ["最近7天", "最近30天", "最近90天"],
+                list(load_language_policy().routing.time_clarification_options),
             )
             return state
         state["_initial_topic_recall"] = True
@@ -2240,6 +2241,20 @@ When run_diana_action returns terminal=true, stop immediately. The API returns t
         selected_id = str(action_id or "").strip()
         if session.terminal:
             return self._turn_payload(session)
+        if selected_id in self.GROUNDED_MODE_BLOCKED_ACTION_IDS:
+            payload = self._turn_payload(session)
+            payload.update(
+                {
+                    "status": "ACTION_REJECTED",
+                    "error": "GROUNDED_MODE_ACTION_DISABLED",
+                    "rejectedActionId": selected_id,
+                    "next": (
+                        "Use successful Core semantic reads to commit_grounded_query_contract, "
+                        "then compile_grounded_query."
+                    ),
+                }
+            )
+            return payload
         if selected_id not in session.available_actions:
             payload = self._turn_payload(session)
             payload.update(

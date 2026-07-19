@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Set, Tuple
@@ -15,34 +15,408 @@ from merchant_ai.models import (
 )
 from merchant_ai.services.answer_formatting import source_aware_metric_label
 from merchant_ai.services.query import query_bundle_complete_rows
+from merchant_ai.services.language_policy import load_language_policy
+from merchant_ai.services.text_parsing import (
+    contains_any_literal,
+    split_on_characters,
+)
 from merchant_ai.services.time_semantics import declared_time_column_for_intent
 
 
-NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d[\d,]*(?:\.\d+)?%?")
-DATETIME_PATTERN = re.compile(
-    r"(?<!\d)(?P<year>\d{4})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})"
-    r"[ T](?P<hour>\d{1,2}):(?P<minute>\d{2})"
-    r"(?::(?P<second>\d{2})(?P<fraction>\.\d{1,6})?)?"
-    r"(?P<timezone>Z|[+-]\d{2}:?\d{2})?(?!\d)"
+
+@dataclass(frozen=True)
+class _TextMatch:
+    source: str
+    start_index: int
+    end_index: int
+    groups: Dict[str, str] | None = None
+
+    def group(self, key: int | str = 0) -> str:
+        if key == 0:
+            return self.source[self.start_index : self.end_index]
+        return str((self.groups or {}).get(str(key), ""))
+
+    def start(self) -> int:
+        return self.start_index
+
+    def end(self) -> int:
+        return self.end_index
+
+    def span(self) -> Tuple[int, int]:
+        return self.start_index, self.end_index
+
+
+class _DeterministicScanner:
+    def __init__(self, finder: Any) -> None:
+        self.finder = finder
+
+    def finditer(self, value: Any) -> List[_TextMatch]:
+        return list(self.finder(str(value or "")))
+
+    def findall(self, value: Any) -> List[str]:
+        return [match.group(0) for match in self.finditer(value)]
+
+    def fullmatch(self, value: Any) -> _TextMatch | None:
+        text = str(value or "")
+        matches = self.finditer(text)
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+        return match if match.span() == (0, len(text)) else None
+
+
+def _ascii_digit_end(
+    text: str,
+    start: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    cursor = start
+    while (
+        cursor < len(text)
+        and cursor - start < maximum
+        and text[cursor].isascii()
+        and text[cursor].isdigit()
+    ):
+        cursor += 1
+    return cursor if cursor - start >= minimum else -1
+
+
+def _date_match_at(text: str, start: int) -> _TextMatch | None:
+    if start > 0 and text[start - 1].isdigit():
+        return None
+    year_end = _ascii_digit_end(text, start, minimum=4, maximum=4)
+    if year_end < 0 or year_end >= len(text) or text[year_end] not in {"-", "/"}:
+        return None
+    month_start = year_end + 1
+    month_end = _ascii_digit_end(text, month_start, minimum=1, maximum=2)
+    if month_end < 0 or month_end >= len(text) or text[month_end] not in {"-", "/"}:
+        return None
+    day_start = month_end + 1
+    day_end = _ascii_digit_end(text, day_start, minimum=1, maximum=2)
+    if day_end < 0 or (day_end < len(text) and text[day_end].isdigit()):
+        return None
+    return _TextMatch(
+        text,
+        start,
+        day_end,
+        {
+            "year": text[start:year_end],
+            "month": text[month_start:month_end],
+            "day": text[day_start:day_end],
+        },
+    )
+
+
+def _date_matches(text: str) -> Iterable[_TextMatch]:
+    cursor = 0
+    while cursor < len(text):
+        match = _date_match_at(text, cursor)
+        if match is None:
+            cursor += 1
+            continue
+        yield match
+        cursor = match.end()
+
+
+def _datetime_matches(text: str) -> Iterable[_TextMatch]:
+    for date_match in _date_matches(text):
+        cursor = date_match.end()
+        if cursor >= len(text) or text[cursor] not in {" ", "T"}:
+            continue
+        hour_start = cursor + 1
+        hour_end = _ascii_digit_end(text, hour_start, minimum=1, maximum=2)
+        if hour_end < 0 or hour_end >= len(text) or text[hour_end] != ":":
+            continue
+        minute_start = hour_end + 1
+        minute_end = _ascii_digit_end(text, minute_start, minimum=2, maximum=2)
+        if minute_end < 0:
+            continue
+        cursor = minute_end
+        second = ""
+        fraction = ""
+        if cursor < len(text) and text[cursor] == ":":
+            second_start = cursor + 1
+            second_end = _ascii_digit_end(text, second_start, minimum=2, maximum=2)
+            if second_end < 0:
+                continue
+            second = text[second_start:second_end]
+            cursor = second_end
+            if cursor < len(text) and text[cursor] == ".":
+                fraction_start = cursor
+                fraction_end = _ascii_digit_end(
+                    text,
+                    cursor + 1,
+                    minimum=1,
+                    maximum=6,
+                )
+                if fraction_end < 0:
+                    continue
+                fraction = text[fraction_start:fraction_end]
+                cursor = fraction_end
+        timezone = ""
+        if cursor < len(text) and text[cursor] == "Z":
+            timezone = "Z"
+            cursor += 1
+        elif cursor < len(text) and text[cursor] in {"+", "-"}:
+            zone_start = cursor
+            zone_hour_end = _ascii_digit_end(
+                text,
+                cursor + 1,
+                minimum=2,
+                maximum=2,
+            )
+            if zone_hour_end < 0:
+                continue
+            cursor = zone_hour_end
+            if cursor < len(text) and text[cursor] == ":":
+                cursor += 1
+            zone_minute_end = _ascii_digit_end(
+                text,
+                cursor,
+                minimum=2,
+                maximum=2,
+            )
+            if zone_minute_end < 0:
+                continue
+            cursor = zone_minute_end
+            timezone = text[zone_start:cursor]
+        if cursor < len(text) and text[cursor].isdigit():
+            continue
+        groups = dict(date_match.groups or {})
+        groups.update(
+            {
+                "hour": text[hour_start:hour_end],
+                "minute": text[minute_start:minute_end],
+                "second": second,
+                "fraction": fraction,
+                "timezone": timezone,
+            }
+        )
+        yield _TextMatch(text, date_match.start(), cursor, groups)
+
+
+def _number_matches(text: str) -> Iterable[_TextMatch]:
+    cursor = 0
+    ascii_word = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    while cursor < len(text):
+        start = cursor
+        if text[cursor] in {"+", "-"}:
+            cursor += 1
+        if cursor >= len(text) or not (
+            text[cursor].isascii() and text[cursor].isdigit()
+        ):
+            cursor = start + 1
+            continue
+        if start > 0 and text[start - 1] in ascii_word:
+            cursor = start + 1
+            continue
+        while cursor < len(text) and (
+            (text[cursor].isascii() and text[cursor].isdigit())
+            or text[cursor] == ","
+        ):
+            cursor += 1
+        if cursor < len(text) and text[cursor] == ".":
+            decimal_end = _ascii_digit_end(
+                text,
+                cursor + 1,
+                minimum=1,
+                maximum=max(1, len(text) - cursor - 1),
+            )
+            if decimal_end > 0:
+                cursor = decimal_end
+        if cursor < len(text) and text[cursor] == "%":
+            cursor += 1
+        yield _TextMatch(text, start, cursor)
+
+
+def _entity_matches(text: str) -> Iterable[_TextMatch]:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    cursor = 0
+    while cursor < len(text):
+        if not (text[cursor].isascii() and text[cursor].isalpha()):
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor] in allowed:
+            cursor += 1
+        token = text[start:cursor]
+        if len(token) >= 4 and any(
+            character.isdigit() for character in token[3:]
+        ):
+            yield _TextMatch(text, start, cursor)
+
+
+def _factual_sentence_matches(text: str) -> Iterable[_TextMatch]:
+    separators = {"。", "！", "？", "!", "?", "\n"}
+    start = 0
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] not in separators:
+            cursor += 1
+            continue
+        end = cursor if text[cursor] == "\n" else cursor + 1
+        if end > start:
+            yield _TextMatch(text, start, end)
+        cursor += 1
+        start = cursor
+    if start < len(text):
+        yield _TextMatch(text, start, len(text))
+
+
+NUMBER_PATTERN = _DeterministicScanner(_number_matches)
+DATETIME_PATTERN = _DeterministicScanner(_datetime_matches)
+DATE_PATTERN = _DeterministicScanner(_date_matches)
+ENTITY_PATTERN = _DeterministicScanner(_entity_matches)
+FACTUAL_SENTENCE_PATTERN = _DeterministicScanner(
+    _factual_sentence_matches
 )
-DATE_PATTERN = re.compile(r"(?<!\d)\d{4}[-/]\d{1,2}[-/]\d{1,2}(?!\d)")
-ENTITY_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\d[A-Za-z0-9_-]*\b")
-FACTUAL_SENTENCE_PATTERN = re.compile(r"[^。！？!?\n]+[。！？!?]?")
-SYSTEM_FORMULA_EXPLANATION_PATTERN = re.compile(
-    r"^(?:统计说明|计算说明|口径|公式)[:：]",
-    flags=re.I,
-)
-ORDERED_LIST_PREFIX_PATTERN = re.compile(
-    r"^\s*(?:\d+|[一二三四五六七八九十]+)[.、)]\s*"
-)
-NEGATED_ASSERTION_PATTERN = re.compile(
-    r"(?:不能确认|无法确认|无法判断|不能判断|没有.{0,24}证据|缺少.{0,24}证据|未能证明|不代表)"
-)
-SQL_FUNCTION_PATTERN = re.compile(
-    r"\b(?:sum|count|avg|min|max|coalesce|nullif|round|cast|if)\s*\(",
-    flags=re.I,
-)
-MARKDOWN_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-{3,}:?$")
+
+
+def _is_system_formula_explanation(value: Any) -> bool:
+    text = str(value or "").strip()
+    headings = load_language_policy().answer.formula_explanation_headings
+    return any(
+        text.casefold().startswith(prefix.casefold() + separator)
+        for prefix in headings
+        for separator in (":", "：")
+    )
+
+
+def _strip_ordered_list_prefix(value: str) -> str:
+    text = str(value or "")
+    cursor = 0
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    token_start = cursor
+    while cursor < len(text) and (
+        (text[cursor].isascii() and text[cursor].isdigit())
+        or text[cursor].isnumeric()
+    ):
+        cursor += 1
+    if cursor == token_start or cursor >= len(text) or text[cursor] not in {".", "、", ")"}:
+        return text
+    cursor += 1
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    return text[cursor:]
+
+
+def _is_negated_assertion(value: Any) -> bool:
+    text = str(value or "")
+    policy = load_language_policy().answer
+    if contains_any_literal(text, policy.negated_assertion_markers):
+        return True
+    for prefix in policy.missing_evidence_prefixes:
+        start = text.find(prefix)
+        while start >= 0:
+            evidence = text.find(policy.evidence_noun, start + len(prefix))
+            if 0 <= evidence - (start + len(prefix)) <= 24:
+                return True
+            start = text.find(prefix, start + 1)
+    return False
+
+
+def _markdown_separator_cell(value: Any) -> bool:
+    text = str(value or "").strip()
+    if text.startswith(":"):
+        text = text[1:]
+    if text.endswith(":"):
+        text = text[:-1]
+    return len(text) >= 3 and set(text) == {"-"}
+
+
+def _split_unescaped_pipes(value: str) -> List[str]:
+    output: List[str] = []
+    current: List[str] = []
+    escaped = False
+    for character in str(value or ""):
+        if character == "|" and not escaped:
+            output.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+        if character == "\\":
+            escaped = not escaped
+        else:
+            escaped = False
+    output.append("".join(current))
+    return output
+
+
+def _split_clauses(value: Any, separators: str) -> List[str]:
+    return [
+        item.strip()
+        for item in split_on_characters(value, separators)
+        if item.strip()
+    ]
+
+
+def _normalize_label_characters(value: Any) -> str:
+    removed = {"_", "`", "：", ":", "（", "）", "(", ")", "-"}
+    return "".join(
+        character
+        for character in str(value or "").strip().lower()
+        if not character.isspace() and character not in removed
+    )
+
+
+def _sql_function_spans(text: str) -> List[Tuple[int, int]]:
+    names = {"sum", "count", "avg", "min", "max", "coalesce", "nullif", "round", "cast", "if"}
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        if not (
+            text[cursor].isascii()
+            and (text[cursor].isalpha() or text[cursor] == "_")
+        ):
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and (
+            text[cursor].isascii()
+            and (text[cursor].isalnum() or text[cursor] == "_")
+        ):
+            cursor += 1
+        token = text[start:cursor].casefold()
+        scan = cursor
+        while scan < len(text) and text[scan].isspace():
+            scan += 1
+        if token in names and scan < len(text) and text[scan] == "(":
+            spans.append((start, scan + 1))
+    return spans
+
+
+def _case_expression_spans(text: str) -> List[Tuple[int, int]]:
+    tokens: List[Tuple[int, int, str]] = []
+    cursor = 0
+    while cursor < len(text):
+        if not (text[cursor].isascii() and text[cursor].isalpha()):
+            cursor += 1
+            continue
+        start = cursor
+        cursor += 1
+        while cursor < len(text) and text[cursor].isascii() and text[cursor].isalpha():
+            cursor += 1
+        tokens.append((start, cursor, text[start:cursor].casefold()))
+    spans: List[Tuple[int, int]] = []
+    for index, (start, _, token) in enumerate(tokens):
+        if token != "case":
+            continue
+        closing = next(
+            (
+                end
+                for _, end, candidate in tokens[index + 1 :]
+                if candidate == "end"
+            ),
+            -1,
+        )
+        if closing >= 0:
+            spans.append((start, closing))
+    return spans
 
 DerivedNumber = Tuple[Decimal, List[str], List[str], str]
 
@@ -232,7 +606,7 @@ def extract_answer_claims(answer: str, facts: List[VerifiedFact] | None = None) 
 def append_prose_claims(text: str, claims: List[AnswerClaim], non_entity_tokens: Set[str] | None = None) -> None:
     for match in FACTUAL_SENTENCE_PATTERN.finditer(text):
         sentence = match.group(0).strip(" -*\t\r\n")
-        sentence = ORDERED_LIST_PREFIX_PATTERN.sub("", sentence).strip()
+        sentence = _strip_ordered_list_prefix(sentence).strip()
         if not sentence:
             continue
         numbers = extract_numeric_tokens(sentence)
@@ -251,7 +625,7 @@ def qualitative_trend_assertion(sentence: str, known_metric_labels: Set[str]) ->
     executed facts, so this does not encode any business metric or table name.
     """
 
-    if NEGATED_ASSERTION_PATTERN.search(str(sentence or "")):
+    if _is_negated_assertion(sentence):
         return False
     if not direction_word(sentence):
         return False
@@ -267,11 +641,16 @@ def markdown_table_cells(line: str) -> List[str]:
         text = text[1:-1]
     else:
         text = text[1:]
-    return [cell.replace(r"\|", "|").strip() for cell in re.split(r"(?<!\\)\|", text)]
+    return [
+        cell.replace(r"\|", "|").strip()
+        for cell in _split_unescaped_pipes(text)
+    ]
 
 
 def markdown_separator_row(cells: List[str]) -> bool:
-    return bool(cells) and all(MARKDOWN_SEPARATOR_CELL_PATTERN.fullmatch(cell.strip()) for cell in cells)
+    return bool(cells) and all(
+        _markdown_separator_cell(cell) for cell in cells
+    )
 
 
 def markdown_table_claim(
@@ -304,8 +683,13 @@ def markdown_table_claim(
 
 
 def deterministic_position_cell(header: str, value: str, row_position: int) -> bool:
-    normalized_header = re.sub(r"[\s_.#：:（）()\-]+", "", str(header or "").strip().lower())
-    if normalized_header not in {"排名", "排行", "名次", "序号", "行号", "rank", "ranking", "no", "number", "index"}:
+    normalized_header = "".join(
+        character
+        for character in str(header or "").strip().lower()
+        if not character.isspace()
+        and character not in {"_", ".", "#", "：", ":", "（", "）", "(", ")", "-"}
+    )
+    if normalized_header not in load_language_policy().answer.position_column_labels:
         return False
     number = decimal_token(value)
     return number is not None and number == number.to_integral_value() and number == Decimal(row_position)
@@ -339,26 +723,22 @@ def extract_numeric_tokens(text: str) -> List[str]:
 
 
 def system_formula_expression_spans(text: str) -> List[Tuple[int, int]]:
-    if not SYSTEM_FORMULA_EXPLANATION_PATTERN.match(str(text or "").strip()):
+    if not _is_system_formula_explanation(text):
         return []
     spans: List[Tuple[int, int]] = []
-    for match in SQL_FUNCTION_PATTERN.finditer(text):
-        opening = text.find("(", match.start(), match.end())
+    for start, end in _sql_function_spans(text):
+        opening = text.find("(", start, end)
         closing = matching_parenthesis(text, opening)
         if closing >= 0:
-            spans.append((match.start(), closing + 1))
-    for match in re.finditer(r"\bCASE\b.*?\bEND\b", text, flags=re.I):
-        spans.append(match.span())
+            spans.append((start, closing + 1))
+    spans.extend(_case_expression_spans(text))
     return spans
 
 
 def system_contextual_number_spans(text: str) -> List[Tuple[int, int]]:
-    if not SYSTEM_FORMULA_EXPLANATION_PATTERN.match(str(text or "").strip()):
+    if not _is_system_formula_explanation(text):
         return []
-    spans: List[Tuple[int, int]] = []
-    for pattern in contextual_number_patterns():
-        spans.extend(match.span() for match in re.finditer(pattern, str(text or ""), flags=re.I))
-    return spans
+    return _contextual_number_spans(text)
 
 
 def matching_parenthesis(text: str, opening: int) -> int:
@@ -398,9 +778,10 @@ def span_overlaps(span: Tuple[int, int], candidates: Iterable[Tuple[int, int]]) 
 
 def factual_answer_body(answer: str) -> str:
     kept: List[str] = []
+    headings = load_language_policy().answer.rule_evidence_headings
     for raw_line in str(answer or "").splitlines():
         line = raw_line.strip()
-        if re.match(r"^规则依据[:：]", line):
+        if any(line.startswith((heading + ":", heading + "：")) for heading in headings):
             break
         kept.append(raw_line)
     return "\n".join(kept)
@@ -453,13 +834,14 @@ def support_for_claim(
 
 def trend_direction_support(claim_text: str, facts: List[VerifiedFact]) -> Tuple[str, List[str]]:
     text = str(claim_text or "")
-    if NEGATED_ASSERTION_PATTERN.search(text):
+    if _is_negated_assertion(text):
         return "", []
-    if not re.search(r"(上升|增加|提升|上涨|下降|减少|降低|下滑|持平)", text):
+    direction_markers = load_language_policy().answer.trend_direction_markers
+    if not contains_any_literal(text, tuple(marker for values in direction_markers.values() for marker in values)):
         return "", []
     matched_fact_ids: List[str] = []
     trends = trend_fact_groups(facts)
-    clauses = [item.strip() for item in re.split(r"[；;。.!！?？\n]+", text) if item.strip()]
+    clauses = _split_clauses(text, "；;。.!！?？\n")
     for clause in clauses:
         claimed = direction_word(clause)
         if not claimed:
@@ -541,7 +923,11 @@ def expected_trend_direction_for_clause(trend: Dict[str, Any], clause: str) -> s
     if not points:
         return str(trend.get("direction") or "")
     claim_dates = [normalize_temporal_token(item) for item in DATE_PATTERN.findall(str(clause or ""))]
-    if re.search(r"较\s*前(?:一|1)?(?:日|天)", str(clause or "")) and claim_dates:
+    compact_clause = "".join(str(clause or "").split())
+    if contains_any_literal(
+        compact_clause,
+        load_language_policy().answer.previous_day_comparison_markers,
+    ) and claim_dates:
         target_date = claim_dates[-1]
         for index, point in enumerate(points):
             if str(point.get("date") or "") != target_date or index <= 0:
@@ -565,16 +951,21 @@ def claim_segment_for_label(text: str, normalized_label: str) -> str:
         return text
     raw_index = max(0, min(len(text), index))
     tail = text[raw_index:]
-    return re.split(r"[；;。.!！?？\n]", tail, maxsplit=1)[0]
+    boundaries = [
+        tail.find(separator)
+        for separator in "；;。.!！?？\n"
+        if tail.find(separator) >= 0
+    ]
+    return tail[: min(boundaries)] if boundaries else tail
 
 
 def direction_word(text: str) -> str:
-    if re.search(r"(持平|不变)", text):
-        return "flat"
-    if re.search(r"(上升|增加|提升|上涨)", text):
-        return "up"
-    if re.search(r"(下降|减少|降低|下滑)", text):
-        return "down"
+    for direction in ("flat", "up", "down"):
+        if contains_any_literal(
+            text,
+            load_language_policy().answer.trend_direction_markers.get(direction, ()),
+        ):
+            return direction
     return ""
 
 
@@ -752,10 +1143,10 @@ def claim_contexts_for_value(raw: str, claim_text: str) -> List[str]:
     """
 
     text = str(claim_text or "")
-    clauses = [item.strip() for item in re.split(r"[；;。.!！?？\n]+", text) if item.strip()]
+    clauses = _split_clauses(text, "；;。.!！?？\n")
     contexts: List[str] = []
     for clause in clauses:
-        segments = [item.strip() for item in re.split(r"[，,]+", clause) if item.strip()]
+        segments = _split_clauses(clause, "，,")
         for index, segment in enumerate(segments):
             occurrences = sum(
                 1
@@ -796,7 +1187,7 @@ def claim_has_competing_fact_label(
 
 
 def normalize_label_text(value: Any) -> str:
-    return re.sub(r"[\s_`：:（）()\-]+", "", str(value or "").strip().lower())
+    return _normalize_label_characters(value)
 
 
 def contextual_question_number_supported(raw: str, claim_text: str, question: str) -> bool:
@@ -818,33 +1209,124 @@ def contextual_question_date_supported(raw: str, claim_text: str, question: str)
 
 def contextual_number_tokens(text: str) -> Set[Decimal]:
     values: Set[Decimal] = set()
-    for pattern in contextual_number_patterns():
-        for raw in re.findall(pattern, str(text or ""), flags=re.I):
-            number = decimal_token(raw)
-            if number is not None:
-                values.add(number)
+    source = str(text or "")
+    spans = _contextual_number_spans(source)
+    for match in NUMBER_PATTERN.finditer(source):
+        if not any(
+            start <= match.start() and match.end() <= end
+            for start, end in spans
+        ):
+            continue
+        number = decimal_token(match.group(0))
+        if number is not None:
+            values.add(number)
     return values
 
 
-def contextual_number_patterns() -> List[str]:
-    return [
-        r"(?:最近|近|过去)\s*(\d+(?:\.\d+)?)\s*(?:天|日|周|月|年)",
-        r"(?:前|top)\s*(\d+(?:\.\d+)?)\s*(?:个|名|条|项|笔|天)?",
-        r"(?:超过|高于|低于|不少于|不超过|阈值)\s*(\d+(?:\.\d+)?%?)",
-        r"(?:merchant_id|merchantId|商家ID)\s*[=:：]\s*(\d+(?:\.\d+)?)",
-    ]
+def _marker_ending_before(
+    text: str,
+    number_start: int,
+    markers: Iterable[str],
+    *,
+    allow_assignment_separator: bool = False,
+) -> Tuple[int, str] | None:
+    cursor = number_start
+    while cursor > 0 and text[cursor - 1].isspace():
+        cursor -= 1
+    if allow_assignment_separator:
+        while cursor > 0 and text[cursor - 1] in {"=", ":", "："}:
+            cursor -= 1
+        while cursor > 0 and text[cursor - 1].isspace():
+            cursor -= 1
+    folded = text.casefold()
+    for marker in sorted(
+        {str(item) for item in markers if str(item)},
+        key=len,
+        reverse=True,
+    ):
+        start = cursor - len(marker)
+        if start >= 0 and folded[start:cursor] == marker.casefold():
+            return start, marker
+    return None
+
+
+def _contextual_number_spans(text: str) -> List[Tuple[int, int]]:
+    source = str(text or "")
+    language = load_language_policy()
+    temporal_prefixes = language.temporal.prefixes
+    temporal_units = tuple(language.temporal.units)
+    ranking_prefixes = (
+        *language.routing.ranking_ordinal_prefixes,
+        *language.routing.ranking_top_prefixes,
+    )
+    threshold_markers = language.answer.threshold_markers
+    principal_markers = language.answer.principal_markers
+    spans: List[Tuple[int, int]] = []
+    for match in NUMBER_PATTERN.finditer(source):
+        after = match.end()
+        while after < len(source) and source[after].isspace():
+            after += 1
+        temporal_marker = _marker_ending_before(
+            source,
+            match.start(),
+            temporal_prefixes,
+        )
+        if temporal_marker is not None:
+            unit = next(
+                (
+                    item
+                    for item in sorted(temporal_units, key=len, reverse=True)
+                    if source.startswith(item, after)
+                ),
+                "",
+            )
+            if unit:
+                spans.append((temporal_marker[0], after + len(unit)))
+                continue
+        ranking_marker = _marker_ending_before(
+            source,
+            match.start(),
+            ranking_prefixes,
+        )
+        if ranking_marker is not None:
+            suffix_end = (
+                after + 1
+                if after < len(source) and source[after] in language.answer.ranking_counter_characters
+                else match.end()
+            )
+            spans.append((ranking_marker[0], suffix_end))
+            continue
+        threshold_marker = _marker_ending_before(
+            source,
+            match.start(),
+            threshold_markers,
+        )
+        if threshold_marker is not None:
+            spans.append((threshold_marker[0], match.end()))
+            continue
+        principal_marker = _marker_ending_before(
+            source,
+            match.start(),
+            principal_markers,
+            allow_assignment_separator=True,
+        )
+        if principal_marker is not None:
+            spans.append((principal_marker[0], match.end()))
+    return list(dict.fromkeys(spans))
 
 
 def numeric_occurrences_are_contextual(raw: str, text: str) -> bool:
     target = decimal_token(raw)
     if target is None:
         return False
-    scrubbed = DATE_PATTERN.sub(lambda match: " " * len(match.group(0)), str(text or ""))
-    contextual_spans = [
-        match.span()
-        for pattern in contextual_number_patterns()
-        for match in re.finditer(pattern, scrubbed, flags=re.I)
-    ]
+    source = str(text or "")
+    scrubbed_characters = list(source)
+    for match in DATE_PATTERN.finditer(source):
+        scrubbed_characters[match.start() : match.end()] = [
+            " "
+        ] * (match.end() - match.start())
+    scrubbed = "".join(scrubbed_characters)
+    contextual_spans = _contextual_number_spans(scrubbed)
     target_spans = [
         match.span()
         for match in NUMBER_PATTERN.finditer(scrubbed)
@@ -886,9 +1368,31 @@ def supported_derived_numeric_token(
 
 def claim_asserts_direct_metric_value(claim_text: str) -> bool:
     text = str(claim_text or "")
-    if re.search(r"(变化|变动|差值|差额|增量|减少|增加|上升|下降|提升|降低|波动|环比|同比|涨幅|跌幅|少了|多了|change|delta|diff|increase|decrease)", text, flags=re.I):
+    policy = load_language_policy().answer
+    if contains_any_literal(
+        text,
+        policy.direct_value_exclusion_markers,
+        case_sensitive=False,
+    ):
         return False
-    return bool(re.search(r"(?:为|是|达到|等于|合计|总计|当前|本次|查询范围内|[:：]).{0,12}[-+]?\d", text))
+    markers = policy.direct_value_markers
+    number_spans = [match.span() for match in NUMBER_PATTERN.finditer(text)]
+    return any(
+        0 <= start - (index + len(marker)) <= 12
+        for marker in markers
+        for index in _literal_offsets(text, marker)
+        for start, _ in number_spans
+    )
+
+
+def _literal_offsets(text: str, literal: str) -> Iterable[int]:
+    cursor = 0
+    while literal and cursor <= len(text) - len(literal):
+        index = text.find(literal, cursor)
+        if index < 0:
+            return
+        yield index
+        cursor = index + 1
 
 
 def governed_fact_columns(intent: Any, task: Any) -> Set[str]:
@@ -1093,7 +1597,21 @@ def decimal_value(value: Any) -> Decimal | None:
         except (InvalidOperation, ValueError):
             return None
     text = str(value or "").strip().replace(",", "")
-    if not text or not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+    unsigned = text[1:] if text.startswith(("-", "+")) else text
+    integer, separator, fraction = unsigned.partition(".")
+    if (
+        not integer
+        or not integer.isascii()
+        or not integer.isdigit()
+        or (
+            separator
+            and (
+                not fraction
+                or not fraction.isascii()
+                or not fraction.isdigit()
+            )
+        )
+    ):
         return None
     try:
         return Decimal(text)
@@ -1184,7 +1702,7 @@ def normalize_temporal_token(value: Any) -> str:
         )
     date_match = DATE_PATTERN.fullmatch(text)
     if date_match:
-        year, month, day = re.split(r"[-/]", text)
+        year, month, day = text.replace("/", "-").split("-")
         return "%04d-%02d-%02d" % (int(year), int(month), int(day))
     return text
 

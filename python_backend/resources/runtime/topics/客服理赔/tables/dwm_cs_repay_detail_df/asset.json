@@ -1432,10 +1432,7 @@
       "formula": "SUM(repay_bill_cnt) / NULLIF(SUM(order_detail_cnt), 0)",
       "unit": "%",
       "description": "同一商品、订单集合或日期粒度下，赔付明细单量占订单明细去重下单数的比例；分子来自赔付明细单量，分母来自订单明细去重下单数。",
-      "sourceColumns": [
-        "repay_bill_cnt",
-        "order_detail_cnt"
-      ],
+      "sourceColumns": [],
       "aliases": [
         "商品维度赔付率",
         "compensation_rate",
@@ -1473,7 +1470,11 @@
         "asOfPolicy": "latest_available_partition",
         "missingDataPolicy": "disclose_unknown",
         "zeroValuePolicy": "preserve_observed_zero"
-      }
+      },
+      "requiresMetrics": [
+        "repay_bill_cnt",
+        "order_detail_cnt"
+      ]
     },
     {
       "metricKey": "repay_success_amt",

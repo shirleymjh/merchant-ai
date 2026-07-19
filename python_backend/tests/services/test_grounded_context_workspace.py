@@ -67,18 +67,13 @@ def test_context_workspace_replay_is_idempotent_but_request_change_conflicts(
     replay = GroundedContextWorkspace.open(_settings(tmp_path), **arguments)
 
     assert replay.request_fingerprint == first.request_fingerprint
-    with pytest.raises(
-        GroundedContextWorkspaceError,
-        match="GROUNDED_CONTEXT_REQUEST_CONFLICT",
-    ):
+    with pytest.raises(GroundedContextWorkspaceError) as question_conflict:
         GroundedContextWorkspace.open(
             _settings(tmp_path),
             **{**arguments, "question": "different question"},
         )
-    with pytest.raises(
-        GroundedContextWorkspaceError,
-        match="GROUNDED_CONTEXT_REQUEST_CONFLICT",
-    ):
+    assert "GROUNDED_CONTEXT_REQUEST_CONFLICT" in str(question_conflict.value)
+    with pytest.raises(GroundedContextWorkspaceError) as scope_conflict:
         GroundedContextWorkspace.open(
             _settings(tmp_path),
             **{
@@ -89,6 +84,7 @@ def test_context_workspace_replay_is_idempotent_but_request_change_conflicts(
                 },
             },
         )
+    assert "GROUNDED_CONTEXT_REQUEST_CONFLICT" in str(scope_conflict.value)
 
 
 def test_context_workspace_manifest_create_is_concurrency_safe(tmp_path: Path) -> None:
@@ -156,10 +152,7 @@ def test_context_workspace_rejects_symlinked_parent_before_external_creation(
         target_is_directory=True,
     )
 
-    with pytest.raises(
-        GroundedContextWorkspaceError,
-        match="GROUNDED_CONTEXT_WORKSPACE_OUTSIDE_ROOT",
-    ):
+    with pytest.raises(GroundedContextWorkspaceError) as outside_root_error:
         GroundedContextWorkspace.open(
             _settings(workspace_root),
             thread_id="thread-1",
@@ -169,6 +162,7 @@ def test_context_workspace_rejects_symlinked_parent_before_external_creation(
             user_scope={"userId": "user-1"},
             question="question",
         )
+    assert "GROUNDED_CONTEXT_WORKSPACE_OUTSIDE_ROOT" in str(outside_root_error.value)
 
     assert list(outside_root.iterdir()) == []
 
@@ -198,16 +192,12 @@ def test_context_workspace_rejects_symlinked_scratch_and_subagent_parents(
         target_is_directory=True,
     )
 
-    with pytest.raises(
-        GroundedContextWorkspaceError,
-        match="GROUNDED_SCRATCH_WRITE_FAILED",
-    ):
+    with pytest.raises(GroundedContextWorkspaceError) as scratch_error:
         workspace.write_core_scratch("notes/step.txt", "outside denied")
-    with pytest.raises(
-        GroundedContextWorkspaceError,
-        match="GROUNDED_SUBAGENT_WORKSPACE_OUTSIDE_ROOT",
-    ):
+    assert "GROUNDED_SCRATCH_WRITE_FAILED" in str(scratch_error.value)
+    with pytest.raises(GroundedContextWorkspaceError) as subagent_error:
         workspace.subagent_workspace("analysis", "job-1")
+    assert "GROUNDED_SUBAGENT_WORKSPACE_OUTSIDE_ROOT" in str(subagent_error.value)
 
     assert list(outside_scratch.iterdir()) == []
     assert list(outside_subagent.iterdir()) == []

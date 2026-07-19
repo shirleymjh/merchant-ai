@@ -38,6 +38,56 @@ def resolve_skill_script(skill_dir: Path, metadata: Dict[str, Any]) -> Path | No
     return candidate
 
 
+def normalize_skill_package_id(value: str) -> str:
+    """Canonicalize a Skill package identifier without naming any Skill.
+
+    Codex/Deep-Agent Skill package names are hyphenated, while older callers
+    may still carry underscore-separated identifiers.  Treat separators as a
+    transport concern and bind execution to the unique package whose formal
+    ``SKILL.md`` name has the same canonical identifier.
+    """
+
+    output: list[str] = []
+    separator_pending = False
+    for character in str(value or "").strip().casefold():
+        if character.isascii() and character.isalnum():
+            if separator_pending and output:
+                output.append("-")
+            output.append(character)
+            separator_pending = False
+            continue
+        separator_pending = bool(output)
+    return "".join(output).strip("-")
+
+
+def resolve_skill_package(root: Path, requested_name: str) -> Path | None:
+    """Resolve one formally declared Skill package, failing closed on ambiguity."""
+
+    from merchant_ai.services.answer import load_skill_frontmatter
+
+    requested_id = normalize_skill_package_id(requested_name)
+    if not requested_id or not root.is_dir():
+        return None
+    matches: list[Path] = []
+    for skill_file in sorted(root.glob("*/SKILL.md")):
+        package = skill_file.parent.resolve()
+        try:
+            package.relative_to(root.resolve())
+        except ValueError:
+            continue
+        metadata = load_skill_frontmatter(skill_file)
+        declared_name = str(metadata.get("name") or "").strip()
+        declared_id = normalize_skill_package_id(declared_name)
+        directory_id = normalize_skill_package_id(package.name)
+        if (
+            declared_id
+            and declared_id == directory_id
+            and declared_id == requested_id
+        ):
+            matches.append(package)
+    return matches[0] if len(matches) == 1 else None
+
+
 @dataclass
 class SkillWorkerResult:
     answer: str
@@ -148,9 +198,10 @@ class SkillWorkerExecutor:
                     "progress": ["no_match", "skipped"],
                 },
             )
-        skill_dir = self.settings.resources_root / "runtime" / "agent_skills" / selected_skill
-        skill_file = skill_dir / "SKILL.md"
-        if not skill_file.exists():
+        skill_root = self.settings.resources_root / "runtime" / "agent_skills"
+        skill_dir = resolve_skill_package(skill_root, selected_skill)
+        skill_file = skill_dir / "SKILL.md" if skill_dir is not None else None
+        if skill_file is None:
             return SkillWorkerResult(
                 answer="",
                 trace={

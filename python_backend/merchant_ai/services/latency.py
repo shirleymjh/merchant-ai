@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict
 
 from merchant_ai.models import AnswerMode, FastUnderstandingResult, QueryPlan
@@ -193,7 +192,14 @@ class LatencyOptimizer:
         if has_attachments:
             score += 2
             reasons.append("attachment_context")
-        if re.search(r"原因|归因|为什么|诊断|异常|建议|分析|下钻|关联", question or "", re.I):
+        understanding = plan.question_understanding if isinstance(plan.question_understanding, dict) else {}
+        analysis_intent = str(fast.analysis_intent or "").strip().lower()
+        requires_explanation = bool(
+            understanding.get("requiresExplanation")
+            or understanding.get("requires_explanation")
+            or analysis_intent not in {"", "lookup", "metric", "trend"}
+        )
+        if requires_explanation:
             score += 2
             reasons.append("analysis_or_attribution")
         if len(executable) > 3:

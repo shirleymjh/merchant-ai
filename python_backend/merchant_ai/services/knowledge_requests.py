@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import unicodedata
 from typing import Any, Dict, Iterable, List
 
 from merchant_ai.models import KnowledgeRequest
+from merchant_ai.services.text_parsing import collapse_whitespace
 
 
 def normalize_knowledge_request_text(value: Any) -> str:
     """Normalize semantic text without retaining presentation-only differences."""
 
     normalized = unicodedata.normalize("NFKC", str(value or ""))
-    return re.sub(r"\s+", " ", normalized.strip()).casefold()
+    return collapse_whitespace(normalized).casefold()
 
 
 def canonical_knowledge_request_payload(request: KnowledgeRequest) -> Dict[str, Any]:

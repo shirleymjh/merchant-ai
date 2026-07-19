@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional
 
 from merchant_ai.models import ConversationMessage
+from merchant_ai.services.text_parsing import collapse_whitespace
 from merchant_ai.services.llm import LlmClient
 
 
@@ -47,7 +47,7 @@ def render_recent_message_history_context(messages: List[ConversationMessage]) -
     ]
     for index, message in enumerate(messages[-MAX_SHORT_TERM_RECENT_MESSAGES:], start=1):
         role = {"user": "用户", "assistant": "助手"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        text = collapse_whitespace(message.text)
         if text:
             lines.append("- %02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
     return "\n".join(lines)[-MAX_SHORT_TERM_CONTEXT_CHARS:]
@@ -62,7 +62,7 @@ def render_rule_based_message_summary(messages: List[ConversationMessage]) -> st
     ]
     for index, message in enumerate(messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
         role = {"user": "用户", "assistant": "助手"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        text = collapse_whitespace(message.text)
         if text:
             lines.append("- %02d %s：%s" % (index, role, text[:500]))
     return "\n".join(lines)[:MAX_SHORT_TERM_SUMMARY_CHARS]
@@ -84,7 +84,7 @@ def summarize_message_history_context(
     rows: List[str] = []
     for index, message in enumerate(older_messages[-(MAX_SHORT_TERM_MESSAGES - MAX_SHORT_TERM_RECENT_MESSAGES) :], start=1):
         role = {"user": "用户", "assistant": "助手"}.get(message.role, message.role or "unknown")
-        text = re.sub(r"\s+", " ", str(message.text or "")).strip()
+        text = collapse_whitespace(message.text)
         if text:
             rows.append("%02d %s：%s" % (index, role, text[:MAX_SHORT_TERM_MESSAGE_CHARS]))
     if not rows:

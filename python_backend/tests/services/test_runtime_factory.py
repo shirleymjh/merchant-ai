@@ -83,8 +83,9 @@ def test_deepagent_factory_branch_never_imports_legacy_workflow(monkeypatch: Any
 def test_legacy_workflow_cannot_be_selected_as_online_query_authority() -> None:
     settings = get_settings().model_copy(update={"agent_mode": "legacy"})
 
-    with pytest.raises(ValueError, match="grounded deepagent only"):
+    with pytest.raises(ValueError) as exc_info:
         runtime_factory.create_runtime(settings)
+    assert "grounded deepagent only" in str(exc_info.value)
 
 
 def test_facade_adapts_api_signature_without_workflow_state() -> None:
@@ -119,7 +120,8 @@ def test_facade_adapts_api_signature_without_workflow_state() -> None:
 
 
 def test_fastapi_production_entry_uses_runtime_factory() -> None:
-    source = Path("python_backend/app/main.py").read_text(encoding="utf-8")
+    source_path = Path(__file__).resolve().parents[2] / "app/main.py"
+    source = source_path.read_text(encoding="utf-8")
     assert "from merchant_ai.services.runtime_factory import create_runtime" in source
     assert "create_workflow" not in source
 

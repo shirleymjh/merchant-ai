@@ -488,8 +488,9 @@ def test_builds_typed_two_table_entity_lookup_without_metric_surrogate() -> None
         "detail_status",
         "published_at",
     ]
-    with pytest.raises(ValueError, match="EXECUTION_SHAPE_NOT_DETERMINISTIC"):
+    with pytest.raises(ValueError) as exc_info:
         compile_deterministic_grounded_query(contract, pack)
+    assert "EXECUTION_SHAPE_NOT_DETERMINISTIC" in str(exc_info.value)
 
 
 def test_order_detail_question_is_bound_as_generic_entity_lookup_not_metric() -> None:

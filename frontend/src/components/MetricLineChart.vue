@@ -152,6 +152,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { Copy, Maximize2, X } from 'lucide-vue-next'
+import { compactFixed, isoDateParts } from '../utils/textParsing'
 
 const props = defineProps({
   title: {
@@ -167,25 +168,6 @@ const props = defineProps({
     default: () => []
   }
 })
-
-const tableLabels = {
-  ads_merchant_profile: '店铺经营指标',
-  dwm_trade_order_detail_di: '订单数据',
-  dwm_trade_refund_detail_di: '退款/售后数据',
-  dwm_goods_detail_df: '商品数据',
-  dwm_cs_ticket_detail_di: '客服工单数据',
-  dwm_cs_repay_detail_df: '赔付数据',
-  dwm_coupon_detail_di: '优惠券数据',
-  dwm_scm_detail_di: '供应链履约数据',
-  dim_merchant_df: '商家资料',
-  dwd_merchant_appeal_detail_df: '申诉数据',
-  dwd_merchant_deposit_recharge_df: '保证金数据'
-}
-
-function tableLabel(table) {
-  const normalized = String(table || '').replace(/^yshopping\./, '').trim()
-  return tableLabels[normalized] || '相关业务数据'
-}
 
 const chartWidth = 640
 const chartHeight = 260
@@ -310,7 +292,7 @@ const peakPoint = computed(() => {
 
 const kicker = computed(() => {
   if (!normalizedRows.value.length) return '趋势分析'
-  return titleLooksLikeAmount(displayTitle.value) ? '金额趋势' : '指标趋势'
+  return '指标趋势'
 })
 
 const peakLabel = computed(() => {
@@ -337,18 +319,13 @@ function formatMetricValue(value) {
   if (Math.abs(value) >= 10000) return `${(value / 10000).toFixed(2)}万`
   if (Math.abs(value) >= 1000) return Number(value).toFixed(0)
   if (Math.abs(value) >= 100) return Number(value).toFixed(1)
-  return Number(value).toFixed(2).replace(/\.00$/, '')
+  return compactFixed(value)
 }
 
 function compactDate(text) {
   const value = String(text || '')
-  const match = value.match(/(\d{4})-(\d{2})-(\d{2})/)
-  if (!match) return value
-  return `${match[2]}-${match[3]}`
-}
-
-function titleLooksLikeAmount(title) {
-  return /金额|gmv|销售额|成交额|流水/i.test(String(title || ''))
+  const parts = isoDateParts(value)
+  return parts.length ? `${parts[1]}-${parts[2]}` : value
 }
 
 async function copyChartData() {

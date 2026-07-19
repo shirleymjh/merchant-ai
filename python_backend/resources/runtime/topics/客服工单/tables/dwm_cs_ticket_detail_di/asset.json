@@ -2715,10 +2715,7 @@
       "formula": "SUM(ticket_cnt) / NULLIF(SUM(order_detail_cnt), 0)",
       "unit": "%",
       "description": "同一商品、订单集合或日期粒度下，客服工单明细量占订单明细去重下单数的比例；分子来自客服工单明细量，分母来自订单明细去重下单数。",
-      "sourceColumns": [
-        "ticket_cnt",
-        "order_detail_cnt"
-      ],
+      "sourceColumns": [],
       "aliases": [
         "商品维度工单率",
         "ticket_rate",
@@ -2756,7 +2753,11 @@
         "asOfPolicy": "latest_available_partition",
         "missingDataPolicy": "disclose_unknown",
         "zeroValuePolicy": "preserve_observed_zero"
-      }
+      },
+      "requiresMetrics": [
+        "ticket_cnt",
+        "order_detail_cnt"
+      ]
     }
   ],
   "terms": [

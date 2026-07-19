@@ -7,6 +7,13 @@ from typing import Any, Dict, Iterator, List, Literal, Optional
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field
 from pydantic_core import core_schema
 
+from merchant_ai.services.authorization_policy import load_authorization_policy
+
+
+_AUTHORIZATION_POLICY = load_authorization_policy()
+DEFAULT_IDENTITY_ROLE = _AUTHORIZATION_POLICY.default_identity_role
+DEFAULT_ACCESS_ROLE = _AUTHORIZATION_POLICY.default_access_role
+
 
 def to_camel(value: str) -> str:
     pieces = value.split("_")
@@ -206,7 +213,7 @@ class UserIdentity(APIModel):
     user_id: str = ""
     merchant_id: str = ""
     display_name: str = ""
-    role: str = "merchant_operator"
+    role: str = DEFAULT_IDENTITY_ROLE
     region: str = ""
     language: str = "zh-CN"
     store_ids: List[str] = Field(default_factory=list)
@@ -216,7 +223,7 @@ class UserIdentity(APIModel):
         return "\n".join(
             [
                 f"- 用户：{self.display_name or self.user_id or '当前商家用户'}",
-                f"- 角色：{self.role or 'merchant_operator'}",
+                f"- 角色：{self.role or DEFAULT_IDENTITY_ROLE}",
                 f"- Region：{self.region or '未限定'}",
                 f"- Language：{self.language or 'zh-CN'}",
                 f"- 门店范围：{', '.join(self.store_ids) if self.store_ids else '当前商家全部授权门店'}",
@@ -354,7 +361,7 @@ class MemoryRecallEvalCase(APIModel):
     topics: List[str] = Field(default_factory=list)
     metrics: List[str] = Field(default_factory=list)
     time_windows: List[int] = Field(default_factory=list)
-    access_role: str = "merchant_analyst"
+    access_role: str = DEFAULT_ACCESS_ROLE
 
 
 class MemoryRecallEvaluationRequest(APIModel):
@@ -785,7 +792,7 @@ class KnowledgeRetrievalRequest(APIModel):
     history_rows: List[Dict[str, Any]] = Field(default_factory=list)
     knowledge_context: str = ""
     merchant_id: str = ""
-    access_role: str = "merchant_operator"
+    access_role: str = DEFAULT_ACCESS_ROLE
     permissions: List[str] = Field(default_factory=list)
     previous_user_question: str = ""
     session_context: str = ""
@@ -1500,7 +1507,7 @@ class NodePlanContract(APIModel):
     authorized_store_ids: List[str] = Field(default_factory=list)
     region_filter_column: str = ""
     store_filter_column: str = ""
-    access_role: str = "merchant_analyst"
+    access_role: str = DEFAULT_ACCESS_ROLE
     row_scope_policy: Dict[str, Any] = Field(default_factory=dict)
     column_access_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     column_display_policy: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
@@ -1733,7 +1740,7 @@ class NodeExecutionContext(APIModel):
     effective_user_id: str = ""
     authorized_region: str = ""
     authorized_store_ids: List[str] = Field(default_factory=list)
-    access_role: str = "merchant_analyst"
+    access_role: str = DEFAULT_ACCESS_ROLE
     question: str = ""
     upstream_entity_sets: List[EntitySet] = Field(default_factory=list)
     upstream_rows: List[Dict[str, Any]] = Field(default_factory=list)

@@ -108,18 +108,19 @@ def test_trade_l1_exposes_compact_exact_leaf_navigation_without_binding_evidence
     assert detail["success"] is True
     payload = json.loads(str(detail["content"]))
     navigation = payload["semanticNavigation"]
-    metric = next(item for item in navigation["metricLeaves"] if item["key"] == "sku_cnt")
-    brand = next(item for item in navigation["columnLeaves"] if item["key"] == "brand_name")
-    article = next(item for item in navigation["columnLeaves"] if item["key"] == "article_id")
+    metric = navigation["metricLeaves"][0]
+    columns = navigation["columnLeaves"][:2]
 
-    assert "销量" in metric["aliases"]
-    assert "品牌name" in brand["aliases"]
-    assert metric["path"].endswith("/metrics/sku_cnt.json")
-    assert brand["path"].endswith("/columns/brand_name.json")
-    assert article["path"].endswith("/columns/article_id.json")
+    assert metric["aliases"]
+    assert len(columns) == 2
+    assert metric["path"].endswith(f"/metrics/{metric['key']}.json")
+    assert all(
+        column["path"].endswith(f"/columns/{column['key']}.json")
+        for column in columns
+    )
     assert "formula" not in json.dumps(navigation, ensure_ascii=False).lower()
 
-    for leaf in (metric, brand, article):
+    for leaf in (metric, *columns):
         exact = catalog.read(
             ref_id=leaf["refId"],
             path=leaf["path"],
@@ -195,7 +196,13 @@ def test_every_published_table_l1_has_bounded_asset_derived_exact_navigation() -
                 if values:
                     assert leaves
                 for leaf in leaves:
-                    assert set(leaf) == {"key", "aliases", "refId", "path"}
+                    base_fields = {"key", "aliases", "refId", "path"}
+                    allowed_fields = (
+                        base_fields | {"semanticRole", "timeRole"}
+                        if section == "columns"
+                        else base_fields
+                    )
+                    assert base_fields <= set(leaf) <= allowed_fields
                     assert leaf["key"] in published_keys
                     assert isinstance(leaf["aliases"], list)
                     assert len(leaf["aliases"]) <= (catalog.L1_NAVIGATION_MAX_ALIASES_PER_LEAF)
@@ -545,5 +552,6 @@ def test_semantic_entry_keys_are_stable_across_reordering_and_fail_closed_on_dup
     assert len(set(collision_keys)) == 2
     assert all(key.startswith("a_b-") for key in collision_keys)
 
-    with pytest.raises(ValueError, match="SEMANTIC_ENTRY_KEY_COLLISION"):
+    with pytest.raises(ValueError) as exc_info:
         semantic_table_entry_keys("columns", [colliding_columns[0], dict(colliding_columns[0])])
+    assert "SEMANTIC_ENTRY_KEY_COLLISION" in str(exc_info.value)

@@ -819,6 +819,10 @@
       "unit": "%",
       "description": "申诉通过次数占申诉次数的比例",
       "sourceColumns": [],
+      "requiresMetrics": [
+        "appeal_pass_cnt",
+        "appeal_cnt"
+      ],
       "aliases": [
         "申诉明细成功率",
         "appeal_success_rate",

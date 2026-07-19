@@ -479,7 +479,7 @@ def test_only_successful_core_read_file_calls_enter_trusted_semantic_evidence() 
     ]
 
 
-def test_plan_graph_rejects_until_core_reads_table_detail_and_exact_definition() -> None:
+def test_legacy_plan_graph_remains_disabled_even_after_exact_semantic_reads() -> None:
     catalog = _EvidenceSemanticCatalogStub()
     backend = ReadOnlySemanticBackend(catalog)
     domain = _PlanActionDomainStub()
@@ -503,9 +503,9 @@ def test_plan_graph_rejects_until_core_reads_table_detail_and_exact_definition()
     rejected = adapter._execute_action(session, "plan_graph", "compile the selected table")
 
     assert rejected["status"] == "ACTION_REJECTED"
-    assert rejected["error"] == "CORE_SEMANTIC_EVIDENCE_REQUIRED"
-    assert rejected["missingSemanticEvidence"] == ["EXACT_DEFINITION_OR_SCHEMA_REQUIRED"]
-    assert "read_file" in rejected["next"]
+    assert rejected["error"] == "GROUNDED_MODE_ACTION_DISABLED"
+    assert rejected["rejectedActionId"] == "plan_graph"
+    assert "commit_grounded_query_contract" in rejected["next"]
     assert domain.handler_calls == 0
     assert session.state["core_semantic_evidence"] == session.core_semantic_evidence
     assert session.state["core_managed_filesystem"] is True
@@ -516,15 +516,16 @@ def test_plan_graph_rejects_until_core_reads_table_detail_and_exact_definition()
     with backend.scope_to_session(session):
         backend.read("/topics/SALES/tables/fact_order/metrics/gmv.json")
 
-    completed = adapter._execute_action(session, "plan_graph", "compile from Core-read refs")
+    still_rejected = adapter._execute_action(session, "plan_graph", "compile from Core-read refs")
 
-    assert completed["status"] == "ACTION_REQUIRED"
-    assert domain.handler_calls == 1
-    assert session.state["plan_graph_handler_called"] is True
+    assert still_rejected["status"] == "ACTION_REJECTED"
+    assert still_rejected["error"] == "GROUNDED_MODE_ACTION_DISABLED"
+    assert domain.handler_calls == 0
+    assert "plan_graph_handler_called" not in session.state
     assert len(session.state["core_semantic_evidence"]) == 2
-    assert completed["coreSemanticEvidence"]["contractProposalReady"] is True
-    assert completed["coreSemanticEvidence"]["missingForContractProposal"] == []
-    assert session.state["lead_decisions"][-1].source == "deepagent_core_react"
+    assert still_rejected["coreSemanticEvidence"]["contractProposalReady"] is True
+    assert still_rejected["coreSemanticEvidence"]["missingForContractProposal"] == []
+    assert "lead_decisions" not in session.state
 
 
 def test_runtime_continuation_is_not_traced_as_a_core_model_decision() -> None:

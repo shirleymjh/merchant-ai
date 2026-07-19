@@ -81,9 +81,7 @@ def _serialized_request(
                 {
                     "type": str(getattr(message, "type", "") or ""),
                     "content": _message_text(message),
-                    "toolCalls": list(
-                        getattr(message, "tool_calls", None) or []
-                    ),
+                    "toolCalls": list(getattr(message, "tool_calls", None) or []),
                 }
                 for message in messages
             ],
@@ -127,9 +125,7 @@ class ProviderAwareContextTokenCounter:
         self,
         model: Any = None,
         *,
-        provider_counter: Optional[
-            Callable[[list[Any], Any, list[Any]], int]
-        ] = None,
+        provider_counter: Optional[Callable[[list[Any], Any, list[Any]], int]] = None,
     ) -> None:
         self.model = model
         self.provider_counter = provider_counter
@@ -142,9 +138,7 @@ class ProviderAwareContextTokenCounter:
     ) -> GroundedTokenCount:
         if self.provider_counter is not None:
             try:
-                tokens = int(
-                    self.provider_counter(messages, system_message, tools)
-                )
+                tokens = int(self.provider_counter(messages, system_message, tools))
                 if tokens >= 0:
                     return GroundedTokenCount(
                         tokens=tokens,
@@ -172,10 +166,7 @@ class ProviderAwareContextTokenCounter:
                     if tokens >= 0:
                         return GroundedTokenCount(
                             tokens=tokens,
-                            source=(
-                                "model.%s.get_num_tokens_from_messages_with_tools"
-                                % model_name
-                            ),
+                            source=("model.%s.get_num_tokens_from_messages_with_tools" % model_name),
                             authority="PROVIDER_MODEL",
                             fallback_used=False,
                         )
@@ -187,25 +178,17 @@ class ProviderAwareContextTokenCounter:
                     if not tools:
                         return GroundedTokenCount(
                             tokens=message_tokens,
-                            source=(
-                                "model.%s.get_num_tokens_from_messages"
-                                % model_name
-                            ),
+                            source=("model.%s.get_num_tokens_from_messages" % model_name),
                             authority="PROVIDER_MODEL",
                             fallback_used=False,
                         )
-                    serialized_tools = _canonical_json(
-                        [_tool_payload(tool) for tool in tools]
-                    )
+                    serialized_tools = _canonical_json([_tool_payload(tool) for tool in tools])
                     if callable(text_counter):
                         tool_tokens = int(text_counter(serialized_tools))
                         if tool_tokens >= 0:
                             return GroundedTokenCount(
                                 tokens=message_tokens + tool_tokens,
-                                source=(
-                                    "model.%s.message_and_text_tokenizers"
-                                    % model_name
-                                ),
+                                source=("model.%s.message_and_text_tokenizers" % model_name),
                                 authority="PROVIDER_MODEL",
                                 fallback_used=False,
                             )
@@ -215,11 +198,7 @@ class ProviderAwareContextTokenCounter:
                     )
                     return GroundedTokenCount(
                         tokens=message_tokens + tool_tokens,
-                        source=(
-                            "model.%s.message_tokenizer+"
-                            "conservative_utf8_tool_schema_estimate"
-                            % model_name
-                        ),
+                        source=("model.%s.message_tokenizer+conservative_utf8_tool_schema_estimate" % model_name),
                         authority="MIXED",
                         fallback_used=True,
                     )
@@ -304,21 +283,70 @@ def _result_artifact_receipts(run_result: Any) -> list[dict[str, Any]]:
 
 def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
     runtime = getattr(session, "runtime", None)
-    goal_ids_by_artifact = dict(
-        getattr(session, "artifact_goal_ids", None) or {}
+    goal_ids_by_artifact = dict(getattr(session, "artifact_goal_ids", None) or {})
+    population_enforced = bool(
+        getattr(session, "population_gate_enforced", False)
+    )
+    population_query_ids = dict(
+        getattr(
+            session,
+            "population_artifact_query_node_ids",
+            None,
+        )
+        or {}
+    )
+    population_post_results = dict(
+        getattr(session, "population_post_gate_results", None)
+        or {}
     )
     receipts: list[dict[str, Any]] = []
-    for artifact in list(
-        getattr(runtime, "verified_query_ledger", None) or []
-    ):
-        if not verified_query_artifact_integrity_valid(artifact):
+    for artifact in list(getattr(runtime, "verified_query_ledger", None) or []):
+        artifact_id = str(
+            getattr(artifact, "artifact_id", "") or ""
+        )
+        query_node_id = str(
+            population_query_ids.get(artifact_id) or ""
+        )
+        post_result = dict(
+            population_post_results.get(query_node_id) or {}
+        )
+        population_authorized = bool(
+            not population_enforced
+            or (
+                query_node_id
+                and post_result.get("accepted") is True
+                and str(post_result.get("stage") or "")
+                == "POST_RESULT"
+                and str(
+                    getattr(
+                        artifact,
+                        "publication_status",
+                        "",
+                    )
+                    or ""
+                )
+                == "PUBLISHED"
+                and bool(
+                    getattr(
+                        getattr(
+                            artifact,
+                            "verified_evidence",
+                            None,
+                        ),
+                        "passed",
+                        False,
+                    )
+                )
+            )
+        )
+        if (
+            not population_authorized
+            or not verified_query_artifact_integrity_valid(artifact)
+        ):
             continue
         run_result = getattr(artifact, "run_result", None)
         bundle = getattr(run_result, "merged_query_bundle", None)
-        artifact_id = str(getattr(artifact, "artifact_id", "") or "")
-        publication_status = str(
-            getattr(artifact, "publication_status", "") or ""
-        )
+        publication_status = str(getattr(artifact, "publication_status", "") or "")
         published_result_artifacts = (
             [
                 dict(item)
@@ -340,15 +368,9 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
                 "queryArtifactId": artifact_id,
                 "generation": int(getattr(artifact, "generation", 0) or 0),
                 "attemptId": str(getattr(artifact, "attempt_id", "") or ""),
-                "contractFingerprint": str(
-                    getattr(artifact, "contract_fingerprint", "") or ""
-                ),
-                "sqlFingerprint": str(
-                    getattr(artifact, "sql_fingerprint", "") or ""
-                ),
-                "executionMode": str(
-                    getattr(artifact, "execution_mode", "") or ""
-                ),
+                "contractFingerprint": str(getattr(artifact, "contract_fingerprint", "") or ""),
+                "sqlFingerprint": str(getattr(artifact, "sql_fingerprint", "") or ""),
+                "executionMode": str(getattr(artifact, "execution_mode", "") or ""),
                 "semanticActivationFingerprint": str(
                     getattr(
                         artifact,
@@ -374,22 +396,10 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
                     or []
                 ),
                 "publicationStatus": publication_status,
-                "goalIds": sorted(
-                    {
-                        str(item)
-                        for item in goal_ids_by_artifact.get(artifact_id, [])
-                        if str(item)
-                    }
-                ),
-                "resultCoverage": str(
-                    getattr(bundle, "result_coverage", "") or ""
-                ),
-                "originalRowCount": int(
-                    getattr(bundle, "original_row_count", 0) or 0
-                ),
-                "storedRowCount": len(
-                    list(getattr(bundle, "rows", None) or [])
-                ),
+                "goalIds": sorted({str(item) for item in goal_ids_by_artifact.get(artifact_id, []) if str(item)}),
+                "resultCoverage": str(getattr(bundle, "result_coverage", "") or ""),
+                "originalRowCount": int(getattr(bundle, "original_row_count", 0) or 0),
+                "storedRowCount": len(list(getattr(bundle, "rows", None) or [])),
                 "resultArtifacts": published_result_artifacts,
             }
         )
@@ -410,28 +420,28 @@ def build_grounded_recovery_payload(
 ) -> dict[str, Any]:
     runtime = getattr(session, "runtime", None)
     workspace = getattr(session, "context_workspace", None)
-    goal_contract = _model_payload(
-        getattr(session, "question_goal_contract", None)
-    )
-    graph_receipt = _model_payload(
-        getattr(session, "execution_graph_receipt", None)
-    )
-    graph_edges = [
+    goal_contract = _model_payload(getattr(session, "question_goal_contract", None))
+    graph_receipt = _model_payload(getattr(session, "execution_graph_receipt", None))
+    graph_edges = [_model_payload(item) for item in list(getattr(session, "execution_graph_edges", None) or [])]
+    graph_proposal = _model_payload(getattr(session, "execution_graph_proposal", None))
+    replan_evidence = [
         _model_payload(item)
-        for item in list(
-            getattr(session, "execution_graph_edges", None) or []
+        for _evidence_id, item in sorted(
+            dict(
+                getattr(
+                    session,
+                    "execution_graph_replan_evidence",
+                    None,
+                )
+                or {}
+            ).items()
         )
     ]
-    active_contract = _model_payload(
-        getattr(runtime, "active_contract", None)
-    )
-    semantic_activation = _model_payload(
-        getattr(runtime, "semantic_activation_seal", None)
-    )
+    population_graph_receipt = _model_payload(getattr(session, "population_graph_receipt", None))
+    active_contract = _model_payload(getattr(runtime, "active_contract", None))
+    semantic_activation = _model_payload(getattr(runtime, "semantic_activation_seal", None))
     branches: list[Any] = []
-    for branch_id, context in sorted(
-        dict(getattr(session, "query_branch_contexts", None) or {}).items()
-    ):
+    for branch_id, context in sorted(dict(getattr(session, "query_branch_contexts", None) or {}).items()):
         spec = getattr(context, "spec", None)
         ledger = getattr(context, "semantic_ledger", None)
         refs = getattr(ledger, "refs", None)
@@ -442,78 +452,38 @@ def build_grounded_recovery_payload(
                 "branchId": str(branch_id),
                 "spec": _model_payload(spec),
                 "status": str(getattr(context, "status", "") or ""),
-                "contractScopeQueryIds": list(
-                    getattr(context, "contract_scope_query_ids", None) or []
-                ),
-                "dependencyQueryIds": list(
-                    getattr(context, "dependency_query_ids", None) or []
-                ),
-                "dependencyGoalIds": list(
-                    getattr(context, "dependency_goal_ids", None) or []
-                ),
+                "contractScopeQueryIds": list(getattr(context, "contract_scope_query_ids", None) or []),
+                "dependencyQueryIds": list(getattr(context, "dependency_query_ids", None) or []),
+                "dependencyGoalIds": list(getattr(context, "dependency_goal_ids", None) or []),
                 "semanticRefIds": refs() if callable(refs) else [],
                 "semanticPaths": paths() if callable(paths) else [],
-                "verifiedArtifactIds": list(
-                    getattr(context, "verified_artifact_ids", None) or []
-                ),
+                "verifiedArtifactIds": list(getattr(context, "verified_artifact_ids", None) or []),
                 "lastGaps": [
-                    dict(item)
-                    for item in list(
-                        getattr(context, "last_gaps", None) or []
-                    )
-                    if isinstance(item, dict)
+                    dict(item) for item in list(getattr(context, "last_gaps", None) or []) if isinstance(item, dict)
                 ],
-                "runtimePhase": str(
-                    getattr(branch_runtime, "phase", "") or ""
-                ),
-                "activeGeneration": int(
-                    getattr(branch_runtime, "active_generation", 0) or 0
-                ),
-                "activeAttemptId": str(
-                    getattr(branch_runtime, "active_attempt_id", "") or ""
-                ),
+                "runtimePhase": str(getattr(branch_runtime, "phase", "") or ""),
+                "activeGeneration": int(getattr(branch_runtime, "active_generation", 0) or 0),
+                "activeAttemptId": str(getattr(branch_runtime, "active_attempt_id", "") or ""),
             }
         )
     payload: dict[str, Any] = {
         "schemaVersion": RECOVERY_SCHEMA_VERSION,
         "artifactKind": "GROUNDED_CONTEXT_RECOVERY",
         "identityBinding": {
-            "threadFingerprint": str(
-                getattr(workspace, "thread_fingerprint", "") or ""
-            ),
-            "runFingerprint": str(
-                getattr(workspace, "run_fingerprint", "") or ""
-            ),
-            "ownerFingerprint": str(
-                getattr(workspace, "owner_fingerprint", "") or ""
-            ),
-            "requestFingerprint": str(
-                getattr(workspace, "request_fingerprint", "") or ""
-            ),
-            "threadIdHash": hashlib.sha256(
-                str(thread_id or "").encode("utf-8")
-            ).hexdigest(),
-            "runIdHash": hashlib.sha256(
-                str(run_id or "").encode("utf-8")
-            ).hexdigest(),
+            "threadFingerprint": str(getattr(workspace, "thread_fingerprint", "") or ""),
+            "runFingerprint": str(getattr(workspace, "run_fingerprint", "") or ""),
+            "ownerFingerprint": str(getattr(workspace, "owner_fingerprint", "") or ""),
+            "requestFingerprint": str(getattr(workspace, "request_fingerprint", "") or ""),
+            "threadIdHash": hashlib.sha256(str(thread_id or "").encode("utf-8")).hexdigest(),
+            "runIdHash": hashlib.sha256(str(run_id or "").encode("utf-8")).hexdigest(),
         },
         "phase": {
             "runtimePhase": str(getattr(runtime, "phase", "") or ""),
-            "activeGeneration": int(
-                getattr(runtime, "active_generation", 0) or 0
-            ),
-            "activeAttemptId": str(
-                getattr(runtime, "active_attempt_id", "") or ""
-            ),
-            "activeExecutionMode": str(
-                getattr(runtime, "active_execution_mode", "") or ""
-            ),
-            "dataCollectionSealed": bool(
-                getattr(session, "data_collection_sealed", False)
-            ),
-            "analysisSkillStarted": bool(
-                getattr(session, "analysis_skill_started", False)
-            ),
+            "activeGeneration": int(getattr(runtime, "active_generation", 0) or 0),
+            "activeAttemptId": str(getattr(runtime, "active_attempt_id", "") or ""),
+            "activeExecutionMode": str(getattr(runtime, "active_execution_mode", "") or ""),
+            "dataCollectionSealed": bool(getattr(session, "data_collection_sealed", False)),
+            "analysisSkillStarted": bool(getattr(session, "analysis_skill_started", False)),
         },
         "question": str(getattr(runtime, "question", "") or ""),
         "goalContract": {
@@ -532,15 +502,50 @@ def build_grounded_recovery_payload(
             ),
         },
         "executionGraph": {
-            "generation": int(
-                getattr(session, "execution_graph_generation", 0) or 0
-            ),
-            "fingerprint": str(
-                getattr(session, "execution_graph_fingerprint", "") or ""
-            ),
+            "generation": int(getattr(session, "execution_graph_generation", 0) or 0),
+            "fingerprint": str(getattr(session, "execution_graph_fingerprint", "") or ""),
             "receipt": graph_receipt,
+            "proposal": graph_proposal,
             "edges": graph_edges,
             "branches": branches,
+            "revisionCount": int(
+                getattr(
+                    session,
+                    "execution_graph_revision_count",
+                    0,
+                )
+                or 0
+            ),
+            "maximumRevisionCount": int(
+                getattr(
+                    session,
+                    "execution_graph_max_revision_count",
+                    0,
+                )
+                or 0
+            ),
+            "replanEvidence": replan_evidence,
+            "usedReplanEvidenceFingerprints": list(
+                getattr(
+                    session,
+                    "execution_graph_used_replan_fingerprints",
+                    None,
+                )
+                or []
+            ),
+            "revisionHistory": [
+                dict(item)
+                for item in list(
+                    getattr(
+                        session,
+                        "execution_graph_history",
+                        None,
+                    )
+                    or []
+                )
+                if isinstance(item, dict)
+            ],
+            "populationReceipt": population_graph_receipt,
         },
         "activeContract": {
             "fingerprint": _fingerprint(active_contract) if active_contract else "",
@@ -601,9 +606,7 @@ def build_grounded_model_recovery_message(
     query_receipts = [
         {
             "queryArtifactId": str(item.get("queryArtifactId") or ""),
-            "contractFingerprint": str(
-                item.get("contractFingerprint") or ""
-            ),
+            "contractFingerprint": str(item.get("contractFingerprint") or ""),
             "sqlFingerprint": str(item.get("sqlFingerprint") or ""),
             "goalIds": list(item.get("goalIds") or []),
             "resultCoverage": str(item.get("resultCoverage") or ""),
@@ -653,9 +656,7 @@ def compact_summary_to_reference_only(
             "identityBinding": dict(payload.get("identityBinding") or {}),
             "phase": dict(payload.get("phase") or {}),
             "question": str(payload.get("question") or ""),
-            "goalContractFingerprint": str(
-                goal_contract.get("fingerprint") or ""
-            ),
+            "goalContractFingerprint": str(goal_contract.get("fingerprint") or ""),
             "semanticRefIds": [
                 str(item.get("refId") or "")
                 for item in list(payload.get("semanticReceipts") or [])
@@ -665,6 +666,10 @@ def compact_summary_to_reference_only(
                 "generation": execution_graph.get("generation"),
                 "fingerprint": execution_graph.get("fingerprint"),
                 "receipt": graph_receipt,
+                "revisionCount": execution_graph.get("revisionCount"),
+                "maximumRevisionCount": execution_graph.get("maximumRevisionCount"),
+                "replanEvidence": list(execution_graph.get("replanEvidence") or []),
+                "populationReceipt": execution_graph.get("populationReceipt"),
             },
             "queryArtifactIds": [
                 str(item.get("queryArtifactId") or "")

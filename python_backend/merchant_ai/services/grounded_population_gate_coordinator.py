@@ -123,9 +123,7 @@ class PopulationExecutionNodeBinding(_StrictFrozenModel):
 
 
 class PopulationExecutionGraphBinding(_StrictFrozenModel):
-    binding_version: Literal["population_execution_graph_binding.v1"] = (
-        "population_execution_graph_binding.v1"
-    )
+    binding_version: Literal["population_execution_graph_binding.v1"] = "population_execution_graph_binding.v1"
     graph_id: str
     graph_version: int = Field(ge=1)
     graph_fingerprint: str
@@ -156,13 +154,7 @@ def population_execution_graph_binding_fingerprint(
 def seal_population_execution_graph_binding(
     binding: PopulationExecutionGraphBinding,
 ) -> PopulationExecutionGraphBinding:
-    return binding.model_copy(
-        update={
-            "binding_fingerprint": population_execution_graph_binding_fingerprint(
-                binding
-            )
-        }
-    )
+    return binding.model_copy(update={"binding_fingerprint": population_execution_graph_binding_fingerprint(binding)})
 
 
 class PopulationDynamicGraphNode(_StrictFrozenModel):
@@ -200,14 +192,16 @@ class PopulationDynamicGraphEdge(_StrictFrozenModel):
 
 
 class PopulationDynamicGraphReceipt(_StrictFrozenModel):
-    receipt_version: Literal["population_dynamic_graph_receipt.v1"] = (
-        "population_dynamic_graph_receipt.v1"
-    )
+    receipt_version: Literal["population_dynamic_graph_receipt.v1"] = "population_dynamic_graph_receipt.v1"
     graph_id: str
     graph_version: int = Field(ge=1)
     graph_fingerprint: str
     nodes: tuple[PopulationDynamicGraphNode, ...]
     edges: tuple[PopulationDynamicGraphEdge, ...] = ()
+    parent_receipt_fingerprint: str = ""
+    revision_evidence_fingerprint: str = ""
+    carried_forward_query_node_ids: tuple[str, ...] = ()
+    retired_query_node_ids: tuple[str, ...] = ()
     receipt_fingerprint: str = ""
 
     @model_validator(mode="after")
@@ -221,11 +215,22 @@ class PopulationDynamicGraphReceipt(_StrictFrozenModel):
             "nodes.query_node_id",
         )
         node_ids = {item.query_node_id for item in self.nodes}
+        _require_unique(
+            self.carried_forward_query_node_ids,
+            "carried_forward_query_node_ids",
+        )
+        _require_unique(
+            self.retired_query_node_ids,
+            "retired_query_node_ids",
+        )
+        if set(self.carried_forward_query_node_ids) - node_ids:
+            raise ValueError("carried-forward query nodes must remain active")
+        if set(self.retired_query_node_ids).intersection(node_ids):
+            raise ValueError("retired query nodes cannot remain active")
+        if self.parent_receipt_fingerprint and not (self.revision_evidence_fingerprint):
+            raise ValueError("a revised graph requires structured evidence")
         for edge in self.edges:
-            if (
-                edge.source_query_node_id not in node_ids
-                or edge.target_query_node_id not in node_ids
-            ):
+            if edge.source_query_node_id not in node_ids or edge.target_query_node_id not in node_ids:
                 raise ValueError("dynamic graph edge endpoint is unknown")
         return self
 
@@ -241,13 +246,7 @@ def population_dynamic_graph_receipt_fingerprint(
 def seal_population_dynamic_graph_receipt(
     receipt: PopulationDynamicGraphReceipt,
 ) -> PopulationDynamicGraphReceipt:
-    return receipt.model_copy(
-        update={
-            "receipt_fingerprint": (
-                population_dynamic_graph_receipt_fingerprint(receipt)
-            )
-        }
-    )
+    return receipt.model_copy(update={"receipt_fingerprint": (population_dynamic_graph_receipt_fingerprint(receipt))})
 
 
 class PopulationNodeGateRecord(_StrictFrozenModel):
@@ -273,19 +272,11 @@ def population_node_gate_record_fingerprint(
 def seal_population_node_gate_record(
     record: PopulationNodeGateRecord,
 ) -> PopulationNodeGateRecord:
-    return record.model_copy(
-        update={
-            "record_fingerprint": (
-                population_node_gate_record_fingerprint(record)
-            )
-        }
-    )
+    return record.model_copy(update={"record_fingerprint": (population_node_gate_record_fingerprint(record))})
 
 
 class PopulationPublishedArtifactReceipt(_StrictFrozenModel):
-    receipt_version: Literal["population_published_artifact_receipt.v1"] = (
-        "population_published_artifact_receipt.v1"
-    )
+    receipt_version: Literal["population_published_artifact_receipt.v1"] = "population_published_artifact_receipt.v1"
     ledger_artifact_id: str
     source_query_artifact_id: str = ""
     publication_status: str
@@ -333,11 +324,7 @@ def seal_population_published_artifact_receipt(
     receipt: PopulationPublishedArtifactReceipt,
 ) -> PopulationPublishedArtifactReceipt:
     return receipt.model_copy(
-        update={
-            "receipt_fingerprint": (
-                population_published_artifact_receipt_fingerprint(receipt)
-            )
-        }
+        update={"receipt_fingerprint": (population_published_artifact_receipt_fingerprint(receipt))}
     )
 
 
@@ -365,19 +352,11 @@ def population_artifact_ledger_entry_fingerprint(
 def seal_population_artifact_ledger_entry(
     entry: PopulationArtifactLedgerEntry,
 ) -> PopulationArtifactLedgerEntry:
-    return entry.model_copy(
-        update={
-            "entry_fingerprint": population_artifact_ledger_entry_fingerprint(
-                entry
-            )
-        }
-    )
+    return entry.model_copy(update={"entry_fingerprint": population_artifact_ledger_entry_fingerprint(entry)})
 
 
 class PopulationArtifactLedgerSnapshot(_StrictFrozenModel):
-    snapshot_version: Literal["population_artifact_ledger_snapshot.v1"] = (
-        "population_artifact_ledger_snapshot.v1"
-    )
+    snapshot_version: Literal["population_artifact_ledger_snapshot.v1"] = "population_artifact_ledger_snapshot.v1"
     ledger_id: str
     ledger_authority_fingerprint: str
     ledger_revision: int = Field(ge=0)
@@ -413,11 +392,7 @@ def seal_population_artifact_ledger_snapshot(
     snapshot: PopulationArtifactLedgerSnapshot,
 ) -> PopulationArtifactLedgerSnapshot:
     return snapshot.model_copy(
-        update={
-            "snapshot_fingerprint": (
-                population_artifact_ledger_snapshot_fingerprint(snapshot)
-            )
-        }
+        update={"snapshot_fingerprint": (population_artifact_ledger_snapshot_fingerprint(snapshot))}
     )
 
 
@@ -469,6 +444,14 @@ class PopulationNodePreExecutionCommand(_PopulationGateCommand):
     claims: tuple[PopulationExecutionClaim, ...]
 
 
+class PopulationGraphRevisionCommand(_PopulationGateCommand):
+    previous_graph_receipt_fingerprint: str
+    revised_graph_receipt: PopulationDynamicGraphReceipt
+    revision_evidence_fingerprint: str
+    revision_ordinal: int = Field(ge=1)
+    maximum_revision_count: int = Field(ge=1)
+
+
 class PopulationResultSelection(_StrictFrozenModel):
     consumer_goal_id: str
     query_node_id: str
@@ -507,9 +490,7 @@ class PopulationGateCoordinatorIssue(_StrictFrozenModel):
 
 
 class PopulationGateState(_StrictFrozenModel):
-    state_version: Literal["population_gate_state.v1"] = (
-        "population_gate_state.v1"
-    )
+    state_version: Literal["population_gate_state.v1"] = "population_gate_state.v1"
     gate_id: str
     revision: int = Field(ge=1)
     phase: PopulationGatePhase
@@ -517,7 +498,10 @@ class PopulationGateState(_StrictFrozenModel):
     graph_fingerprint: str = ""
     graph_binding: PopulationExecutionGraphBinding | None = None
     graph_receipt: PopulationDynamicGraphReceipt | None = None
+    graph_receipt_history: tuple[PopulationDynamicGraphReceipt, ...] = ()
+    graph_revision_evidence_fingerprints: tuple[str, ...] = ()
     node_gate_records: tuple[PopulationNodeGateRecord, ...] = ()
+    retired_node_gate_records: tuple[PopulationNodeGateRecord, ...] = ()
     goal_attestation: PopulationVerificationAttestation
     pre_execution_attestation: PopulationVerificationAttestation | None = None
     post_result_attestation: PopulationVerificationAttestation | None = None
@@ -533,9 +517,7 @@ def population_gate_state_fingerprint(state: PopulationGateState) -> str:
 
 
 def seal_population_gate_state(state: PopulationGateState) -> PopulationGateState:
-    return state.model_copy(
-        update={"state_fingerprint": population_gate_state_fingerprint(state)}
-    )
+    return state.model_copy(update={"state_fingerprint": population_gate_state_fingerprint(state)})
 
 
 class PopulationGateTransitionResult(_StrictFrozenModel):
@@ -628,18 +610,10 @@ class PopulationGateCoordinator:
     ) -> None:
         self.state_store = state_store
         self.ledger_reader = ledger_reader
-        self.trusted_semantic_verifier_fingerprints = _trusted_values(
-            trusted_semantic_verifier_fingerprints
-        )
-        self.trusted_lineage_verifier_fingerprints = _trusted_values(
-            trusted_lineage_verifier_fingerprints
-        )
-        self.trusted_artifact_verifier_fingerprints = _trusted_values(
-            trusted_artifact_verifier_fingerprints
-        )
-        self.trusted_ledger_authority_fingerprints = _trusted_values(
-            trusted_ledger_authority_fingerprints
-        )
+        self.trusted_semantic_verifier_fingerprints = _trusted_values(trusted_semantic_verifier_fingerprints)
+        self.trusted_lineage_verifier_fingerprints = _trusted_values(trusted_lineage_verifier_fingerprints)
+        self.trusted_artifact_verifier_fingerprints = _trusted_values(trusted_artifact_verifier_fingerprints)
+        self.trusted_ledger_authority_fingerprints = _trusted_values(trusted_ledger_authority_fingerprints)
         self.verifier = verifier or PopulationSemanticVerifier()
 
     def get_state(self, gate_id: str) -> PopulationGateState | None:
@@ -660,8 +634,7 @@ class PopulationGateCoordinator:
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.STATE_STORE_FAILED,
-                "The population gate state store failed closed: %s"
-                % _bounded_error(exc),
+                "The population gate state store failed closed: %s" % _bounded_error(exc),
             )
         if existing is not None:
             return _transition_failure(
@@ -672,19 +645,11 @@ class PopulationGateCoordinator:
         verification = self.verifier.verify_goal_declaration(
             GoalDeclarationPopulationVerificationInput(
                 question_fingerprint=command.question_fingerprint,
-                goal_skeleton_fingerprint=(
-                    command.goal_skeleton_fingerprint
-                ),
-                goal_contract_fingerprint=(
-                    command.goal_contract_fingerprint
-                ),
-                declaration_author_fingerprint=(
-                    command.declaration_author_fingerprint
-                ),
+                goal_skeleton_fingerprint=(command.goal_skeleton_fingerprint),
+                goal_contract_fingerprint=(command.goal_contract_fingerprint),
+                declaration_author_fingerprint=(command.declaration_author_fingerprint),
                 semantic_review=command.semantic_review,
-                trusted_semantic_verifier_fingerprints=(
-                    self.trusted_semantic_verifier_fingerprints
-                ),
+                trusted_semantic_verifier_fingerprints=(self.trusted_semantic_verifier_fingerprints),
                 declarations=command.declarations,
             )
         )
@@ -699,9 +664,7 @@ class PopulationGateCoordinator:
                 gate_id=command.gate_id,
                 revision=1,
                 phase=PopulationGatePhase.GOAL_DECLARATION,
-                goal_contract_fingerprint=(
-                    command.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(command.goal_contract_fingerprint),
                 goal_attestation=verification.attestation,
             )
         )
@@ -710,8 +673,7 @@ class PopulationGateCoordinator:
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.STATE_STORE_FAILED,
-                "The population gate state store failed closed: %s"
-                % _bounded_error(exc),
+                "The population gate state store failed closed: %s" % _bounded_error(exc),
                 verification=verification,
             )
         if not created:
@@ -720,8 +682,7 @@ class PopulationGateCoordinator:
             except Exception as exc:
                 return _transition_failure(
                     PopulationGateCode.STATE_STORE_FAILED,
-                    "The population gate state store failed closed: %s"
-                    % _bounded_error(exc),
+                    "The population gate state store failed closed: %s" % _bounded_error(exc),
                     verification=verification,
                 )
             return _transition_failure(
@@ -761,17 +722,11 @@ class PopulationGateCoordinator:
             )
         verification = self.verifier.verify_pre_execution(
             PreExecutionPopulationVerificationInput(
-                goal_contract_fingerprint=(
-                    command.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(command.goal_contract_fingerprint),
                 graph_fingerprint=command.graph_binding.graph_fingerprint,
                 declaration_attestation=state.goal_attestation,
-                trusted_lineage_verifier_fingerprints=(
-                    self.trusted_lineage_verifier_fingerprints
-                ),
-                trusted_artifact_verifier_fingerprints=(
-                    self.trusted_artifact_verifier_fingerprints
-                ),
+                trusted_lineage_verifier_fingerprints=(self.trusted_lineage_verifier_fingerprints),
+                trusted_artifact_verifier_fingerprints=(self.trusted_artifact_verifier_fingerprints),
                 claims=command.claims,
             )
         )
@@ -787,15 +742,9 @@ class PopulationGateCoordinator:
                 update={
                     "revision": state.revision + 1,
                     "phase": PopulationGatePhase.PRE_EXECUTION,
-                    "graph_fingerprint": (
-                        command.graph_binding.graph_fingerprint
-                    ),
-                    "graph_binding": command.graph_binding.model_copy(
-                        deep=True
-                    ),
-                    "pre_execution_attestation": (
-                        verification.attestation.model_copy(deep=True)
-                    ),
+                    "graph_fingerprint": (command.graph_binding.graph_fingerprint),
+                    "graph_binding": command.graph_binding.model_copy(deep=True),
+                    "pre_execution_attestation": (verification.attestation.model_copy(deep=True)),
                     "state_fingerprint": "",
                 }
             )
@@ -841,22 +790,12 @@ class PopulationGateCoordinator:
             )
         verification = self.verifier.verify_pre_execution(
             PreExecutionPopulationVerificationInput(
-                goal_contract_fingerprint=(
-                    command.goal_contract_fingerprint
-                ),
-                graph_fingerprint=(
-                    command.graph_receipt.graph_fingerprint
-                ),
+                goal_contract_fingerprint=(command.goal_contract_fingerprint),
+                graph_fingerprint=(command.graph_receipt.graph_fingerprint),
                 declaration_attestation=state.goal_attestation,
-                trusted_lineage_verifier_fingerprints=(
-                    self.trusted_lineage_verifier_fingerprints
-                ),
-                trusted_artifact_verifier_fingerprints=(
-                    self.trusted_artifact_verifier_fingerprints
-                ),
-                required_consumer_goal_ids=(
-                    command.required_consumer_goal_ids
-                ),
+                trusted_lineage_verifier_fingerprints=(self.trusted_lineage_verifier_fingerprints),
+                trusted_artifact_verifier_fingerprints=(self.trusted_artifact_verifier_fingerprints),
+                required_consumer_goal_ids=(command.required_consumer_goal_ids),
                 consumer_scope_selection_explicit=True,
                 claims=command.claims,
             )
@@ -871,16 +810,10 @@ class PopulationGateCoordinator:
         record = seal_population_node_gate_record(
             PopulationNodeGateRecord(
                 query_node_id=command.node_binding.query_node_id,
-                graph_receipt_fingerprint=(
-                    command.graph_receipt.receipt_fingerprint
-                ),
+                graph_receipt_fingerprint=(command.graph_receipt.receipt_fingerprint),
                 node_binding=command.node_binding.model_copy(deep=True),
-                required_consumer_goal_ids=(
-                    command.required_consumer_goal_ids
-                ),
-                pre_execution_attestation=(
-                    verification.attestation.model_copy(deep=True)
-                ),
+                required_consumer_goal_ids=(command.required_consumer_goal_ids),
+                pre_execution_attestation=(verification.attestation.model_copy(deep=True)),
             )
         )
         next_state = seal_population_gate_state(
@@ -888,20 +821,72 @@ class PopulationGateCoordinator:
                 update={
                     "revision": state.revision + 1,
                     "phase": PopulationGatePhase.PRE_EXECUTION,
-                    "graph_fingerprint": (
-                        command.graph_receipt.graph_fingerprint
-                    ),
-                    "graph_receipt": (
-                        command.graph_receipt.model_copy(deep=True)
-                    ),
-                    "node_gate_records": tuple(
-                        [*state.node_gate_records, record]
-                    ),
+                    "graph_fingerprint": (command.graph_receipt.graph_fingerprint),
+                    "graph_receipt": (command.graph_receipt.model_copy(deep=True)),
+                    "node_gate_records": tuple([*state.node_gate_records, record]),
                     "state_fingerprint": "",
                 }
             )
         )
         return self._commit_existing(state, next_state, verification)
+
+    def revise_dynamic_graph(
+        self,
+        command: PopulationGraphRevisionCommand,
+    ) -> PopulationGateTransitionResult:
+        """CAS-install one evidence-bound revision without rewriting records."""
+
+        loaded = self._load_incremental_state(command)
+        if isinstance(loaded, PopulationGateTransitionResult):
+            return loaded
+        state = loaded
+        issues = _dynamic_graph_revision_issues(command, state)
+        if issues:
+            return _transition_failure(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "The population graph revision is invalid.",
+                state=state,
+                issues=issues,
+            )
+        current_receipt = state.graph_receipt
+        assert current_receipt is not None
+        revised_receipt = command.revised_graph_receipt
+        active_node_ids = {item.query_node_id for item in revised_receipt.nodes}
+        next_active_records = tuple(item for item in state.node_gate_records if item.query_node_id in active_node_ids)
+        newly_retired_records = tuple(
+            item for item in state.node_gate_records if item.query_node_id not in active_node_ids
+        )
+        history = tuple(
+            [
+                *state.graph_receipt_history,
+                current_receipt.model_copy(deep=True),
+            ]
+        )
+        next_state = seal_population_gate_state(
+            state.model_copy(
+                update={
+                    "revision": state.revision + 1,
+                    "graph_fingerprint": (revised_receipt.graph_fingerprint),
+                    "graph_receipt": revised_receipt.model_copy(deep=True),
+                    "graph_receipt_history": history,
+                    "graph_revision_evidence_fingerprints": tuple(
+                        [
+                            *state.graph_revision_evidence_fingerprints,
+                            command.revision_evidence_fingerprint,
+                        ]
+                    ),
+                    "node_gate_records": next_active_records,
+                    "retired_node_gate_records": tuple(
+                        [
+                            *state.retired_node_gate_records,
+                            *newly_retired_records,
+                        ]
+                    ),
+                    "state_fingerprint": "",
+                }
+            )
+        )
+        return self._commit_existing(state, next_state, None)
 
     def commit_post_result(
         self,
@@ -929,19 +914,14 @@ class PopulationGateCoordinator:
                 issues=chain_issues,
             )
         try:
-            ledger_authority = _text(
-                self.ledger_reader.authority_fingerprint
-            )
+            ledger_authority = _text(self.ledger_reader.authority_fingerprint)
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.LEDGER_READ_FAILED,
-                "The artifact ledger authority could not be read: %s"
-                % _bounded_error(exc),
+                "The artifact ledger authority could not be read: %s" % _bounded_error(exc),
                 state=state,
             )
-        if ledger_authority not in set(
-            self.trusted_ledger_authority_fingerprints
-        ):
+        if ledger_authority not in set(self.trusted_ledger_authority_fingerprints):
             return _transition_failure(
                 PopulationGateCode.LEDGER_AUTHORITY_UNTRUSTED,
                 "The artifact ledger authority is not server-trusted.",
@@ -951,17 +931,14 @@ class PopulationGateCoordinator:
             ledger_snapshot = PopulationArtifactLedgerSnapshot.model_validate(
                 self.ledger_reader.snapshot_population_artifacts(
                     gate_id=state.gate_id,
-                    goal_contract_fingerprint=(
-                        state.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
                     graph_fingerprint=state.graph_fingerprint,
                 )
             )
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.LEDGER_READ_FAILED,
-                "The artifact ledger snapshot failed closed: %s"
-                % _bounded_error(exc),
+                "The artifact ledger snapshot failed closed: %s" % _bounded_error(exc),
                 state=state,
             )
         ledger_issues = _ledger_snapshot_issues(
@@ -997,16 +974,10 @@ class PopulationGateCoordinator:
             )
         verification = self.verifier.verify_post_result(
             PostResultPopulationVerificationInput(
-                goal_contract_fingerprint=(
-                    state.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(state.goal_contract_fingerprint),
                 graph_fingerprint=state.graph_fingerprint,
-                pre_execution_attestation=(
-                    state.pre_execution_attestation
-                ),
-                trusted_artifact_verifier_fingerprints=(
-                    self.trusted_artifact_verifier_fingerprints
-                ),
+                pre_execution_attestation=(state.pre_execution_attestation),
+                trusted_artifact_verifier_fingerprints=(self.trusted_artifact_verifier_fingerprints),
                 results=result_evidence,
             )
         )
@@ -1017,25 +988,14 @@ class PopulationGateCoordinator:
                 state=state,
                 verification=verification,
             )
-        receipt_fingerprints = tuple(
-            sorted(
-                {
-                    selection.receipt_fingerprint
-                    for selection in command.selections
-                }
-            )
-        )
+        receipt_fingerprints = tuple(sorted({selection.receipt_fingerprint for selection in command.selections}))
         next_state = seal_population_gate_state(
             state.model_copy(
                 update={
                     "revision": state.revision + 1,
                     "phase": PopulationGatePhase.POST_RESULT,
-                    "post_result_attestation": (
-                        verification.attestation.model_copy(deep=True)
-                    ),
-                    "ledger_snapshot_fingerprint": (
-                        ledger_snapshot.snapshot_fingerprint
-                    ),
+                    "post_result_attestation": (verification.attestation.model_copy(deep=True)),
+                    "ledger_snapshot_fingerprint": (ledger_snapshot.snapshot_fingerprint),
                     "published_receipt_fingerprints": receipt_fingerprints,
                     "state_fingerprint": "",
                 }
@@ -1059,11 +1019,7 @@ class PopulationGateCoordinator:
                 "The node POST belongs to a different graph.",
                 state=state,
             )
-        matching = [
-            item
-            for item in state.node_gate_records
-            if item.query_node_id == command.query_node_id
-        ]
+        matching = [item for item in state.node_gate_records if item.query_node_id == command.query_node_id]
         if len(matching) != 1:
             return _transition_failure(
                 PopulationGateCode.PHASE_MISMATCH,
@@ -1086,19 +1042,14 @@ class PopulationGateCoordinator:
                 issues=record_issues,
             )
         try:
-            ledger_authority = _text(
-                self.ledger_reader.authority_fingerprint
-            )
+            ledger_authority = _text(self.ledger_reader.authority_fingerprint)
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.LEDGER_READ_FAILED,
-                "The artifact ledger authority could not be read: %s"
-                % _bounded_error(exc),
+                "The artifact ledger authority could not be read: %s" % _bounded_error(exc),
                 state=state,
             )
-        if ledger_authority not in set(
-            self.trusted_ledger_authority_fingerprints
-        ):
+        if ledger_authority not in set(self.trusted_ledger_authority_fingerprints):
             return _transition_failure(
                 PopulationGateCode.LEDGER_AUTHORITY_UNTRUSTED,
                 "The artifact ledger authority is not server-trusted.",
@@ -1108,17 +1059,14 @@ class PopulationGateCoordinator:
             ledger_snapshot = PopulationArtifactLedgerSnapshot.model_validate(
                 self.ledger_reader.snapshot_population_artifacts(
                     gate_id=state.gate_id,
-                    goal_contract_fingerprint=(
-                        state.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
                     graph_fingerprint=state.graph_fingerprint,
                 )
             )
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.LEDGER_READ_FAILED,
-                "The artifact ledger snapshot failed closed: %s"
-                % _bounded_error(exc),
+                "The artifact ledger snapshot failed closed: %s" % _bounded_error(exc),
                 state=state,
             )
         ledger_issues = _ledger_snapshot_issues(
@@ -1147,19 +1095,11 @@ class PopulationGateCoordinator:
             )
         verification = self.verifier.verify_post_result(
             PostResultPopulationVerificationInput(
-                goal_contract_fingerprint=(
-                    state.goal_contract_fingerprint
-                ),
+                goal_contract_fingerprint=(state.goal_contract_fingerprint),
                 graph_fingerprint=state.graph_fingerprint,
-                pre_execution_attestation=(
-                    record.pre_execution_attestation
-                ),
-                trusted_artifact_verifier_fingerprints=(
-                    self.trusted_artifact_verifier_fingerprints
-                ),
-                required_consumer_goal_ids=(
-                    record.required_consumer_goal_ids
-                ),
+                pre_execution_attestation=(record.pre_execution_attestation),
+                trusted_artifact_verifier_fingerprints=(self.trusted_artifact_verifier_fingerprints),
+                required_consumer_goal_ids=(record.required_consumer_goal_ids),
                 consumer_scope_selection_explicit=True,
                 results=result_evidence,
             )
@@ -1171,33 +1111,19 @@ class PopulationGateCoordinator:
                 state=state,
                 verification=verification,
             )
-        receipt_fingerprints = tuple(
-            sorted(
-                {
-                    item.receipt_fingerprint
-                    for item in command.selections
-                }
-            )
-        )
+        receipt_fingerprints = tuple(sorted({item.receipt_fingerprint for item in command.selections}))
         completed = seal_population_node_gate_record(
             record.model_copy(
                 update={
-                    "post_result_attestation": (
-                        verification.attestation.model_copy(deep=True)
-                    ),
-                    "ledger_snapshot_fingerprint": (
-                        ledger_snapshot.snapshot_fingerprint
-                    ),
-                    "published_receipt_fingerprints": (
-                        receipt_fingerprints
-                    ),
+                    "post_result_attestation": (verification.attestation.model_copy(deep=True)),
+                    "ledger_snapshot_fingerprint": (ledger_snapshot.snapshot_fingerprint),
+                    "published_receipt_fingerprints": (receipt_fingerprints),
                     "record_fingerprint": "",
                 }
             )
         )
         records = tuple(
-            completed if item.query_node_id == command.query_node_id else item
-            for item in state.node_gate_records
+            completed if item.query_node_id == command.query_node_id else item for item in state.node_gate_records
         )
         next_state = seal_population_gate_state(
             state.model_copy(
@@ -1205,9 +1131,7 @@ class PopulationGateCoordinator:
                     "revision": state.revision + 1,
                     "phase": PopulationGatePhase.POST_RESULT,
                     "node_gate_records": records,
-                    "ledger_snapshot_fingerprint": (
-                        ledger_snapshot.snapshot_fingerprint
-                    ),
+                    "ledger_snapshot_fingerprint": (ledger_snapshot.snapshot_fingerprint),
                     "published_receipt_fingerprints": tuple(
                         sorted(
                             {
@@ -1231,8 +1155,7 @@ class PopulationGateCoordinator:
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.STATE_STORE_FAILED,
-                "The population gate state store failed closed: %s"
-                % _bounded_error(exc),
+                "The population gate state store failed closed: %s" % _bounded_error(exc),
             )
         if stored is None:
             return _transition_failure(
@@ -1270,8 +1193,7 @@ class PopulationGateCoordinator:
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.STATE_STORE_FAILED,
-                "The population gate state store failed closed: %s"
-                % _bounded_error(exc),
+                "The population gate state store failed closed: %s" % _bounded_error(exc),
             )
         if stored is None:
             return _transition_failure(
@@ -1308,7 +1230,7 @@ class PopulationGateCoordinator:
         self,
         previous: PopulationGateState,
         next_state: PopulationGateState,
-        verification: PopulationVerificationResult,
+        verification: PopulationVerificationResult | None,
     ) -> PopulationGateTransitionResult:
         try:
             committed = self.state_store.compare_and_swap_population_gate(
@@ -1320,8 +1242,7 @@ class PopulationGateCoordinator:
         except Exception as exc:
             return _transition_failure(
                 PopulationGateCode.STATE_STORE_FAILED,
-                "The population gate state store failed closed: %s"
-                % _bounded_error(exc),
+                "The population gate state store failed closed: %s" % _bounded_error(exc),
                 state=previous,
                 verification=verification,
             )
@@ -1331,8 +1252,7 @@ class PopulationGateCoordinator:
             except Exception as exc:
                 return _transition_failure(
                     PopulationGateCode.STATE_STORE_FAILED,
-                    "The population gate state store failed closed: %s"
-                    % _bounded_error(exc),
+                    "The population gate state store failed closed: %s" % _bounded_error(exc),
                     state=previous,
                     verification=verification,
                 )
@@ -1345,6 +1265,173 @@ class PopulationGateCoordinator:
         return _transition_success(next_state, verification)
 
 
+def _dynamic_edge_signature(
+    edge: PopulationDynamicGraphEdge,
+) -> tuple[str, str, str, str]:
+    return (
+        edge.source_query_node_id,
+        edge.target_query_node_id,
+        edge.dependency_mode,
+        edge.artifact_kind,
+    )
+
+
+def _dynamic_graph_revision_issues(
+    command: PopulationGraphRevisionCommand,
+    state: PopulationGateState,
+) -> list[PopulationGateCoordinatorIssue]:
+    issues: list[PopulationGateCoordinatorIssue] = []
+    current = state.graph_receipt
+    revised = command.revised_graph_receipt
+    if current is None:
+        return [
+            _coordinator_issue(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "A dynamic graph must be active before revision.",
+            )
+        ]
+    if not revised.receipt_fingerprint or revised.receipt_fingerprint != population_dynamic_graph_receipt_fingerprint(
+        revised
+    ):
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "The revised dynamic graph receipt is not sealed.",
+            )
+        )
+    if (
+        command.previous_graph_receipt_fingerprint != current.receipt_fingerprint
+        or revised.parent_receipt_fingerprint != current.receipt_fingerprint
+        or revised.graph_version != current.graph_version + 1
+    ):
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.CAS_REVISION_MISMATCH,
+                "The revised graph is not the next child of the active receipt.",
+                details={
+                    "activeGraphVersion": current.graph_version,
+                    "revisedGraphVersion": revised.graph_version,
+                },
+            )
+        )
+    if (
+        not command.revision_evidence_fingerprint
+        or command.revision_evidence_fingerprint != revised.revision_evidence_fingerprint
+    ):
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "The population graph revision lacks bound structured evidence.",
+            )
+        )
+    completed_revisions = len(state.graph_revision_evidence_fingerprints)
+    if command.revision_ordinal != completed_revisions + 1 or completed_revisions >= command.maximum_revision_count:
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.PHASE_MISMATCH,
+                "The population graph revision budget is exhausted or out of order.",
+            )
+        )
+    if command.revision_evidence_fingerprint in set(state.graph_revision_evidence_fingerprints):
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.BINDING_MISMATCH,
+                "A population graph revision trigger cannot be replayed.",
+            )
+        )
+
+    current_nodes = {item.query_node_id: item for item in current.nodes}
+    revised_nodes = {item.query_node_id: item for item in revised.nodes}
+    carried_ids = set(revised.carried_forward_query_node_ids)
+    retired_ids = set(revised.retired_query_node_ids)
+    removed_ids = set(current_nodes) - set(revised_nodes)
+    if removed_ids != retired_ids:
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "Every removed node must be explicitly retired by the revision.",
+                details={
+                    "removedQueryNodeIds": sorted(removed_ids),
+                    "retiredQueryNodeIds": sorted(retired_ids),
+                },
+            )
+        )
+    retained_ids = set(current_nodes).intersection(revised_nodes)
+    if carried_ids != retained_ids:
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.GRAPH_BINDING_INVALID,
+                "Every retained node must be explicitly carried forward.",
+            )
+        )
+    current_incoming: dict[
+        str,
+        set[tuple[str, str, str, str]],
+    ] = {node_id: set() for node_id in current_nodes}
+    revised_incoming: dict[
+        str,
+        set[tuple[str, str, str, str]],
+    ] = {node_id: set() for node_id in revised_nodes}
+    for edge in current.edges:
+        current_incoming[edge.target_query_node_id].add(_dynamic_edge_signature(edge))
+    for edge in revised.edges:
+        revised_incoming[edge.target_query_node_id].add(_dynamic_edge_signature(edge))
+    for node_id in sorted(retained_ids):
+        if (
+            set(current_nodes[node_id].consumer_goal_ids) != set(revised_nodes[node_id].consumer_goal_ids)
+            or current_incoming[node_id] != revised_incoming[node_id]
+        ):
+            issues.append(
+                _coordinator_issue(
+                    PopulationGateCode.BINDING_MISMATCH,
+                    "A carried node or its input population lineage changed.",
+                    query_node_id=node_id,
+                )
+            )
+
+    records_by_node = {item.query_node_id: item for item in state.node_gate_records}
+    for node_id, record in records_by_node.items():
+        if record.post_result_attestation is not None:
+            if node_id not in carried_ids:
+                issues.append(
+                    _coordinator_issue(
+                        PopulationGateCode.BINDING_MISMATCH,
+                        "A published node must be carried into the next revision.",
+                        query_node_id=node_id,
+                    )
+                )
+        elif node_id not in retired_ids:
+            issues.append(
+                _coordinator_issue(
+                    PopulationGateCode.BINDING_MISMATCH,
+                    "A consumed PRE without POST must be retired before recovery.",
+                    query_node_id=node_id,
+                )
+            )
+        issues.extend(_node_record_issues(record, state))
+
+    historical_ids = {
+        item.query_node_id
+        for receipt in (
+            *state.graph_receipt_history,
+            current,
+        )
+        for item in receipt.nodes
+    }
+    added_ids = set(revised_nodes) - set(current_nodes)
+    replayed_node_ids = added_ids.intersection(historical_ids)
+    if replayed_node_ids:
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.BINDING_MISMATCH,
+                "A new revision cannot reuse a historical query-node identity.",
+                details={"queryNodeIds": sorted(replayed_node_ids)},
+            )
+        )
+    issues.extend(_dynamic_graph_population_issues(revised, state))
+    return _dedupe_issues(issues)
+
+
 def _dynamic_graph_node_issues(
     command: PopulationNodePreExecutionCommand,
     state: PopulationGateState,
@@ -1352,10 +1439,8 @@ def _dynamic_graph_node_issues(
     receipt = command.graph_receipt
     node = command.node_binding
     issues: list[PopulationGateCoordinatorIssue] = []
-    if (
-        not receipt.receipt_fingerprint
-        or receipt.receipt_fingerprint
-        != population_dynamic_graph_receipt_fingerprint(receipt)
+    if not receipt.receipt_fingerprint or receipt.receipt_fingerprint != population_dynamic_graph_receipt_fingerprint(
+        receipt
     ):
         issues.append(
             _coordinator_issue(
@@ -1364,10 +1449,7 @@ def _dynamic_graph_node_issues(
                 path="graphReceipt.receiptFingerprint",
             )
         )
-    if state.graph_receipt is not None and (
-        state.graph_receipt.receipt_fingerprint
-        != receipt.receipt_fingerprint
-    ):
+    if state.graph_receipt is not None and (state.graph_receipt.receipt_fingerprint != receipt.receipt_fingerprint):
         issues.append(
             _coordinator_issue(
                 PopulationGateCode.BINDING_MISMATCH,
@@ -1375,9 +1457,7 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
             )
         )
-    if state.graph_fingerprint and (
-        state.graph_fingerprint != receipt.graph_fingerprint
-    ):
+    if state.graph_fingerprint and (state.graph_fingerprint != receipt.graph_fingerprint):
         issues.append(
             _coordinator_issue(
                 PopulationGateCode.BINDING_MISMATCH,
@@ -1385,9 +1465,7 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
             )
         )
-    graph_nodes = {
-        item.query_node_id: item for item in receipt.nodes
-    }
+    graph_nodes = {item.query_node_id: item for item in receipt.nodes}
     declared_node = graph_nodes.get(node.query_node_id)
     if declared_node is None:
         issues.append(
@@ -1397,9 +1475,7 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
             )
         )
-    elif set(declared_node.consumer_goal_ids) != set(
-        node.consumer_goal_ids
-    ):
+    elif set(declared_node.consumer_goal_ids) != set(node.consumer_goal_ids):
         issues.append(
             _coordinator_issue(
                 PopulationGateCode.GRAPH_BINDING_INVALID,
@@ -1407,10 +1483,7 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
             )
         )
-    if any(
-        item.query_node_id == node.query_node_id
-        for item in state.node_gate_records
-    ):
+    if any(item.query_node_id == node.query_node_id for item in state.node_gate_records):
         issues.append(
             _coordinator_issue(
                 PopulationGateCode.BINDING_MISMATCH,
@@ -1418,18 +1491,9 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
             )
         )
-    attested_consumers = {
-        item.consumer_goal_id
-        for item in state.goal_attestation.accepted_scopes
-    }
-    expected_consumers = tuple(
-        sorted(
-            attested_consumers.intersection(node.consumer_goal_ids)
-        )
-    )
-    if set(command.required_consumer_goal_ids) != set(
-        expected_consumers
-    ):
+    attested_consumers = {item.consumer_goal_id for item in state.goal_attestation.accepted_scopes}
+    expected_consumers = tuple(sorted(attested_consumers.intersection(node.consumer_goal_ids)))
+    if set(command.required_consumer_goal_ids) != set(expected_consumers):
         issues.append(
             _coordinator_issue(
                 PopulationGateCode.GRAPH_BINDING_INVALID,
@@ -1437,24 +1501,19 @@ def _dynamic_graph_node_issues(
                 query_node_id=node.query_node_id,
                 details={
                     "expectedConsumerGoalIds": list(expected_consumers),
-                    "actualConsumerGoalIds": list(
-                        command.required_consumer_goal_ids
-                    ),
+                    "actualConsumerGoalIds": list(command.required_consumer_goal_ids),
                 },
             )
         )
     for claim in command.claims:
         if (
             claim.query_node_id != node.query_node_id
-            or claim.consumer_goal_id
-            not in set(command.required_consumer_goal_ids)
+            or claim.consumer_goal_id not in set(command.required_consumer_goal_ids)
             or claim.generation != node.generation
             or claim.attempt_id != node.attempt_id
-            or claim.query_contract_fingerprint
-            != node.query_contract_fingerprint
+            or claim.query_contract_fingerprint != node.query_contract_fingerprint
             or claim.sql_ast_fingerprint != node.sql_ast_fingerprint
-            or claim.effective_scope.snapshot_fingerprint
-            != node.snapshot_fingerprint
+            or claim.effective_scope.snapshot_fingerprint != node.snapshot_fingerprint
         ):
             issues.append(
                 _coordinator_issue(
@@ -1470,12 +1529,9 @@ def _dynamic_graph_node_issues(
                 or proof.query_node_id != node.query_node_id
                 or proof.generation != node.generation
                 or proof.attempt_id != node.attempt_id
-                or proof.query_contract_fingerprint
-                != node.query_contract_fingerprint
-                or proof.sql_ast_fingerprint
-                != node.sql_ast_fingerprint
-                or proof.result_snapshot_fingerprint
-                != node.snapshot_fingerprint
+                or proof.query_contract_fingerprint != node.query_contract_fingerprint
+                or proof.sql_ast_fingerprint != node.sql_ast_fingerprint
+                or proof.result_snapshot_fingerprint != node.snapshot_fingerprint
             ):
                 issues.append(
                     _coordinator_issue(
@@ -1497,23 +1553,13 @@ def _dynamic_graph_population_issues(
     node_ids_by_goal: dict[str, set[str]] = {}
     for node in receipt.nodes:
         for goal_id in node.consumer_goal_ids:
-            node_ids_by_goal.setdefault(goal_id, set()).add(
-                node.query_node_id
-            )
-    adjacency: dict[str, set[str]] = {
-        node.query_node_id: set() for node in receipt.nodes
-    }
-    artifact_adjacency: dict[str, set[str]] = {
-        node.query_node_id: set() for node in receipt.nodes
-    }
+            node_ids_by_goal.setdefault(goal_id, set()).add(node.query_node_id)
+    adjacency: dict[str, set[str]] = {node.query_node_id: set() for node in receipt.nodes}
+    artifact_adjacency: dict[str, set[str]] = {node.query_node_id: set() for node in receipt.nodes}
     for edge in receipt.edges:
-        adjacency[edge.source_query_node_id].add(
-            edge.target_query_node_id
-        )
+        adjacency[edge.source_query_node_id].add(edge.target_query_node_id)
         if edge.dependency_mode == "VERIFIED_ARTIFACT":
-            artifact_adjacency[edge.source_query_node_id].add(
-                edge.target_query_node_id
-            )
+            artifact_adjacency[edge.source_query_node_id].add(edge.target_query_node_id)
 
     def has_path(
         source: str,
@@ -1582,15 +1628,10 @@ def _node_dependency_issues(
     state: PopulationGateState,
 ) -> list[PopulationGateCoordinatorIssue]:
     target = command.node_binding.query_node_id
-    records = {
-        item.query_node_id: item for item in state.node_gate_records
-    }
+    records = {item.query_node_id: item for item in state.node_gate_records}
     issues: list[PopulationGateCoordinatorIssue] = []
     for edge in command.graph_receipt.edges:
-        if (
-            edge.target_query_node_id != target
-            or edge.dependency_mode != "VERIFIED_ARTIFACT"
-        ):
+        if edge.target_query_node_id != target or edge.dependency_mode != "VERIFIED_ARTIFACT":
             continue
         source = records.get(edge.source_query_node_id)
         if source is None or source.post_result_attestation is None:
@@ -1617,8 +1658,7 @@ def _node_record_issues(
     issues: list[PopulationGateCoordinatorIssue] = []
     if (
         not record.record_fingerprint
-        or record.record_fingerprint
-        != population_node_gate_record_fingerprint(record)
+        or record.record_fingerprint != population_node_gate_record_fingerprint(record)
         or record.query_node_id != record.node_binding.query_node_id
     ):
         issues.append(
@@ -1629,19 +1669,45 @@ def _node_record_issues(
             )
         )
         return issues
+    matching_receipts = tuple(
+        receipt
+        for receipt in (
+            *state.graph_receipt_history,
+            *((state.graph_receipt,) if state.graph_receipt is not None else ()),
+        )
+        if receipt.receipt_fingerprint == record.graph_receipt_fingerprint
+    )
+    if len(matching_receipts) != 1:
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.ATTESTATION_CHAIN_INVALID,
+                "The node record graph receipt is absent or ambiguous.",
+                query_node_id=record.query_node_id,
+            )
+        )
+        return issues
+    record_receipt = matching_receipts[0]
+    receipt_nodes = {item.query_node_id: item for item in record_receipt.nodes}
+    receipt_node = receipt_nodes.get(record.query_node_id)
+    if receipt_node is None or set(receipt_node.consumer_goal_ids) != set(record.node_binding.consumer_goal_ids):
+        issues.append(
+            _coordinator_issue(
+                PopulationGateCode.ATTESTATION_CHAIN_INVALID,
+                "The node record does not match its immutable graph receipt.",
+                query_node_id=record.query_node_id,
+            )
+        )
+        return issues
     pre = record.pre_execution_attestation
     goal = state.goal_attestation
     if (
         not pre.passed
         or not pre.gate_open
         or _enum_text(pre.stage) != "PRE_EXECUTION"
-        or pre.goal_contract_fingerprint
-        != state.goal_contract_fingerprint
-        or pre.graph_fingerprint != state.graph_fingerprint
-        or pre.previous_attestation_fingerprint
-        != goal.attestation_fingerprint
-        or pre.attestation_fingerprint
-        != population_attestation_fingerprint(pre)
+        or pre.goal_contract_fingerprint != state.goal_contract_fingerprint
+        or pre.graph_fingerprint != record_receipt.graph_fingerprint
+        or pre.previous_attestation_fingerprint != goal.attestation_fingerprint
+        or pre.attestation_fingerprint != population_attestation_fingerprint(pre)
     ):
         issues.append(
             _coordinator_issue(
@@ -1655,13 +1721,10 @@ def _node_record_issues(
         not post.passed
         or not post.gate_open
         or _enum_text(post.stage) != "POST_RESULT"
-        or post.goal_contract_fingerprint
-        != state.goal_contract_fingerprint
-        or post.graph_fingerprint != state.graph_fingerprint
-        or post.previous_attestation_fingerprint
-        != pre.attestation_fingerprint
-        or post.attestation_fingerprint
-        != population_attestation_fingerprint(post)
+        or post.goal_contract_fingerprint != state.goal_contract_fingerprint
+        or post.graph_fingerprint != record_receipt.graph_fingerprint
+        or post.previous_attestation_fingerprint != pre.attestation_fingerprint
+        or post.attestation_fingerprint != population_attestation_fingerprint(post)
     ):
         issues.append(
             _coordinator_issue(
@@ -1683,10 +1746,8 @@ def _graph_binding_issues(
 ) -> list[PopulationGateCoordinatorIssue]:
     binding = command.graph_binding
     issues: list[PopulationGateCoordinatorIssue] = []
-    if (
-        not binding.binding_fingerprint
-        or binding.binding_fingerprint
-        != population_execution_graph_binding_fingerprint(binding)
+    if not binding.binding_fingerprint or binding.binding_fingerprint != population_execution_graph_binding_fingerprint(
+        binding
     ):
         issues.append(
             _coordinator_issue(
@@ -1750,8 +1811,7 @@ def _graph_binding_issues(
                 issues.append(
                     _coordinator_issue(
                         PopulationGateCode.GRAPH_BINDING_INVALID,
-                        "The population claim does not match the graph node %s."
-                        % field_name,
+                        "The population claim does not match the graph node %s." % field_name,
                         consumer_goal_id=claim.consumer_goal_id,
                         query_node_id=claim.query_node_id,
                         path="claims.%s" % field_name,
@@ -1805,8 +1865,7 @@ def _graph_binding_issues(
                     issues.append(
                         _coordinator_issue(
                             PopulationGateCode.GRAPH_BINDING_INVALID,
-                            "A lineage proof does not match the frozen graph %s."
-                            % field_name,
+                            "A lineage proof does not match the frozen graph %s." % field_name,
                             consumer_goal_id=claim.consumer_goal_id,
                             query_node_id=claim.query_node_id,
                             path="claims.lineageProofs.%s" % field_name,
@@ -1827,8 +1886,7 @@ def _attestation_chain_issues(
         or not goal.gate_open
         or str(goal.stage) != PopulationVerificationStage.GOAL_DECLARATION.value
         or goal.goal_contract_fingerprint != state.goal_contract_fingerprint
-        or goal.attestation_fingerprint
-        != population_attestation_fingerprint(goal)
+        or goal.attestation_fingerprint != population_attestation_fingerprint(goal)
     ):
         issues.append(
             _coordinator_issue(
@@ -1849,13 +1907,10 @@ def _attestation_chain_issues(
             not pre.passed
             or not pre.gate_open
             or str(pre.stage) != PopulationVerificationStage.PRE_EXECUTION.value
-            or pre.goal_contract_fingerprint
-            != state.goal_contract_fingerprint
+            or pre.goal_contract_fingerprint != state.goal_contract_fingerprint
             or pre.graph_fingerprint != state.graph_fingerprint
-            or pre.previous_attestation_fingerprint
-            != goal.attestation_fingerprint
-            or pre.attestation_fingerprint
-            != population_attestation_fingerprint(pre)
+            or pre.previous_attestation_fingerprint != goal.attestation_fingerprint
+            or pre.attestation_fingerprint != population_attestation_fingerprint(pre)
         ):
             issues.append(
                 _coordinator_issue(
@@ -1875,8 +1930,7 @@ def _ledger_snapshot_issues(
     issues: list[PopulationGateCoordinatorIssue] = []
     if (
         not snapshot.snapshot_fingerprint
-        or snapshot.snapshot_fingerprint
-        != population_artifact_ledger_snapshot_fingerprint(snapshot)
+        or snapshot.snapshot_fingerprint != population_artifact_ledger_snapshot_fingerprint(snapshot)
     ):
         issues.append(
             _coordinator_issue(
@@ -1893,8 +1947,7 @@ def _ledger_snapshot_issues(
             )
         )
     if (
-        snapshot.goal_contract_fingerprint
-        != state.goal_contract_fingerprint
+        snapshot.goal_contract_fingerprint != state.goal_contract_fingerprint
         or snapshot.graph_fingerprint != state.graph_fingerprint
     ):
         issues.append(
@@ -1914,17 +1967,11 @@ def _ledger_snapshot_issues(
     for entry in snapshot.entries:
         if (
             not entry.entry_fingerprint
-            or entry.entry_fingerprint
-            != population_artifact_ledger_entry_fingerprint(entry)
-            or entry.ledger_artifact_id
-            != entry.receipt.ledger_artifact_id
-            or entry.publication_status
-            != entry.receipt.publication_status
+            or entry.entry_fingerprint != population_artifact_ledger_entry_fingerprint(entry)
+            or entry.ledger_artifact_id != entry.receipt.ledger_artifact_id
+            or entry.publication_status != entry.receipt.publication_status
             or not entry.receipt.receipt_fingerprint
-            or entry.receipt.receipt_fingerprint
-            != population_published_artifact_receipt_fingerprint(
-                entry.receipt
-            )
+            or entry.receipt.receipt_fingerprint != population_published_artifact_receipt_fingerprint(entry.receipt)
         ):
             issues.append(
                 _coordinator_issue(
@@ -1945,9 +1992,7 @@ def _result_evidence_from_ledger(
     list[PopulationGateCoordinatorIssue],
 ]:
     issues: list[PopulationGateCoordinatorIssue] = []
-    identities = [
-        (item.consumer_goal_id, item.query_node_id) for item in selections
-    ]
+    identities = [(item.consumer_goal_id, item.query_node_id) for item in selections]
     if len(identities) != len(set(identities)):
         issues.append(
             _coordinator_issue(
@@ -1960,10 +2005,7 @@ def _result_evidence_from_ledger(
     nodes = (
         {item.query_node_id: item for item in graph_binding.nodes}
         if graph_binding is not None
-        else {
-            item.query_node_id: item.node_binding
-            for item in state.node_gate_records
-        }
+        else {item.query_node_id: item.node_binding for item in state.node_gate_records}
     )
     results: list[PopulationResultEvidence] = []
     for selection in selections:
@@ -1993,10 +2035,7 @@ def _result_evidence_from_ledger(
                     **common,
                 )
             )
-        if (
-            entry.publication_status != "PUBLISHED"
-            or receipt.publication_status != "PUBLISHED"
-        ):
+        if entry.publication_status != "PUBLISHED" or receipt.publication_status != "PUBLISHED":
             issues.append(
                 _coordinator_issue(
                     PopulationGateCode.RESULT_NOT_PUBLISHED,
@@ -2045,12 +2084,10 @@ def _result_evidence_from_ledger(
                 )
             )
         if (
-            receipt.goal_contract_fingerprint
-            != state.goal_contract_fingerprint
+            receipt.goal_contract_fingerprint != state.goal_contract_fingerprint
             or receipt.graph_fingerprint != state.graph_fingerprint
             or receipt.query_node_id != selection.query_node_id
-            or selection.consumer_goal_id
-            not in set(receipt.covered_consumer_goal_ids)
+            or selection.consumer_goal_id not in set(receipt.covered_consumer_goal_ids)
         ):
             issues.append(
                 _coordinator_issue(
@@ -2070,11 +2107,9 @@ def _result_evidence_from_ledger(
         elif (
             receipt.generation != node.generation
             or receipt.attempt_id != node.attempt_id
-            or evidence.goal_contract_fingerprint
-            != state.goal_contract_fingerprint
+            or evidence.goal_contract_fingerprint != state.goal_contract_fingerprint
             or evidence.graph_fingerprint != state.graph_fingerprint
-            or evidence.query_contract_fingerprint
-            != node.query_contract_fingerprint
+            or evidence.query_contract_fingerprint != node.query_contract_fingerprint
             or evidence.sql_ast_fingerprint != node.sql_ast_fingerprint
             or evidence.snapshot_fingerprint != node.snapshot_fingerprint
         ):
@@ -2090,18 +2125,14 @@ def _result_evidence_from_ledger(
                 consumer_goal_id=selection.consumer_goal_id,
                 query_node_id=selection.query_node_id,
                 result_artifact=evidence,
-                lineage_proof_fingerprints=(
-                    evidence.lineage_proof_fingerprints
-                ),
+                lineage_proof_fingerprints=(evidence.lineage_proof_fingerprints),
             )
         )
     return tuple(results), _dedupe_issues(issues)
 
 
 def _copy_state(state: PopulationGateState) -> PopulationGateState:
-    return PopulationGateState.model_validate(
-        state.model_dump(by_alias=True, mode="json")
-    )
+    return PopulationGateState.model_validate(state.model_dump(by_alias=True, mode="json"))
 
 
 def _trusted_values(values: Sequence[str]) -> tuple[str, ...]:
@@ -2154,7 +2185,7 @@ def _dedupe_issues(
 
 def _transition_success(
     state: PopulationGateState,
-    verification: PopulationVerificationResult,
+    verification: PopulationVerificationResult | None,
 ) -> PopulationGateTransitionResult:
     return PopulationGateTransitionResult(
         accepted=True,

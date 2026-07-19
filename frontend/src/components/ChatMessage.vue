@@ -400,6 +400,18 @@
 import { computed, ref } from 'vue'
 import { AlertTriangle, ArrowRight, BookOpenCheck, Check, CheckCircle2, Copy, Download, FileChartColumnIncreasing, Filter, Info, Maximize2, Sparkles, ThumbsDown, ThumbsUp, X } from 'lucide-vue-next'
 import { buildAnalysisReport, hasAnalysisReportContent } from '../api/analysisReport'
+import {
+  collapseWhitespace,
+  compactFixed,
+  delimitedContents,
+  humanizeIdentifier,
+  isAsciiIdentifier,
+  markdownLine,
+  replaceAllLiteral,
+  replaceCharacters,
+  safeFileName as normalizedFileName,
+  stripDatabaseQualifier
+} from '../utils/textParsing'
 import MerchantAnalysisReport from './MerchantAnalysisReport.vue'
 import MetricLineChart from './MetricLineChart.vue'
 
@@ -457,7 +469,7 @@ const displayTime = new Date().toLocaleString('zh-CN', {
   day: '2-digit',
   hour: '2-digit',
   minute: '2-digit'
-}).replace(/\//g, '/')
+})
 
 const toastMessage = ref('')
 const expandedTable = ref(null)
@@ -692,7 +704,7 @@ const aggregateSections = computed(() => {
         title: section?.title || '',
         tables: section?.dorisTables || [],
         rows,
-        mode: inferAggregateMode(section?.title || '', rows)
+        mode: inferAggregateMode(section)
       }
     })
     .filter(section => isAggregateRows(section.rows))
@@ -707,7 +719,7 @@ const aggregateSections = computed(() => {
     title: '',
     tables: props.tables || [],
     rows,
-    mode: inferAggregateMode('', rows)
+    mode: inferAggregateMode({})
   }]
 })
 
@@ -760,57 +772,36 @@ const answerBlocks = computed(() => {
   }
 
   for (const rawLine of String(props.text || '').split('\n')) {
-    const line = cleanMarkdown(rawLine)
-    if (!line) {
+    const parsed = markdownLine(rawLine)
+    if (parsed.kind === 'empty') {
       flush()
       continue
     }
-    if (/^([一二三四五六七八九十]+、|\d+[.、]\s*)/.test(line)) {
+    if (parsed.kind === 'heading') {
       flush()
-      current.title = line
+      current.title = parsed.text
       continue
     }
-    const bulletMatch = line.match(/^[-*•]\s+(.+)$/)
-    if (bulletMatch) {
-      current.items.push(bulletMatch[1].trim())
+    if (parsed.kind === 'bullet') {
+      current.items.push(parsed.text)
       continue
     }
     if (!current.text) {
-      current.text = line
+      current.text = parsed.text
     } else {
-      current.text += `\n${line}`
+      current.text += `\n${parsed.text}`
     }
   }
   flush()
   return sections.length ? sections : [{ title: '', text: props.text, items: [] }]
 })
 
-function cleanMarkdown(rawLine) {
-  return String(rawLine || '')
-    .trim()
-    .replace(/^#{1,6}\s*/, '')
-    .replace(/^>\s*/, '')
-    .replace(/\*\*/g, '')
-    .replace(/`([^`]+)`/g, '$1')
-    .trim()
-}
-
 function answerSelectedTitles(text) {
-  const titles = new Set()
-  const matcher = /【([^】]+)】/g
-  let match = matcher.exec(String(text || ''))
-  while (match) {
-    titles.add(normalizeSectionTitle(match[1]))
-    match = matcher.exec(String(text || ''))
-  }
-  return titles
+  return new Set(delimitedContents(text, '【', '】').map(normalizeSectionTitle))
 }
 
 function normalizeSectionTitle(title) {
-  return String(title || '')
-    .replace(/[／/]/g, '-')
-    .replace(/\s+/g, '')
-    .trim()
+  return collapseWhitespace(replaceCharacters(title, '／/', '-'), '').trim()
 }
 
 function extractDisplayRows(rows) {
@@ -875,23 +866,20 @@ function isIdentifierColumn(column) {
 
 function numericValue(value) {
   if (value === null || value === undefined || value === '' || typeof value === 'boolean') return null
-  const numeric = Number(String(value).replace(/,/g, ''))
+  const numeric = Number(replaceAllLiteral(String(value), ','))
   return Number.isFinite(numeric) ? numeric : null
 }
 
-function formatMetricSummaryValue(value, column) {
+function formatMetricSummaryValue(value) {
   const numeric = numericValue(value)
   if (numeric === null) return formatCell(value)
-  if (/amt|amount|gmv|金额/i.test(String(column || ''))) {
-    return `${formatCompactNumber(numeric)}元`
-  }
   return formatCompactNumber(numeric)
 }
 
 function formatCompactNumber(value) {
-  if (Math.abs(value) >= 10000) return `${(value / 10000).toFixed(2).replace(/\.00$/, '')}万`
+  if (Math.abs(value) >= 10000) return `${compactFixed(value / 10000)}万`
   if (Number.isInteger(value)) return String(value)
-  return value.toFixed(2).replace(/\.00$/, '')
+  return compactFixed(value)
 }
 
 function collectColumns(rows) {
@@ -909,279 +897,38 @@ function collectColumns(rows) {
 
 const COLUMN_LABEL_LIMIT = 10
 
-const columnLabels = {
-  group_value: '分组对象',
-  metric_value: '指标值',
-  sample_count: '记录数',
-  pt: '日期',
-  value: '数值',
-  cnt: '数量',
-  merchant_id: '商家编号',
-  merchant_name: '商家名称',
-  seller_id: '卖家编号',
-  seller_name: '卖家名称',
-  user_id: '用户编号',
-  buyer_id: '买家编号',
-  buyer_name: '买家昵称',
-  order_id: '主订单号',
-  sub_order_id: '订单号',
-  sub_order_status_name: '订单状态',
-  sku_name: '商品名称',
-  sku_title: '商品标题',
-  sku_cnt: '商品数量',
-  sku_count: '商品数量',
-  pay_amt: '退款金额',
-  order_detail_cnt: '订单量',
-  order_gmv_amt_1d: 'GMV',
-  pay_gmv_amt_1d: '支付GMV',
-  trade_success_gmv_amt_1d: '交易成功GMV',
-  refund_amt_1d: '退款金额',
-  seller_repay_amt_1d: '赔付金额',
-  cs_ticket_cnt_1d: '咨询工单量',
-  pay_order_cnt_1d: '支付订单量',
-  pay_status_name: '支付状态',
-  pay_way_name: '赔款方式',
-  sub_order_create_time: '下单时间',
-  refund_id: '退货单号',
-  refund_status_name: '退款状态',
-  refund_reason: '退款原因',
-  refund_create_time: '退款时间',
-  ticket_id: '工单编号',
-  ticket_title: '工单标题',
-  ticket_status_name: '工单状态',
-  priority_name: '优先级',
-  is_reopen: '是否二开',
-  is_reminder: '是否催单',
-  ticket_score: '工单评分',
-  ticket_create_time: '工单时间',
-  bill_id: '赔付单号',
-  repay_amt: '赔付金额',
-  repay_status_name: '赔付状态',
-  create_time: '创建时间',
-  modify_time: '变更时间',
-  coupon_id: '券编号',
-  template_title: '券模板标题',
-  coupon_amt: '优惠金额',
-  coupon_send_status_name: '发券状态',
-  coupon_create_time: '发券时间',
-  spu_id: '商品编号',
-  spu_name: '商品名称',
-  spu_status_name: '商品状态',
-  audit_operate_type_name: '审核操作',
-  is_audit_pass: '审核通过',
-  audit_remark: '审核备注',
-  spu_apply_create_time: '申请时间',
-  appeal_id: '申诉编号',
-  appeal_status_name: '申诉状态',
-  apply_type_name: '申诉类型',
-  reason: '申诉原因',
-  deposit_recharge_id: '充值单号',
-  trans_id: '交易流水号',
-  currency: '币种',
-  deposit_recharge_amt: '充值金额',
-  remark: '备注',
-  inbound_id: '入库单号',
-  inbound_status_name: '入库状态',
-  sku_id: '规格编号',
-  inbound_cnt: '入库数量',
-  warehouse_id: '仓库编号',
-  check_status_name: '质检状态',
-  identify_result_name: '鉴定结果',
-  outbound_id: '出库单号',
-  address_json: '地址信息',
-  address_province_name: '省份',
-  address_city_name: '城市',
-  address_district_name: '区县',
-  address_street_name: '街道',
-  discount_amt: '优惠金额',
-  discount_id: '优惠编号',
-  discount_type_name: '优惠类型',
-  freight_amt: '运费金额',
-  logistic_id: '物流编号',
-  express_id: '运单号',
-  express_status_name: '物流状态',
-  refund_type_name: '退款类型',
-  refund_desc: '退款描述',
-  responsible_party_name: '责任方',
-  buyer_mobile: '买家手机号',
-  refund_discount_amt: '退款优惠金额',
-  company_name: '公司名称',
-  merchant_type_name: '商户类型',
-  brand_type_name: '资质类型',
-  balance_type_name: '结算类型',
-  mobile: '商家手机号',
-  license_id: '营业执照号',
-  contact_name: '联系人',
-  business_address: '经营地址',
-  send_address: '发货地址',
-  refnd_address: '退货地址',
-  bank_name: '开户行',
-  bank_account: '银行账号',
-  account_type_name: '账户类型',
-  ship_model_name: '发货模式',
-  is_invoice: '是否开票',
-  is_unconditional_refund: '七天无理由',
-  init_deposit_amt: '初始保证金',
-  deposit_freeze: '冻结保证金',
-  deposit_amt: '保证金',
-  min_poundage: '手续费下限',
-  max_poundage: '手续费上限',
-  poundage_discount: '费率折扣'
-}
-
-const columnTokenLabels = {
-  account: '账户',
-  address: '地址',
-  amt: '金额',
-  appeal: '申诉',
-  apply: '申请',
-  audit: '审核',
-  balance: '结算',
-  bank: '银行',
-  bill: '账单',
-  biz: '业务',
-  brand: '资质',
-  buyer: '买家',
-  category: '类目',
-  check: '质检',
-  city: '城市',
-  close: '关闭',
-  code: '编码',
-  company: '公司',
-  contact: '联系人',
-  cnt: '数量',
-  color: '颜色',
-  coupon: '优惠券',
-  create: '创建',
-  currency: '币种',
-  deposit: '保证金',
-  desc: '描述',
-  detail: '明细',
-  discount: '优惠',
-  district: '区县',
-  express: '快递',
-  fee: '费用',
-  freight: '运费',
-  freeze: '冻结',
-  gmv: 'GMV',
-  goods: '商品',
-  id: '编号',
-  identify: '鉴定',
-  inbound: '入库',
-  invoice: '发票',
-  is: '是否',
-  item: '商品',
-  level1: '一级',
-  level2: '二级',
-  level3: '三级',
-  license: '营业执照',
-  logistic: '物流',
-  merchant: '商家',
-  mobile: '手机号',
-  modify: '变更',
-  name: '名称',
-  note: '备注',
-  order: '订单',
-  outbound: '出库',
-  party: '方',
-  pay: '支付',
-  poundage: '手续费',
-  price: '价格',
-  priority: '优先级',
-  product: '商品',
-  province: '省份',
-  reason: '原因',
-  recharge: '充值',
-  refund: '退款',
-  remark: '备注',
-  repay: '赔付',
-  responsible: '责任',
-  seller: '卖家',
-  send: '发货',
-  sku: 'SKU',
-  spu: '商品',
-  status: '状态',
-  street: '街道',
-  sub: '子',
-  subsidy: '补贴',
-  ticket: '工单',
-  time: '时间',
-  title: '标题',
-  trans: '交易',
-  type: '类型',
-  user: '用户',
-  warehouse: '仓库',
-  way: '方式'
-}
-
-const tableLabels = {
-  ads_merchant_profile: '店铺经营指标',
-  dwm_trade_order_detail_di: '订单数据',
-  dwm_trade_refund_detail_di: '退款/售后数据',
-  dwm_goods_detail_df: '商品数据',
-  dwm_cs_ticket_detail_di: '客服工单数据',
-  dwm_cs_repay_detail_df: '赔付数据',
-  dwm_coupon_detail_di: '优惠券数据',
-  dwm_scm_detail_di: '供应链履约数据',
-  dim_merchant_df: '商家资料',
-  dwd_merchant_appeal_detail_df: '申诉数据',
-  dwd_merchant_deposit_recharge_df: '保证金数据'
-}
+const metricPresentation = computed(() => {
+  const result = {}
+  for (const item of props.merchantExperience?.metricDisclosures || []) {
+    const key = String(item?.metricKey || '').trim().toLowerCase()
+    if (key) result[key] = item
+  }
+  return result
+})
 
 function tableLabel(table) {
-  const normalized = String(table || '').replace(/^yshopping\./, '').trim()
-  return tableLabels[normalized] || '相关业务数据'
+  return stripDatabaseQualifier(table) || '相关数据'
 }
 
 function columnLabel(column) {
-  const rawColumn = String(column)
-  const mapped = columnLabels[rawColumn] || columnLabels[rawColumn.toLowerCase()]
-  const label = mapped || humanizeColumnName(rawColumn)
-  return shortenLabel(cleanLabel(label))
-}
-
-function cleanLabel(label) {
-  return label
-    .replace(/\s*\d+\s*[-、.:：].*$/g, '')
-    .replace(/\s*包括[:：].*$/g, '')
-    .replace(/_id$/i, '编号')
-    .replace(/_/g, ' ')
-    .replace(/[（(][^）)]*[）)]/g, '')
-    .replace(/\b\d+\s*[-、.:：]?\s*[^,，;；\s]+/g, '')
-    .replace(/[，,；;、]\s*\d+.*$/g, '')
-    .replace(/\s+/g, '')
-    .trim()
+  const rawColumn = String(column || '').trim()
+  const governed = metricPresentation.value[rawColumn.toLowerCase()]?.displayName
+  const label = governed || (isAsciiIdentifier(rawColumn) ? humanizeIdentifier(rawColumn) : rawColumn)
+  return shortenLabel(label || rawColumn)
 }
 
 function shortenLabel(label) {
-  if (label.length <= COLUMN_LABEL_LIMIT) return label
-  return label
-    .replace('营业执照', '执照')
-    .replace('交易流水', '流水')
-    .replace('编号', '号')
-    .replace('金额元', '金额')
-    .slice(0, COLUMN_LABEL_LIMIT)
+  const value = String(label || '').trim()
+  return value.length <= COLUMN_LABEL_LIMIT ? value : value.slice(0, COLUMN_LABEL_LIMIT)
 }
-
-function humanizeColumnName(column) {
-  const tokens = column
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .toLowerCase()
-    .split(/[_\s]+/)
-    .filter(Boolean)
-  const label = tokens.map((token) => columnTokenLabels[token] || token).join('')
-  return label || column
-}
-
 function formatCell(value) {
   if (value === null || value === undefined || value === '') return '-'
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
 
-function inferAggregateMode(title, rows) {
-  const text = `${title || ''} ${(rows || []).map(row => row?.group_value || '').join(' ')}`
-  return /top|排行|最高|最低|前\d+/i.test(text) ? 'topn' : 'group'
+function inferAggregateMode(section) {
+  return String(section?.resultRole || '').trim().toUpperCase() === 'TOPN' ? 'topn' : 'group'
 }
 
 function presentSectionTitle(title) {
@@ -1196,26 +943,14 @@ function presentSectionTitle(title) {
 }
 
 function looksLikeRawField(title) {
-  return /^[a-z][a-z0-9_]*$/i.test(String(title || ''))
+  return isAsciiIdentifier(String(title || ''))
 }
 
-function resolveGroupLabel(title) {
-  const text = String(title || '')
-  if (text.includes('商品')) return '商品'
-  if (text.includes('原因')) return '原因'
-  if (text.includes('状态')) return '状态'
-  if (text.includes('工单')) return '对象'
+function resolveGroupLabel() {
   return '分组对象'
 }
 
-function resolveMetricLabel(title) {
-  const text = String(title || '')
-  if (text.includes('GMV') || text.includes('金额') || text.includes('销售额') || text.includes('成交额')) {
-    return '金额'
-  }
-  if (text.includes('订单量') || text.includes('退款量') || text.includes('工单量') || text.includes('履约量')) {
-    return '数量'
-  }
+function resolveMetricLabel() {
   return '指标值'
 }
 
@@ -1223,15 +958,12 @@ function formatAggregateGroup(row) {
   return formatCell(row?.group_value)
 }
 
-function formatAggregateMetric(value, title) {
+function formatAggregateMetric(value) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) {
     return formatCell(value)
   }
-  if (resolveMetricLabel(title) === '金额') {
-    return `${numeric.toFixed(2)}元`
-  }
-  return Number.isInteger(numeric) ? `${numeric}` : numeric.toFixed(2)
+  return Number.isInteger(numeric) ? `${numeric}` : compactFixed(numeric)
 }
 
 function formatAggregateCount(value) {
@@ -1336,21 +1068,18 @@ function tableToDelimitedText(section, rows, delimiter) {
 
 function csvEscape(value) {
   const text = String(value ?? '')
-  if (/[",\n]/.test(text)) {
-    return `"${text.replace(/"/g, '""')}"`
+  if (text.includes('"') || text.includes(',') || text.includes('\n')) {
+    return `"${replaceAllLiteral(text, '"', '""')}"`
   }
   return text
 }
 
 function textEscape(value) {
-  return String(value ?? '').replace(/\t/g, ' ').replace(/\n/g, ' ')
+  return replaceCharacters(String(value ?? ''), '\t\n', ' ')
 }
 
 function safeFileName(name) {
-  return String(name || '查询结果')
-    .replace(/[\\/:*?"<>|]/g, '_')
-    .replace(/\s+/g, '_')
-    .slice(0, 60)
+  return normalizedFileName(name, '查询结果', 60)
 }
 
 async function writeClipboardText(text) {

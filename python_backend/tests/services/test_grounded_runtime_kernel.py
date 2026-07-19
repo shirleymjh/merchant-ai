@@ -648,6 +648,64 @@ def test_valid_candidate_executes_verifies_and_answers_through_contract_executor
     assert session.phase == "ANSWERED"
 
 
+def test_serial_verified_artifact_requires_pre_ledger_authorization() -> None:
+    question = "最近30天工单量"
+    runtime = kernel(
+        builder=QueueBuilder([contract(question, "READY")]),
+        compiler=FakeCompiler(valid=True),
+        executor=FakeExecutor(),
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+    attempt = runtime.propose_contract(session, [], {})
+    runtime.activate_contract(session, attempt.attempt_id)
+    runtime.execute_active(session)
+
+    with pytest.raises(RuntimeError) as raised:
+        runtime.verify_active(
+            session,
+            pre_ledger_authorizer=lambda _artifact: False,
+        )
+
+    assert str(raised.value) == (
+        "VERIFIED_QUERY_ARTIFACT_ADOPTION_REJECTED"
+    )
+    assert session.verified_query_ledger == []
+    assert session.verified_evidence is None
+    assert session.run_result is None
+    assert runtime.latest_verified_query_artifact(session) is None
+    assert session.answer == ""
+
+
+def test_serial_verified_artifact_is_visible_after_authorization() -> None:
+    question = "最近30天工单量"
+    runtime = kernel(
+        builder=QueueBuilder([contract(question, "READY")]),
+        compiler=FakeCompiler(valid=True),
+        executor=FakeExecutor(),
+    )
+    session = runtime.new_session(question, "m-1")
+    session.workspace_topics = ["客服工单"]
+    attempt = runtime.propose_contract(session, [], {})
+    runtime.activate_contract(session, attempt.attempt_id)
+    runtime.execute_active(session)
+    staged_ids: list[str] = []
+
+    verified = runtime.verify_active(
+        session,
+        pre_ledger_authorizer=lambda artifact: (
+            staged_ids.append(artifact.artifact_id) is None
+        ),
+    )
+
+    assert verified.passed is True
+    assert len(staged_ids) == 1
+    assert [item.artifact_id for item in session.verified_query_ledger] == (
+        staged_ids
+    )
+    assert runtime.latest_verified_query_artifact(session) is not None
+
+
 def test_kernel_forwards_optional_runtime_budget_to_contract_executor() -> None:
     question = "最近30天工单量"
     executor = FakeExecutor()
@@ -675,8 +733,9 @@ def test_missing_runtime_services_fail_closed_and_clarification_is_typed() -> No
     )
     session = runtime.new_session("工单量最多的商品", "m-1")
 
-    with pytest.raises(RuntimeError, match="refusing to fall back"):
+    with pytest.raises(RuntimeError) as exc_info:
         runtime.recall_navigation(session)
+    assert "refusing to fall back" in str(exc_info.value)
 
     clarification = runtime.request_clarification(
         session,

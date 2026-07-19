@@ -24,6 +24,7 @@ from merchant_ai.services.grounded_population_gate_coordinator import (
     PopulationArtifactLedgerEntry,
     PopulationDynamicGraphReceipt,
     PopulationExecutionNodeBinding,
+    PopulationGraphRevisionCommand,
     PopulationGateCoordinator,
     PopulationGateCode,
     PopulationNodePostResultCommand,
@@ -111,16 +112,11 @@ class PopulationPreExecutionNodeReference(_StrictFrozenModel):
             "query_contract_fingerprint",
         ):
             _require_text(getattr(self, field_name), field_name)
-        normalized = tuple(
-            _require_text(item, "consumer_goal_ids")
-            for item in self.consumer_goal_ids
-        )
+        normalized = tuple(_require_text(item, "consumer_goal_ids") for item in self.consumer_goal_ids)
         if not normalized:
             raise ValueError("consumer_goal_ids must not be empty")
         if len(set(normalized)) != len(normalized):
-            raise ValueError(
-                "consumer_goal_ids must not contain duplicates"
-            )
+            raise ValueError("consumer_goal_ids must not contain duplicates")
         return self
 
 
@@ -153,22 +149,12 @@ class PopulationPreExecutionReference(_StrictFrozenModel):
         if (
             not self.graph_receipt.receipt_fingerprint
             or self.graph_receipt.receipt_fingerprint
-            != population_dynamic_graph_receipt_fingerprint(
-                self.graph_receipt
-            )
+            != population_dynamic_graph_receipt_fingerprint(self.graph_receipt)
         ):
             raise ValueError("graph_receipt must be sealed")
-        matches = tuple(
-            item
-            for item in self.graph_receipt.nodes
-            if item.query_node_id == self.node.query_node_id
-        )
-        if len(matches) != 1 or set(matches[0].consumer_goal_ids) != set(
-            self.node.consumer_goal_ids
-        ):
-            raise ValueError(
-                "node must match one Goal assignment in graph_receipt"
-            )
+        matches = tuple(item for item in self.graph_receipt.nodes if item.query_node_id == self.node.query_node_id)
+        if len(matches) != 1 or set(matches[0].consumer_goal_ids) != set(self.node.consumer_goal_ids):
+            raise ValueError("node must match one Goal assignment in graph_receipt")
         return self
 
 
@@ -184,11 +170,7 @@ def seal_population_pre_execution_reference(
     reference: PopulationPreExecutionReference,
 ) -> PopulationPreExecutionReference:
     return reference.model_copy(
-        update={
-            "reference_fingerprint": (
-                population_pre_execution_reference_fingerprint(reference)
-            )
-        }
+        update={"reference_fingerprint": (population_pre_execution_reference_fingerprint(reference))}
     )
 
 
@@ -196,11 +178,7 @@ def population_pre_execution_reference_valid(
     reference: PopulationPreExecutionReference,
 ) -> bool:
     declared = _text(reference.reference_fingerprint)
-    return bool(
-        declared
-        and declared
-        == population_pre_execution_reference_fingerprint(reference)
-    )
+    return bool(declared and declared == population_pre_execution_reference_fingerprint(reference))
 
 
 class GroundedPopulationRuntimeGateError(RuntimeError):
@@ -282,16 +260,22 @@ class GroundedPopulationExecutionGate:
             ledger_authority_fingerprint,
             "ledger_authority_fingerprint",
         )
-        if (
-            self.declaration_author_fingerprint
-            == self.semantic_authority_fingerprint
-        ):
-            raise ValueError(
-                "Core declaration and semantic reviewer authorities must differ"
-            )
+        if self.declaration_author_fingerprint == self.semantic_authority_fingerprint:
+            raise ValueError("Core declaration and semantic reviewer authorities must differ")
         self.semantic_timeout_seconds = float(semantic_timeout_seconds)
         if self.semantic_timeout_seconds <= 0:
             raise ValueError("semantic_timeout_seconds must be positive")
+        self.maximum_graph_revision_count = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "grounded_execution_graph_max_revisions",
+                    2,
+                )
+                or 2
+            ),
+        )
         self._runs: dict[str, _PopulationRunAuthority] = {}
         self._lock = RLock()
 
@@ -312,13 +296,9 @@ class GroundedPopulationExecutionGate:
         ledger_provider: Callable[[], Sequence[Any]],
     ) -> None:
         if not isinstance(workspace, GroundedContextWorkspace):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_WORKSPACE_REQUIRED"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_WORKSPACE_REQUIRED")
         if not callable(ledger_provider):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_LEDGER_PROVIDER_REQUIRED"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_LEDGER_PROVIDER_REQUIRED")
         owner = _require_text(
             workspace.owner_fingerprint,
             "workspace.owner_fingerprint",
@@ -338,9 +318,7 @@ class GroundedPopulationExecutionGate:
                 or existing.workspace.owner_fingerprint != owner
                 or existing.workspace.request_fingerprint != run_authority
             ):
-                raise GroundedPopulationRuntimeGateError(
-                    "POPULATION_RUN_WORKSPACE_CONFLICT"
-                )
+                raise GroundedPopulationRuntimeGateError("POPULATION_RUN_WORKSPACE_CONFLICT")
             self._runs[run_authority] = authority
 
     def gate_id(
@@ -350,22 +328,25 @@ class GroundedPopulationExecutionGate:
         run_authority_fingerprint: str,
         goal_contract_fingerprint: str,
     ) -> str:
-        return "population_gate_%s" % _stable_fingerprint(
-            {
-                "contextOwnerFingerprint": _require_text(
-                    context_owner_fingerprint,
-                    "context_owner_fingerprint",
-                ),
-                "runAuthorityFingerprint": _require_text(
-                    run_authority_fingerprint,
-                    "run_authority_fingerprint",
-                ),
-                "goalContractFingerprint": _require_text(
-                    goal_contract_fingerprint,
-                    "goal_contract_fingerprint",
-                ),
-            }
-        )[:32]
+        return (
+            "population_gate_%s"
+            % _stable_fingerprint(
+                {
+                    "contextOwnerFingerprint": _require_text(
+                        context_owner_fingerprint,
+                        "context_owner_fingerprint",
+                    ),
+                    "runAuthorityFingerprint": _require_text(
+                        run_authority_fingerprint,
+                        "run_authority_fingerprint",
+                    ),
+                    "goalContractFingerprint": _require_text(
+                        goal_contract_fingerprint,
+                        "goal_contract_fingerprint",
+                    ),
+                }
+            )[:32]
+        )
 
     def commit_goal(
         self,
@@ -379,9 +360,7 @@ class GroundedPopulationExecutionGate:
             context_owner_fingerprint,
             run_authority_fingerprint,
         )
-        fingerprint = original_question_goal_contract_fingerprint(
-            goal_contract
-        )
+        fingerprint = original_question_goal_contract_fingerprint(goal_contract)
         facade = self._facade(authority)
         return facade.commit_goal(
             gate_id=self.gate_id(
@@ -392,6 +371,93 @@ class GroundedPopulationExecutionGate:
             expected_revision=0,
             exact_question=exact_question,
             goal_contract=goal_contract,
+        )
+
+    def revise_graph(
+        self,
+        *,
+        context_owner_fingerprint: str,
+        run_authority_fingerprint: str,
+        goal_contract_fingerprint: str,
+        previous_graph_receipt_fingerprint: str,
+        revised_graph_receipt: PopulationDynamicGraphReceipt,
+        revision_evidence_fingerprint: str,
+    ) -> PopulationOnlineGateCallResult:
+        """CAS-install one sealed revision and invalidate its parent receipt."""
+
+        authority = self._run_authority(
+            context_owner_fingerprint,
+            run_authority_fingerprint,
+        )
+        facade = self._facade(authority)
+        gate_id = self.gate_id(
+            context_owner_fingerprint=context_owner_fingerprint,
+            run_authority_fingerprint=run_authority_fingerprint,
+            goal_contract_fingerprint=goal_contract_fingerprint,
+        )
+        revised = (
+            revised_graph_receipt
+            if isinstance(
+                revised_graph_receipt,
+                PopulationDynamicGraphReceipt,
+            )
+            else PopulationDynamicGraphReceipt.model_validate(revised_graph_receipt)
+        )
+        attempts = self.maximum_graph_revision_count + 2
+        for _attempt in range(attempts):
+            state = facade.coordinator.get_state(gate_id)
+            if state is None or state.graph_receipt is None:
+                return self._failure(
+                    PopulationVerificationStage.PRE_EXECUTION,
+                    "POPULATION_GRAPH_STATE_NOT_FOUND",
+                )
+            if (
+                state.graph_receipt.receipt_fingerprint == revised.receipt_fingerprint
+                and revision_evidence_fingerprint in set(state.graph_revision_evidence_fingerprints)
+            ):
+                return PopulationOnlineGateCallResult(
+                    stage=PopulationVerificationStage.PRE_EXECUTION,
+                    accepted=True,
+                    code="GRAPH_REVISION_ALREADY_COMMITTED",
+                    message="The population graph revision is already active.",
+                )
+            if state.graph_receipt.receipt_fingerprint != previous_graph_receipt_fingerprint:
+                return self._failure(
+                    PopulationVerificationStage.PRE_EXECUTION,
+                    "POPULATION_GRAPH_REVISION_STALE",
+                )
+            transition = facade.coordinator.revise_dynamic_graph(
+                PopulationGraphRevisionCommand(
+                    gate_id=gate_id,
+                    expected_revision=state.revision,
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
+                    previous_graph_receipt_fingerprint=(previous_graph_receipt_fingerprint),
+                    revised_graph_receipt=revised,
+                    revision_evidence_fingerprint=(revision_evidence_fingerprint),
+                    revision_ordinal=(len(state.graph_revision_evidence_fingerprints) + 1),
+                    maximum_revision_count=(self.maximum_graph_revision_count),
+                )
+            )
+            code = str(getattr(transition.code, "value", transition.code))
+            if transition.accepted:
+                return PopulationOnlineGateCallResult(
+                    stage=PopulationVerificationStage.PRE_EXECUTION,
+                    accepted=True,
+                    code=code,
+                    message=transition.message,
+                    transition=transition,
+                )
+            if code != PopulationGateCode.CAS_REVISION_MISMATCH.value:
+                return PopulationOnlineGateCallResult(
+                    stage=PopulationVerificationStage.PRE_EXECUTION,
+                    accepted=False,
+                    code=code,
+                    message=transition.message,
+                    transition=transition,
+                )
+        return self._failure(
+            PopulationVerificationStage.PRE_EXECUTION,
+            "POPULATION_GRAPH_REVISION_CAS_CONTENTION",
         )
 
     def build_pre_execution_reference(
@@ -415,15 +481,9 @@ class GroundedPopulationExecutionGate:
         )
         state = facade.coordinator.get_state(gate_id)
         if state is None:
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_GOAL_STATE_NOT_FOUND"
-            )
-        if state.goal_contract_fingerprint != _text(
-            goal_contract_fingerprint
-        ):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_GOAL_STATE_NOT_READY"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_GOAL_STATE_NOT_FOUND")
+        if state.goal_contract_fingerprint != _text(goal_contract_fingerprint):
+            raise GroundedPopulationRuntimeGateError("POPULATION_GOAL_STATE_NOT_READY")
         normalized_receipt = (
             graph_receipt
             if isinstance(graph_receipt, PopulationDynamicGraphReceipt)
@@ -437,29 +497,18 @@ class GroundedPopulationExecutionGate:
         if (
             not normalized_receipt.receipt_fingerprint
             or normalized_receipt.receipt_fingerprint
-            != population_dynamic_graph_receipt_fingerprint(
-                normalized_receipt
-            )
+            != population_dynamic_graph_receipt_fingerprint(normalized_receipt)
         ):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_DYNAMIC_GRAPH_RECEIPT_INVALID"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_DYNAMIC_GRAPH_RECEIPT_INVALID")
         if state.graph_receipt is not None and (
-            state.graph_receipt.receipt_fingerprint
-            != normalized_receipt.receipt_fingerprint
+            state.graph_receipt.receipt_fingerprint != normalized_receipt.receipt_fingerprint
         ):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_DYNAMIC_GRAPH_RECEIPT_CHANGED"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_DYNAMIC_GRAPH_RECEIPT_CHANGED")
         return seal_population_pre_execution_reference(
             PopulationPreExecutionReference(
                 gate_id=gate_id,
-                context_owner_fingerprint=(
-                    authority.workspace.owner_fingerprint
-                ),
-                run_authority_fingerprint=(
-                    authority.workspace.request_fingerprint
-                ),
+                context_owner_fingerprint=(authority.workspace.owner_fingerprint),
+                run_authority_fingerprint=(authority.workspace.request_fingerprint),
                 goal_contract_fingerprint=state.goal_contract_fingerprint,
                 graph_receipt=normalized_receipt,
                 node=normalized_node,
@@ -489,19 +538,15 @@ class GroundedPopulationExecutionGate:
                 "POPULATION_PRE_NODE_EVIDENCE_INVALID",
             )
         node_reference = reference.node
-        actual_contract_fingerprint = grounded_query_contract_fingerprint(
-            execution.contract
-        )
+        actual_contract_fingerprint = grounded_query_contract_fingerprint(execution.contract)
         ast_fingerprint = _text(execution.actual_sql_ast_fingerprint)
         if (
             _text(execution.query_node_id) != node_reference.query_node_id
-            or actual_contract_fingerprint
-            != node_reference.query_contract_fingerprint
+            or actual_contract_fingerprint != node_reference.query_contract_fingerprint
             or not ast_fingerprint
             or (
                 node_reference.expected_sql_ast_fingerprint
-                and node_reference.expected_sql_ast_fingerprint
-                != ast_fingerprint
+                and node_reference.expected_sql_ast_fingerprint != ast_fingerprint
             )
         ):
             return self._failure(
@@ -513,9 +558,7 @@ class GroundedPopulationExecutionGate:
                 PopulationVerificationStage.PRE_EXECUTION,
                 "POPULATION_PRE_SNAPSHOT_REQUIRED",
             )
-        snapshot_fingerprint = grounded_data_snapshot_fingerprint(
-            execution.data_snapshot
-        )
+        snapshot_fingerprint = grounded_data_snapshot_fingerprint(execution.data_snapshot)
         node_binding = PopulationExecutionNodeBinding(
             query_node_id=node_reference.query_node_id,
             consumer_goal_ids=node_reference.consumer_goal_ids,
@@ -536,30 +579,21 @@ class GroundedPopulationExecutionGate:
                 )
             required_consumers = tuple(
                 sorted(
-                    {
-                        item.consumer_goal_id
-                        for item in state.goal_attestation.accepted_scopes
-                    }.intersection(node_reference.consumer_goal_ids)
+                    {item.consumer_goal_id for item in state.goal_attestation.accepted_scopes}.intersection(
+                        node_reference.consumer_goal_ids
+                    )
                 )
             )
             try:
-                source_entries: tuple[
-                    PopulationArtifactLedgerEntry, ...
-                ] = ()
+                source_entries: tuple[PopulationArtifactLedgerEntry, ...] = ()
                 if self._requires_published_source_ledger(
                     reference,
                     execution.contract,
                 ):
-                    source_ledger = (
-                        facade.coordinator.ledger_reader.snapshot_population_artifacts(
-                            gate_id=state.gate_id,
-                            goal_contract_fingerprint=(
-                                state.goal_contract_fingerprint
-                            ),
-                            graph_fingerprint=(
-                                reference.graph_receipt.graph_fingerprint
-                            ),
-                        )
+                    source_ledger = facade.coordinator.ledger_reader.snapshot_population_artifacts(
+                        gate_id=state.gate_id,
+                        goal_contract_fingerprint=(state.goal_contract_fingerprint),
+                        graph_fingerprint=(reference.graph_receipt.graph_fingerprint),
                     )
                     source_entries = tuple(source_ledger.entries)
                 claims = self._execution_claims(
@@ -580,18 +614,14 @@ class GroundedPopulationExecutionGate:
                 PopulationNodePreExecutionCommand(
                     gate_id=reference.gate_id,
                     expected_revision=state.revision,
-                    goal_contract_fingerprint=(
-                        state.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
                     graph_receipt=reference.graph_receipt,
                     node_binding=node_binding,
                     required_consumer_goal_ids=required_consumers,
                     claims=claims,
                 )
             )
-            if result.accepted or result.code != (
-                PopulationGateCode.CAS_REVISION_MISMATCH.value
-            ):
+            if result.accepted or result.code != (PopulationGateCode.CAS_REVISION_MISMATCH.value):
                 return result
         return self._failure(
             PopulationVerificationStage.PRE_EXECUTION,
@@ -624,9 +654,7 @@ class GroundedPopulationExecutionGate:
                     "POPULATION_PRE_STATE_NOT_FOUND",
                 )
             matching_records = tuple(
-                item
-                for item in state.node_gate_records
-                if item.query_node_id == reference.node.query_node_id
+                item for item in state.node_gate_records if item.query_node_id == reference.node.query_node_id
             )
             if len(matching_records) != 1:
                 return self._failure(
@@ -642,9 +670,7 @@ class GroundedPopulationExecutionGate:
             try:
                 ledger = facade.coordinator.ledger_reader.snapshot_population_artifacts(
                     gate_id=state.gate_id,
-                    goal_contract_fingerprint=(
-                        state.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
                     graph_fingerprint=state.graph_fingerprint,
                 )
             except Exception:
@@ -658,8 +684,7 @@ class GroundedPopulationExecutionGate:
                     entry
                     for entry in ledger.entries
                     if entry.receipt.query_node_id == scope.query_node_id
-                    and scope.consumer_goal_id
-                    in set(entry.receipt.covered_consumer_goal_ids)
+                    and scope.consumer_goal_id in set(entry.receipt.covered_consumer_goal_ids)
                 )
                 if len(matching_entries) != 1:
                     return self._failure(
@@ -672,26 +697,20 @@ class GroundedPopulationExecutionGate:
                         consumer_goal_id=scope.consumer_goal_id,
                         query_node_id=scope.query_node_id,
                         ledger_artifact_id=entry.ledger_artifact_id,
-                        receipt_fingerprint=(
-                            entry.receipt.receipt_fingerprint
-                        ),
+                        receipt_fingerprint=(entry.receipt.receipt_fingerprint),
                     )
                 )
             result = facade.commit_node_post_result(
                 PopulationNodePostResultCommand(
                     gate_id=state.gate_id,
                     expected_revision=state.revision,
-                    goal_contract_fingerprint=(
-                        state.goal_contract_fingerprint
-                    ),
+                    goal_contract_fingerprint=(state.goal_contract_fingerprint),
                     graph_fingerprint=state.graph_fingerprint,
                     query_node_id=reference.node.query_node_id,
                     selections=tuple(selections),
                 )
             )
-            if result.accepted or result.code != (
-                PopulationGateCode.CAS_REVISION_MISMATCH.value
-            ):
+            if result.accepted or result.code != (PopulationGateCode.CAS_REVISION_MISMATCH.value):
                 return result
         return self._failure(
             PopulationVerificationStage.POST_RESULT,
@@ -714,9 +733,7 @@ class GroundedPopulationExecutionGate:
             reference.context_owner_fingerprint,
             reference.run_authority_fingerprint,
         )
-        state = self._facade(authority).coordinator.get_state(
-            reference.gate_id
-        )
+        state = self._facade(authority).coordinator.get_state(reference.gate_id)
         if state is None or state.graph_receipt is None:
             return self._failure(
                 PopulationVerificationStage.POST_RESULT,
@@ -724,20 +741,15 @@ class GroundedPopulationExecutionGate:
             )
         receipt = reference.graph_receipt
         if (
-            state.graph_receipt.receipt_fingerprint
-            != receipt.receipt_fingerprint
+            state.graph_receipt.receipt_fingerprint != receipt.receipt_fingerprint
             or state.graph_fingerprint != receipt.graph_fingerprint
         ):
             return self._failure(
                 PopulationVerificationStage.POST_RESULT,
                 "POPULATION_GRAPH_BINDING_MISMATCH",
             )
-        expected_nodes = {
-            item.query_node_id: item for item in receipt.nodes
-        }
-        records = {
-            item.query_node_id: item for item in state.node_gate_records
-        }
+        expected_nodes = {item.query_node_id: item for item in receipt.nodes}
+        records = {item.query_node_id: item for item in state.node_gate_records}
         if (
             len(state.node_gate_records) != len(expected_nodes)
             or len(records) != len(expected_nodes)
@@ -751,32 +763,57 @@ class GroundedPopulationExecutionGate:
         for node_id, node in expected_nodes.items():
             record = records[node_id]
             post = record.post_result_attestation
+            record_receipts = tuple(
+                candidate
+                for candidate in (
+                    *tuple(
+                        getattr(
+                            state,
+                            "graph_receipt_history",
+                            (),
+                        )
+                    ),
+                    state.graph_receipt,
+                )
+                if candidate.receipt_fingerprint == record.graph_receipt_fingerprint
+            )
+            record_receipt = record_receipts[0] if len(record_receipts) == 1 else None
+            record_receipt_node = next(
+                (
+                    item
+                    for item in (record_receipt.nodes if record_receipt is not None else ())
+                    if item.query_node_id == node_id
+                ),
+                None,
+            )
+            pre = record.pre_execution_attestation
             if (
-                record.record_fingerprint
-                != population_node_gate_record_fingerprint(record)
-                or record.graph_receipt_fingerprint
-                != receipt.receipt_fingerprint
-                or set(record.node_binding.consumer_goal_ids)
-                != set(node.consumer_goal_ids)
+                record.record_fingerprint != population_node_gate_record_fingerprint(record)
+                or record_receipt is None
+                or record_receipt_node is None
+                or (
+                    record.graph_receipt_fingerprint != receipt.receipt_fingerprint
+                    and node_id not in set(receipt.carried_forward_query_node_ids)
+                )
+                or set(record.node_binding.consumer_goal_ids) != set(node.consumer_goal_ids)
+                or set(record_receipt_node.consumer_goal_ids) != set(node.consumer_goal_ids)
+                or not pre.passed
+                or not pre.gate_open
+                or pre.graph_fingerprint != record_receipt.graph_fingerprint
+                or pre.attestation_fingerprint != population_attestation_fingerprint(pre)
                 or post is None
                 or not post.passed
                 or not post.gate_open
-                or post.attestation_fingerprint
-                != population_attestation_fingerprint(post)
-                or post.previous_attestation_fingerprint
-                != record.pre_execution_attestation.attestation_fingerprint
+                or post.graph_fingerprint != record_receipt.graph_fingerprint
+                or post.attestation_fingerprint != population_attestation_fingerprint(post)
+                or post.previous_attestation_fingerprint != record.pre_execution_attestation.attestation_fingerprint
             ):
                 return self._failure(
                     PopulationVerificationStage.POST_RESULT,
                     "POPULATION_GRAPH_ATTESTATION_INCOMPLETE",
                 )
-            post_consumers.update(
-                item.consumer_goal_id for item in post.accepted_scopes
-            )
-        expected_consumers = {
-            item.consumer_goal_id
-            for item in state.goal_attestation.accepted_scopes
-        }
+            post_consumers.update(item.consumer_goal_id for item in post.accepted_scopes)
+        expected_consumers = {item.consumer_goal_id for item in state.goal_attestation.accepted_scopes}
         if post_consumers != expected_consumers:
             return self._failure(
                 PopulationVerificationStage.POST_RESULT,
@@ -824,20 +861,14 @@ class GroundedPopulationExecutionGate:
                 source_entries=source_entries,
             )
             if cross_node is None:
-                mechanism, preserved, complete = (
-                    self._lineage_observation(
-                        required,
-                        contract=contract,
-                        sql=sql,
-                        consumer_goal_ids=(
-                            node_reference.consumer_goal_ids
-                        ),
-                    )
+                mechanism, preserved, complete = self._lineage_observation(
+                    required,
+                    contract=contract,
+                    sql=sql,
+                    consumer_goal_ids=(node_reference.consumer_goal_ids),
                 )
                 effective = required.model_copy(deep=True)
-                artifact_evidence: tuple[
-                    PopulationArtifactEvidence, ...
-                ] = ()
+                artifact_evidence: tuple[PopulationArtifactEvidence, ...] = ()
                 source_node_ids = (node_reference.query_node_id,)
                 entity_mapping_fingerprint = ""
                 relationship_ref_ids: tuple[str, ...] = ()
@@ -845,20 +876,14 @@ class GroundedPopulationExecutionGate:
             else:
                 required = cross_node.required_scope
                 effective = cross_node.effective_scope
-                mechanism = (
-                    PopulationLineageMechanism.VERIFIED_RESULT_ARTIFACT
-                )
+                mechanism = PopulationLineageMechanism.VERIFIED_RESULT_ARTIFACT
                 preserved = required.constraints
                 complete = True
                 artifact_evidence = cross_node.artifact_evidence
                 source_node_ids = cross_node.source_node_ids
-                entity_mapping_fingerprint = (
-                    cross_node.entity_mapping_fingerprint
-                )
+                entity_mapping_fingerprint = cross_node.entity_mapping_fingerprint
                 relationship_ref_ids = cross_node.relationship_ref_ids
-                grain_mapping_fingerprint = (
-                    cross_node.grain_mapping_fingerprint
-                )
+                grain_mapping_fingerprint = cross_node.grain_mapping_fingerprint
             proof = PopulationLineageProof(
                 proof_id="population_proof_%s"
                 % _stable_fingerprint(
@@ -869,31 +894,20 @@ class GroundedPopulationExecutionGate:
                         "generation": node_reference.generation,
                         "attemptId": node_reference.attempt_id,
                         "sqlAstFingerprint": sql_ast_fingerprint,
-                        "sourceArtifactFingerprints": sorted(
-                            item.artifact_fingerprint
-                            for item in artifact_evidence
-                        ),
+                        "sourceArtifactFingerprints": sorted(item.artifact_fingerprint for item in artifact_evidence),
                     }
                 )[:32],
                 mechanism=mechanism,
                 verifier_fingerprint=self.lineage_authority_fingerprint,
                 verified=True,
-                graph_fingerprint=(
-                    reference.graph_receipt.graph_fingerprint
-                ),
+                graph_fingerprint=(reference.graph_receipt.graph_fingerprint),
                 query_node_id=node_reference.query_node_id,
                 generation=node_reference.generation,
                 attempt_id=node_reference.attempt_id,
-                query_contract_fingerprint=(
-                    node_reference.query_contract_fingerprint
-                ),
+                query_contract_fingerprint=(node_reference.query_contract_fingerprint),
                 sql_ast_fingerprint=sql_ast_fingerprint,
-                source_population_fingerprint=(
-                    required.population_fingerprint
-                ),
-                result_population_fingerprint=(
-                    effective.population_fingerprint
-                ),
+                source_population_fingerprint=(required.population_fingerprint),
+                result_population_fingerprint=(effective.population_fingerprint),
                 source_goal_ids=required.source_goal_ids,
                 source_node_ids=source_node_ids,
                 preserved_constraints=preserved,
@@ -905,12 +919,8 @@ class GroundedPopulationExecutionGate:
                 source_grain_fingerprint=required.grain_fingerprint,
                 result_grain_fingerprint=effective.grain_fingerprint,
                 grain_mapping_fingerprint=grain_mapping_fingerprint,
-                source_snapshot_fingerprint=(
-                    required.snapshot_fingerprint
-                ),
-                result_snapshot_fingerprint=(
-                    effective.snapshot_fingerprint
-                ),
+                source_snapshot_fingerprint=(required.snapshot_fingerprint),
+                result_snapshot_fingerprint=(effective.snapshot_fingerprint),
                 complete_membership=complete,
             )
             claims.append(
@@ -919,14 +929,10 @@ class GroundedPopulationExecutionGate:
                     query_node_id=node_reference.query_node_id,
                     generation=node_reference.generation,
                     attempt_id=node_reference.attempt_id,
-                    declaration_scope_fingerprint=(
-                        attested.declaration_scope_fingerprint
-                    ),
+                    declaration_scope_fingerprint=(attested.declaration_scope_fingerprint),
                     required_scope=required,
                     effective_scope=effective,
-                    query_contract_fingerprint=(
-                        node_reference.query_contract_fingerprint
-                    ),
+                    query_contract_fingerprint=(node_reference.query_contract_fingerprint),
                     sql_ast_fingerprint=sql_ast_fingerprint,
                     lineage_proofs=(proof,),
                 )
@@ -942,8 +948,7 @@ class GroundedPopulationExecutionGate:
         return bool(
             contract.upstream_entity_bindings
             and any(
-                edge.target_query_node_id == target_node_id
-                and edge.dependency_mode == "VERIFIED_ARTIFACT"
+                edge.target_query_node_id == target_node_id and edge.dependency_mode == "VERIFIED_ARTIFACT"
                 for edge in reference.graph_receipt.edges
             )
         )
@@ -959,17 +964,8 @@ class GroundedPopulationExecutionGate:
         current_snapshot_fingerprint: str,
         source_entries: Sequence[PopulationArtifactLedgerEntry],
     ) -> _CrossNodePopulationLineage | None:
-        source_goal_ids = tuple(
-            dict.fromkeys(
-                _text(item) for item in attested.source_goal_ids
-            )
-        )
-        if (
-            not source_goal_ids
-            or set(source_goal_ids).issubset(
-                reference.node.consumer_goal_ids
-            )
-        ):
+        source_goal_ids = tuple(dict.fromkeys(_text(item) for item in attested.source_goal_ids))
+        if not source_goal_ids or set(source_goal_ids).issubset(reference.node.consumer_goal_ids):
             return None
         if not contract.upstream_entity_bindings or not source_entries:
             return None
@@ -978,18 +974,12 @@ class GroundedPopulationExecutionGate:
         incoming_source_nodes = {
             edge.source_query_node_id
             for edge in reference.graph_receipt.edges
-            if edge.target_query_node_id == target_node_id
-            and edge.dependency_mode == "VERIFIED_ARTIFACT"
+            if edge.target_query_node_id == target_node_id and edge.dependency_mode == "VERIFIED_ARTIFACT"
         }
-        graph_nodes = {
-            item.query_node_id: item
-            for item in reference.graph_receipt.nodes
-        }
+        graph_nodes = {item.query_node_id: item for item in reference.graph_receipt.nodes}
         records_by_node: dict[str, list[Any]] = {}
         for record in state.node_gate_records:
-            records_by_node.setdefault(record.query_node_id, []).append(
-                record
-            )
+            records_by_node.setdefault(record.query_node_id, []).append(record)
 
         selected_evidence: dict[str, PopulationArtifactEvidence] = {}
         selected_bindings: list[Any] = []
@@ -999,15 +989,12 @@ class GroundedPopulationExecutionGate:
             matching_source_nodes = tuple(
                 node
                 for node in graph_nodes.values()
-                if source_goal_id in set(node.consumer_goal_ids)
-                and node.query_node_id in incoming_source_nodes
+                if source_goal_id in set(node.consumer_goal_ids) and node.query_node_id in incoming_source_nodes
             )
             if len(matching_source_nodes) != 1:
                 return None
             source_node = matching_source_nodes[0]
-            source_records = tuple(
-                records_by_node.get(source_node.query_node_id, ())
-            )
+            source_records = tuple(records_by_node.get(source_node.query_node_id, ()))
             if len(source_records) != 1:
                 return None
             source_record = source_records[0]
@@ -1017,8 +1004,7 @@ class GroundedPopulationExecutionGate:
             source_scopes = tuple(
                 scope
                 for scope in source_post.accepted_scopes
-                if scope.consumer_goal_id == source_goal_id
-                and scope.query_node_id == source_node.query_node_id
+                if scope.consumer_goal_id == source_goal_id and scope.query_node_id == source_node.query_node_id
             )
             if len(source_scopes) != 1:
                 return None
@@ -1041,46 +1027,28 @@ class GroundedPopulationExecutionGate:
                         source_scope=source_scope,
                     ):
                         matching_pairs.append((binding, entry))
-            artifact_ids = {
-                pair[1].receipt.evidence.artifact_id
-                for pair in matching_pairs
-            }
+            artifact_ids = {pair[1].receipt.evidence.artifact_id for pair in matching_pairs}
             if len(artifact_ids) != 1:
                 return None
             artifact_id = next(iter(artifact_ids))
             artifact_pairs = tuple(
-                pair
-                for pair in matching_pairs
-                if pair[1].receipt.evidence.artifact_id
-                == artifact_id
+                pair for pair in matching_pairs if pair[1].receipt.evidence.artifact_id == artifact_id
             )
             evidence = artifact_pairs[0][1].receipt.evidence
-            selected_evidence[artifact_id] = evidence.model_copy(
-                deep=True
-            )
+            selected_evidence[artifact_id] = evidence.model_copy(deep=True)
             selected_bindings.extend(pair[0] for pair in artifact_pairs)
             selected_source_nodes.append(source_node.query_node_id)
             selected_source_scopes.append(source_scope)
 
         population_fingerprints = {
-            scope.population_fingerprint
-            for scope in selected_source_scopes
-            if _text(scope.population_fingerprint)
+            scope.population_fingerprint for scope in selected_source_scopes if _text(scope.population_fingerprint)
         }
         source_snapshots = {
-            scope.snapshot_fingerprint
-            for scope in selected_source_scopes
-            if _text(scope.snapshot_fingerprint)
+            scope.snapshot_fingerprint for scope in selected_source_scopes if _text(scope.snapshot_fingerprint)
         }
-        source_grains = {
-            scope.grain_fingerprint
-            for scope in selected_source_scopes
-            if _text(scope.grain_fingerprint)
-        }
+        source_grains = {scope.grain_fingerprint for scope in selected_source_scopes if _text(scope.grain_fingerprint)}
         source_identities = {
-            scope.entity_identity_ref
-            for scope in selected_source_scopes
-            if _text(scope.entity_identity_ref)
+            scope.entity_identity_ref for scope in selected_source_scopes if _text(scope.entity_identity_ref)
         }
         if (
             len(population_fingerprints) != 1
@@ -1128,15 +1096,10 @@ class GroundedPopulationExecutionGate:
                 }
             )
 
-        artifact_evidence = tuple(
-            selected_evidence[key]
-            for key in sorted(selected_evidence)
-        )
+        artifact_evidence = tuple(selected_evidence[key] for key in sorted(selected_evidence))
         required_scope = resolved_scope.model_copy(
             update={
-                "source_artifact_ids": tuple(
-                    item.artifact_id for item in artifact_evidence
-                ),
+                "source_artifact_ids": tuple(item.artifact_id for item in artifact_evidence),
                 "population_fingerprint": source_population,
                 "entity_identity_ref": source_identity,
                 "grain_fingerprint": source_grain,
@@ -1146,9 +1109,7 @@ class GroundedPopulationExecutionGate:
         )
         effective_scope = resolved_scope.model_copy(
             update={
-                "source_artifact_ids": tuple(
-                    item.artifact_id for item in artifact_evidence
-                ),
+                "source_artifact_ids": tuple(item.artifact_id for item in artifact_evidence),
                 "population_fingerprint": source_population,
                 "entity_identity_ref": result_identity,
                 "grain_fingerprint": result_grain,
@@ -1160,9 +1121,7 @@ class GroundedPopulationExecutionGate:
             required_scope=required_scope,
             effective_scope=effective_scope,
             artifact_evidence=artifact_evidence,
-            source_node_ids=tuple(
-                dict.fromkeys(selected_source_nodes)
-            ),
+            source_node_ids=tuple(dict.fromkeys(selected_source_nodes)),
             entity_mapping_fingerprint=entity_mapping_fingerprint,
             relationship_ref_ids=relationship_ref_ids,
             grain_mapping_fingerprint=grain_mapping_fingerprint,
@@ -1207,8 +1166,7 @@ class GroundedPopulationExecutionGate:
         if not isinstance(values, (list, tuple)):
             return False
         return bool(
-            int(binding.value_count or 0) == len(values)
-            and binding.values_hash == _stable_fingerprint(list(values))
+            int(binding.value_count or 0) == len(values) and binding.values_hash == _stable_fingerprint(list(values))
         )
 
     @staticmethod
@@ -1232,16 +1190,11 @@ class GroundedPopulationExecutionGate:
         return bool(
             entry.publication_status == "PUBLISHED"
             and receipt.publication_status == "PUBLISHED"
-            and receipt.source_query_artifact_id
-            == binding.source_query_artifact_id
+            and receipt.source_query_artifact_id == binding.source_query_artifact_id
             and receipt.query_node_id == source_node_id
-            and source_goal_id in set(
-                receipt.covered_consumer_goal_ids
-            )
-            and receipt.generation
-            == source_record.node_binding.generation
-            and receipt.attempt_id
-            == source_record.node_binding.attempt_id
+            and source_goal_id in set(receipt.covered_consumer_goal_ids)
+            and receipt.generation == source_record.node_binding.generation
+            and receipt.attempt_id == source_record.node_binding.attempt_id
             and evidence.query_contract_fingerprint
             == binding.source_contract_fingerprint
             == source_record.node_binding.query_contract_fingerprint
@@ -1251,10 +1204,8 @@ class GroundedPopulationExecutionGate:
             and evidence.snapshot_fingerprint
             == source_scope.snapshot_fingerprint
             == source_record.node_binding.snapshot_fingerprint
-            and evidence.population_fingerprint
-            == source_scope.population_fingerprint
-            and binding.source_entity_identity
-            == source_scope.entity_identity_ref
+            and evidence.population_fingerprint == source_scope.population_fingerprint
+            and binding.source_entity_identity == source_scope.entity_identity_ref
             and evidence.coverage in complete_coverage
             and evidence.verified
             and evidence.immutable
@@ -1274,8 +1225,7 @@ class GroundedPopulationExecutionGate:
                 }:
                     continue
                 if any(
-                    binding.source_column in set(key_pair)
-                    and binding.target_column in set(key_pair)
+                    binding.source_column in set(key_pair) and binding.target_column in set(key_pair)
                     for key_pair in relationship.keys
                 ):
                     refs.add(relationship.semantic_ref_id)
@@ -1293,9 +1243,7 @@ class GroundedPopulationExecutionGate:
             {
                 "scopeKind": _enum_value(attested.scope_kind),
                 "sourceGoalIds": sorted(attested.source_goal_ids),
-                "sourceArtifactIds": sorted(
-                    attested.source_artifact_ids
-                ),
+                "sourceArtifactIds": sorted(attested.source_artifact_ids),
                 "semantics": semantics,
             }
         )
@@ -1309,9 +1257,7 @@ class GroundedPopulationExecutionGate:
                     for item in contract.tables
                 ],
                 "groupEntityIdentities": sorted(
-                    _text(item.entity_identity)
-                    for item in contract.dimensions
-                    if _text(item.entity_identity)
+                    _text(item.entity_identity) for item in contract.dimensions if _text(item.entity_identity)
                 ),
             }
         )
@@ -1319,32 +1265,16 @@ class GroundedPopulationExecutionGate:
             {
                 _text(value)
                 for value in [
-                    *[
-                        item.entity_identity
-                        for item in contract.selected_fields
-                    ],
-                    *[
-                        item.entity_identity
-                        for item in contract.dimensions
-                    ],
-                    *[
-                        item.entity_identity
-                        for item in contract.entity_filters
-                    ],
-                    *[
-                        item.target_entity_identity
-                        for item in contract.upstream_entity_bindings
-                    ],
+                    *[item.entity_identity for item in contract.selected_fields],
+                    *[item.entity_identity for item in contract.dimensions],
+                    *[item.entity_identity for item in contract.entity_filters],
+                    *[item.target_entity_identity for item in contract.upstream_entity_bindings],
                 ]
                 if _text(value)
             }
         )
         entity_identity_ref = (
-            identities[0]
-            if len(identities) == 1
-            else _stable_fingerprint(identities)
-            if identities
-            else ""
+            identities[0] if len(identities) == 1 else _stable_fingerprint(identities) if identities else ""
         )
         constraints = self._population_constraints(
             contract,
@@ -1373,9 +1303,7 @@ class GroundedPopulationExecutionGate:
             grain_fingerprint=grain_fingerprint,
             snapshot_fingerprint=snapshot_fingerprint,
             constraints=constraints,
-            complete_membership_required=(
-                attested.complete_membership_required
-            ),
+            complete_membership_required=(attested.complete_membership_required),
         )
 
     @staticmethod
@@ -1399,18 +1327,11 @@ class GroundedPopulationExecutionGate:
                 by_alias=True,
                 mode="json",
             ),
-            "entityFilters": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in contract.entity_filters
-            ],
+            "entityFilters": [item.model_dump(by_alias=True, mode="json") for item in contract.entity_filters],
             "upstreamEntityBindings": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in contract.upstream_entity_bindings
+                item.model_dump(by_alias=True, mode="json") for item in contract.upstream_entity_bindings
             ],
-            "relationships": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in contract.relationships
-            ],
+            "relationships": [item.model_dump(by_alias=True, mode="json") for item in contract.relationships],
             "referenceScope": contract.reference_scope.model_dump(
                 by_alias=True,
                 mode="json",
@@ -1436,13 +1357,7 @@ class GroundedPopulationExecutionGate:
                         }
                     ),
                     kind=PopulationConstraintKind.TIME,
-                    semantic_ref_ids=tuple(
-                        item
-                        for item in (
-                            _text(contract.time_field.semantic_ref_id),
-                        )
-                        if item
-                    ),
+                    semantic_ref_ids=tuple(item for item in (_text(contract.time_field.semantic_ref_id),) if item),
                 )
             )
         for item in contract.entity_filters:
@@ -1488,19 +1403,11 @@ class GroundedPopulationExecutionGate:
                 fingerprint=_stable_fingerprint(
                     {
                         "constraintKind": "GOVERNED_SCOPE",
-                        "tableRefs": sorted(
-                            item.detail_ref_id for item in contract.tables
-                        ),
+                        "tableRefs": sorted(item.detail_ref_id for item in contract.tables),
                     }
                 ),
                 kind=PopulationConstraintKind.GOVERNED_SCOPE,
-                semantic_ref_ids=tuple(
-                    sorted(
-                        item.detail_ref_id
-                        for item in contract.tables
-                        if item.detail_ref_id
-                    )
-                ),
+                semantic_ref_ids=tuple(sorted(item.detail_ref_id for item in contract.tables if item.detail_ref_id)),
             )
         )
         return tuple(constraints)
@@ -1528,9 +1435,7 @@ class GroundedPopulationExecutionGate:
                 True,
             )
         if kind == PopulationScopeKind.PREDICATE_SCOPE.value and (
-            contract.reference_scope.executable
-            and contract.reference_scope.referent_type
-            == "PREDICATE_SCOPE"
+            contract.reference_scope.executable and contract.reference_scope.referent_type == "PREDICATE_SCOPE"
         ):
             return (
                 PopulationLineageMechanism.SAME_QUERY_PREDICATE_LINEAGE,
@@ -1546,9 +1451,7 @@ class GroundedPopulationExecutionGate:
                 self._time_only_constraints(scope.constraints),
                 False,
             )
-        if not set(scope.source_goal_ids).issubset(
-            set(consumer_goal_ids)
-        ):
+        if not set(scope.source_goal_ids).issubset(set(consumer_goal_ids)):
             return (
                 PopulationLineageMechanism.SAME_QUERY_PREDICATE_LINEAGE,
                 self._time_only_constraints(scope.constraints),
@@ -1567,12 +1470,7 @@ class GroundedPopulationExecutionGate:
     def _time_only_constraints(
         constraints: Sequence[PopulationConstraintEvidence],
     ) -> tuple[PopulationConstraintEvidence, ...]:
-        return tuple(
-            item
-            for item in constraints
-            if _enum_value(item.kind)
-            == PopulationConstraintKind.TIME.value
-        )
+        return tuple(item for item in constraints if _enum_value(item.kind) == PopulationConstraintKind.TIME.value)
 
     @staticmethod
     def _ast_lineage_mechanism(
@@ -1585,16 +1483,10 @@ class GroundedPopulationExecutionGate:
         except Exception:
             return None
         cte_aliases = {
-            _text(item.alias_or_name).lower()
-            for item in root.find_all(exp.CTE)
-            if _text(item.alias_or_name)
+            _text(item.alias_or_name).lower() for item in root.find_all(exp.CTE) if _text(item.alias_or_name)
         }
         if cte_aliases:
-            referenced = {
-                _text(item.name).lower()
-                for item in root.find_all(exp.Table)
-                if _text(item.name)
-            }
+            referenced = {_text(item.name).lower() for item in root.find_all(exp.Table) if _text(item.name)}
             if cte_aliases.intersection(referenced):
                 return PopulationLineageMechanism.SAME_QUERY_CTE_LINEAGE
         if any(True for _item in root.find_all(exp.Exists)):
@@ -1628,18 +1520,14 @@ class GroundedPopulationExecutionGate:
             or authority.workspace.owner_fingerprint != owner
             or authority.workspace.request_fingerprint != run_authority
         ):
-            raise GroundedPopulationRuntimeGateError(
-                "POPULATION_RUN_AUTHORITY_NOT_REGISTERED"
-            )
+            raise GroundedPopulationRuntimeGateError("POPULATION_RUN_AUTHORITY_NOT_REGISTERED")
         return authority
 
     def _facade(
         self,
         authority: _PopulationRunAuthority,
     ) -> PopulationOnlineGateFacade:
-        state_store = GroundedWorkspacePopulationGateStateStore(
-            authority.workspace
-        )
+        state_store = GroundedWorkspacePopulationGateStateStore(authority.workspace)
         ledger_reader = PublishedGroundedPopulationLedgerReader(
             settings=self.settings,
             workspace=authority.workspace,
@@ -1649,34 +1537,24 @@ class GroundedPopulationExecutionGate:
         )
         reviewer = IndependentPopulationSemanticReviewer(
             self.semantic_provider,
-            trusted_provider_authority_fingerprints=(
-                self.semantic_authority_fingerprint,
-            ),
+            trusted_provider_authority_fingerprints=(self.semantic_authority_fingerprint,),
             timeout_seconds=self.semantic_timeout_seconds,
         )
         coordinator = PopulationGateCoordinator(
             state_store=state_store,
             ledger_reader=ledger_reader,
-            trusted_semantic_verifier_fingerprints=(
-                self.semantic_authority_fingerprint,
-            ),
-            trusted_lineage_verifier_fingerprints=(
-                self.lineage_authority_fingerprint,
-            ),
+            trusted_semantic_verifier_fingerprints=(self.semantic_authority_fingerprint,),
+            trusted_lineage_verifier_fingerprints=(self.lineage_authority_fingerprint,),
             trusted_artifact_verifier_fingerprints=(
                 self.artifact_authority_fingerprint,
                 self.ledger_authority_fingerprint,
             ),
-            trusted_ledger_authority_fingerprints=(
-                self.ledger_authority_fingerprint,
-            ),
+            trusted_ledger_authority_fingerprints=(self.ledger_authority_fingerprint,),
         )
         return PopulationOnlineGateFacade(
             semantic_reviewer=reviewer,
             coordinator=coordinator,
-            declaration_author_fingerprint=(
-                self.declaration_author_fingerprint
-            ),
+            declaration_author_fingerprint=(self.declaration_author_fingerprint),
         )
 
     @staticmethod
