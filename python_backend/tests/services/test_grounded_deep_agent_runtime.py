@@ -58,6 +58,12 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedUpstreamEntityHint,
 )
 from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
+from merchant_ai.services.grounded_query_branches import (
+    GroundedBranchBudget,
+    GroundedBranchBudgetLimits,
+    GroundedQueryBranchContext,
+    GroundedQueryBranchSpec,
+)
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
@@ -1682,6 +1688,113 @@ def test_subagent_retry_requires_next_generation_and_parent_goal_binding() -> No
     assert repeated_generation["issues"][0]["expectedGeneration"] == 2
     assert next_generation["status"] == "COMPLETED"
     assert unknown_parent["code"] == "SUBAGENT_PARENT_GOAL_UNKNOWN"
+
+
+def test_query_subagent_receives_only_one_prepared_branch_execution_tool() -> None:
+    factory = CapturingFactory()
+    outer = runtime(factory)
+    root_runtime = GroundedRuntimeSession(
+        session_id="root-query-subagent",
+        question="复杂指标是多少",
+        merchant_id="merchant-1",
+        workspace_topics=["客服工单"],
+    )
+    branch_runtime = GroundedRuntimeSession(
+        session_id="branch-query-subagent",
+        question="计算复杂指标",
+        merchant_id="merchant-1",
+        workspace_topics=["客服工单"],
+        active_generation=3,
+        active_execution_mode=GroundedExecutionMode.CORE_SQL_REQUIRED,
+        active_contract=GroundedQueryContract(
+            question="计算复杂指标",
+            topics=["客服工单"],
+            status="READY",
+            query_shape="COMPLEX",
+            evidence_refs=["semantic:客服工单:tickets:detail"],
+        ),
+    )
+    branch_context = GroundedQueryBranchContext(
+        spec=GroundedQueryBranchSpec(
+            query_id="query.complex",
+            objective="计算复杂指标",
+            goal_ids=["metric.primary"],
+            topic_scope=["客服工单"],
+            evidence_ref_ids=["semantic:客服工单:tickets:detail"],
+        ),
+        runtime=branch_runtime,
+        budget=GroundedBranchBudget(
+            "query.complex",
+            GroundedBranchBudgetLimits(),
+        ),
+        status="PREPARED",
+    )
+    deep_session = GroundedDeepAgentSession(
+        runtime=root_runtime,
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="复杂指标是多少",
+            goals=[MetricQuestionGoal(goal_id="metric.primary", label="复杂指标")],
+        ),
+        query_branch_contexts={"query.complex": branch_context},
+        parallel_branches={"query.complex": branch_runtime},
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-query-subagent",
+        run_id="run-query-subagent",
+        session=deep_session,
+    )
+    calls: list[dict[str, Any]] = []
+
+    def execute_branch(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "status": "VERIFIED",
+                "queryId": kwargs["queries"][0].query_id,
+            }
+        )
+
+    prepared = outer._prepare_grounded_subagent_task(
+        context,
+        task=GroundedSubagentGoalContract(
+            sub_goal_id="subgoal.query.complex",
+            parent_goal_ids=["metric.primary"],
+            objective="隔离完成复杂 SQL 推理并执行已准备分支",
+            required_outputs=["queryReceipt"],
+            input_artifact_refs=["query-branch:query.complex"],
+            evidence_requirements=[
+                GroundedSubagentEvidenceRequirement(
+                    requirement_id="verified.query.receipt",
+                    description="Return the verified branch receipt.",
+                    accepted_ref_types=["VERIFIED_QUERY_ARTIFACT"],
+                )
+            ],
+            allowed_capabilities=["QUERY_BRANCH"],
+            budget=GroundedSubagentBudget(max_tool_calls=2, timeout_seconds=20),
+            generation=1,
+            query_branch_ids=["query.complex"],
+        ),
+        execute_branch_tool=SimpleNamespace(func=execute_branch),
+    )
+
+    assert branch_context.runtime is branch_runtime
+    assert [item.name for item in prepared.job.tools] == ["execute_assigned_query"]
+    assert prepared.grant.query_branch_ids == ["query.complex"]
+    assert prepared.grant.allowed_tool_names == ["execute_assigned_query"]
+    assert prepared.grant.artifact_ids == []
+    assert prepared.job.user_payload["queryBranch"]["queryId"] == "query.complex"
+    result = json.loads(
+        prepared.job.tools[0].func(
+            sql="SELECT governed_metric FROM tickets",
+            rationale="Use the exact prepared Contract.",
+            evidence_ref_ids=["semantic:客服工单:tickets:detail"],
+        )
+    )
+
+    assert result == {"status": "VERIFIED", "queryId": "query.complex"}
+    assert len(calls) == 1
+    assert [item.query_id for item in calls[0]["queries"]] == ["query.complex"]
+    assert calls[0]["runtime"].context is context
 
 
 def test_full_table_asset_is_never_exposed_by_grounded_filesystem_or_thin_recall() -> None:

@@ -14,6 +14,7 @@ from merchant_ai.config import Settings
 from merchant_ai.models import (
     AgentRunResult,
     AgentTaskResult,
+    ClarificationRequest,
     DataSnapshotContract,
     QueryBundle,
     SqlValidationResult,
@@ -132,6 +133,10 @@ class _IdempotentPopulationRevisionGate:
     def __init__(self, base_receipt_fingerprint: str) -> None:
         self.active_receipt_fingerprint = base_receipt_fingerprint
         self.revision_calls: list[tuple[str, str]] = []
+
+    @staticmethod
+    def register_run(**_kwargs: Any) -> None:
+        return None
 
     def revise_graph(
         self,
@@ -335,18 +340,7 @@ def _spawn_graph_revision_recovery(
         runtime, kernel, catalog = _runtime(
             require_parallel_overlap=False
         )
-        context = _context(kernel, "two independent metrics")
         settings = Settings(harness_workspace_path=workspace_path)
-        workspace = GroundedContextWorkspace.open(
-            settings,
-            thread_id=context.thread_id,
-            run_id=context.run_id,
-            merchant_id="merchant-1",
-            access_role="merchant",
-            user_scope={},
-            question=context.session.runtime.question,
-        )
-        context.session.context_workspace = workspace
         runtime.settings = settings
         runtime.population_gate_enforced = True
         runtime.population_execution_gate = (
@@ -354,12 +348,11 @@ def _spawn_graph_revision_recovery(
                 base_population_fingerprint
             )
         )
-
-        reports = runtime._recover_pending_graph_revisions(
-            context.session,
-            runtime_budget=None,
+        kernel.route_topic = lambda _session: None  # type: ignore[attr-defined]
+        kernel.recall_navigation = (  # type: ignore[attr-defined]
+            lambda _session: None
         )
-        for topic in context.session.runtime.workspace_topics:
+        for topic in ("电商交易", "电商退货"):
             catalog.documents[
                 "topics/%s/manifest.json" % topic
             ] = {
@@ -371,23 +364,69 @@ def _spawn_graph_revision_recovery(
                     ensure_ascii=False,
                 ),
             }
-        initial_context = json.loads(
-            runtime._initial_context(context.session)
+
+        captured: dict[str, Any] = {}
+
+        class _RecoveryBootstrapGraph:
+            @staticmethod
+            def invoke(
+                payload: dict[str, Any],
+                *,
+                config: Any = None,
+                context: Any = None,
+            ) -> None:
+                del config
+                captured["initialContext"] = json.loads(
+                    payload["messages"][0]["content"]
+                )
+                captured["session"] = context.session
+                context.session.runtime.clarification = (
+                    ClarificationRequest(
+                        question="recovery acceptance complete",
+                        stage="acceptance",
+                        type="recovery_acceptance",
+                    )
+                )
+
+        runtime.deep_agent_graph = _RecoveryBootstrapGraph()
+        response = runtime._run_once(
+            "two independent metrics",
+            "merchant-1",
+            access_role="merchant",
+            user_scope={},
+            thread_id="branch-thread",
+            run_id="branch-run",
         )
-        receipt = context.session.execution_graph_receipt
-        population_receipt = context.session.population_graph_receipt
+        session = captured["session"]
+        initial_context = captured["initialContext"]
+        bootstrap_recovery = next(
+            item
+            for item in session.execution_graph_history
+            if item.get("status")
+            == "JOURNAL_RECOVERY_COMPLETED_AT_BOOTSTRAP"
+        )
+        reports = list(bootstrap_recovery["transactions"])
+        receipt = session.execution_graph_receipt
+        population_receipt = session.population_graph_receipt
+        workspace = session.context_workspace
         assert receipt is not None
         assert population_receipt is not None
+        assert workspace is not None
         result_queue.put(
             {
                 "ok": True,
                 "pid": os.getpid(),
+                "responseClarificationType": (
+                    response.clarification.type
+                    if response.clarification is not None
+                    else ""
+                ),
                 "reports": reports,
                 "goalIds": [
                     item.goal_id
                     for item in (
-                        context.session.question_goal_contract.goals
-                        if context.session.question_goal_contract
+                        session.question_goal_contract.goals
+                        if session.question_goal_contract
                         is not None
                         else []
                     )
@@ -403,23 +442,21 @@ def _spawn_graph_revision_recovery(
                 "branchStatuses": {
                     query_node_id: branch.status
                     for query_node_id, branch in (
-                        context.session.query_branch_contexts.items()
+                        session.query_branch_contexts.items()
                     )
                 },
                 "ledgerArtifactIds": [
                     item.artifact_id
-                    for item in (
-                        context.session.runtime.verified_query_ledger
-                    )
+                    for item in session.runtime.verified_query_ledger
                 ],
                 "authorizedArtifactIds": [
                     item.artifact_id
                     for item in _authorized_verified_query_artifacts(
-                        context.session
+                        session
                     )
                 ],
                 "artifactGoalIds": dict(
-                    context.session.artifact_goal_ids
+                    session.artifact_goal_ids
                 ),
                 "restoredExecutionState": initial_context[
                     "restoredExecutionState"
@@ -1079,6 +1116,9 @@ def test_spawned_process_restores_unseeded_session_and_continues_local_replan(
     assert process.exitcode == 0
     assert result["ok"] is True, result.get("error")
     assert result["pid"] != os.getpid()
+    assert result["responseClarificationType"] == (
+        "recovery_acceptance"
+    )
     assert result["reports"][0]["baseSessionRestored"] is True
     assert result["reports"][0]["status"] == "EXECUTION_COMMITTED"
     assert result["goalIds"] == ["metric.first", "metric.second"]

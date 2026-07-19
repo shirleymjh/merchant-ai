@@ -443,6 +443,22 @@ def _strip_inline_sample_evidence(value: str) -> str:
         search_from = remove_from
 
 
+def active_recall_manifest_token(settings: Settings) -> str:
+    """Return the shared Knowledge activation version for this workspace."""
+
+    manifest_path = settings.resolved_workspace_path / "recall_index_manifest.json"
+    if not manifest_path.exists():
+        return ""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    return "%s:%s" % (
+        str(payload.get("indexVersion") or ""),
+        str(payload.get("semanticSourceHash") or ""),
+    )
+
+
 class TopicAssetService:
     SEMANTIC_LIST_FIELDS = set(ACTIVE_SEMANTIC_SIDECAR_FIELDS)
     SEMANTIC_SIDECAR_FILES = {
@@ -481,6 +497,7 @@ class TopicAssetService:
             Tuple[str, ...],
             Tuple[SemanticActivationSignature, str],
         ] = {}
+        self._observed_recall_manifest_token = active_recall_manifest_token(settings)
 
     @property
     def root(self) -> Path:
@@ -494,6 +511,16 @@ class TopicAssetService:
         self._topic_names_cache = None
         self._topic_contract_cache.clear()
         self._semantic_source_hash_cache.clear()
+
+    def refresh_if_recall_manifest_changed(self) -> bool:
+        """Drop local semantic caches after another worker publishes."""
+
+        current = active_recall_manifest_token(self.settings)
+        if current == self._observed_recall_manifest_token:
+            return False
+        self.clear_cache()
+        self._observed_recall_manifest_token = current
+        return True
 
     def list_topic(self, topic: str) -> Dict[str, Any]:
         topic_dir = self.root / topic
@@ -587,6 +614,7 @@ class TopicAssetService:
         absent, malformed, or not explicitly active.
         """
 
+        self.refresh_if_recall_manifest_changed()
         if topic in self._manifest_cache:
             return self._manifest_cache[topic]
         manifest = [
@@ -793,6 +821,7 @@ class TopicAssetService:
         return names
 
     def all_topic_names(self) -> List[str]:
+        self.refresh_if_recall_manifest_changed()
         if self._topic_names_cache is not None:
             return self._topic_names_cache
         if not self.root.exists():
@@ -812,6 +841,7 @@ class TopicAssetService:
         return [path.name for path in sorted(self.root.iterdir()) if path.is_dir()]
 
     def semantic_source_hash(self, topics: Iterable[str]) -> str:
+        self.refresh_if_recall_manifest_changed()
         cache_key = tuple(sorted({str(item or "") for item in topics if item}))
         files = self.canonical_semantic_files(cache_key)
         signature = semantic_activation_signature(self.root, files)
@@ -888,6 +918,7 @@ class TopicAssetService:
         return self.root / topic / "tables" / table
 
     def load_table_asset(self, topic: str, table: str) -> Dict[str, Any]:
+        self.refresh_if_recall_manifest_changed()
         cache_key = (topic, table)
         if cache_key in self._table_asset_cache:
             return self._table_asset_cache[cache_key]
@@ -1184,6 +1215,7 @@ class TopicAssetService:
         }
 
     def load_relationships(self, topic: str) -> List[Dict[str, Any]]:
+        self.refresh_if_recall_manifest_changed()
         if topic in self._relationship_cache:
             return self._relationship_cache[topic]
         if not self.load_manifest(topic):
@@ -2631,6 +2663,7 @@ class HybridRecallService:
         self.semantic_catalog = SemanticCatalogService(topic_assets)
         self._documents: Optional[List[RecallItem]] = None
         self._recall_cache = build_ttl_cache("hybrid_recall", settings, settings.cache_recall_ttl_seconds)
+        self._observed_recall_manifest_token = active_recall_manifest_token(settings)
 
     def recall(
         self,
@@ -2641,6 +2674,7 @@ class HybridRecallService:
         merchant_id: str,
         topic_categories: List[QuestionCategory],
     ) -> RecallBundle:
+        self.refresh_if_recall_manifest_changed()
         query_terms = recall_terms(question, getattr(keywords, "keywords", []))
         allowed_topics = set(self.topic_assets.topic_names_for_categories(topic_categories))
         metric_refs = [
@@ -2702,11 +2736,24 @@ class HybridRecallService:
         self._documents = None
         self._recall_cache.clear()
         self.semantic_catalog.clear_cache()
+        self.topic_assets.clear_cache()
+
+    def refresh_if_recall_manifest_changed(self) -> bool:
+        """Drop stale local recall snapshots after cross-worker activation."""
+
+        current = active_recall_manifest_token(self.settings)
+        if current == self._observed_recall_manifest_token:
+            return False
+        self.clear_cache()
+        self._observed_recall_manifest_token = current
+        self.topic_assets.refresh_if_recall_manifest_changed()
+        return True
 
     def cache_trace(self) -> Dict[str, Any]:
         return {"recall": self._recall_cache.trace()}
 
     def _load_documents(self) -> List[RecallItem]:
+        self.refresh_if_recall_manifest_changed()
         if self._documents is not None:
             return self._documents
         docs: List[RecallItem] = []
