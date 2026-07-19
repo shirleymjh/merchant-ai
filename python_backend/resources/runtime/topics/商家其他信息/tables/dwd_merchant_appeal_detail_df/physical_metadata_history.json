@@ -1,0 +1,52 @@
+[
+  {
+    "topic": "商家其他信息",
+    "tableName": "dwd_merchant_appeal_detail_df",
+    "syncedAt": "2026-07-19T23:25:04.657076Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "086e30aecdc761f4bf1848c68acd81ea8c65558591d372f2cbfb8668b542b008",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "DUPLICATE KEY",
+      "primaryKeyColumns": [
+        "appeal_id"
+      ],
+      "partitionColumns": [
+        "pt"
+      ],
+      "bucketColumns": [
+        "appeal_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [
+        {
+          "name": "idx_merchant_id",
+          "column": "merchant_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "商家id倒排索引"
+        }
+      ],
+      "invertedIndexColumns": [
+        "merchant_id"
+      ],
+      "partitionCount": 124,
+      "bucketCount": 8,
+      "partitionSnapshotHash": "2bcc4d1083394d95535e2446099bd67b6ce96bd3a3411dd6d05576d63aeb821b",
+      "ddlHash": "bfce51ed4766f7218524a69ac851a1e76dacc7182ea861b0fbdafb20918dedb8",
+      "capturedAt": "2026-07-19T23:25:04.657076Z"
+    }
+  }
+]

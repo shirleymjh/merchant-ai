@@ -793,7 +793,7 @@ def review_operator_knowledge_suggestion(
     _auth: None = OpsAuth,
 ) -> Dict[str, Any]:
     target = require_ops_merchant_access(merchant_id or settings.merchant_id)
-    return memory_governance_service.review_suggestion(target, item_id, request)
+    return memory_governance_service.review_and_activate_suggestion(target, item_id, request)
 
 
 @router.post("/api/ops/knowledge-suggestions/{item_id}/request-publish")
@@ -1116,6 +1116,33 @@ def refresh_topic_table_incrementally(
         target.merchant_id = settings.merchant_id
     require_ops_merchant_access(target.merchant_id, Permission.OPS_WRITE)
     return topic_builder_workflow.refresh_incremental(target)
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/refresh-physical-metadata")
+def refresh_topic_table_physical_metadata(
+    topic: str,
+    table_name: str,
+    merchant_id: Optional[str] = Query(default=None),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    effective_merchant_id = require_ops_merchant_access(
+        merchant_id or settings.merchant_id,
+        Permission.OPS_WRITE,
+    )
+    result = topic_builder_workflow.refresh_physical_metadata(topic, table_name)
+    result["merchantId"] = effective_merchant_id
+    if result.get("status") == "SYNCED":
+        index_result = recall_index_manager.rebuild(
+            changed_only=True,
+            topic=topic,
+            table_name=table_name,
+        )
+        result["recallIndex"] = index_result
+        result["cacheInvalidated"] = bool(
+            result.get("cacheInvalidated")
+            or index_result.get("cacheInvalidated")
+        )
+    return result
 
 
 @router.post("/api/topics/{topic}/tables/{table_name}/es-upsert")

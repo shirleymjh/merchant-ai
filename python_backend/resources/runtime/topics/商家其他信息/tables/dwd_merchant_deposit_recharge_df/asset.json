@@ -709,5 +709,34 @@
   "entityLookupPolicy": {
     "mode": "clarify",
     "timeColumn": "pt"
+  },
+  "physicalMetadata": {
+    "keyModel": "UNIQUE KEY",
+    "primaryKeyColumns": [
+      "deposit_recharge_id",
+      "pt"
+    ],
+    "bucketColumns": [
+      "deposit_recharge_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [],
+    "invertedIndexColumns": [],
+    "partitionCount": 1,
+    "bucketCount": 1,
+    "partitionSnapshotHash": "c25daae140504bc0a28a9219d399eaf44f1616f6fe9397ae234808803e20d5f0",
+    "ddlHash": "24e29dd6ff84214e898bfb937ce2153dd8fcca83849c3e77826debe5c7f8fe52",
+    "partitionColumns": [],
+    "capturedAt": "2026-07-19T23:29:16.134735Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:29:16.134735Z",
+    "previousFingerprint": "5d68430fc47345dbdab2dece52d95d0dcb829549119b6e2d3d106114d7b7aeee",
+    "fingerprint": "6f3906cdd09b6931aba40f32ae818ef267ae25eb8404fcad178ed3ed1d4a5a65",
+    "changedFields": [
+      "partitionColumns"
+    ]
   }
 }

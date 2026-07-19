@@ -1,0 +1,68 @@
+[
+  {
+    "topic": "经营画像",
+    "tableName": "ads_merchant_profile",
+    "syncedAt": "2026-07-19T23:25:05.698901Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "1eebbc2a7e4c4b573a0e1a2c57344faabcee4c9058b472e4a438c081534f1fa4",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "merchant_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "merchant_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "7ee6a36bd79c36100411a6d92c2b3163b6980362ad96f344c10215461cd88978",
+      "ddlHash": "6f4847f5a5b4eebec3136770c76aaf060d4a2ce3d0f6d42e22b86364f1338811",
+      "capturedAt": "2026-07-19T23:25:05.698901Z"
+    }
+  },
+  {
+    "topic": "经营画像",
+    "tableName": "ads_merchant_profile",
+    "syncedAt": "2026-07-19T23:29:16.831617Z",
+    "previousFingerprint": "1eebbc2a7e4c4b573a0e1a2c57344faabcee4c9058b472e4a438c081534f1fa4",
+    "fingerprint": "49c97ed0942c5a845d0fc42e43602709c66f040bfecf3ff0f33ea0a5c9a47920",
+    "changedFields": [
+      "partitionColumns"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "merchant_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "merchant_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "7ee6a36bd79c36100411a6d92c2b3163b6980362ad96f344c10215461cd88978",
+      "ddlHash": "6f4847f5a5b4eebec3136770c76aaf060d4a2ce3d0f6d42e22b86364f1338811",
+      "partitionColumns": [],
+      "capturedAt": "2026-07-19T23:29:16.831617Z"
+    }
+  }
+]

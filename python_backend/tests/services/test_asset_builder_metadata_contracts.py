@@ -173,6 +173,171 @@ def test_builder_uses_physical_metadata_and_leaves_business_contracts_undeclared
     assert asset["physicalMetadata"]["ddlHash"]
 
 
+def test_live_doris_physical_facts_sync_directly_into_published_semantic_asset(
+    tmp_path,
+) -> None:
+    settings = get_settings().model_copy(
+        update={
+            "topic_path": str(tmp_path / "topics"),
+            "harness_workspace_path": str(tmp_path / "workspace"),
+        }
+    )
+    table_dir = (
+        tmp_path / "topics" / "neutral" / "tables" / "opaque_source"
+    )
+    original_metric = {
+        "metricKey": "value_total",
+        "formula": "SUM(value_x)",
+        "aggregationPolicy": "period_rollup",
+    }
+    write_json(
+        table_dir / "asset.json",
+        {
+            "topic": "neutral",
+            "tableName": "opaque_source",
+            "status": "PUBLISHED",
+            "metrics": [original_metric],
+            "knowledgeRules": [{"ruleId": "business-rule", "content": "keep"}],
+            "semanticLineage": {
+                "topic": "neutral",
+                "tableName": "opaque_source",
+                "metrics": [{"metricKey": "value_total", "marker": "keep"}],
+            },
+            "physicalMetadata": {
+                "bucketColumns": ["stale_key"],
+                "bucketCount": 1,
+                "source": "stale_snapshot",
+            },
+        },
+    )
+    assets = TopicAssetService(settings)
+    workflow = TopicBuilderWorkflow(
+        settings,
+        NeutralDoris(),
+        assets,
+        llm=type("DisabledLlm", (), {"configured": False})(),
+    )
+
+    result = workflow.refresh_physical_metadata("neutral", "opaque_source")
+
+    assert result["success"] is True
+    assert result["status"] == "SYNCED"
+    published = json.loads(
+        (table_dir / "asset.json").read_text(encoding="utf-8")
+    )
+    assert published["status"] == "PUBLISHED"
+    assert published["metrics"] == [original_metric]
+    assert published["knowledgeRules"] == [
+        {"ruleId": "business-rule", "content": "keep"}
+    ]
+    assert published["physicalMetadata"]["partitionColumns"] == ["event_day"]
+    assert published["physicalMetadata"]["partitionCount"] == 2
+    assert published["physicalMetadata"]["bucketColumns"] == ["tenant_key"]
+    assert published["physicalMetadata"]["bucketCount"] == 4
+    assert published["physicalMetadata"]["invertedIndexColumns"] == [
+        "entity_key"
+    ]
+    assert published["physicalMetadataGovernance"]["syncMode"] == (
+        "automatic_objective_fact"
+    )
+    assert published["semanticLineage"]["physicalMetadata"][
+        "partitionColumns"
+    ] == ["event_day"]
+    assert published["semanticLineage"]["metrics"] == [
+        {"metricKey": "value_total", "marker": "keep"}
+    ]
+    history = json.loads(
+        (table_dir / "physical_metadata_history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history[-1]["fingerprint"] == result[
+        "physicalMetadataFingerprint"
+    ]
+
+    unchanged = workflow.refresh_physical_metadata(
+        "neutral",
+        "opaque_source",
+    )
+    assert unchanged["status"] == "UNCHANGED"
+
+
+def test_published_demo_semantic_assets_embed_physical_layout_contracts() -> None:
+    settings = get_settings()
+    paths = sorted(settings.resolved_topic_path.glob("*/tables/*/asset.json"))
+
+    assert paths
+    for path in paths:
+        asset = json.loads(path.read_text(encoding="utf-8"))
+        assert asset["status"] == "PUBLISHED", path
+        physical = asset.get("physicalMetadata") or {}
+        assert physical.get("source") == "show_create_table", path
+        assert physical.get("ddlHash"), path
+        assert isinstance(physical.get("primaryKeyColumns"), list), path
+        assert isinstance(physical.get("partitionColumns"), list), path
+        assert isinstance(physical.get("bucketColumns"), list), path
+        assert isinstance(physical.get("invertedIndexes"), list), path
+        assert isinstance(physical.get("invertedIndexColumns"), list), path
+        assert int(physical.get("bucketCount") or 0) > 0, path
+        governance = asset.get("physicalMetadataGovernance") or {}
+        assert governance.get("syncMode") == "automatic_objective_fact", path
+        assert governance.get("fingerprint"), path
+
+
+def test_physical_metadata_sync_never_erases_last_good_asset_when_doris_is_down(
+    tmp_path,
+) -> None:
+    settings = get_settings().model_copy(
+        update={"topic_path": str(tmp_path / "topics")}
+    )
+    asset_path = (
+        tmp_path
+        / "topics"
+        / "neutral"
+        / "tables"
+        / "opaque_source"
+        / "asset.json"
+    )
+    write_json(
+        asset_path,
+        {
+            "topic": "neutral",
+            "tableName": "opaque_source",
+            "status": "PUBLISHED",
+            "physicalMetadata": {
+                "partitionColumns": ["event_day"],
+                "bucketColumns": ["tenant_key"],
+                "bucketCount": 4,
+                "ddlHash": "last-good",
+            },
+        },
+    )
+    original = asset_path.read_bytes()
+
+    class UnavailableDoris:
+        def show_create_table(self, _table):
+            raise RuntimeError("down")
+
+        def show_indexes(self, _table):
+            raise RuntimeError("down")
+
+        def show_partitions(self, _table):
+            raise RuntimeError("down")
+
+    workflow = TopicBuilderWorkflow(
+        settings,
+        UnavailableDoris(),
+        TopicAssetService(settings),
+        llm=type("DisabledLlm", (), {"configured": False})(),
+    )
+
+    result = workflow.refresh_physical_metadata("neutral", "opaque_source")
+
+    assert result["status"] == "UNAVAILABLE"
+    assert result["code"] == "PHYSICAL_METADATA_UNAVAILABLE"
+    assert asset_path.read_bytes() == original
+
+
 def test_topic_builder_fails_before_sampling_without_governed_tenant_column(tmp_path):
     settings = get_settings().model_copy(
         update={"topic_path": str(tmp_path / "topics"), "harness_workspace_path": str(tmp_path / "workspace")}

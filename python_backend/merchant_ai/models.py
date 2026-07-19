@@ -412,6 +412,10 @@ class KnowledgeSuggestionReviewRequest(APIModel):
     reviewer: str = ""
     review_note: str = ""
     action: str = "review"
+    topic: str = ""
+    table_name: str = ""
+    activate_immediately: bool = True
+    auto_index: bool = True
 
 
 class KnowledgeSuggestionActionRequest(APIModel):

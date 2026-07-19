@@ -3203,5 +3203,34 @@
   "entityLookupPolicy": {
     "mode": "clarify",
     "timeColumn": "pt"
+  },
+  "physicalMetadata": {
+    "keyModel": "UNIQUE KEY",
+    "primaryKeyColumns": [
+      "merchant_id",
+      "pt"
+    ],
+    "bucketColumns": [
+      "merchant_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [],
+    "invertedIndexColumns": [],
+    "partitionCount": 1,
+    "bucketCount": 1,
+    "partitionSnapshotHash": "e97402db1c8152ed87f11bba0d8321b85cfb42dbd41f9f34505b8bbb0b42268b",
+    "ddlHash": "bc09703ed22eaa9c9d9bc9576610e83098706242948e379e1cb9bd44f5bb60c7",
+    "partitionColumns": [],
+    "capturedAt": "2026-07-19T23:29:16.905052Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:29:16.905052Z",
+    "previousFingerprint": "21108cb96f51a8267a3392dd3aa49079d496a228dc371aabfd69fb4bbfb4a004",
+    "fingerprint": "635d0aee7b8edd3c250aa86bffb0759e962c3ca9748cde58295503e18255f078",
+    "changedFields": [
+      "partitionColumns"
+    ]
   }
 }

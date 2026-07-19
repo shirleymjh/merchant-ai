@@ -1,0 +1,61 @@
+[
+  {
+    "topic": "客服理赔",
+    "tableName": "dwm_cs_repay_detail_df",
+    "syncedAt": "2026-07-19T23:25:04.997180Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "8fac2ba85dbfb25157c8faea9ca352c74dab08fdf82262b84985af5753aeae40",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "bill_id",
+        "pt"
+      ],
+      "partitionColumns": [
+        "pt"
+      ],
+      "bucketColumns": [
+        "bill_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [
+        {
+          "name": "idx_bill_id",
+          "column": "bill_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "赔付单号索引"
+        },
+        {
+          "name": "idx_seller_id",
+          "column": "seller_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "卖家id索引"
+        }
+      ],
+      "invertedIndexColumns": [
+        "bill_id",
+        "seller_id"
+      ],
+      "partitionCount": 124,
+      "bucketCount": 8,
+      "partitionSnapshotHash": "5547d06cdfc4b25f6dffb7ca82c4fab974d245196e0caec7ae269a961aeb77bd",
+      "ddlHash": "08554ba165df16c1323f7161d4ce5bb30d70781120519b7007ef570f8d53239a",
+      "capturedAt": "2026-07-19T23:25:04.997180Z"
+    }
+  }
+]

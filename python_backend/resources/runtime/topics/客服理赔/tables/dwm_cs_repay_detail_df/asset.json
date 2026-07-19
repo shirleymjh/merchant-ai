@@ -711,8 +711,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:compensation_bill",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "赔付单号，PF190827160812345",
       "aliases": [
         "赔付单号",
@@ -758,8 +764,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:order",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "订单号",
       "aliases": [
         "订单号",
@@ -808,8 +820,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:ticket",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "工单号",
       "aliases": [
         "工单号",
@@ -826,8 +844,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:buyer",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "赔付买家id",
       "aliases": [
         "赔付买家id",
@@ -1083,8 +1107,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:sub_order",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "子订单号",
       "aliases": [
         "子订单号",
@@ -1231,8 +1261,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:coupon",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "优惠券id",
       "aliases": [
         "优惠券id",
@@ -1249,8 +1285,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:promotion_activity",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "活动id",
       "aliases": [
         "活动id",
@@ -2077,5 +2119,64 @@
   "entityLookupPolicy": {
     "mode": "clarify",
     "timeColumn": "pt"
+  },
+  "physicalMetadata": {
+    "keyModel": "UNIQUE KEY",
+    "primaryKeyColumns": [
+      "bill_id",
+      "pt"
+    ],
+    "partitionColumns": [
+      "pt"
+    ],
+    "bucketColumns": [
+      "bill_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [
+      {
+        "name": "idx_bill_id",
+        "column": "bill_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "赔付单号索引"
+      },
+      {
+        "name": "idx_seller_id",
+        "column": "seller_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "卖家id索引"
+      }
+    ],
+    "invertedIndexColumns": [
+      "bill_id",
+      "seller_id"
+    ],
+    "partitionCount": 124,
+    "bucketCount": 8,
+    "partitionSnapshotHash": "5547d06cdfc4b25f6dffb7ca82c4fab974d245196e0caec7ae269a961aeb77bd",
+    "ddlHash": "08554ba165df16c1323f7161d4ce5bb30d70781120519b7007ef570f8d53239a",
+    "capturedAt": "2026-07-19T23:25:04.997180Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:25:04.997180Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "8fac2ba85dbfb25157c8faea9ca352c74dab08fdf82262b84985af5753aeae40",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ]
   }
 }

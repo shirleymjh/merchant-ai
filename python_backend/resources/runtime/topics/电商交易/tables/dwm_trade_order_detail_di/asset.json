@@ -2785,8 +2785,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:coupon",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "优惠方式关联的id，优惠券id,红包账号等",
       "aliases": [
         "优惠方式关联的id",
@@ -5823,5 +5829,65 @@
       ],
       "evidence": "明细表命名规则"
     }
-  ]
+  ],
+  "physicalMetadata": {
+    "keyModel": "UNIQUE KEY",
+    "primaryKeyColumns": [
+      "order_id",
+      "sub_order_id",
+      "pt"
+    ],
+    "partitionColumns": [
+      "pt"
+    ],
+    "bucketColumns": [
+      "order_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [
+      {
+        "name": "idx_sub_order_id",
+        "column": "sub_order_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "子订单号索引"
+      },
+      {
+        "name": "idx_seller_id",
+        "column": "seller_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "卖家id索引"
+      }
+    ],
+    "invertedIndexColumns": [
+      "sub_order_id",
+      "seller_id"
+    ],
+    "partitionCount": 124,
+    "bucketCount": 8,
+    "partitionSnapshotHash": "576b18e7ee195a0ff2fc963378517374a411193ce81f8ccd674e968dbe59f073",
+    "ddlHash": "86af6076fc2ab17b9f18747041d7db477370d34677ec9470270604bf673b2cbb",
+    "capturedAt": "2026-07-19T23:25:05.329755Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:25:05.329755Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "56b8e8b6da90cde2b95b44300df7ebe9421d604994f1dea3366c896bd54d23e0",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ]
+  }
 }

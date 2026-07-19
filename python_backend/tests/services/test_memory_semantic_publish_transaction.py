@@ -1,7 +1,7 @@
 import json
 
 from merchant_ai.config import get_settings
-from merchant_ai.models import ExtractedKeywords, QuestionCategory
+from merchant_ai.models import ExtractedKeywords, KnowledgeSuggestionReviewRequest, QuestionCategory
 from merchant_ai.services.assets import HybridRecallService, TopicAssetService, semantic_candidate_source_hash
 from merchant_ai.services.memory import KnowledgeSuggestionGovernanceService, StructuredMemoryStore
 from merchant_ai.services.recall_index import RecallIndexManager
@@ -259,6 +259,73 @@ def test_memory_suggestion_publish_uses_atomic_authority_and_is_immediately_reca
         [QuestionCategory(runtime["topic"])],
     )
     assert any(item.topic == runtime["topic"] and item.table == runtime["table"] for item in recalled.items)
+
+
+def test_approval_immediately_activates_for_current_and_new_recall_sessions(tmp_path):
+    runtime = _setup_runtime(tmp_path)
+    memory = runtime["store"].load("seller_100")
+    memory["knowledgeSuggestions"][0]["status"] = "candidate"
+    runtime["store"].save("seller_100", memory)
+
+    result = runtime["service"].review_and_activate_suggestion(
+        "seller_100",
+        "ks_open_rule",
+        KnowledgeSuggestionReviewRequest(
+            approved=True,
+            reviewer="reviewer",
+            review_note="approved and activate now",
+        ),
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "ACTIVATED"
+    assert result["reviewStatus"] == "approved"
+    assert result["activationStatus"] == "INDEXED"
+    assert result["suggestion"]["status"] == "indexed"
+
+    current_session = runtime["recallProvider"].recall(
+        "异常成交需要人工复核",
+        ExtractedKeywords(keywords=["异常成交", "人工复核"]),
+        [],
+        "",
+        "seller_100",
+        [QuestionCategory(runtime["topic"])],
+    )
+    assert any(item.topic == runtime["topic"] and item.table == runtime["table"] for item in current_session.items)
+
+    fresh_assets = TopicAssetService(runtime["settings"])
+    fresh_session_provider = HybridRecallService(runtime["settings"], fresh_assets)
+    fresh_session = fresh_session_provider.recall(
+        "异常成交需要人工复核",
+        ExtractedKeywords(keywords=["异常成交", "人工复核"]),
+        [],
+        "",
+        "seller_100",
+        [QuestionCategory(runtime["topic"])],
+    )
+    assert any(item.topic == runtime["topic"] and item.table == runtime["table"] for item in fresh_session.items)
+
+
+def test_approval_is_not_reported_effective_when_activation_readback_fails(tmp_path):
+    runtime = _setup_runtime(tmp_path, post_publishable=False)
+    memory = runtime["store"].load("seller_100")
+    memory["knowledgeSuggestions"][0]["status"] = "candidate"
+    runtime["store"].save("seller_100", memory)
+
+    result = runtime["service"].review_and_activate_suggestion(
+        "seller_100",
+        "ks_open_rule",
+        KnowledgeSuggestionReviewRequest(
+            approved=True,
+            reviewer="reviewer",
+        ),
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "POST_PUBLISH_RELEASE_GATE_FAILED"
+    assert result["reviewStatus"] == "approved"
+    assert result["activationStatus"] == "POST_PUBLISH_RELEASE_GATE_FAILED"
+    assert runtime["store"].load("seller_100")["knowledgeSuggestions"][0]["status"] == "approved"
 
 
 def test_memory_suggestion_post_publish_gate_failure_restores_every_surface_and_pending(tmp_path):

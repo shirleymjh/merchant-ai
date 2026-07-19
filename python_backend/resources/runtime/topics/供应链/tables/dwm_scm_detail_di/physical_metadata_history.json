@@ -1,0 +1,52 @@
+[
+  {
+    "topic": "供应链",
+    "tableName": "dwm_scm_detail_di",
+    "syncedAt": "2026-07-19T23:25:04.227896Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "2ec30eb403cd97e7b28d28cd02c16530930ee4fca04fd41fffe8db846c7c7882",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "DUPLICATE KEY",
+      "primaryKeyColumns": [
+        "inbound_id"
+      ],
+      "partitionColumns": [
+        "pt"
+      ],
+      "bucketColumns": [
+        "inbound_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [
+        {
+          "name": "idx_inbound_id",
+          "column": "inbound_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "主键倒排索引"
+        }
+      ],
+      "invertedIndexColumns": [
+        "inbound_id"
+      ],
+      "partitionCount": 124,
+      "bucketCount": 8,
+      "partitionSnapshotHash": "8e229a7c53e4fabac8a5041af17b62f7a9f2964cbf5e5d8866a10d985cc48ee9",
+      "ddlHash": "4fd17d2c28e07de7551af5bb468822db481ddebe170a518f645d77c79afd50ad",
+      "capturedAt": "2026-07-19T23:25:04.227896Z"
+    }
+  }
+]

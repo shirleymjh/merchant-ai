@@ -11,7 +11,9 @@ from merchant_ai.services.memory import (
     default_memory_status,
     filter_memory_items,
     is_metric_definition_dispute,
+    knowledge_suggestion_from_event,
     knowledge_suggestion_proposed_scope,
+    memory_event_from_state,
     memory_item_counts,
 )
 
@@ -173,6 +175,40 @@ def test_derived_metric_selection_is_not_itself_a_definition_dispute() -> None:
     )
 
 
+def test_correction_proposal_keeps_its_intent_bound_semantic_publish_target() -> None:
+    plan = QueryPlan(
+        intents=[
+            QuestionIntent(
+                answer_mode=AnswerMode.DERIVED,
+                metric_resolution={
+                    "metricKey": "refund_rate",
+                    "semanticRefId": (
+                        "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate"
+                    ),
+                },
+            )
+        ]
+    )
+    event = memory_event_from_state(
+        {
+            "question": "不对，退款率应该用退款单数 / 订单数。",
+            "requested_merchant_id": "seller_1",
+            "plan": plan,
+            "answer": "已生成待审核口径建议。",
+        }
+    )
+
+    suggestion = knowledge_suggestion_from_event(event)
+
+    assert event["knowledgePublishTarget"] == {
+        "topic": "电商退货",
+        "tableName": "dwm_trade_refund_detail_di",
+        "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
+    }
+    assert suggestion["topic"] == "电商退货"
+    assert suggestion["sourceTable"] == "dwm_trade_refund_detail_di"
+
+
 def test_mixed_correction_keeps_independent_curated_personal_preference(tmp_path) -> None:
     settings = get_settings().model_copy(
         update={
@@ -260,6 +296,17 @@ def test_private_or_unclassified_knowledge_cannot_enter_shared_publish_flow():
         "seller_1",
         "merchant_rule",
         SimpleNamespace(action="approve", approved=True, reviewer="ops", review_note=""),
+    )["status"] == "PRIVATE_MEMORY_NOT_PUBLISHABLE"
+    assert service.review_and_activate_suggestion(
+        "seller_1",
+        "merchant_rule",
+        SimpleNamespace(
+            action="approve",
+            approved=True,
+            reviewer="ops",
+            review_note="",
+            activate_immediately=True,
+        ),
     )["status"] == "PRIVATE_MEMORY_NOT_PUBLISHABLE"
     assert service.request_publish_suggestion("seller_1", "merchant_rule")["status"] == "PRIVATE_MEMORY_NOT_PUBLISHABLE"
     assert service.publish_suggestion("seller_1", "merchant_rule")["status"] == "PRIVATE_MEMORY_NOT_PUBLISHABLE"

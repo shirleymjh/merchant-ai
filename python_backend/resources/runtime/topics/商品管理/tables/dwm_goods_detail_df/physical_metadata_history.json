@@ -1,0 +1,60 @@
+[
+  {
+    "topic": "商品管理",
+    "tableName": "dwm_goods_detail_df",
+    "syncedAt": "2026-07-19T23:25:04.352635Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "fc2dca63efce77335114ed3dbf3e01f91861875b8fd508b79ef118a7cb18edd9",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "DUPLICATE KEY",
+      "primaryKeyColumns": [
+        "spu_id"
+      ],
+      "partitionColumns": [
+        "pt"
+      ],
+      "bucketColumns": [
+        "spu_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [
+        {
+          "name": "idx_spu_id",
+          "column": "spu_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "spu ID倒排索引"
+        },
+        {
+          "name": "idx_seller_id",
+          "column": "seller_id",
+          "type": "INVERTED",
+          "properties": "",
+          "comment": "spu发布人id倒排索引"
+        }
+      ],
+      "invertedIndexColumns": [
+        "spu_id",
+        "seller_id"
+      ],
+      "partitionCount": 124,
+      "bucketCount": 8,
+      "partitionSnapshotHash": "d9ac73bee64b5dca45734c56a39d915d908c2a3779b17b74d351c0fad07fdf4d",
+      "ddlHash": "33e504ceffcb84186fa0f8ba7b3223de3e2a9140aaca99b7aa8ea2f97bcb6c1b",
+      "capturedAt": "2026-07-19T23:25:04.352635Z"
+    }
+  }
+]

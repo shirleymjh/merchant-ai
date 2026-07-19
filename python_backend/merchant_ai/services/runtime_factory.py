@@ -313,7 +313,7 @@ def create_runtime(settings: Optional[Settings] = None) -> Any:
 def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
     doris_repository = DorisRepository(settings)
     answer_repository = AnswerRepository(settings)
-    pending_store = PendingAnswerStore()
+    pending_store = PendingAnswerStore(settings)
     topic_assets = TopicAssetService(settings)
     recall_service = HybridRecallService(settings, topic_assets)
     semantic_catalog = recall_service.semantic_catalog

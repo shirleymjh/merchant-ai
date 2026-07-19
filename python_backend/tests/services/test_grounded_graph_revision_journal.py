@@ -14,12 +14,21 @@ from merchant_ai.services.grounded_execution_graph import (
     GroundedExecutionGraphProposal,
     GroundedExecutionNodeSpec,
     build_grounded_execution_graph_receipt,
+    discovery_evidence_snapshot_fingerprint,
     grounded_execution_graph_fingerprint,
 )
+from merchant_ai.services.grounded_goal_contract import (
+    MetricQuestionGoal,
+    OriginalQuestionGoalContract,
+    original_question_goal_contract_fingerprint,
+)
 from merchant_ai.services.grounded_graph_revision_journal import (
+    GroundedGraphRevisionBaseBranchCheckpoint,
+    GroundedGraphRevisionBaseSessionCheckpoint,
     GroundedGraphRevisionJournalError,
     GroundedGraphRevisionTransactionJournal,
     build_grounded_graph_revision_recovery_payload,
+    seal_grounded_graph_revision_base_session_checkpoint,
 )
 from merchant_ai.services.grounded_population_gate_coordinator import (
     PopulationDynamicGraphEdge,
@@ -48,35 +57,181 @@ def _workspace(tmp_path) -> GroundedContextWorkspace:
 
 def _revision_inputs(tmp_path):
     workspace = _workspace(tmp_path)
+    semantic_evidence = [
+        {
+            "refId": "semantic:topic-a:source",
+            "path": "topics/topic-a/source.json",
+            "topic": "topic-a",
+            "contentHash": _fingerprint("source evidence"),
+        },
+        {
+            "refId": "semantic:topic-a:consumer",
+            "path": "topics/topic-a/consumer.json",
+            "topic": "topic-a",
+            "contentHash": _fingerprint("consumer evidence"),
+        },
+    ]
+    goal_contract = OriginalQuestionGoalContract(
+        question="journal question",
+        goals=[
+            MetricQuestionGoal(
+                goal_id="goal-source",
+                label="source goal",
+            ),
+            MetricQuestionGoal(
+                goal_id="goal-consumer",
+                label="consumer goal",
+            ),
+        ],
+    )
+    goal_fingerprint = original_question_goal_contract_fingerprint(
+        goal_contract
+    )
+    discovery_fingerprint = discovery_evidence_snapshot_fingerprint(
+        semantic_evidence
+    )
+    nodes = [
+        GroundedExecutionNodeSpec(
+            client_key="source",
+            objective="source objective",
+            goal_ids=["goal-source"],
+            topic_scope=["topic-a"],
+            evidence_ref_ids=["semantic:topic-a:source"],
+        ),
+        GroundedExecutionNodeSpec(
+            client_key="consumer",
+            objective="consumer objective",
+            goal_ids=["goal-consumer"],
+            topic_scope=["topic-a"],
+            evidence_ref_ids=["semantic:topic-a:consumer"],
+        ),
+    ]
+    edges = [
+        GroundedExecutionEdgeSpec(
+            source_client_key="source",
+            target_client_key="consumer",
+            dependency_mode="VERIFIED_ARTIFACT",
+            artifact_kind="VERIFIED_ENTITY_SET",
+            target_binding_ref="semantic:topic-a:binding",
+        )
+    ]
+    base_proposal = GroundedExecutionGraphProposal(
+        base_version=0,
+        goal_contract_fingerprint=goal_fingerprint,
+        discovery_snapshot_fingerprint=discovery_fingerprint,
+        nodes=nodes,
+        edges=edges,
+    )
+    base_execution_receipt = build_grounded_execution_graph_receipt(
+        base_proposal,
+        version=1,
+    )
+    base_population_receipt = seal_population_dynamic_graph_receipt(
+        PopulationDynamicGraphReceipt(
+            graph_id=base_execution_receipt.graph_id,
+            graph_version=base_execution_receipt.version,
+            graph_fingerprint=base_execution_receipt.fingerprint,
+            nodes=tuple(
+                PopulationDynamicGraphNode(
+                    query_node_id=query_node_id,
+                    consumer_goal_ids=tuple(
+                        next(
+                            node.goal_ids
+                            for node in base_proposal.nodes
+                            if node.client_key == client_key
+                        )
+                    ),
+                )
+                for client_key, query_node_id in (
+                    base_execution_receipt.node_ids.items()
+                )
+            ),
+            edges=(
+                PopulationDynamicGraphEdge(
+                    source_query_node_id=(
+                        base_execution_receipt.node_ids["source"]
+                    ),
+                    target_query_node_id=(
+                        base_execution_receipt.node_ids["consumer"]
+                    ),
+                    dependency_mode="VERIFIED_ARTIFACT",
+                    artifact_kind="VERIFIED_ENTITY_SET",
+                ),
+            ),
+        )
+    )
+    base_checkpoint = (
+        seal_grounded_graph_revision_base_session_checkpoint(
+            GroundedGraphRevisionBaseSessionCheckpoint(
+                question=goal_contract.question,
+                goal_contract=goal_contract.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                execution_proposal=base_proposal.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                execution_receipt=base_execution_receipt.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                population_receipt=base_population_receipt.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                semantic_evidence=tuple(semantic_evidence),
+                branches=(
+                    GroundedGraphRevisionBaseBranchCheckpoint(
+                        client_key="source",
+                        query_node_id=(
+                            base_execution_receipt.node_ids["source"]
+                        ),
+                        objective="source objective",
+                        goal_ids=("goal-source",),
+                        topic_scope=("topic-a",),
+                        evidence_ref_ids=(
+                            "semantic:topic-a:source",
+                        ),
+                        lifecycle="UNEXECUTED",
+                        status="DECLARED",
+                    ),
+                    GroundedGraphRevisionBaseBranchCheckpoint(
+                        client_key="consumer",
+                        query_node_id=(
+                            base_execution_receipt.node_ids["consumer"]
+                        ),
+                        objective="consumer objective",
+                        goal_ids=("goal-consumer",),
+                        topic_scope=("topic-a",),
+                        evidence_ref_ids=(
+                            "semantic:topic-a:consumer",
+                        ),
+                        dependency_query_node_ids=(
+                            base_execution_receipt.node_ids["source"],
+                        ),
+                        lifecycle="UNEXECUTED",
+                        status="WAITING_VERIFIED_ENTITY_SET",
+                    ),
+                ),
+                runtime_state={
+                    "activeGoalContractFingerprint": goal_fingerprint,
+                    "workspaceTopics": ["topic-a"],
+                },
+            )
+        )
+    )
+    base_checkpoint_reference = (
+        GroundedGraphRevisionTransactionJournal(
+            workspace
+        ).persist_base_session_checkpoint(base_checkpoint)
+    )
     proposal = GroundedExecutionGraphProposal(
         base_version=1,
-        goal_contract_fingerprint=_fingerprint("goal-contract"),
-        discovery_snapshot_fingerprint=_fingerprint("discovery-snapshot"),
-        nodes=[
-            GroundedExecutionNodeSpec(
-                client_key="source",
-                objective="source objective",
-                goal_ids=["goal-source"],
-                topic_scope=["topic-a"],
-                evidence_ref_ids=["semantic:topic-a:source"],
-            ),
-            GroundedExecutionNodeSpec(
-                client_key="consumer",
-                objective="consumer objective",
-                goal_ids=["goal-consumer"],
-                topic_scope=["topic-a"],
-                evidence_ref_ids=["semantic:topic-a:consumer"],
-            ),
-        ],
-        edges=[
-            GroundedExecutionEdgeSpec(
-                source_client_key="source",
-                target_client_key="consumer",
-                dependency_mode="VERIFIED_ARTIFACT",
-                artifact_kind="VERIFIED_ENTITY_SET",
-                target_binding_ref="semantic:topic-a:binding",
-            )
-        ],
+        goal_contract_fingerprint=goal_fingerprint,
+        discovery_snapshot_fingerprint=discovery_fingerprint,
+        nodes=nodes,
+        edges=edges,
     )
     execution_receipt = build_grounded_execution_graph_receipt(
         proposal,
@@ -104,7 +259,9 @@ def _revision_inputs(tmp_path):
                     artifact_kind="VERIFIED_ENTITY_SET",
                 ),
             ),
-            parent_receipt_fingerprint=_fingerprint("base-population-receipt"),
+            parent_receipt_fingerprint=(
+                base_population_receipt.receipt_fingerprint
+            ),
             revision_evidence_fingerprint=_fingerprint("evidence-set"),
         )
     )
@@ -112,11 +269,16 @@ def _revision_inputs(tmp_path):
         execution_proposal=proposal,
         execution_receipt=execution_receipt,
         population_receipt=population_receipt,
+        base_session_checkpoint=base_checkpoint_reference,
     )
     values = {
-        "base_execution_receipt_fingerprint": _fingerprint("base-execution-receipt"),
+        "base_execution_receipt_fingerprint": (
+            base_execution_receipt.fingerprint
+        ),
         "new_execution_receipt_fingerprint": (grounded_execution_graph_fingerprint(proposal)),
-        "base_population_receipt_fingerprint": _fingerprint("base-population-receipt"),
+        "base_population_receipt_fingerprint": (
+            base_population_receipt.receipt_fingerprint
+        ),
         "new_population_receipt_fingerprint": (population_receipt.receipt_fingerprint),
         "evidence_set_fingerprint": _fingerprint("evidence-set"),
         "recovery_payload": payload,

@@ -1,0 +1,68 @@
+[
+  {
+    "topic": "电商退货",
+    "tableName": "dwm_trade_refund_detail_di",
+    "syncedAt": "2026-07-19T23:25:05.568185Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "3c9e7b981de4a2b2a84ed93d983270b1c19879d32cbd9f2e533d20941035b3d9",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "refund_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "refund_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "abb12354f0cc6c053fd9f44d302c06fa7ed1801d3dcd2886df9036e58773e544",
+      "ddlHash": "ca49ec4a4848ad9fa839af710cafb2118c43d7ffebd8b06c36f9a0c399ab3e1d",
+      "capturedAt": "2026-07-19T23:25:05.568185Z"
+    }
+  },
+  {
+    "topic": "电商退货",
+    "tableName": "dwm_trade_refund_detail_di",
+    "syncedAt": "2026-07-19T23:29:16.737339Z",
+    "previousFingerprint": "3c9e7b981de4a2b2a84ed93d983270b1c19879d32cbd9f2e533d20941035b3d9",
+    "fingerprint": "14ccdaa1b4697070e1fdbe427865a3b01c1fc7330a2bb5cf94b5be62bad3c4aa",
+    "changedFields": [
+      "partitionColumns"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "refund_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "refund_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "abb12354f0cc6c053fd9f44d302c06fa7ed1801d3dcd2886df9036e58773e544",
+      "ddlHash": "ca49ec4a4848ad9fa839af710cafb2118c43d7ffebd8b06c36f9a0c399ab3e1d",
+      "partitionColumns": [],
+      "capturedAt": "2026-07-19T23:29:16.737339Z"
+    }
+  }
+]

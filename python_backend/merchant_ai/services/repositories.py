@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import inspect
+import os
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -814,21 +817,80 @@ class AnswerRepository:
 
 
 class PendingAnswerStore:
-    def __init__(self):
+    """Keep feedback attribution available across runs and process restarts.
+
+    Runtime instances use a workspace-backed spool.  The optional in-memory
+    mode remains useful for isolated unit tests and lightweight adapters.
+    Files are authoritative when persistence is enabled so another worker can
+    consume or remove a pending answer without leaving a stale local copy.
+    """
+
+    def __init__(self, settings: Optional[Settings] = None, root: Optional[Path] = None):
         self._answers: Dict[str, PendingAnswer] = {}
         self._lock = RLock()
+        self._root = Path(root) if root is not None else (
+            settings.resolved_workspace_path / "pending_answers"
+            if settings is not None
+            else None
+        )
+        if self._root is not None:
+            self._root.mkdir(parents=True, exist_ok=True)
+            try:
+                self._root.chmod(0o700)
+            except OSError:
+                pass
 
     def put(self, answer: PendingAnswer) -> None:
         with self._lock:
             self._answers[answer.id] = answer
+            path = self._path(answer.id)
+            if path is None:
+                return
+            payload = answer.model_dump(by_alias=True, mode="json")
+            temporary = path.with_name(".%s.%s.%s.tmp" % (path.name, os.getpid(), uuid.uuid4().hex))
+            try:
+                with temporary.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, default=str)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    temporary.chmod(0o600)
+                except OSError:
+                    pass
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def get(self, answer_id: str) -> Optional[PendingAnswer]:
         with self._lock:
-            return self._answers.get(answer_id)
+            path = self._path(answer_id)
+            if path is None:
+                return self._answers.get(answer_id)
+            if not path.exists():
+                self._answers.pop(answer_id, None)
+                return None
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                answer = PendingAnswer.model_validate(payload)
+            except (OSError, ValueError, TypeError):
+                return None
+            if answer.id != answer_id:
+                return None
+            self._answers[answer_id] = answer
+            return answer
 
     def remove(self, answer_id: str) -> None:
         with self._lock:
             self._answers.pop(answer_id, None)
+            path = self._path(answer_id)
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+    def _path(self, answer_id: str) -> Optional[Path]:
+        if self._root is None:
+            return None
+        digest = hashlib.sha256(str(answer_id or "").encode("utf-8")).hexdigest()
+        return self._root / (digest + ".json")
 
 
 class MerchantService:

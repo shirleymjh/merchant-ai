@@ -772,8 +772,14 @@
       "role": "KEY",
       "canonicalEntityRef": "entity:coupon",
       "comparisonPolicy": "exact",
-      "filterOperators": ["EQ", "IN"],
-      "lookupTimePolicy": {"mode": "clarify", "timeRequired": true},
+      "filterOperators": [
+        "EQ",
+        "IN"
+      ],
+      "lookupTimePolicy": {
+        "mode": "clarify",
+        "timeRequired": true
+      },
       "description": "券编号",
       "aliases": [
         "券编号",
@@ -2312,5 +2318,63 @@
   "entityLookupPolicy": {
     "mode": "clarify",
     "timeColumn": "pt"
+  },
+  "physicalMetadata": {
+    "keyModel": "DUPLICATE KEY",
+    "primaryKeyColumns": [
+      "coupon_id"
+    ],
+    "partitionColumns": [
+      "pt"
+    ],
+    "bucketColumns": [
+      "coupon_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [
+      {
+        "name": "idx_coupon_id",
+        "column": "coupon_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "券编号倒排索引"
+      },
+      {
+        "name": "idx_seller_id",
+        "column": "seller_id",
+        "type": "INVERTED",
+        "properties": "",
+        "comment": "津贴商家id倒排索引"
+      }
+    ],
+    "invertedIndexColumns": [
+      "coupon_id",
+      "seller_id"
+    ],
+    "partitionCount": 124,
+    "bucketCount": 8,
+    "partitionSnapshotHash": "a76f17eaa4ebeaf926f245bf7ce68397525568b42d53b9c50f3b4a0478f6ff58",
+    "ddlHash": "908bf9c56db364840349bbadaef9f7c928ef1d96145daf0de79d9f1fd49a141a",
+    "capturedAt": "2026-07-19T23:25:05.459934Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:25:05.459934Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "7a8a6e65c53b50deeac7bdf9fcba0e2313df5d77730a6bfeddae07f2534e2ce8",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionColumns",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ]
   }
 }

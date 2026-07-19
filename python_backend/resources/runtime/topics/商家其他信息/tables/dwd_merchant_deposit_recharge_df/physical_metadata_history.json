@@ -1,0 +1,68 @@
+[
+  {
+    "topic": "商家其他信息",
+    "tableName": "dwd_merchant_deposit_recharge_df",
+    "syncedAt": "2026-07-19T23:25:04.737091Z",
+    "previousFingerprint": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "fingerprint": "5d68430fc47345dbdab2dece52d95d0dcb829549119b6e2d3d106114d7b7aeee",
+    "changedFields": [
+      "bucketColumns",
+      "bucketCount",
+      "ddlHash",
+      "invertedIndexColumns",
+      "invertedIndexes",
+      "keyModel",
+      "partitionCount",
+      "partitionSnapshotHash",
+      "primaryKeyColumns",
+      "source"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "deposit_recharge_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "deposit_recharge_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "c25daae140504bc0a28a9219d399eaf44f1616f6fe9397ae234808803e20d5f0",
+      "ddlHash": "24e29dd6ff84214e898bfb937ce2153dd8fcca83849c3e77826debe5c7f8fe52",
+      "capturedAt": "2026-07-19T23:25:04.737091Z"
+    }
+  },
+  {
+    "topic": "商家其他信息",
+    "tableName": "dwd_merchant_deposit_recharge_df",
+    "syncedAt": "2026-07-19T23:29:16.134735Z",
+    "previousFingerprint": "5d68430fc47345dbdab2dece52d95d0dcb829549119b6e2d3d106114d7b7aeee",
+    "fingerprint": "6f3906cdd09b6931aba40f32ae818ef267ae25eb8404fcad178ed3ed1d4a5a65",
+    "changedFields": [
+      "partitionColumns"
+    ],
+    "physicalMetadata": {
+      "keyModel": "UNIQUE KEY",
+      "primaryKeyColumns": [
+        "deposit_recharge_id",
+        "pt"
+      ],
+      "bucketColumns": [
+        "deposit_recharge_id"
+      ],
+      "source": "show_create_table",
+      "invertedIndexes": [],
+      "invertedIndexColumns": [],
+      "partitionCount": 1,
+      "bucketCount": 1,
+      "partitionSnapshotHash": "c25daae140504bc0a28a9219d399eaf44f1616f6fe9397ae234808803e20d5f0",
+      "ddlHash": "24e29dd6ff84214e898bfb937ce2153dd8fcca83849c3e77826debe5c7f8fe52",
+      "partitionColumns": [],
+      "capturedAt": "2026-07-19T23:29:16.134735Z"
+    }
+  }
+]

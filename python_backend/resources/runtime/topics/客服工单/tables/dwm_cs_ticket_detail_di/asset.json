@@ -3800,5 +3800,34 @@
   "entityLookupPolicy": {
     "mode": "clarify",
     "timeColumn": "pt"
+  },
+  "physicalMetadata": {
+    "keyModel": "UNIQUE KEY",
+    "primaryKeyColumns": [
+      "ticket_id",
+      "pt"
+    ],
+    "bucketColumns": [
+      "ticket_id"
+    ],
+    "source": "show_create_table",
+    "invertedIndexes": [],
+    "invertedIndexColumns": [],
+    "partitionCount": 1,
+    "bucketCount": 1,
+    "partitionSnapshotHash": "64b0966594c641134a6f712ed66a04520478b6d58e38adc5adc105e619905ff2",
+    "ddlHash": "d19c4619b0f70aafda26acddd5c3a932fa2e8156871d6f85aced1330584d5d25",
+    "partitionColumns": [],
+    "capturedAt": "2026-07-19T23:29:16.209602Z"
+  },
+  "physicalMetadataGovernance": {
+    "source": "live_doris_metadata",
+    "syncMode": "automatic_objective_fact",
+    "syncedAt": "2026-07-19T23:29:16.209602Z",
+    "previousFingerprint": "b8a717e6dc6a086859cfdd4665a474cba81a7c6efaf645c77bb6929a4a4e9461",
+    "fingerprint": "38424ae89f39d82d184fd694cc8e716fcd83ee950e3313988ae576fba1bf1a61",
+    "changedFields": [
+      "partitionColumns"
+    ]
   }
 }

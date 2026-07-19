@@ -76,6 +76,12 @@ from merchant_ai.services.grounded_sql_candidate import (
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
+from merchant_ai.services.grounded_subagent_runtime import (
+    GroundedSubagentBudget,
+    GroundedSubagentDispatchPlan,
+    GroundedSubagentEvidenceRequirement,
+    GroundedSubagentGoalContract,
+)
 
 
 def _stable_test_hash(value: Any) -> str:
@@ -542,6 +548,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "execute_grounded_query",
         "execute_grounded_query_batch",
         "publish_verified_entity_set",
+        "delegate_grounded_tasks",
         "delegate_grounded_exploration",
         "finalize_evidence_collection",
         "compose_verified_answer",
@@ -1477,6 +1484,204 @@ def test_task_dispatch_is_blocked_before_subagent_execution() -> None:
 
     assert result.status == "error"
     assert called["handler"] is False
+
+
+def _subagent_goal(
+    *,
+    sub_goal_id: str = "subgoal.read.metric",
+    generation: int = 1,
+    parent_goal_ids: list[str] | None = None,
+) -> GroundedSubagentGoalContract:
+    return GroundedSubagentGoalContract(
+        sub_goal_id=sub_goal_id,
+        parent_goal_ids=parent_goal_ids or ["metric.primary"],
+        objective="隔离阅读当前 Topic 证据并返回候选引用",
+        required_outputs=["finding"],
+        input_artifact_refs=[],
+        evidence_requirements=[
+            GroundedSubagentEvidenceRequirement(
+                requirement_id="evidence.semantic.refs",
+                description="Return exact semantic refs for Root review.",
+                accepted_ref_types=["SEMANTIC_REF"],
+            )
+        ],
+        allowed_capabilities=["READ_CONTEXT"],
+        budget=GroundedSubagentBudget(
+            max_tool_calls=3,
+            timeout_seconds=9,
+        ),
+        generation=generation,
+    )
+
+
+def test_core_dynamically_dispatches_goal_bound_task_with_exact_capability_grant() -> None:
+    factory = CapturingFactory()
+    outer = runtime(factory)
+    deep_session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="subagent-dispatch",
+            question="主指标是多少",
+            merchant_id="merchant-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="主指标是多少",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.primary",
+                    label="主指标",
+                )
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-subagent-dispatch",
+        run_id="run-subagent-dispatch",
+        session=deep_session,
+    )
+
+    class Isolated:
+        def __init__(self) -> None:
+            self.jobs: list[Any] = []
+
+        def run(self, job: Any, *, on_progress: Any = None) -> IsolatedSubagentResult:
+            self.jobs.append(job)
+            if on_progress is not None:
+                on_progress("subagent", "started", job.job_id)
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={"runId": job.job_id},
+                raw_output=json.dumps(
+                    {
+                        "summary": "候选引用已定位，等待 Root 复核。",
+                        "finding": "semantic:客服工单:tickets:detail",
+                        "evidenceRefs": ["semantic:客服工单:tickets:detail"],
+                        "gaps": [],
+                        "recommendedNextAction": "ROOT_READ_EXACT_REF",
+                        "proposedSubGoals": [],
+                        "evidenceGaps": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                update_count=2,
+            )
+
+    isolated = Isolated()
+    outer.subagent_runtime = isolated  # type: ignore[assignment]
+    tools = {item.name: item for item in outer.tools}
+    response = json.loads(
+        tools["delegate_grounded_tasks"].func(
+            plan=GroundedSubagentDispatchPlan(
+                tasks=[_subagent_goal()],
+                reason="Long semantic investigation benefits from isolation.",
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert response["status"] == "COMPLETED"
+    assert response["outputAuthority"] == "ADVISORY"
+    assert response["tasks"][0]["subGoalId"] == "subgoal.read.metric"
+    assert response["tasks"][0]["generation"] == 1
+    assert response["tasks"][0]["advisoryOutput"]["finding"].startswith("semantic:")
+    assert len(isolated.jobs) == 1
+    job = isolated.jobs[0]
+    assert job.capability_grant.fingerprint_valid()
+    assert job.capability_grant.parent_goal_ids == ["metric.primary"]
+    assert job.capability_grant.generation == 1
+    assert job.capability_grant.allowed_tool_names == ["grep", "ls", "read_file"]
+    assert job.capability_grant.query_branch_ids == []
+    assert job.capability_grant.skill_names == []
+    assert job.capability_grant.max_tool_calls == 3
+    assert job.model_timeout_seconds == 9
+    assert job.tools == []
+    assert deep_session.core_semantic_evidence == []
+
+
+def test_subagent_retry_requires_next_generation_and_parent_goal_binding() -> None:
+    factory = CapturingFactory()
+    outer = runtime(factory)
+    deep_session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="subagent-generation",
+            question="主指标是多少",
+            merchant_id="merchant-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="主指标是多少",
+            goals=[MetricQuestionGoal(goal_id="metric.primary", label="主指标")],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-subagent-generation",
+        run_id="run-subagent-generation",
+        session=deep_session,
+    )
+
+    class Isolated:
+        def run(self, job: Any, *, on_progress: Any = None) -> IsolatedSubagentResult:
+            return IsolatedSubagentResult(
+                job_id=job.job_id,
+                thread_id=job.thread_id,
+                checkpoint={},
+                raw_output=json.dumps(
+                    {
+                        "summary": "done",
+                        "finding": "ref",
+                        "evidenceRefs": [],
+                        "gaps": [],
+                        "recommendedNextAction": "ROOT_REVIEW",
+                        "proposedSubGoals": [],
+                        "evidenceGaps": [],
+                    }
+                ),
+                update_count=1,
+            )
+
+    outer.subagent_runtime = Isolated()  # type: ignore[assignment]
+    delegate = {item.name: item for item in outer.tools}["delegate_grounded_tasks"]
+
+    first = json.loads(
+        delegate.func(
+            plan=GroundedSubagentDispatchPlan(tasks=[_subagent_goal()]),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    repeated_generation = json.loads(
+        delegate.func(
+            plan=GroundedSubagentDispatchPlan(tasks=[_subagent_goal()]),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    next_generation = json.loads(
+        delegate.func(
+            plan=GroundedSubagentDispatchPlan(
+                tasks=[_subagent_goal(generation=2)]
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    unknown_parent = json.loads(
+        delegate.func(
+            plan=GroundedSubagentDispatchPlan(
+                tasks=[
+                    _subagent_goal(
+                        sub_goal_id="subgoal.unknown.parent",
+                        parent_goal_ids=["metric.unknown"],
+                    )
+                ]
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert first["status"] == "COMPLETED"
+    assert repeated_generation["code"] == "SUBAGENT_GOAL_GENERATION_INVALID"
+    assert repeated_generation["issues"][0]["expectedGeneration"] == 2
+    assert next_generation["status"] == "COMPLETED"
+    assert unknown_parent["code"] == "SUBAGENT_PARENT_GOAL_UNKNOWN"
 
 
 def test_full_table_asset_is_never_exposed_by_grounded_filesystem_or_thin_recall() -> None:

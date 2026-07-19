@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
+import traceback
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -39,6 +42,7 @@ from merchant_ai.services.grounded_runtime_budget import (
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeKernel,
     GroundedRuntimeSession,
+    verified_query_artifact_integrity_fingerprint,
 )
 from merchant_ai.services.grounded_population_runtime_gate import (
     PopulationPreExecutionReference,
@@ -241,6 +245,62 @@ def _failed_revision_payload(
     }
 
 
+def _carried_verified_branch_revision_payload(
+    context,
+    frozen: dict[str, Any],
+) -> dict[str, Any]:
+    receipt = context.session.execution_graph_receipt
+    proposal = context.session.execution_graph_proposal
+    assert receipt is not None
+    assert proposal is not None
+    failed_query_id = frozen["clientNodeIds"]["second"]
+    context.session.query_branch_contexts[failed_query_id].status = "FAILED"
+    evidence = build_grounded_execution_graph_replan_evidence(
+        trigger_kind="EXECUTION_ERROR",
+        source_stage="EXECUTION",
+        source_query_node_id=failed_query_id,
+        code="DORIS_ERROR",
+        graph_receipt=receipt,
+        details={"failureCodes": ["DORIS_ERROR"]},
+    )
+    context.session.execution_graph_replan_evidence[
+        evidence.evidence_id
+    ] = evidence
+    carried = next(
+        item for item in proposal.nodes if item.client_key == "first"
+    )
+    failed = next(
+        item for item in proposal.nodes if item.client_key == "second"
+    )
+    replacement = failed.model_dump(by_alias=True, mode="json")
+    replacement["clientKey"] = "second_recovery"
+    return {
+        "baseGraphId": receipt.graph_id,
+        "baseVersion": receipt.version,
+        "baseFingerprint": receipt.fingerprint,
+        "triggerEvidenceSet": [
+            {
+                "evidenceId": evidence.evidence_id,
+                "evidenceFingerprint": evidence.evidence_fingerprint,
+            }
+        ],
+        "graph": {
+            "baseVersion": receipt.version,
+            "goalContractFingerprint": (
+                proposal.goal_contract_fingerprint
+            ),
+            "discoverySnapshotFingerprint": (
+                proposal.discovery_snapshot_fingerprint
+            ),
+            "nodes": [
+                carried.model_dump(by_alias=True, mode="json"),
+                replacement,
+            ],
+            "edges": [],
+        },
+    }
+
+
 def _restore_base_session(
     target,
     source,
@@ -263,6 +323,123 @@ def _restore_base_session(
     target.population_graph_receipt = (
         source.population_graph_receipt.model_copy(deep=True) if source.population_graph_receipt is not None else None
     )
+
+
+def _spawn_graph_revision_recovery(
+    workspace_path: str,
+    base_population_fingerprint: str,
+    expected_artifact_id: str,
+    result_queue: Any,
+) -> None:
+    try:
+        runtime, kernel, catalog = _runtime(
+            require_parallel_overlap=False
+        )
+        context = _context(kernel, "two independent metrics")
+        settings = Settings(harness_workspace_path=workspace_path)
+        workspace = GroundedContextWorkspace.open(
+            settings,
+            thread_id=context.thread_id,
+            run_id=context.run_id,
+            merchant_id="merchant-1",
+            access_role="merchant",
+            user_scope={},
+            question=context.session.runtime.question,
+        )
+        context.session.context_workspace = workspace
+        runtime.settings = settings
+        runtime.population_gate_enforced = True
+        runtime.population_execution_gate = (
+            _IdempotentPopulationRevisionGate(
+                base_population_fingerprint
+            )
+        )
+
+        reports = runtime._recover_pending_graph_revisions(
+            context.session,
+            runtime_budget=None,
+        )
+        for topic in context.session.runtime.workspace_topics:
+            catalog.documents[
+                "topics/%s/manifest.json" % topic
+            ] = {
+                "refId": "semantic:%s:manifest" % topic,
+                "kind": "TOPIC_MANIFEST",
+                "topic": topic,
+                "content": json.dumps(
+                    {"topic": topic},
+                    ensure_ascii=False,
+                ),
+            }
+        initial_context = json.loads(
+            runtime._initial_context(context.session)
+        )
+        receipt = context.session.execution_graph_receipt
+        population_receipt = context.session.population_graph_receipt
+        assert receipt is not None
+        assert population_receipt is not None
+        result_queue.put(
+            {
+                "ok": True,
+                "pid": os.getpid(),
+                "reports": reports,
+                "goalIds": [
+                    item.goal_id
+                    for item in (
+                        context.session.question_goal_contract.goals
+                        if context.session.question_goal_contract
+                        is not None
+                        else []
+                    )
+                ],
+                "receipt": receipt.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                "populationReceipt": population_receipt.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                "branchStatuses": {
+                    query_node_id: branch.status
+                    for query_node_id, branch in (
+                        context.session.query_branch_contexts.items()
+                    )
+                },
+                "ledgerArtifactIds": [
+                    item.artifact_id
+                    for item in (
+                        context.session.runtime.verified_query_ledger
+                    )
+                ],
+                "authorizedArtifactIds": [
+                    item.artifact_id
+                    for item in _authorized_verified_query_artifacts(
+                        context.session
+                    )
+                ],
+                "artifactGoalIds": dict(
+                    context.session.artifact_goal_ids
+                ),
+                "restoredExecutionState": initial_context[
+                    "restoredExecutionState"
+                ],
+                "pendingCount": len(
+                    GroundedGraphRevisionTransactionJournal(
+                        workspace
+                    ).discover_pending()
+                ),
+                "expectedArtifactId": expected_artifact_id,
+            }
+        )
+    except BaseException:
+        result_queue.put(
+            {
+                "ok": False,
+                "pid": os.getpid(),
+                "error": traceback.format_exc(),
+            }
+        )
 
 
 def test_snapshot_mismatch_mints_complete_trigger_set_and_one_revision_retires_all() -> None:
@@ -795,6 +972,147 @@ def test_new_runtime_rolls_forward_each_graph_revision_crash_window(
     assert restarted_context.session.execution_graph_receipt.fingerprint == recovered["receipt"]["fingerprint"]
     assert len(population_gate.revision_calls) == expected_population_calls
     assert GroundedGraphRevisionTransactionJournal(restarted_workspace).discover_pending() == ()
+
+
+def test_spawned_process_restores_unseeded_session_and_continues_local_replan(
+    tmp_path,
+) -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "two independent metrics")
+    frozen = _two_node_graph(runtime, context)
+    carried_query_id = frozen["clientNodeIds"]["first"]
+    failed_query_id = frozen["clientNodeIds"]["second"]
+    prepared = _prepare_frozen_node(
+        runtime,
+        context,
+        carried_query_id,
+    )
+    assert prepared["queries"][0]["status"] == "PREPARED"
+    executed = json.loads(
+        _tools(runtime)["execute_grounded_query_batch"].func(
+            queries=[{"queryId": carried_query_id}],
+            reason="publish one branch before the crash",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert executed["status"] == "VERIFIED"
+    artifact = context.session.runtime.verified_query_ledger[0]
+    artifact.publication_status = "PUBLISHED"
+    artifact.ledger_fingerprint = (
+        verified_query_artifact_integrity_fingerprint(artifact)
+    )
+    context.session.population_artifact_query_node_ids[
+        artifact.artifact_id
+    ] = carried_query_id
+    context.session.population_post_gate_results[
+        carried_query_id
+    ] = {
+        "accepted": True,
+        "code": "COMMITTED",
+        "stage": "POST_RESULT",
+        "queryNodeId": carried_query_id,
+    }
+    base_population = _install_population_revision_base(
+        context,
+        frozen,
+    )
+    revision = _carried_verified_branch_revision_payload(
+        context,
+        frozen,
+    )
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "workspace")
+    )
+    workspace = GroundedContextWorkspace.open(
+        settings,
+        thread_id=context.thread_id,
+        run_id=context.run_id,
+        merchant_id="merchant-1",
+        access_role="merchant",
+        user_scope={},
+        question=context.session.runtime.question,
+    )
+    context.session.context_workspace = workspace
+    runtime.settings = settings
+    runtime.population_gate_enforced = True
+    runtime.population_execution_gate = (
+        _IdempotentPopulationRevisionGate(
+            base_population.receipt_fingerprint
+        )
+    )
+
+    def crash_after_prepare(stage: str, _transaction_id: str) -> None:
+        if stage == "AFTER_PREPARE":
+            raise _RevisionCrash(stage)
+
+    runtime.graph_revision_fault_injector = crash_after_prepare
+    with pytest.raises(_RevisionCrash):
+        _tools(runtime)["revise_grounded_execution_graph"].func(
+            revision=revision,
+            runtime=SimpleNamespace(context=context),
+        )
+    pending = GroundedGraphRevisionTransactionJournal(
+        workspace
+    ).discover_pending()
+    assert len(pending) == 1
+    assert pending[0].phase == "PREPARED"
+
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    process = process_context.Process(
+        target=_spawn_graph_revision_recovery,
+        args=(
+            str(tmp_path / "workspace"),
+            base_population.receipt_fingerprint,
+            artifact.artifact_id,
+            result_queue,
+        ),
+    )
+    process.start()
+    process.join(timeout=30)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        raise AssertionError("spawned recovery process timed out")
+    result = result_queue.get(timeout=5)
+
+    assert process.exitcode == 0
+    assert result["ok"] is True, result.get("error")
+    assert result["pid"] != os.getpid()
+    assert result["reports"][0]["baseSessionRestored"] is True
+    assert result["reports"][0]["status"] == "EXECUTION_COMMITTED"
+    assert result["goalIds"] == ["metric.first", "metric.second"]
+    assert result["receipt"]["version"] == 2
+    assert result["receipt"]["carriedForwardNodeIds"] == [
+        carried_query_id
+    ]
+    replacement_query_id = result["receipt"]["nodeIds"][
+        "second_recovery"
+    ]
+    assert result["branchStatuses"] == {
+        carried_query_id: "VERIFIED",
+        replacement_query_id: "DECLARED",
+    }
+    assert failed_query_id not in result["branchStatuses"]
+    assert result["ledgerArtifactIds"] == [artifact.artifact_id]
+    assert result["authorizedArtifactIds"] == [artifact.artifact_id]
+    assert result["artifactGoalIds"][artifact.artifact_id] == [
+        "metric.first"
+    ]
+    assert (
+        result["populationReceipt"]["graphFingerprint"]
+        == result["receipt"]["fingerprint"]
+    )
+    restored = result["restoredExecutionState"]
+    assert restored["goalContract"]["question"] == (
+        context.session.runtime.question
+    )
+    assert restored["verifiedQueryArtifactIds"] == [
+        artifact.artifact_id
+    ]
+    assert restored["readyQueryIds"] == [replacement_query_id]
+    assert restored["nextAction"] == "PREPARE_READY_GRAPH_NODES"
+    assert result["pendingCount"] == 0
 
 
 def test_same_runtime_finishes_journal_after_execution_switch_without_repeating_population_or_graph_revision(

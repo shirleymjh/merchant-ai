@@ -1768,6 +1768,134 @@ class KnowledgeSuggestionGovernanceService:
         }
         return result
 
+    def review_and_activate_suggestion(
+        self,
+        merchant_id: str,
+        suggestion_id: str,
+        request: KnowledgeSuggestionReviewRequest,
+    ) -> Dict[str, Any]:
+        """Approve and atomically publish a shared Knowledge proposal.
+
+        The review record is retained when activation fails so operators can
+        retry, but the call itself fails closed: an approval response is never
+        reported as effective until filesystem publication, recall-index
+        commit, and activation readback all succeed.
+        """
+
+        memory = self.memory_store.load(merchant_id)
+        existing = find_knowledge_suggestion(memory, suggestion_id)
+        if not existing:
+            return {
+                "success": False,
+                "status": "NOT_FOUND",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+            }
+        scope_failure = shared_knowledge_scope_failure(
+            merchant_id,
+            suggestion_id,
+            existing,
+            "review_and_activate",
+        )
+        if scope_failure:
+            return scope_failure
+        current_status = knowledge_suggestion_status(existing)
+        requested_action = str(getattr(request, "action", "") or "review").strip().lower()
+        activate_immediately = bool(getattr(request, "activate_immediately", True))
+        approving = bool(getattr(request, "approved", False)) and requested_action in {
+            "approve",
+            "review",
+        }
+        if approving and current_status in {"published", "indexed"}:
+            return {
+                "success": True,
+                "status": "ACTIVATED",
+                "merchantId": merchant_id,
+                "suggestionId": suggestion_id,
+                "reviewStatus": "approved",
+                "activationStatus": current_status.upper(),
+                "idempotent": True,
+                "suggestion": existing,
+            }
+
+        requested_topic = str(getattr(request, "topic", "") or "").strip()
+        requested_table = str(getattr(request, "table_name", "") or "").strip()
+        if approving and (requested_topic or requested_table):
+            existing["topic"] = requested_topic or str(existing.get("topic") or "")
+            existing["sourceTable"] = requested_table or str(existing.get("sourceTable") or "")
+            existing["updatedAt"] = datetime.now().isoformat()
+            memory["knowledgeSuggestions"] = replace_knowledge_suggestion(
+                memory.get("knowledgeSuggestions") or [],
+                existing,
+            )
+            saved = self.memory_store.save(merchant_id, memory)
+            existing = find_knowledge_suggestion(saved, suggestion_id)
+
+        effective_request = request
+        if approving and activate_immediately and requested_action != "approve":
+            effective_request = request.model_copy(update={"action": "approve"})
+        reviewed = self.review_suggestion(merchant_id, suggestion_id, effective_request)
+        if not reviewed.get("success") or reviewed.get("status") != "approved":
+            return reviewed
+        if not activate_immediately:
+            return reviewed
+
+        reviewed_suggestion = reviewed.get("suggestion") if isinstance(reviewed.get("suggestion"), dict) else {}
+        activation = self.publish_suggestion(
+            merchant_id,
+            suggestion_id,
+            reviewer=str(getattr(request, "reviewer", "") or ""),
+            review_note=str(getattr(request, "review_note", "") or ""),
+            topic=str(getattr(request, "topic", "") or reviewed_suggestion.get("topic") or ""),
+            table_name=str(
+                getattr(request, "table_name", "")
+                or reviewed_suggestion.get("sourceTable")
+                or ""
+            ),
+        )
+        if not activation.get("success"):
+            return {
+                **activation,
+                "success": False,
+                "reviewStatus": "approved",
+                "activationStatus": str(activation.get("status") or "ACTIVATION_FAILED"),
+                "review": reviewed,
+            }
+
+        indexed: Dict[str, Any] = {}
+        if bool(getattr(request, "auto_index", True)):
+            indexed = self.mark_suggestion_indexed(
+                merchant_id,
+                suggestion_id,
+                str(((activation.get("suggestion") or {}).get("publishedRefId") or "")),
+            )
+            if not indexed.get("success"):
+                return {
+                    **activation,
+                    "success": False,
+                    "status": "ACTIVATION_STATUS_COMMIT_FAILED",
+                    "reviewStatus": "approved",
+                    "activationStatus": "PUBLISHED",
+                    "review": reviewed,
+                    "indexed": indexed,
+                }
+
+        effective_suggestion = (
+            indexed.get("suggestion")
+            if isinstance(indexed.get("suggestion"), dict)
+            else activation.get("suggestion")
+        )
+        return {
+            **activation,
+            "success": True,
+            "status": "ACTIVATED",
+            "reviewStatus": "approved",
+            "activationStatus": "INDEXED" if indexed else "PUBLISHED",
+            "review": reviewed,
+            "indexed": indexed,
+            "suggestion": effective_suggestion,
+        }
+
     def apply_merchant_action(
         self,
         merchant_id: str,
@@ -4591,6 +4719,10 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
         created_at=datetime.now().isoformat(),
     )
     payload = event.model_dump(by_alias=True)
+    if memory_type in {"correction", "metric_dispute"}:
+        publish_target = knowledge_publish_target_from_state(state)
+        if publish_target:
+            payload["knowledgePublishTarget"] = publish_target
     if evidence_checked:
         payload["answerEvidenceChecked"] = True
         payload["answerVerified"] = answer_verified
@@ -4787,6 +4919,7 @@ def knowledge_suggestion_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
     metric_name = metrics[0]
     source_memory_id = str(event.get("eventId") or "")
     proposed_scope = "platform" if memory_type == "metric_dispute" else "merchant"
+    publish_target = event.get("knowledgePublishTarget") if isinstance(event.get("knowledgePublishTarget"), dict) else {}
     suggestion = KnowledgeSuggestion(
         suggestion_id="ks_%s_%s" % (stable_slug(metric_name), stable_slug(source_memory_id or str(event.get("question") or ""))[:20]),
         suggestion_type="metric",
@@ -4794,8 +4927,9 @@ def knowledge_suggestion_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
         source=str(event.get("source") or "memory"),
         source_memory_id=source_memory_id,
         source_refs=unique_strings(event.get("evidenceRefs") or []),
-        topic=(unique_strings(event.get("topics") or []) or [""])[0],
+        topic=str(publish_target.get("topic") or (unique_strings(event.get("topics") or []) or [""])[0]),
         metric_name=metric_name,
+        source_table=str(publish_target.get("tableName") or ""),
         aliases=unique_strings([metric_name, *extract_metric_like_terms(str(event.get("question") or ""))])[:12],
         dependency_fields=unique_strings(event.get("metrics") or [])[:12],
         scope_type=proposed_scope,
@@ -5082,7 +5216,10 @@ def curator_candidate_to_suggestion(
     metric_name = str(raw.get("metricName") or "").strip()
     if not metric_name and kind == "metric_definition" and event_metrics:
         metric_name = event_metrics[0]
-    topic = str(raw.get("topic") or "").strip() or ((unique_strings(event.get("topics") or []) or [""])[0])
+    publish_target = event.get("knowledgePublishTarget") if isinstance(event.get("knowledgePublishTarget"), dict) else {}
+    topic = str(publish_target.get("topic") or raw.get("topic") or "").strip() or (
+        (unique_strings(event.get("topics") or []) or [""])[0]
+    )
     title = str(raw.get("title") or "").strip()[:160] or metric_name or "业务知识"
     fingerprint = hashlib.sha256(
         ("%s|%s|%s|%s" % (scope_type, kind, topic, content)).encode("utf-8")
@@ -5105,6 +5242,7 @@ def curator_candidate_to_suggestion(
         source_refs=unique_strings(event.get("evidenceRefs") or []),
         topic=topic,
         metric_name=metric_name,
+        source_table=str(publish_target.get("tableName") or ""),
         aliases=unique_strings(raw.get("aliases") or [])[:12],
         dependency_fields=event_metrics[:12],
         scope_type=scope_type,
@@ -5396,6 +5534,35 @@ def state_semantic_refs(state: AgentState) -> List[str]:
             if ref:
                 refs.append(ref)
     return unique_strings(refs)
+
+
+def knowledge_publish_target_from_state(
+    state: AgentState,
+) -> Dict[str, str]:
+    """Resolve the governed semantic target already bound to this answer.
+
+    Knowledge approval must never guess a table.  A target is emitted only
+    from an existing intent-bound semantic reference.
+    """
+
+    plan = state.get("plan")
+    intents = list(getattr(plan, "intents", []) or []) if plan is not None else []
+    semantic_refs: List[str] = []
+    for intent in intents:
+        resolution = getattr(intent, "metric_resolution", {}) or {}
+        semantic_refs.extend(
+            unique_strings(
+                [
+                    resolution.get("semanticRefId"),
+                    resolution.get("semantic_ref_id"),
+                ]
+            )
+        )
+    for ref_id in unique_strings(semantic_refs):
+        parts = [part for part in str(ref_id or "").split(":") if part]
+        if len(parts) >= 4 and parts[0] == "semantic" and parts[1] and parts[2]:
+            return {"topic": parts[1], "tableName": parts[2], "semanticRefId": ref_id}
+    return {}
 
 
 def state_recall_refs(state: AgentState) -> List[str]:
@@ -6548,9 +6715,16 @@ def resolve_memory_conflicts(memory: Dict[str, Any], event: Dict[str, Any]) -> O
 def reduce_related_memory(memory: Dict[str, Any], event: Dict[str, Any], reason: str) -> None:
     topics = set(unique_strings(event.get("topics") or []))
     metrics = set(unique_strings(event.get("metrics") or []))
+    event_scope_key = memory_principal_scope_key(event)
     for group in ["events", "preferences", "facts"]:
         for item in memory.get(group) or []:
             if item.get("eventId") == event.get("eventId"):
+                continue
+            # Personal feedback may only mutate memory owned by the exact same
+            # principal scope.  A merchant-level storage file can contain
+            # records for multiple users/stores, so topic overlap alone is not
+            # sufficient authority to lower another principal's confidence.
+            if memory_principal_scope_key(item) != event_scope_key:
                 continue
             overlaps = bool((topics & set(unique_strings(item.get("topics") or []))) or (metrics & set(unique_strings(item.get("metrics") or []))))
             if overlaps:
@@ -6635,11 +6809,12 @@ def rank_memory_events(events: List[Dict[str, Any]], question: str) -> List[Dict
 
 
 def event_fingerprint(event: Dict[str, Any]) -> str:
-    return "%s|%s|%s|%s" % (
+    return "%s|%s|%s|%s|%s" % (
         event.get("question", "")[:120],
         ",".join(event.get("metrics") or []),
         ",".join(str(item) for item in event.get("timeWindows") or []),
         event.get("memoryType", ""),
+        memory_principal_scope_key(event),
     )
 
 

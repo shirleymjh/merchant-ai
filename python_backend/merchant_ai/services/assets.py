@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
+import uuid
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -483,6 +485,15 @@ class TopicAssetService:
     @property
     def root(self) -> Path:
         return self.settings.resolved_topic_path
+
+    def clear_cache(self) -> None:
+        self._table_asset_cache.clear()
+        self._manifest_cache.clear()
+        self._navigation_manifest_cache.clear()
+        self._relationship_cache.clear()
+        self._topic_names_cache = None
+        self._topic_contract_cache.clear()
+        self._semantic_source_hash_cache.clear()
 
     def list_topic(self, topic: str) -> Dict[str, Any]:
         topic_dir = self.root / topic
@@ -6083,6 +6094,44 @@ def normalize_physical_table_metadata(payload: Any) -> Dict[str, Any]:
     return {}
 
 
+def _physical_metadata_identity(payload: Any) -> Dict[str, Any]:
+    """Return stable physical layout state without observation timestamps."""
+
+    if not isinstance(payload, dict):
+        return {}
+    normalized = json.loads(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    )
+    normalized.pop("capturedAt", None)
+    return normalized
+
+
+def _physical_metadata_fingerprint(payload: Any) -> str:
+    identity = _physical_metadata_identity(payload)
+    serialized = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _metadata_row_value(row: Dict[str, Any], *candidate_keys: str) -> Any:
     normalized = {
         "".join(character.casefold() for character in str(key) if character.isalnum()): value
@@ -6997,6 +7046,165 @@ class TopicBuilderWorkflow:
         built = self.build(request)
         return {**built, "schemaDiff": diff}
 
+    def refresh_physical_metadata(self, topic: str, table: str) -> Dict[str, Any]:
+        """Synchronize objective Doris layout facts into a published asset.
+
+        Business semantics remain review-governed.  Physical layout facts are
+        sourced only from live Doris metadata and may be refreshed directly;
+        an unavailable datasource never erases the last known-good snapshot.
+        """
+
+        scoped_topic = str(topic or "").strip()
+        scoped_table = str(table or "").strip()
+        if not scoped_topic or not scoped_table:
+            return {
+                "success": False,
+                "status": "INVALID_REQUEST",
+                "code": (
+                    "TOPIC_UNDECLARED"
+                    if not scoped_topic
+                    else "TABLE_UNDECLARED"
+                ),
+                "message": (
+                    "topic is required"
+                    if not scoped_topic
+                    else "tableName is required"
+                ),
+            }
+
+        published_dir = self.topic_assets.table_asset_dir(
+            scoped_topic,
+            scoped_table,
+        )
+        asset_path = published_dir / "asset.json"
+        if not asset_path.exists():
+            return {
+                "success": False,
+                "status": "NOT_FOUND",
+                "code": "PUBLISHED_ASSET_NOT_FOUND",
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+            }
+
+        physical_metadata = self._load_physical_metadata(scoped_table)
+        if not physical_metadata:
+            return {
+                "success": False,
+                "status": "UNAVAILABLE",
+                "code": "PHYSICAL_METADATA_UNAVAILABLE",
+                "message": (
+                    "live Doris physical metadata could not be captured; "
+                    "the published asset was left unchanged"
+                ),
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+            }
+
+        original_bytes = asset_path.read_bytes()
+        published = read_json(asset_path)
+        if not isinstance(published, dict):
+            return {
+                "success": False,
+                "status": "INVALID",
+                "code": "PUBLISHED_ASSET_INVALID",
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+            }
+        if str(published.get("status") or "").upper() != "PUBLISHED":
+            return {
+                "success": False,
+                "status": "INVALID",
+                "code": "PHYSICAL_METADATA_REQUIRES_PUBLISHED_ASSET",
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+            }
+
+        previous_metadata = dict(published.get("physicalMetadata") or {})
+        previous_identity = _physical_metadata_identity(previous_metadata)
+        current_identity = _physical_metadata_identity(physical_metadata)
+        previous_fingerprint = _physical_metadata_fingerprint(previous_identity)
+        current_fingerprint = _physical_metadata_fingerprint(current_identity)
+        if previous_identity == current_identity:
+            return {
+                "success": True,
+                "status": "UNCHANGED",
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+                "physicalMetadata": previous_metadata,
+                "physicalMetadataFingerprint": current_fingerprint,
+                "checkedAt": str(physical_metadata.get("capturedAt") or ""),
+            }
+
+        candidate = json.loads(
+            json.dumps(published, ensure_ascii=False, default=str)
+        )
+        candidate["physicalMetadata"] = physical_metadata
+        changed_fields = sorted(
+            key
+            for key in set(previous_identity) | set(current_identity)
+            if previous_identity.get(key) != current_identity.get(key)
+        )
+        candidate["physicalMetadataGovernance"] = {
+            "source": "live_doris_metadata",
+            "syncMode": "automatic_objective_fact",
+            "syncedAt": str(physical_metadata.get("capturedAt") or ""),
+            "previousFingerprint": previous_fingerprint,
+            "fingerprint": current_fingerprint,
+            "changedFields": changed_fields,
+        }
+        existing_lineage = candidate.get("semanticLineage")
+        if isinstance(existing_lineage, dict):
+            lineage = json.loads(
+                json.dumps(existing_lineage, ensure_ascii=False, default=str)
+            )
+            lineage["physicalMetadata"] = semantic_asset_lineage(
+                scoped_topic,
+                scoped_table,
+                {**candidate, "physicalMetadata": physical_metadata},
+                [],
+                [],
+            )["physicalMetadata"]
+            candidate["semanticLineage"] = lineage
+
+        if asset_path.read_bytes() != original_bytes:
+            return {
+                "success": False,
+                "status": "CONFLICT",
+                "code": "PUBLISHED_ASSET_CHANGED_DURING_SYNC",
+                "message": "retry after the concurrent semantic publish completes",
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+            }
+        _atomic_write_json_file(asset_path, candidate)
+
+        history_path = published_dir / "physical_metadata_history.json"
+        history = read_json(history_path)
+        records = list(history if isinstance(history, list) else [])
+        records.append(
+            {
+                "topic": scoped_topic,
+                "tableName": scoped_table,
+                "syncedAt": str(physical_metadata.get("capturedAt") or ""),
+                "previousFingerprint": previous_fingerprint,
+                "fingerprint": current_fingerprint,
+                "changedFields": changed_fields,
+                "physicalMetadata": physical_metadata,
+            }
+        )
+        _atomic_write_json_file(history_path, records[-100:])
+        self.topic_assets.clear_cache()
+        return {
+            "success": True,
+            "status": "SYNCED",
+            "topic": scoped_topic,
+            "tableName": scoped_table,
+            "physicalMetadata": physical_metadata,
+            "physicalMetadataFingerprint": current_fingerprint,
+            "changedFields": changed_fields,
+            "historyPath": str(history_path),
+            "cacheInvalidated": True,
+        }
+
     def build_batch(self, requests: List[TopicBuildRequest]) -> Dict[str, Any]:
         results = []
         success_count = 0
@@ -7091,6 +7299,16 @@ class TopicBuilderWorkflow:
                 raw_ddl.encode("utf-8")
             ).hexdigest()
         if metadata:
+            for field in (
+                "primaryKeyColumns",
+                "partitionColumns",
+                "bucketColumns",
+                "invertedIndexes",
+                "invertedIndexColumns",
+            ):
+                metadata.setdefault(field, [])
+            metadata.setdefault("partitionCount", 0)
+            metadata.setdefault("bucketCount", 0)
             metadata["capturedAt"] = datetime.utcnow().isoformat() + "Z"
         return metadata
 
