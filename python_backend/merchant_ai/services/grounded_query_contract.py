@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from pydantic import Field, computed_field
 
@@ -2425,12 +2424,14 @@ def compile_grounded_query(
         if grounded.query_shape == "RANKED"
         else []
     )
-    for field in ranked_selected_fields:
-        if field.table != execution_table:
+    for selected_field in ranked_selected_fields:
+        if selected_field.table != execution_table:
             raise ValueError(
                 "grounded deterministic ranking labels must belong to the execution table"
             )
-        output_alias = str(field.output_alias or field.column or "").strip()
+        output_alias = str(
+            selected_field.output_alias or selected_field.column or ""
+        ).strip()
         if not output_alias or len(output_alias) > 128 or any(
             ord(character) < 32 for character in output_alias
         ):
@@ -2454,14 +2455,18 @@ def compile_grounded_query(
             or group_dimension.business_name
             or group_by
         )
-    for field in ranked_selected_fields:
-        output_alias = str(field.output_alias or field.column or "").strip()
+    for selected_field in ranked_selected_fields:
+        output_alias = str(
+            selected_field.output_alias or selected_field.column or ""
+        ).strip()
         if output_alias:
             source_column_labels[output_alias] = output_alias
-        if field.column:
+        if selected_field.column:
             source_column_labels.setdefault(
-                field.column,
-                output_alias or field.business_name or field.column,
+                selected_field.column,
+                output_alias
+                or selected_field.business_name
+                or selected_field.column,
             )
 
     def metric_resolution(metric: GroundedMetricBinding) -> dict[str, Any]:
@@ -2854,7 +2859,19 @@ def _grounded_entity_filter_obligations(
 
 
 def _safe_task_token(value: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "")).strip("_")
+    characters: list[str] = []
+    for character in str(value or ""):
+        permitted = (
+            "A" <= character <= "Z"
+            or "a" <= character <= "z"
+            or "0" <= character <= "9"
+            or character == "_"
+        )
+        if permitted:
+            characters.append(character)
+        elif not characters or characters[-1] != "_":
+            characters.append("_")
+    token = "".join(characters).strip("_")
     return token[:64] or "metric"
 
 
@@ -3352,18 +3369,18 @@ def requested_semantic_label(
 ) -> str:
     """Prefer the governed alias explicitly used by the user."""
 
-    normalized_question = re.sub(r"\s+", "", str(question or "")).casefold()
+    normalized_question = _without_whitespace(question).casefold()
     candidates = _dedupe([*aliases, fallback])
     matched = [
         candidate
         for candidate in candidates
         if candidate
-        and re.sub(r"\s+", "", candidate).casefold() in normalized_question
+        and _without_whitespace(candidate).casefold() in normalized_question
     ]
     if matched:
         return max(
             matched,
-            key=lambda item: len(re.sub(r"\s+", "", item)),
+            key=lambda item: len(_without_whitespace(item)),
         )
     return str(fallback or "").strip()
 
@@ -4055,7 +4072,7 @@ def _contract_preserves_native_time_grain(
 
 
 def _formula_top_level_aggregation(formula: str) -> str:
-    compact = re.sub(r"\s+", "", str(formula or "")).upper()
+    compact = _without_whitespace(formula).upper()
     if compact.startswith("COUNT(DISTINCT"):
         return "COUNT_DISTINCT"
     for operation in ("SUM", "AVG", "COUNT", "MIN", "MAX", "MAX_BY", "MIN_BY", "NDV"):
@@ -4277,14 +4294,19 @@ def grounded_detail_relationship_candidates(
 def _metric_phrase_in_question(question: str, aliases: Sequence[str]) -> str:
     """Preserve the user's wording after semantic binding has already succeeded."""
 
-    normalized_question = re.sub(r"[\s_\-—·]+", "", str(question or "")).lower()
+    normalized_question = _without_metric_phrase_separators(question).lower()
     matches = [
         str(alias).strip()
         for alias in aliases
         if str(alias or "").strip()
-        and re.sub(r"[\s_\-—·]+", "", str(alias)).lower() in normalized_question
+        and _without_metric_phrase_separators(alias).lower()
+        in normalized_question
     ]
-    return max(matches, key=lambda item: len(re.sub(r"\s+", "", item)), default="")
+    return max(
+        matches,
+        key=lambda item: len(_without_whitespace(item)),
+        default="",
+    )
 
 
 def _without_time_phrase(value: str) -> str:
@@ -4292,7 +4314,41 @@ def _without_time_phrase(value: str) -> str:
     spans = extract_temporal_lexical_spans(text)
     for span in reversed(spans):
         text = text[: span.start] + text[span.end :]
-    return re.sub(r"^[\s，,、的]+|[\s，,、的]+$", "", text).strip()
+    return _strip_edge_characters(text, frozenset({"，", ",", "、", "的"}))
+
+
+def _without_whitespace(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value or "")
+        if not character.isspace()
+    )
+
+
+def _without_metric_phrase_separators(value: Any) -> str:
+    separators = frozenset({"_", "-", "—", "·"})
+    return "".join(
+        character
+        for character in str(value or "")
+        if not character.isspace() and character not in separators
+    )
+
+
+def _strip_edge_characters(
+    value: str,
+    characters: frozenset[str],
+) -> str:
+    start = 0
+    end = len(value)
+    while start < end and (
+        value[start].isspace() or value[start] in characters
+    ):
+        start += 1
+    while end > start and (
+        value[end - 1].isspace() or value[end - 1] in characters
+    ):
+        end -= 1
+    return value[start:end]
 
 
 def _dedupe(values: Iterable[str]) -> list[str]:

@@ -8,10 +8,10 @@ import stat
 import time
 import uuid
 import fcntl
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 import sqlglot
 from sqlglot import exp
@@ -47,6 +47,7 @@ from merchant_ai.services.grounded_context_workspace import (
     _atomic_write_at,
     _open_directory_beneath,
     _read_regular_file_at,
+    grounded_context_owner_fingerprint,
     validated_grounded_query_artifact_roots,
 )
 from merchant_ai.services.assets import (
@@ -66,12 +67,34 @@ from merchant_ai.services.grounded_query_contract import (
     grounded_detail_relationship_candidates,
 )
 from merchant_ai.services.grounded_runtime_budget import GroundedRuntimeBudget
+from merchant_ai.services.grounded_execution_identity import (
+    GroundedNodeExecutionIdentitySeal,
+    GroundedRunExecutionIdentitySeal,
+    build_grounded_node_execution_identity,
+    build_grounded_run_execution_identity,
+    grounded_data_snapshot_identity,
+    require_grounded_execution_identity_live,
+)
+from merchant_ai.services.grounded_result_streaming import (
+    GroundedResultArtifactReceipt,
+    GroundedResultStreamLimits,
+    GroundedResultStreamMaterializer,
+    GroundedResultStreamingError,
+    grounded_canonical_json_sha256,
+)
+from merchant_ai.services.grounded_population_runtime_gate import (
+    GroundedPopulationExecutionGate,
+    GroundedPopulationRuntimeGateError,
+    PopulationExecutorNodeEvidence,
+    PopulationPreExecutionReference,
+)
 from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
+from merchant_ai.services.tool_runtime import ExecutionIdentity
 from merchant_ai.services.time_semantics import (
     CALENDAR_ANCHOR_POLICY,
     LATEST_PARTITION_ANCHOR_POLICY,
@@ -92,6 +115,34 @@ class GroundedSqlCompilation:
     access_contracts: tuple[NodePlanContract, ...] = ()
 
 
+@dataclass
+class _GroundedStreamingRowState:
+    """Bounded pre-mask state retained while the full result streams."""
+
+    preview_limit: int
+    raw_preview_rows: list[dict[str, Any]] = dataclass_field(
+        default_factory=list
+    )
+    row_count: int = 0
+    filter_column_missing: bool = False
+    observed_filter_values: set[str] = dataclass_field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _GroundedExecutionIdentityContext:
+    execution_identity: ExecutionIdentity
+    run_identity: GroundedRunExecutionIdentitySeal
+    node_identity: GroundedNodeExecutionIdentitySeal
+    user_scope: dict[str, Any]
+    reference_scope: Any
+    graph_fingerprint: str
+    query_node_id: str
+    goal_contract_fingerprint: str
+    query_contract_fingerprint: str
+    sql_ast_fingerprint: str
+    access_contracts: tuple[NodePlanContract, ...]
+
+
 class GroundedQueryExecutionKernel:
     """Data Engine for the two explicitly governed grounded execution lanes.
 
@@ -109,10 +160,14 @@ class GroundedQueryExecutionKernel:
         settings: Settings,
         *,
         access_control: AccessControlService | None = None,
+        population_execution_gate: (
+            GroundedPopulationExecutionGate | None
+        ) = None,
     ) -> None:
         self.doris_repository = doris_repository
         self.settings = settings
         self.access_control = access_control or AccessControlService(settings)
+        self.population_execution_gate = population_execution_gate
 
     def capture_data_snapshot(
         self,
@@ -141,11 +196,19 @@ class GroundedQueryExecutionKernel:
         context_owner_fingerprint: str = "",
         access_role: str = "merchant_analyst",
         user_scope: dict[str, Any] | None = None,
+        execution_reference_scope: Any = None,
+        execution_goal_contract_fingerprint: str = "",
+        expected_semantic_activation_fingerprint: str = "",
+        population_pre_execution_reference: (
+            PopulationPreExecutionReference | None
+        ) = None,
+        population_query_node_id: str = "",
         execution_preparation: Any = None,
         runtime_budget: GroundedRuntimeBudget | None = None,
         data_snapshot_contract: DataSnapshotContract | None = None,
         execution_generation: int = 0,
         execution_attempt_id: str = "",
+        cancel_events: Iterable[Any] | None = None,
     ) -> AgentRunResult:
         if execution_preparation is None or not bool(
             getattr(execution_preparation, "executable", False)
@@ -157,6 +220,14 @@ class GroundedQueryExecutionKernel:
             raise RuntimeError("grounded direct execution requires exactly one compiled node")
 
         intent = plan.intents[0]
+        stream_query = getattr(
+            self.doris_repository,
+            "stream_query_batches",
+            None,
+        )
+        streaming_artifact_mode = bool(
+            artifact_root and callable(stream_query)
+        )
         candidate_validation = getattr(
             execution_preparation,
             "candidate_validation",
@@ -181,6 +252,7 @@ class GroundedQueryExecutionKernel:
                 asset_pack,
                 access_role=access_role,
                 user_scope=user_scope or {},
+                complete_result_artifact=streaming_artifact_mode,
             )
             validation = self.validate_sql(compilation.sql, asset_pack)
         if not validation.valid:
@@ -225,6 +297,73 @@ class GroundedQueryExecutionKernel:
                 denied.message,
             )
 
+        governed_detail = bool(
+            contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+            and str(execution_goal_contract_fingerprint or "").strip()
+        )
+        if governed_detail and not artifact_root:
+            unavailable = SqlValidationResult(
+                valid=False,
+                error_code="QUERY_RESULT_COMPLETE_ARTIFACT_REQUIRED",
+                message=(
+                    "governed detail execution requires a complete result "
+                    "artifact root"
+                ),
+                base_tables=list(compilation.tables),
+            )
+            return self._failed_result(
+                plan,
+                compilation,
+                unavailable,
+                unavailable.error_code,
+                unavailable.message,
+            )
+        if (
+            artifact_root
+            and contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+            and not streaming_artifact_mode
+        ):
+            unavailable = SqlValidationResult(
+                valid=False,
+                error_code="QUERY_RESULT_STREAMING_REQUIRED",
+                message=(
+                    "complete detail publication requires a streaming Doris "
+                    "repository"
+                ),
+                base_tables=list(compilation.tables),
+            )
+            return self._failed_result(
+                plan,
+                compilation,
+                unavailable,
+                unavailable.error_code,
+                unavailable.message,
+            )
+
+        validated_artifact_roots: tuple[Path, Path] | None = None
+        if artifact_root:
+            try:
+                validated_artifact_roots = (
+                    validated_grounded_query_artifact_roots(
+                        self.settings.resolved_workspace_path,
+                        artifact_root,
+                    )
+                )
+            except (GroundedContextWorkspaceError, OSError) as exc:
+                invalid_root = SqlValidationResult(
+                    valid=False,
+                    error_code="QUERY_RESULT_ARTIFACT_ROOT_INVALID",
+                    message=str(exc)[:500],
+                    base_tables=list(compilation.tables),
+                )
+                return self._failed_result(
+                    plan,
+                    compilation,
+                    invalid_root,
+                    invalid_root.error_code,
+                    invalid_root.message,
+                )
+
         query_timeout_seconds = max(
             1,
             int(getattr(self.settings, "doris_read_timeout_seconds", 30) or 30),
@@ -246,104 +385,315 @@ class GroundedQueryExecutionKernel:
                 ),
             )
 
-        active_data_snapshot = data_snapshot_contract
-        capture_snapshot = getattr(
-            self.doris_repository,
-            "capture_data_snapshot",
-            None,
-        )
-        if active_data_snapshot is None and callable(capture_snapshot):
-            active_data_snapshot = capture_snapshot(
-                str(
-                    getattr(
-                        execution_preparation,
-                        "asset_pack_fingerprint",
-                        "",
-                    )
-                    or ""
-                )
+        normalized_user_scope = dict(user_scope or {})
+        normalized_activation_fingerprint = str(
+            expected_semantic_activation_fingerprint or ""
+        ).strip()
+        try:
+            active_data_snapshot = self._prepare_data_snapshot(
+                data_snapshot_contract,
+                expected_semantic_activation_fingerprint=(
+                    normalized_activation_fingerprint
+                ),
+                governed=bool(
+                    artifact_root
+                    and str(execution_goal_contract_fingerprint or "").strip()
+                ),
             )
-        if active_data_snapshot is None:
-            active_data_snapshot = DataSnapshotContract(
-                unsupported_reason="DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+            execution_identity_context = (
+                self._prepare_execution_identity_context(
+                    merchant_id=merchant_id,
+                    access_role=access_role,
+                    user_scope=normalized_user_scope,
+                    reference_scope=execution_reference_scope,
+                    context_owner_fingerprint=context_owner_fingerprint,
+                    goal_contract_fingerprint=(
+                        execution_goal_contract_fingerprint
+                    ),
+                    plan=plan,
+                    compilation=compilation,
+                    contract=contract,
+                    candidate_validation=candidate_validation,
+                    data_snapshot=active_data_snapshot,
+                    execution_generation=execution_generation,
+                    execution_attempt_id=execution_attempt_id,
+                    execution_query_node_id=population_query_node_id,
+                    expected_semantic_activation_fingerprint=(
+                        normalized_activation_fingerprint
+                    ),
+                )
+                if artifact_root
+                and str(execution_goal_contract_fingerprint or "").strip()
+                else None
+            )
+            if execution_identity_context is not None:
+                self._require_execution_identity_live(
+                    "PRE_EXECUTION",
+                    execution_identity_context,
+                    context_owner_fingerprint=context_owner_fingerprint,
+                    merchant_id=merchant_id,
+                    access_role=access_role,
+                    user_scope=normalized_user_scope,
+                    reference_scope=execution_reference_scope,
+                    data_snapshot=active_data_snapshot,
+                    execution_generation=execution_generation,
+                    execution_attempt_id=execution_attempt_id,
+                    goal_contract_fingerprint=(
+                        execution_goal_contract_fingerprint
+                    ),
+                    query_contract_fingerprint=(
+                        grounded_query_contract_fingerprint(contract)
+                    ),
+                    sql_ast_fingerprint=(
+                        execution_identity_context.sql_ast_fingerprint
+                    ),
+                )
+            self._authorize_population_pre_execution(
+                population_pre_execution_reference,
+                contract=contract,
+                compilation=compilation,
+                plan=plan,
+                data_snapshot=active_data_snapshot,
+                actual_sql_ast_fingerprint=(
+                    execution_identity_context.sql_ast_fingerprint
+                    if execution_identity_context is not None
+                    else self._sql_evidence_fingerprint(
+                        grounded_query_contract_fingerprint(contract),
+                        compilation.sql,
+                        candidate_validation,
+                    )
+                ),
+                context_owner_fingerprint=context_owner_fingerprint,
+                goal_contract_fingerprint=(
+                    execution_goal_contract_fingerprint
+                ),
+                execution_generation=execution_generation,
+                execution_attempt_id=execution_attempt_id,
+                population_query_node_id=population_query_node_id,
+            )
+        except Exception as exc:
+            error_code = (
+                "POPULATION_PRE_EXECUTION_REJECTED"
+                if isinstance(exc, GroundedPopulationRuntimeGateError)
+                else "QUERY_EXECUTION_IDENTITY_FAILED"
+            )
+            identity_failure = SqlValidationResult(
+                valid=False,
+                error_code=error_code,
+                message=str(exc)[:500],
+                base_tables=list(compilation.tables),
+            )
+            return self._failed_result(
+                plan,
+                compilation,
+                identity_failure,
+                identity_failure.error_code,
+                identity_failure.message,
+                data_snapshot=(
+                    data_snapshot_contract
+                    if data_snapshot_contract is not None
+                    else DataSnapshotContract()
+                ),
             )
 
+        masked_columns = {
+            key: value
+            for decision in decisions
+            for key, value in (decision.masked_columns or {}).items()
+        }
+        if isinstance(candidate_validation, GroundedSqlValidationResult):
+            masked_columns = self._candidate_output_masks(
+                {
+                    "%s.%s" % (access_contract.preferred_table, key): value
+                    for access_contract, decision in zip(
+                        access_contracts,
+                        decisions,
+                    )
+                    for key, value in (decision.masked_columns or {}).items()
+                },
+                candidate_validation,
+            )
+        masked_contract = compilation.node_contract.model_copy(
+            update={"masked_columns": masked_columns}
+        )
+        streamed_rows_receipt: GroundedResultArtifactReceipt | None = None
+        fetched_row_count = 0
+        artifact_exact_row_count = 0
         started = time.perf_counter()
         try:
-            query_kwargs: dict[str, Any] = {
-                "timeout_seconds": query_timeout_seconds,
-            }
-            query_signature = inspect.signature(self.doris_repository.query)
-            if "data_snapshot_contract" in query_signature.parameters:
-                query_kwargs["data_snapshot_contract"] = active_data_snapshot
-            raw_rows = [
-                dict(row)
-                for row in self.doris_repository.query(
-                    compilation.sql,
-                    **query_kwargs,
+            if streaming_artifact_mode:
+                if validated_artifact_roots is None:
+                    raise RuntimeError(
+                        "QUERY_RESULT_ARTIFACT_ROOT_VALIDATION_REQUIRED"
+                    )
+                _, staging_root = validated_artifact_roots
+                limits = self._result_stream_limits()
+                stream_state = _GroundedStreamingRowState(
+                    preview_limit=limits.preview_rows
                 )
-            ]
-            (
-                result_raw_rows,
-                result_coverage,
-                result_is_truncated,
-                exact_result_row_count,
-            ) = self._classify_result_rows(
-                contract,
-                intent,
-                compilation.sql,
-                raw_rows,
-                core_sql_candidate=isinstance(
-                    candidate_validation,
-                    GroundedSqlValidationResult,
-                ),
-            )
-            entity_filter_verification = (
-                self._candidate_entity_filter_verification(
-                    compilation.node_contract,
+                source_batches = self._repository_stream_batches(
                     compilation.sql,
+                    batch_size=limits.fetch_batch_rows,
+                    cancel_events=cancel_events,
+                    timeout_seconds=query_timeout_seconds,
+                    data_snapshot_contract=active_data_snapshot,
                 )
-                if isinstance(candidate_validation, GroundedSqlValidationResult)
-                else self._entity_filter_verification(
-                    compilation.node_contract,
+                transformed_batches = self._masked_stream_batches(
+                    source_batches,
+                    state=stream_state,
+                    node_contract=compilation.node_contract,
+                    masked_contract=masked_contract,
+                    time_window_role=str(
+                        intent.time_range.window_role or "primary"
+                    ),
+                )
+                streamed_rows_receipt = GroundedResultStreamMaterializer(
+                    staging_root
+                ).materialize_batches(
+                    transformed_batches,
+                    artifact_id="stream_query_%s" % uuid.uuid4().hex,
+                    limits=limits,
+                    cancel_events=cancel_events,
+                )
+                fetched_row_count = streamed_rows_receipt.exact_row_count
+                artifact_exact_row_count = fetched_row_count
+                rows = [
+                    dict(row)
+                    for row in streamed_rows_receipt.preview_rows
+                ]
+                result_raw_rows = list(stream_state.raw_preview_rows)
+                (
+                    result_coverage,
+                    result_is_truncated,
+                    exact_result_row_count,
+                ) = self._classify_streamed_result(
+                    contract,
+                    intent,
+                    compilation.sql,
+                    streamed_rows_receipt,
+                    core_sql_candidate=isinstance(
+                        candidate_validation,
+                        GroundedSqlValidationResult,
+                    ),
+                )
+                entity_filter_verification = (
+                    self._candidate_entity_filter_verification(
+                        compilation.node_contract,
+                        compilation.sql,
+                    )
+                    if isinstance(
+                        candidate_validation,
+                        GroundedSqlValidationResult,
+                    )
+                    else self._streaming_entity_filter_verification(
+                        compilation.node_contract,
+                        stream_state,
+                        compilation.sql,
+                    )
+                    if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+                    else self._deterministic_metric_filter_verification(
+                        compilation.node_contract,
+                        compilation.sql,
+                        fetched_row_count,
+                    )
+                )
+            else:
+                query_kwargs: dict[str, Any] = {
+                    "timeout_seconds": query_timeout_seconds,
+                }
+                query_signature = inspect.signature(
+                    self.doris_repository.query
+                )
+                if "data_snapshot_contract" in query_signature.parameters:
+                    query_kwargs["data_snapshot_contract"] = (
+                        active_data_snapshot
+                    )
+                raw_rows = [
+                    dict(row)
+                    for row in self.doris_repository.query(
+                        compilation.sql,
+                        **query_kwargs,
+                    )
+                ]
+                fetched_row_count = len(raw_rows)
+                (
                     result_raw_rows,
+                    result_coverage,
+                    result_is_truncated,
+                    exact_result_row_count,
+                ) = self._classify_result_rows(
+                    contract,
+                    intent,
                     compilation.sql,
+                    raw_rows,
+                    core_sql_candidate=isinstance(
+                        candidate_validation,
+                        GroundedSqlValidationResult,
+                    ),
                 )
-                if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
-                else self._deterministic_metric_filter_verification(
-                    compilation.node_contract,
-                    compilation.sql,
-                    len(raw_rows),
+                artifact_exact_row_count = len(result_raw_rows)
+                entity_filter_verification = (
+                    self._candidate_entity_filter_verification(
+                        compilation.node_contract,
+                        compilation.sql,
+                    )
+                    if isinstance(
+                        candidate_validation,
+                        GroundedSqlValidationResult,
+                    )
+                    else self._entity_filter_verification(
+                        compilation.node_contract,
+                        result_raw_rows,
+                        compilation.sql,
+                    )
+                    if contract.query_shape in {"DETAIL", "ENTITY_LOOKUP"}
+                    else self._deterministic_metric_filter_verification(
+                        compilation.node_contract,
+                        compilation.sql,
+                        len(raw_rows),
+                    )
                 )
+                rows = apply_column_masks(
+                    result_raw_rows,
+                    masked_contract,
+                )
+                for row in rows:
+                    row.setdefault(
+                        "__timeWindowRole",
+                        str(intent.time_range.window_role or "primary"),
+                    )
+        except GroundedResultStreamingError as exc:
+            failed = SqlValidationResult(
+                valid=False,
+                error_code=exc.code.value,
+                message=str(exc)[:500],
+                base_tables=list(compilation.tables),
             )
-            masked_columns = {
-                key: value
-                for decision in decisions
-                for key, value in (decision.masked_columns or {}).items()
-            }
-            if isinstance(candidate_validation, GroundedSqlValidationResult):
-                masked_columns = self._candidate_output_masks(
-                    {
-                        "%s.%s" % (access_contract.preferred_table, key): value
-                        for access_contract, decision in zip(
-                            access_contracts,
-                            decisions,
-                        )
-                        for key, value in (decision.masked_columns or {}).items()
-                    },
-                    candidate_validation,
-                )
-            rows = apply_column_masks(
-                result_raw_rows,
-                compilation.node_contract.model_copy(
-                    update={"masked_columns": masked_columns}
-                ),
+            return self._failed_result(
+                plan,
+                compilation,
+                failed,
+                failed.error_code,
+                failed.message,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                data_snapshot=active_data_snapshot,
             )
-            for row in rows:
-                row.setdefault(
-                    "__timeWindowRole",
-                    str(intent.time_range.window_role or "primary"),
-                )
+        except GroundedContextWorkspaceError as exc:
+            failed = SqlValidationResult(
+                valid=False,
+                error_code="QUERY_RESULT_ARTIFACT_ROOT_INVALID",
+                message=str(exc)[:500],
+                base_tables=list(compilation.tables),
+            )
+            return self._failed_result(
+                plan,
+                compilation,
+                failed,
+                failed.error_code,
+                failed.message,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                data_snapshot=active_data_snapshot,
+            )
         except Exception as exc:
             failed = SqlValidationResult(
                 valid=False,
@@ -374,13 +724,22 @@ class GroundedQueryExecutionKernel:
                     contract=contract,
                     compilation=compilation,
                     execution_preparation=execution_preparation,
+                    semantic_activation_fingerprint=(
+                        normalized_activation_fingerprint
+                    ),
                     data_snapshot=active_data_snapshot,
                     rows=rows,
+                    streamed_rows_receipt=streamed_rows_receipt,
+                    artifact_exact_row_count=artifact_exact_row_count,
                     result_coverage=result_coverage,
                     result_is_truncated=result_is_truncated,
                     exact_result_row_count=exact_result_row_count,
                     execution_generation=execution_generation,
                     execution_attempt_id=execution_attempt_id,
+                    execution_identity_context=(
+                        execution_identity_context
+                    ),
+                    cancel_events=cancel_events,
                 )
             except Exception as exc:
                 message = "%s:%s" % (type(exc).__name__, str(exc)[:300])
@@ -393,7 +752,7 @@ class GroundedQueryExecutionKernel:
                 for decision in decisions:
                     self.access_control.record_query_audit(
                         decision,
-                        row_count=len(rows),
+                        row_count=fetched_row_count,
                         status="artifact_persistence_failed",
                     )
                 return self._failed_result(
@@ -415,7 +774,7 @@ class GroundedQueryExecutionKernel:
             original_row_count=exact_result_row_count,
             is_truncated=result_is_truncated,
             result_coverage=result_coverage,
-            source_row_counts={task_id: len(rows)},
+            source_row_counts={task_id: fetched_row_count},
             source_artifact_refs={},
             duration_ms=duration_ms,
             cache_hit=bool(getattr(self.doris_repository, "last_cache_hit", False)),
@@ -428,8 +787,17 @@ class GroundedQueryExecutionKernel:
                     "taskId": task_id,
                     "table": compilation.table,
                     "rowCount": len(rows),
-                    "fetchedRowCount": len(raw_rows),
+                    "previewRowCount": len(rows),
+                    "fetchedRowCount": fetched_row_count,
                     "resultCoverage": result_coverage,
+                    "resultArtifactCoverage": (
+                        "ALL_ROWS"
+                        if streamed_rows_receipt is not None
+                        else "INLINE_RESULT"
+                    ),
+                    "resultArtifactComplete": bool(
+                        streamed_rows_receipt is not None
+                    ),
                     "resultRowCountExact": result_coverage
                     in {
                         ResultCoverage.ALL_ROWS.value,
@@ -457,7 +825,10 @@ class GroundedQueryExecutionKernel:
             task_id=task_id,
             sub_agent_type="GROUNDED_DATA_ENGINE",
             success=True,
-            summary="Grounded Data Engine executed %d row(s)" % len(rows),
+            summary=(
+                "Grounded Data Engine executed %d row(s); retained %d preview row(s)"
+                % (fetched_row_count, len(rows))
+            ),
             query_bundle=bundle,
             validation_results=[validation],
             react_trace=[
@@ -473,7 +844,8 @@ class GroundedQueryExecutionKernel:
                         if isinstance(candidate_validation, GroundedSqlValidationResult)
                         else "grounded_data_engine.execute_sql"
                     ),
-                    observation="table=%s;rows=%d" % (compilation.table, len(rows)),
+                    observation="table=%s;rows=%d;preview=%d"
+                    % (compilation.table, fetched_row_count, len(rows)),
                 )
             ],
             node_task_profile=NodeTaskProfile(
@@ -515,12 +887,14 @@ class GroundedQueryExecutionKernel:
                 contract,
                 result_raw_rows,
                 task_id,
+                source_row_count=fetched_row_count,
+                force_truncated=fetched_row_count > len(result_raw_rows),
             ),
         )
         for decision in decisions:
             self.access_control.record_query_audit(
                 decision,
-                row_count=len(rows),
+                row_count=fetched_row_count,
                 status="success",
             )
         return AgentRunResult(
@@ -534,8 +908,11 @@ class GroundedQueryExecutionKernel:
                 )
             ],
             task_results=[task_result],
-            query_bundles=[bundle.model_copy(deep=True)],
-            merged_query_bundle=bundle.model_copy(deep=True),
+            # These are independent bundle projections over one immutable row
+            # population.  Copying the full rows for task/query/merged views
+            # would triple resident result memory before artifact offload.
+            query_bundles=[bundle.model_copy(deep=False)],
+            merged_query_bundle=bundle.model_copy(deep=False),
             evidence_check=EvidenceCheckResult(
                 passed=False,
                 summary=(
@@ -561,6 +938,7 @@ class GroundedQueryExecutionKernel:
         *,
         access_role: str,
         user_scope: dict[str, Any],
+        complete_result_artifact: bool = False,
     ) -> GroundedSqlCompilation:
         if (
             contract.upstream_entity_bindings
@@ -577,6 +955,7 @@ class GroundedQueryExecutionKernel:
                 asset_pack,
                 access_role=access_role,
                 user_scope=user_scope,
+                complete_result_artifact=complete_result_artifact,
             )
         intent = plan.intents[0]
         table = str(intent.preferred_table or contract.primary_table or "").strip()
@@ -1287,6 +1666,9 @@ class GroundedQueryExecutionKernel:
         contract: GroundedQueryContract,
         raw_rows: list[dict[str, Any]],
         task_id: str,
+        *,
+        source_row_count: int | None = None,
+        force_truncated: bool = False,
     ) -> EntitySet | None:
         """Retain pre-mask entity outputs for later verified publication."""
 
@@ -1305,7 +1687,7 @@ class GroundedQueryExecutionKernel:
         if not entity_outputs:
             return None
         column_values: dict[str, list[Any]] = {}
-        truncated = False
+        truncated = bool(force_truncated)
         for output in entity_outputs:
             values_by_key: dict[str, Any] = {}
             for row in raw_rows:
@@ -1326,7 +1708,11 @@ class GroundedQueryExecutionKernel:
             values=list(column_values.get(first_column) or []),
             column_values=column_values,
             truncated=truncated,
-            source_row_count=len(raw_rows),
+            source_row_count=(
+                len(raw_rows)
+                if source_row_count is None
+                else max(0, int(source_row_count))
+            ),
             source_key="grounded_pre_mask_verified_candidate",
         )
 
@@ -1447,6 +1833,7 @@ class GroundedQueryExecutionKernel:
         *,
         access_role: str,
         user_scope: dict[str, Any],
+        complete_result_artifact: bool = False,
     ) -> GroundedSqlCompilation:
         intent = plan.intents[0]
         if contract.metrics:
@@ -1620,11 +2007,11 @@ class GroundedQueryExecutionKernel:
         sql = "SELECT %s FROM %s" % (", ".join(select_parts), from_sql)
         if where:
             sql += " WHERE " + " AND ".join("(%s)" % item for item in where)
-        # Fetch one sentinel row beyond the inline detail cap.  Without that
-        # row, exactly ``limit`` returned rows cannot distinguish a complete
-        # set from a capped preview.  The executor removes the sentinel before
-        # publishing the QueryBundle.
-        sql += " LIMIT %d" % (self._detail_display_limit(intent) + 1)
+        if not complete_result_artifact:
+            # Legacy inline execution fetches one sentinel beyond the display
+            # cap. In complete artifact mode the cursor must reach source EOF;
+            # the display limit applies only to the bounded Core projection.
+            sql += " LIMIT %d" % (self._detail_display_limit(intent) + 1)
 
         access_contracts: list[NodePlanContract] = []
         for table in tables:
@@ -2160,6 +2547,710 @@ class GroundedQueryExecutionKernel:
             node_plan_contracts=[compilation.node_contract.model_copy(deep=True)],
         )
 
+    def _prepare_data_snapshot(
+        self,
+        supplied: DataSnapshotContract | None,
+        *,
+        expected_semantic_activation_fingerprint: str,
+        governed: bool,
+    ) -> DataSnapshotContract:
+        """Capture or revalidate after SQL/ACL and before the first query."""
+
+        expected_activation = str(
+            expected_semantic_activation_fingerprint or ""
+        ).strip()
+        if governed and not expected_activation:
+            raise RuntimeError(
+                "QUERY_EXECUTION_SEMANTIC_ACTIVATION_REQUIRED"
+            )
+        capture = getattr(
+            self.doris_repository,
+            "capture_data_snapshot",
+            None,
+        )
+        revalidate = getattr(
+            self.doris_repository,
+            "revalidate_data_snapshot",
+            None,
+        )
+        if supplied is None:
+            if callable(capture):
+                observed = capture(expected_activation)
+                snapshot = (
+                    observed
+                    if isinstance(observed, DataSnapshotContract)
+                    else DataSnapshotContract.model_validate(observed)
+                )
+            else:
+                snapshot = DataSnapshotContract(
+                    semantic_activation_fingerprint=expected_activation,
+                    unsupported_reason=(
+                        "DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
+                    ),
+                )
+        else:
+            snapshot = supplied.model_copy(deep=True)
+            if callable(revalidate):
+                observed = revalidate(snapshot)
+                if isinstance(observed, DataSnapshotContract):
+                    snapshot = observed.model_copy(deep=True)
+                elif observed is not None and observed is not True:
+                    snapshot = DataSnapshotContract.model_validate(observed)
+            elif callable(capture):
+                current = capture(expected_activation)
+                current_snapshot = (
+                    current
+                    if isinstance(current, DataSnapshotContract)
+                    else DataSnapshotContract.model_validate(current)
+                )
+                if grounded_data_snapshot_identity(
+                    current_snapshot
+                ) != grounded_data_snapshot_identity(snapshot):
+                    raise RuntimeError("DATA_SNAPSHOT_REVALIDATION_MISMATCH")
+            elif governed:
+                raise RuntimeError(
+                    "DATA_SNAPSHOT_REVALIDATION_CAPABILITY_REQUIRED"
+                )
+        if expected_activation and str(
+            snapshot.semantic_activation_fingerprint or ""
+        ).strip() != expected_activation:
+            raise RuntimeError(
+                "DATA_SNAPSHOT_SEMANTIC_ACTIVATION_MISMATCH"
+            )
+        return snapshot
+
+    def _prepare_execution_identity_context(
+        self,
+        *,
+        merchant_id: str,
+        access_role: str,
+        user_scope: Mapping[str, Any],
+        reference_scope: Any,
+        context_owner_fingerprint: str,
+        goal_contract_fingerprint: str,
+        plan: QueryPlan,
+        compilation: GroundedSqlCompilation,
+        contract: GroundedQueryContract,
+        candidate_validation: Any,
+        data_snapshot: DataSnapshotContract,
+        execution_generation: int,
+        execution_attempt_id: str,
+        execution_query_node_id: str,
+        expected_semantic_activation_fingerprint: str,
+    ) -> _GroundedExecutionIdentityContext:
+        goal_fingerprint = str(goal_contract_fingerprint or "").strip()
+        if not self._valid_sha256(goal_fingerprint):
+            raise RuntimeError(
+                "QUERY_EXECUTION_GOAL_CONTRACT_FINGERPRINT_INVALID"
+            )
+        expected_owner = grounded_context_owner_fingerprint(
+            merchant_id,
+            access_role,
+            user_scope,
+        )
+        if expected_owner != str(context_owner_fingerprint or "").strip():
+            raise RuntimeError("QUERY_EXECUTION_CONTEXT_OWNER_MISMATCH")
+        activation_fingerprint = str(
+            expected_semantic_activation_fingerprint or ""
+        ).strip()
+        if not activation_fingerprint or activation_fingerprint != str(
+            data_snapshot.semantic_activation_fingerprint or ""
+        ).strip():
+            raise RuntimeError(
+                "QUERY_EXECUTION_SNAPSHOT_ACTIVATION_MISMATCH"
+            )
+        execution_identity = self._server_execution_identity(
+            merchant_id=merchant_id,
+            access_role=access_role,
+            user_scope=user_scope,
+            data_snapshot=data_snapshot,
+        )
+        run_identity = build_grounded_run_execution_identity(
+            context_owner_fingerprint=context_owner_fingerprint,
+            execution_identity=execution_identity,
+            user_scope=user_scope,
+            reference_scope=reference_scope,
+            datasource_fingerprint=data_snapshot.datasource_fingerprint,
+            cache_generation=data_snapshot.cache_generation,
+        )
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        sql_ast_fingerprint = self._sql_evidence_fingerprint(
+            contract_fingerprint,
+            compilation.sql,
+            candidate_validation,
+        )
+        graph_fingerprint = query_graph_fingerprint(plan)
+        access_contracts = tuple(
+            compilation.access_contracts
+            or (compilation.node_contract,)
+        )
+        query_node_id = str(execution_query_node_id or "").strip() or (
+            plan.intents[0].plan_task_id
+        )
+        node_identity = build_grounded_node_execution_identity(
+            run_identity=run_identity,
+            graph_fingerprint=graph_fingerprint,
+            query_node_id=query_node_id,
+            generation=int(execution_generation or 0),
+            attempt_id=str(execution_attempt_id or "").strip(),
+            goal_contract_fingerprint=goal_fingerprint,
+            query_contract_fingerprint=contract_fingerprint,
+            sql_ast_fingerprint=sql_ast_fingerprint,
+            data_snapshot=data_snapshot,
+            access_contracts=access_contracts,
+        )
+        return _GroundedExecutionIdentityContext(
+            execution_identity=execution_identity,
+            run_identity=run_identity,
+            node_identity=node_identity,
+            user_scope=dict(user_scope),
+            reference_scope=reference_scope,
+            graph_fingerprint=graph_fingerprint,
+            query_node_id=query_node_id,
+            goal_contract_fingerprint=goal_fingerprint,
+            query_contract_fingerprint=contract_fingerprint,
+            sql_ast_fingerprint=sql_ast_fingerprint,
+            access_contracts=access_contracts,
+        )
+
+    def _require_execution_identity_live(
+        self,
+        stage: str,
+        context: _GroundedExecutionIdentityContext,
+        *,
+        context_owner_fingerprint: str,
+        merchant_id: str,
+        access_role: str,
+        user_scope: Mapping[str, Any],
+        reference_scope: Any,
+        data_snapshot: DataSnapshotContract,
+        execution_generation: int,
+        execution_attempt_id: str,
+        goal_contract_fingerprint: str,
+        query_contract_fingerprint: str,
+        sql_ast_fingerprint: str,
+    ) -> None:
+        require_grounded_execution_identity_live(
+            stage=stage,
+            stored_run_identity=context.run_identity,
+            stored_node_identity=context.node_identity,
+            context_owner_fingerprint=context_owner_fingerprint,
+            execution_identity=self._server_execution_identity(
+                merchant_id=merchant_id,
+                access_role=access_role,
+                user_scope=user_scope,
+                data_snapshot=data_snapshot,
+            ),
+            user_scope=user_scope,
+            reference_scope=reference_scope,
+            datasource_fingerprint=data_snapshot.datasource_fingerprint,
+            cache_generation=data_snapshot.cache_generation,
+            graph_fingerprint=context.graph_fingerprint,
+            query_node_id=context.query_node_id,
+            generation=int(execution_generation or 0),
+            attempt_id=str(execution_attempt_id or "").strip(),
+            goal_contract_fingerprint=str(
+                goal_contract_fingerprint or ""
+            ).strip(),
+            query_contract_fingerprint=str(
+                query_contract_fingerprint or ""
+            ).strip(),
+            sql_ast_fingerprint=str(sql_ast_fingerprint or "").strip(),
+            data_snapshot=data_snapshot,
+            access_contracts=context.access_contracts,
+        )
+
+    def _authorize_population_pre_execution(
+        self,
+        reference: PopulationPreExecutionReference | None,
+        *,
+        contract: GroundedQueryContract,
+        compilation: GroundedSqlCompilation,
+        plan: QueryPlan,
+        data_snapshot: DataSnapshotContract,
+        actual_sql_ast_fingerprint: str,
+        context_owner_fingerprint: str,
+        goal_contract_fingerprint: str,
+        execution_generation: int,
+        execution_attempt_id: str,
+        population_query_node_id: str,
+    ) -> None:
+        gate = self.population_execution_gate
+        if gate is None and reference is None:
+            return
+        if gate is None or reference is None:
+            raise GroundedPopulationRuntimeGateError(
+                "POPULATION_PRE_EXECUTION_REJECTED"
+            )
+        if not isinstance(gate, GroundedPopulationExecutionGate) or not isinstance(
+            reference,
+            PopulationPreExecutionReference,
+        ):
+            raise GroundedPopulationRuntimeGateError(
+                "POPULATION_PRE_EXECUTION_REJECTED"
+            )
+        current_node_id = str(population_query_node_id or "").strip() or str(
+            plan.intents[0].plan_task_id or ""
+        ).strip()
+        node_reference = reference.node
+        expected = {
+            "contextOwnerFingerprint": str(
+                context_owner_fingerprint or ""
+            ).strip(),
+            "goalContractFingerprint": str(
+                goal_contract_fingerprint or ""
+            ).strip(),
+            "queryNodeId": current_node_id,
+            "generation": int(execution_generation or 0),
+            "attemptId": str(execution_attempt_id or "").strip(),
+            "queryContractFingerprint": (
+                grounded_query_contract_fingerprint(contract)
+            ),
+        }
+        observed = {
+            "contextOwnerFingerprint": (
+                reference.context_owner_fingerprint
+            ),
+            "goalContractFingerprint": (
+                reference.goal_contract_fingerprint
+            ),
+            "queryNodeId": node_reference.query_node_id,
+            "generation": node_reference.generation,
+            "attemptId": node_reference.attempt_id,
+            "queryContractFingerprint": (
+                node_reference.query_contract_fingerprint
+            ),
+        }
+        if observed != expected:
+            raise GroundedPopulationRuntimeGateError(
+                "POPULATION_PRE_EXECUTION_REJECTED"
+            )
+        current_evidence = PopulationExecutorNodeEvidence(
+            query_node_id=current_node_id,
+            contract=contract,
+            compilation=compilation,
+            data_snapshot=data_snapshot,
+            actual_sql_ast_fingerprint=actual_sql_ast_fingerprint,
+        )
+        result = gate.authorize_node(
+            reference=reference,
+            execution=current_evidence,
+        )
+        if not bool(getattr(result, "accepted", False)):
+            raise GroundedPopulationRuntimeGateError(
+                "POPULATION_PRE_EXECUTION_REJECTED",
+                result=result,
+            )
+
+    @staticmethod
+    def _server_execution_identity(
+        *,
+        merchant_id: str,
+        access_role: str,
+        user_scope: Mapping[str, Any],
+        data_snapshot: DataSnapshotContract,
+    ) -> ExecutionIdentity:
+        scope = dict(user_scope or {})
+        row_policy = scope.get("rowPolicy") or scope.get("row_policy") or {}
+        if not isinstance(row_policy, Mapping):
+            row_policy = {}
+        return ExecutionIdentity.from_server_context(
+            merchant_id=merchant_id,
+            tenant_id=str(
+                scope.get("tenantId") or scope.get("tenant_id") or ""
+            ),
+            principal_id=str(
+                scope.get("principalId")
+                or scope.get("principal_id")
+                or scope.get("userId")
+                or scope.get("user_id")
+                or ""
+            ),
+            role=access_role,
+            permissions=scope.get("permissions") or (),
+            region=str(scope.get("region") or ""),
+            store_ids=(
+                scope.get("storeIds") or scope.get("store_ids") or ()
+            ),
+            row_policy=dict(row_policy),
+            datasource_environment=data_snapshot.datasource_environment,
+            semantic_activation_fingerprint=(
+                data_snapshot.semantic_activation_fingerprint
+            ),
+        )
+
+    @staticmethod
+    def _sql_evidence_fingerprint(
+        contract_fingerprint: str,
+        sql: str,
+        candidate_validation: Any,
+    ) -> str:
+        candidate_fingerprint = str(
+            getattr(candidate_validation, "ast_fingerprint", "") or ""
+        ).strip()
+        if candidate_fingerprint:
+            return candidate_fingerprint
+        return hashlib.sha256(
+            ("%s:%s" % (contract_fingerprint, sql)).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _valid_sha256(value: Any) -> bool:
+        candidate = str(value or "")
+        return len(candidate) == 64 and all(
+            character in "0123456789abcdef" for character in candidate
+        )
+
+    @staticmethod
+    def _cancellation_requested(events: Iterable[Any]) -> bool:
+        return any(
+            bool(getattr(event, "is_set", lambda: False)())
+            for event in events
+            if event is not None
+        )
+
+    def _result_stream_limits(self) -> GroundedResultStreamLimits:
+        return GroundedResultStreamLimits(
+            preview_rows=max(
+                1,
+                int(self.settings.context_artifact_inline_max_rows or 1),
+            ),
+            fetch_batch_rows=max(
+                1,
+                int(self.settings.grounded_result_stream_fetch_batch_rows),
+            ),
+            max_rows=max(
+                1,
+                int(self.settings.grounded_result_stream_max_rows),
+            ),
+            max_bytes=max(
+                2,
+                int(self.settings.grounded_result_stream_max_bytes),
+            ),
+        )
+
+    def _repository_stream_batches(
+        self,
+        sql: str,
+        *,
+        batch_size: int,
+        cancel_events: Iterable[Any] | None,
+        timeout_seconds: int,
+        data_snapshot_contract: DataSnapshotContract,
+    ) -> Iterator[Iterable[Mapping[str, Any]]]:
+        stream = getattr(self.doris_repository, "stream_query_batches", None)
+        if not callable(stream):
+            raise RuntimeError("QUERY_RESULT_STREAMING_REQUIRED")
+        signature = inspect.signature(stream)
+        supports_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        candidate_kwargs = {
+            "batch_size": batch_size,
+            "cancel_events": cancel_events,
+            "timeout_seconds": timeout_seconds,
+            "data_snapshot_contract": data_snapshot_contract,
+        }
+        kwargs = {
+            key: value
+            for key, value in candidate_kwargs.items()
+            if supports_kwargs or key in signature.parameters
+        }
+        return iter(stream(sql, **kwargs))
+
+    def _masked_stream_batches(
+        self,
+        batches: Iterator[Iterable[Mapping[str, Any]]],
+        *,
+        state: _GroundedStreamingRowState,
+        node_contract: NodePlanContract,
+        masked_contract: NodePlanContract,
+        time_window_role: str,
+    ) -> Iterator[list[dict[str, Any]]]:
+        try:
+            for batch in batches:
+                raw_batch = [dict(row) for row in batch]
+                self._observe_streaming_rows(
+                    state,
+                    raw_batch,
+                    node_contract,
+                )
+                masked_batch = apply_column_masks(
+                    raw_batch,
+                    masked_contract,
+                )
+                for row in masked_batch:
+                    row.setdefault("__timeWindowRole", time_window_role)
+                yield masked_batch
+        finally:
+            close = getattr(batches, "close", None)
+            if callable(close):
+                close()
+
+    @staticmethod
+    def _observe_streaming_rows(
+        state: _GroundedStreamingRowState,
+        rows: Sequence[dict[str, Any]],
+        contract: NodePlanContract,
+    ) -> None:
+        remaining = max(
+            0,
+            state.preview_limit - len(state.raw_preview_rows),
+        )
+        if remaining:
+            state.raw_preview_rows.extend(
+                dict(row) for row in rows[:remaining]
+            )
+        state.row_count += len(rows)
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations:
+            return
+        filter_column = str(contract.filter_column or "")
+        policy = entity_comparison_policy(obligations[0].reference)
+        for row in rows:
+            if not filter_column or filter_column not in row:
+                state.filter_column_missing = True
+                continue
+            state.observed_filter_values.update(
+                canonical_entity_values([row.get(filter_column)], policy)
+            )
+
+    @staticmethod
+    def _streaming_entity_filter_verification(
+        contract: NodePlanContract,
+        state: _GroundedStreamingRowState,
+        sql: str,
+    ) -> EntityFilterVerificationProof:
+        obligations = [
+            item
+            for item in contract.entity_filter_obligations
+            if item.required and item.status == "bound"
+        ]
+        if not obligations:
+            return EntityFilterVerificationProof(
+                task_id=contract.task_id,
+                status="not_required",
+            )
+        reference = obligations[0].reference
+        policy = entity_comparison_policy(reference)
+        requested = canonical_entity_values(contract.filter_values, policy)
+        observed = set(state.observed_filter_values)
+        contract_hash = entity_filter_contract_hash(contract)
+        base = {
+            "task_id": contract.task_id,
+            "obligation_id": obligations[0].obligation_id,
+            "field": contract.filter_column,
+            "comparison_policy": policy,
+            "contract_hash": contract_hash,
+            "sql_hash": entity_filter_sql_hash(sql),
+            "requested_value_hashes": sorted(
+                entity_value_hash(item, contract_hash)
+                for item in requested
+            ),
+            "observed_value_hashes": sorted(
+                entity_value_hash(item, contract_hash)
+                for item in observed
+            ),
+            "row_count": state.row_count,
+            "coverage_complete": True,
+        }
+        if not contract.filter_column or not requested:
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_CONTRACT_INVALID",
+                reason=(
+                    "grounded entity filter lacks an executable field/value"
+                ),
+            )
+        if state.filter_column_missing:
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_RESULT_UNVERIFIABLE",
+                reason=(
+                    "detail rows do not expose the governed entity identity"
+                ),
+            )
+        unexpected = observed - requested
+        if unexpected:
+            return EntityFilterVerificationProof(
+                **base,
+                status="failed",
+                code="ENTITY_FILTER_RESULT_MISMATCH",
+                unexpected_value_count=len(unexpected),
+                reason=(
+                    "detail result contains identities outside the requested filter"
+                ),
+            )
+        return EntityFilterVerificationProof(
+            **base,
+            verified=True,
+            status="verified",
+            missing_values=sorted(requested - observed),
+        )
+
+    @classmethod
+    def _classify_streamed_result(
+        cls,
+        contract: GroundedQueryContract,
+        intent: Any,
+        sql: str,
+        receipt: GroundedResultArtifactReceipt,
+        *,
+        core_sql_candidate: bool,
+    ) -> tuple[str, bool, int]:
+        query_shape = str(contract.query_shape or "").upper()
+        if query_shape == "RANKED":
+            coverage = ResultCoverage.TOP_N.value
+        elif query_shape not in {"DETAIL", "ENTITY_LOOKUP"}:
+            coverage = ResultCoverage.ALL_ROWS.value
+        elif core_sql_candidate:
+            coverage = cls._core_sql_detail_coverage(
+                sql,
+                receipt.exact_row_count,
+            )
+        else:
+            coverage = ResultCoverage.ALL_ROWS.value
+        semantic_complete = coverage in {
+            ResultCoverage.ALL_ROWS.value,
+            ResultCoverage.TOP_N.value,
+        }
+        return (
+            coverage,
+            bool(receipt.preview_is_truncated or not semantic_complete),
+            receipt.exact_row_count if semantic_complete else 0,
+        )
+
+    @staticmethod
+    def _execution_identity_authority_payload(
+        context: _GroundedExecutionIdentityContext,
+    ) -> dict[str, Any]:
+        execution_identity = context.execution_identity
+        reference_scope = context.reference_scope
+        if hasattr(reference_scope, "model_dump"):
+            reference_scope = reference_scope.model_dump(
+                by_alias=True,
+                mode="json",
+            )
+        elif isinstance(reference_scope, Mapping):
+            reference_scope = dict(reference_scope)
+        else:
+            reference_scope = {}
+        return {
+            "executionIdentity": {
+                "merchantId": execution_identity.merchant_id,
+                "tenantId": execution_identity.tenant_id,
+                "principalId": execution_identity.principal_id,
+                "role": execution_identity.role,
+                "permissions": list(execution_identity.permissions),
+                "region": execution_identity.region,
+                "storeIds": list(execution_identity.store_ids),
+                "rowPolicyFingerprint": (
+                    execution_identity.row_policy_fingerprint
+                ),
+                "datasourceEnvironment": (
+                    execution_identity.datasource_environment
+                ),
+                "semanticActivationFingerprint": (
+                    execution_identity.semantic_activation_fingerprint
+                ),
+            },
+            "runIdentity": context.run_identity.model_dump(
+                by_alias=True,
+                mode="json",
+            ),
+            "nodeIdentity": context.node_identity.model_dump(
+                by_alias=True,
+                mode="json",
+            ),
+            "userScope": dict(context.user_scope),
+            "referenceScope": reference_scope,
+            "graphFingerprint": context.graph_fingerprint,
+            "queryNodeId": context.query_node_id,
+            "goalContractFingerprint": (
+                context.goal_contract_fingerprint
+            ),
+            "queryContractFingerprint": (
+                context.query_contract_fingerprint
+            ),
+            "sqlAstFingerprint": context.sql_ast_fingerprint,
+            "accessContracts": [
+                item.model_dump(by_alias=True, mode="json")
+                for item in context.access_contracts
+            ],
+        }
+
+    @staticmethod
+    def _execution_identity_context_from_authority(
+        payload: Mapping[str, Any],
+    ) -> _GroundedExecutionIdentityContext:
+        raw_execution_identity = dict(
+            payload.get("executionIdentity") or {}
+        )
+        execution_identity = ExecutionIdentity(
+            merchant_id=str(raw_execution_identity.get("merchantId") or ""),
+            tenant_id=str(raw_execution_identity.get("tenantId") or ""),
+            principal_id=str(
+                raw_execution_identity.get("principalId") or ""
+            ),
+            role=str(raw_execution_identity.get("role") or ""),
+            permissions=tuple(
+                str(item)
+                for item in raw_execution_identity.get("permissions") or []
+            ),
+            region=str(raw_execution_identity.get("region") or ""),
+            store_ids=tuple(
+                str(item)
+                for item in raw_execution_identity.get("storeIds") or []
+            ),
+            row_policy_fingerprint=str(
+                raw_execution_identity.get("rowPolicyFingerprint") or ""
+            ),
+            datasource_environment=str(
+                raw_execution_identity.get("datasourceEnvironment") or ""
+            ),
+            semantic_activation_fingerprint=str(
+                raw_execution_identity.get(
+                    "semanticActivationFingerprint"
+                )
+                or ""
+            ),
+        )
+        return _GroundedExecutionIdentityContext(
+            execution_identity=execution_identity,
+            run_identity=GroundedRunExecutionIdentitySeal.model_validate(
+                payload.get("runIdentity") or {}
+            ),
+            node_identity=GroundedNodeExecutionIdentitySeal.model_validate(
+                payload.get("nodeIdentity") or {}
+            ),
+            user_scope=dict(payload.get("userScope") or {}),
+            reference_scope=dict(payload.get("referenceScope") or {}),
+            graph_fingerprint=str(
+                payload.get("graphFingerprint") or ""
+            ),
+            query_node_id=str(payload.get("queryNodeId") or ""),
+            goal_contract_fingerprint=str(
+                payload.get("goalContractFingerprint") or ""
+            ),
+            query_contract_fingerprint=str(
+                payload.get("queryContractFingerprint") or ""
+            ),
+            sql_ast_fingerprint=str(
+                payload.get("sqlAstFingerprint") or ""
+            ),
+            access_contracts=tuple(
+                NodePlanContract.model_validate(item)
+                for item in payload.get("accessContracts") or []
+            ),
+        )
+
     def _stage_grounded_result_artifacts(
         self,
         *,
@@ -2170,14 +3261,24 @@ class GroundedQueryExecutionKernel:
         contract: GroundedQueryContract,
         compilation: GroundedSqlCompilation,
         execution_preparation: Any,
+        semantic_activation_fingerprint: str,
         data_snapshot: DataSnapshotContract,
         rows: list[dict[str, Any]],
+        streamed_rows_receipt: GroundedResultArtifactReceipt | None,
+        artifact_exact_row_count: int,
         result_coverage: str,
         result_is_truncated: bool,
         exact_result_row_count: int,
         execution_generation: int,
         execution_attempt_id: str,
+        execution_identity_context: (
+            _GroundedExecutionIdentityContext | None
+        ),
+        cancel_events: Iterable[Any] | None,
     ) -> dict[str, Any]:
+        cancellation_events = tuple(cancel_events or ())
+        if self._cancellation_requested(cancellation_events):
+            raise RuntimeError("QUERY_RESULT_ARTIFACT_STAGING_CANCELLED")
         try:
             publication_root, staging_root = (
                 validated_grounded_query_artifact_roots(
@@ -2196,15 +3297,26 @@ class GroundedQueryExecutionKernel:
         if not attempt_id:
             raise RuntimeError("QUERY_RESULT_EXECUTION_ATTEMPT_REQUIRED")
         store = WorkspaceArtifactStore(self.settings, staging_root)
-        rows_canonical_hash = self._canonical_json_sha256(rows)
+        rows_canonical_hash = grounded_canonical_json_sha256(rows)
         sql_hash = hashlib.sha256(
             str(compilation.sql or "").encode("utf-8")
         ).hexdigest()
         contract_fingerprint = grounded_query_contract_fingerprint(contract)
-        preparation_fingerprint = str(
-            getattr(execution_preparation, "asset_pack_fingerprint", "") or ""
-        )
-        if not preparation_fingerprint:
+        activation_fingerprint = str(
+            semantic_activation_fingerprint or ""
+        ).strip()
+        if not activation_fingerprint:
+            # Direct legacy executor tests do not create publication authority.
+            # Governed online calls always provide the sealed activation.
+            activation_fingerprint = str(
+                getattr(
+                    execution_preparation,
+                    "asset_pack_fingerprint",
+                    "",
+                )
+                or ""
+            ).strip()
+        if not activation_fingerprint:
             raise RuntimeError(
                 "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
             )
@@ -2223,20 +3335,122 @@ class GroundedQueryExecutionKernel:
                 )
             ).hexdigest()
         snapshot_identity = self._artifact_snapshot_identity(data_snapshot)
+        snapshot_activation_fingerprint = str(
+            snapshot_identity.get("semanticActivationFingerprint") or ""
+        )
+        if (
+            snapshot_activation_fingerprint
+            and snapshot_activation_fingerprint != activation_fingerprint
+        ):
+            raise RuntimeError(
+                "QUERY_RESULT_SNAPSHOT_ACTIVATION_MISMATCH"
+            )
+
+        if streamed_rows_receipt is not None:
+            if (
+                not streamed_rows_receipt.complete
+                or not streamed_rows_receipt.active
+                or not streamed_rows_receipt.immutable
+                or streamed_rows_receipt.coverage != "ALL_ROWS"
+                or streamed_rows_receipt.exact_row_count
+                != max(0, int(artifact_exact_row_count or 0))
+            ):
+                raise RuntimeError("QUERY_RESULT_STREAM_RECEIPT_INCOMPLETE")
+            rows_artifact = {
+                "success": True,
+                "relativePath": streamed_rows_receipt.rows_relative_path,
+                "sha256": streamed_rows_receipt.rows_canonical_sha256,
+                "contentAddress": streamed_rows_receipt.content_address,
+                "bytes": streamed_rows_receipt.byte_count,
+                "immutable": True,
+            }
+            artifact_coverage = "ALL_ROWS"
+            artifact_complete = True
+            artifact_row_count = streamed_rows_receipt.exact_row_count
+        else:
+            rows_text = json.dumps(
+                rows,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+            rows_bytes = rows_text.encode("utf-8")
+            rows_sha256 = hashlib.sha256(rows_bytes).hexdigest()
+            rows_artifact = {
+                "success": True,
+                "relativePath": "",
+                "sha256": rows_sha256,
+                "contentAddress": "sha256:%s" % rows_sha256,
+                "bytes": len(rows_bytes),
+                "immutable": True,
+                "_content": rows_text,
+            }
+            artifact_complete = str(result_coverage or "") in {
+                ResultCoverage.ALL_ROWS.value,
+                ResultCoverage.TOP_N.value,
+            }
+            artifact_coverage = (
+                "ALL_ROWS" if artifact_complete else "INACTIVE_PARTIAL"
+            )
+            artifact_row_count = len(rows)
+
+        if artifact_row_count != max(
+            0,
+            int(artifact_exact_row_count or 0),
+        ):
+            raise RuntimeError("QUERY_RESULT_ARTIFACT_ROW_COUNT_MISMATCH")
+        seal_identity: dict[str, Any] = {}
+        if execution_identity_context is not None:
+            seal_identity = {
+                "runExecutionIdentity": (
+                    execution_identity_context.run_identity.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                ),
+                "nodeExecutionIdentity": (
+                    execution_identity_context.node_identity.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                ),
+            }
         result_identity = {
             "contractFingerprint": contract_fingerprint,
+            "goalContractFingerprint": (
+                execution_identity_context.goal_contract_fingerprint
+                if execution_identity_context is not None
+                else ""
+            ),
             "sqlSha256": sql_hash,
             "sqlEvidenceFingerprint": sql_evidence_fingerprint,
             "rowsCanonicalSha256": rows_canonical_hash,
             "contextOwnerFingerprint": str(
                 context_owner_fingerprint or ""
             ),
-            "semanticActivationFingerprint": preparation_fingerprint,
+            "semanticActivationFingerprint": activation_fingerprint,
             "dataSnapshot": snapshot_identity,
             "resultCoverage": str(result_coverage or ""),
             "resultIsTruncated": bool(result_is_truncated),
             "storedRowCount": len(rows),
             "exactResultRowCount": max(0, int(exact_result_row_count or 0)),
+            "previewRowCount": len(rows),
+            "artifactRowCount": artifact_row_count,
+            "artifactByteCount": max(
+                0,
+                int(rows_artifact.get("bytes") or 0),
+            ),
+            "artifactRowsSha256": str(
+                rows_artifact.get("sha256") or ""
+            ),
+            "artifactContentAddress": str(
+                rows_artifact.get("contentAddress") or ""
+            ),
+            "artifactCoverage": artifact_coverage,
+            "artifactComplete": bool(artifact_complete),
+            "streamingMaterialized": bool(
+                streamed_rows_receipt is not None
+            ),
             "executionGeneration": generation,
             "executionAttemptId": attempt_id,
             "runFingerprint": hashlib.sha256(
@@ -2245,6 +3459,7 @@ class GroundedQueryExecutionKernel:
             "taskFingerprint": hashlib.sha256(
                 str(task_id or "").encode("utf-8")
             ).hexdigest(),
+            **seal_identity,
         }
         pending_id = "pending_query_%s" % hashlib.sha256(
             json.dumps(
@@ -2255,13 +3470,14 @@ class GroundedQueryExecutionKernel:
             ).encode("utf-8")
         ).hexdigest()
         namespace = pending_id
-        rows_artifact = store.write_json(
-            namespace,
-            "rows.json",
-            rows,
-            preview_chars=0,
-            immutable=True,
-        )
+        if streamed_rows_receipt is None:
+            rows_artifact = store.write_text(
+                namespace,
+                "rows.json",
+                str(rows_artifact.pop("_content")),
+                preview_chars=0,
+                immutable=True,
+            )
         sql_artifact = store.write_text(
             namespace,
             "query.sql",
@@ -2271,8 +3487,10 @@ class GroundedQueryExecutionKernel:
         )
         if not rows_artifact.get("success") or not sql_artifact.get("success"):
             raise RuntimeError("QUERY_RESULT_CONTENT_WRITE_FAILED")
+        if self._cancellation_requested(cancellation_events):
+            raise RuntimeError("QUERY_RESULT_ARTIFACT_STAGING_CANCELLED")
         pending_manifest = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "artifactKind": "GROUNDED_QUERY_RESULT_PENDING",
             "pendingArtifactId": pending_id,
             **result_identity,
@@ -2289,11 +3507,13 @@ class GroundedQueryExecutionKernel:
         )
         if not pending_manifest_artifact.get("success"):
             raise RuntimeError("QUERY_RESULT_PENDING_MANIFEST_WRITE_FAILED")
+        if self._cancellation_requested(cancellation_events):
+            raise RuntimeError("QUERY_RESULT_ARTIFACT_STAGING_CANCELLED")
         # This receipt is deliberately server-private. The runtime kernel
         # removes it from QueryBundle events before the result can reach Core.
         # Absolute roots are retained solely so the verifier gate can reopen
         # and validate the exact staged bytes without trusting caller paths.
-        return {
+        private_receipt = {
             "pendingArtifactId": pending_id,
             "publicationRoot": str(publication_root),
             "stagingRoot": str(staging_root),
@@ -2304,6 +3524,13 @@ class GroundedQueryExecutionKernel:
                 pending_manifest_artifact
             ),
         }
+        if execution_identity_context is not None:
+            private_receipt["executionIdentityAuthority"] = (
+                self._execution_identity_authority_payload(
+                    execution_identity_context
+                )
+            )
+        return private_receipt
 
     def publish_pending_result_artifact(
         self,
@@ -2322,6 +3549,11 @@ class GroundedQueryExecutionKernel:
         expected_stored_row_count: int,
         expected_exact_result_row_count: int,
         expected_rows_canonical_sha256: str,
+        expected_goal_contract_fingerprint: str = "",
+        expected_merchant_id: str = "",
+        expected_access_role: str = "",
+        expected_user_scope: Mapping[str, Any] | None = None,
+        expected_reference_scope: Any = None,
     ) -> dict[str, Any]:
         """Verify exact staged bytes and publish a verifier-bound receipt.
 
@@ -2359,6 +3591,10 @@ class GroundedQueryExecutionKernel:
                 expected_rows_canonical_sha256 or ""
             ),
         }
+        if str(expected_goal_contract_fingerprint or "").strip():
+            expected_identity["goalContractFingerprint"] = str(
+                expected_goal_contract_fingerprint or ""
+            ).strip()
         for key, expected in expected_identity.items():
             if identity.get(key) != expected:
                 raise RuntimeError(
@@ -2398,6 +3634,58 @@ class GroundedQueryExecutionKernel:
             identity.get("sqlSha256") or ""
         ):
             raise RuntimeError("QUERY_RESULT_PENDING_SQL_SHA_MISMATCH")
+        if (
+            identity.get("artifactComplete") is not True
+            or identity.get("artifactCoverage") != "ALL_ROWS"
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_ARTIFACT_INCOMPLETE")
+        artifact_binding = {
+            "sha256": str(identity.get("artifactRowsSha256") or ""),
+            "contentAddress": str(
+                identity.get("artifactContentAddress") or ""
+            ),
+            "bytes": max(0, int(identity.get("artifactByteCount") or 0)),
+        }
+        if any(
+            rows_artifact_receipt.get(key) != value
+            for key, value in artifact_binding.items()
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_FULL_ROWS_MISMATCH")
+
+        authority_payload = dict(
+            receipt.get("executionIdentityAuthority") or {}
+        )
+        if str(expected_goal_contract_fingerprint or "").strip():
+            if not authority_payload:
+                raise RuntimeError(
+                    "QUERY_RESULT_EXECUTION_IDENTITY_AUTHORITY_REQUIRED"
+                )
+            execution_identity_context = (
+                self._execution_identity_context_from_authority(
+                    authority_payload
+                )
+            )
+            self._require_execution_identity_live(
+                "PRE_PUBLICATION",
+                execution_identity_context,
+                context_owner_fingerprint=(
+                    expected_context_owner_fingerprint
+                ),
+                merchant_id=expected_merchant_id,
+                access_role=expected_access_role,
+                user_scope=dict(expected_user_scope or {}),
+                reference_scope=expected_reference_scope,
+                data_snapshot=expected_data_snapshot,
+                execution_generation=expected_generation,
+                execution_attempt_id=expected_attempt_id,
+                goal_contract_fingerprint=(
+                    expected_goal_contract_fingerprint
+                ),
+                query_contract_fingerprint=(
+                    expected_contract_fingerprint
+                ),
+                sql_ast_fingerprint=expected_sql_fingerprint,
+            )
 
         verified_payload = verified_evidence.model_dump(
             by_alias=True,
@@ -2412,6 +3700,10 @@ class GroundedQueryExecutionKernel:
             publication_root,
             rows_artifact_receipt,
             "result_%s_rows.json" % publication_fingerprint,
+            expected_json_row_count=max(
+                0,
+                int(identity.get("artifactRowCount") or 0),
+            ),
         )
         published_sql = self._publish_staged_artifact_streaming(
             staging_root,
@@ -2420,7 +3712,7 @@ class GroundedQueryExecutionKernel:
             "result_%s.sql" % publication_fingerprint,
         )
         final_manifest = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "artifactKind": "GROUNDED_QUERY_RESULT",
             "publicationStatus": "VERIFIED",
             "artifactFingerprint": publication_fingerprint,
@@ -2495,6 +3787,16 @@ class GroundedQueryExecutionKernel:
                 published_sql.get("contentAddress") or ""
             ),
             "storedRowCount": int(identity.get("storedRowCount") or 0),
+            "artifactRowCount": int(
+                identity.get("artifactRowCount") or 0
+            ),
+            "artifactByteCount": int(
+                identity.get("artifactByteCount") or 0
+            ),
+            "artifactCoverage": str(
+                identity.get("artifactCoverage") or ""
+            ),
+            "artifactComplete": bool(identity.get("artifactComplete")),
             "exactResultRowCount": int(
                 identity.get("exactResultRowCount") or 0
             ),
@@ -2547,6 +3849,378 @@ class GroundedQueryExecutionKernel:
         if staging_root != received_staging_root:
             raise RuntimeError("QUERY_RESULT_STAGING_ROOT_MISMATCH")
         return publication_root, staging_root
+
+    def _publish_staged_artifact_streaming(
+        self,
+        staging_root: Path,
+        publication_root: Path,
+        artifact: dict[str, Any],
+        final_name: str,
+        *,
+        expected_json_row_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Hash and atomically link staged bytes without loading them in RAM."""
+
+        expected_sha = str(artifact.get("sha256") or "").strip()
+        expected_bytes = max(0, int(artifact.get("bytes") or 0))
+        if (
+            len(expected_sha) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_sha
+            )
+            or str(artifact.get("contentAddress") or "")
+            != "sha256:%s" % expected_sha
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_RECEIPT_INVALID")
+        source_components = self._artifact_relative_components(
+            str(artifact.get("relativePath") or "")
+        )
+        final_component = self._artifact_file_component(final_name)
+        source_parent_descriptor = -1
+        source_descriptor = -1
+        publication_descriptor = -1
+        publication_locked = False
+        temporary_name = ""
+        try:
+            source_parent_descriptor = self._open_workspace_directory(
+                staging_root,
+                source_components[:-1],
+            )
+            source_name = source_components[-1]
+            source_marker = self._immutable_marker_name(source_name)
+            marker_digest = _read_regular_file_at(
+                source_parent_descriptor,
+                source_marker,
+            ).decode("ascii").strip()
+            if marker_digest != expected_sha:
+                raise RuntimeError(
+                    "QUERY_RESULT_PENDING_IMMUTABLE_MARKER_MISMATCH"
+                )
+            source_descriptor = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_parent_descriptor,
+            )
+            if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+                raise RuntimeError("QUERY_RESULT_PENDING_ARTIFACT_INVALID")
+            if expected_json_row_count is None:
+                actual_sha, actual_bytes = self._hash_descriptor(
+                    source_descriptor
+                )
+                actual_rows = None
+            else:
+                (
+                    actual_sha,
+                    actual_bytes,
+                    actual_rows,
+                ) = self._hash_json_rows_descriptor(source_descriptor)
+            if (
+                actual_sha != expected_sha
+                or actual_bytes != expected_bytes
+                or (
+                    expected_json_row_count is not None
+                    and actual_rows != expected_json_row_count
+                )
+            ):
+                raise RuntimeError(
+                    "QUERY_RESULT_PENDING_ARTIFACT_SHA_MISMATCH"
+                )
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            publication_descriptor = self._open_workspace_directory(
+                publication_root,
+                ("query_results",),
+            )
+            # The precreated publication directory itself is the cross-thread
+            # and cross-process lock target.  This avoids racing to create a
+            # lock path while retaining the already validated directory fd.
+            fcntl.flock(publication_descriptor, fcntl.LOCK_EX)
+            publication_locked = True
+            final_marker = self._immutable_marker_name(final_component)
+            try:
+                final_marker_digest = _read_regular_file_at(
+                    publication_descriptor,
+                    final_marker,
+                ).decode("ascii").strip()
+            except FileNotFoundError:
+                final_marker_digest = ""
+            if final_marker_digest and final_marker_digest != expected_sha:
+                raise RuntimeError("QUERY_RESULT_PUBLICATION_MARKER_CONFLICT")
+            if not final_marker_digest:
+                _atomic_write_at(
+                    publication_descriptor,
+                    final_marker,
+                    ("%s\n" % expected_sha).encode("ascii"),
+                    error_code="QUERY_RESULT_PUBLICATION_MARKER_FAILED",
+                )
+            try:
+                existing_descriptor = os.open(
+                    final_component,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=publication_descriptor,
+                )
+            except FileNotFoundError:
+                existing_descriptor = -1
+            if existing_descriptor >= 0:
+                try:
+                    actual_sha, actual_bytes = self._hash_descriptor(
+                        existing_descriptor
+                    )
+                finally:
+                    os.close(existing_descriptor)
+                if (
+                    actual_sha != expected_sha
+                    or actual_bytes != expected_bytes
+                ):
+                    raise RuntimeError(
+                        "QUERY_RESULT_PUBLICATION_CONTENT_CONFLICT"
+                    )
+            else:
+                temporary_name = ".artifact-write-%s.tmp" % uuid.uuid4().hex
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=publication_descriptor,
+                )
+                digest = hashlib.sha256()
+                byte_count = 0
+                try:
+                    while True:
+                        chunk = os.read(source_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        byte_count += len(chunk)
+                        self._write_all(temporary_descriptor, chunk)
+                    os.fsync(temporary_descriptor)
+                finally:
+                    os.close(temporary_descriptor)
+                if (
+                    digest.hexdigest() != expected_sha
+                    or byte_count != expected_bytes
+                ):
+                    raise RuntimeError(
+                        "QUERY_RESULT_PENDING_ARTIFACT_SHA_MISMATCH"
+                    )
+                os.link(
+                    temporary_name,
+                    final_component,
+                    src_dir_fd=publication_descriptor,
+                    dst_dir_fd=publication_descriptor,
+                    follow_symlinks=False,
+                )
+                os.unlink(temporary_name, dir_fd=publication_descriptor)
+                temporary_name = ""
+                os.fsync(publication_descriptor)
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                "QUERY_RESULT_CONTENT_PUBLICATION_FAILED:%s" % type(exc).__name__
+            ) from exc
+        finally:
+            if temporary_name and publication_descriptor >= 0:
+                try:
+                    os.unlink(temporary_name, dir_fd=publication_descriptor)
+                except OSError:
+                    pass
+            if publication_locked and publication_descriptor >= 0:
+                fcntl.flock(publication_descriptor, fcntl.LOCK_UN)
+            if publication_descriptor >= 0:
+                os.close(publication_descriptor)
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+            if source_parent_descriptor >= 0:
+                os.close(source_parent_descriptor)
+        relative_path = "query_results/%s" % final_component
+        return {
+            "success": True,
+            "relativePath": relative_path,
+            "merchantUri": merchant_uri_for_artifact(
+                relative_path,
+                namespace="query_results",
+            ),
+            "sha256": expected_sha,
+            "contentAddress": "sha256:%s" % expected_sha,
+            "bytes": expected_bytes,
+            "immutable": True,
+        }
+
+    def _open_workspace_directory(
+        self,
+        root: Path,
+        components: tuple[str, ...],
+        *,
+        create: bool = False,
+    ) -> int:
+        trusted_workspace = self.settings.resolved_workspace_path.resolve(
+            strict=True
+        )
+        lexical_root = Path(os.path.abspath(str(root)))
+        try:
+            root_components = tuple(
+                lexical_root.relative_to(trusted_workspace).parts
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "QUERY_RESULT_ARTIFACT_ROOT_OUTSIDE_WORKSPACE"
+            ) from exc
+        return _open_directory_beneath(
+            trusted_workspace,
+            (*root_components, *components),
+            create=create,
+        )
+
+    @staticmethod
+    def _artifact_relative_components(relative_path: str) -> tuple[str, ...]:
+        path = Path(str(relative_path or ""))
+        components = tuple(path.parts)
+        if (
+            path.is_absolute()
+            or not components
+            or any(
+                not component
+                or component in {".", ".."}
+                or "/" in component
+                or "\\" in component
+                for component in components
+            )
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_PATH_INVALID")
+        return components
+
+    @staticmethod
+    def _artifact_file_component(name: str) -> str:
+        value = str(name or "")
+        if (
+            not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+        ):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_NAME_INVALID")
+        return value
+
+    @staticmethod
+    def _immutable_marker_name(file_name: str) -> str:
+        return ".artifact-immutable-%s.sha256" % hashlib.sha256(
+            file_name.encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _hash_descriptor(descriptor: int) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        byte_count = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+        return digest.hexdigest(), byte_count
+
+    @staticmethod
+    def _hash_json_rows_descriptor(
+        descriptor: int,
+    ) -> tuple[str, int, int]:
+        """Hash and count one canonical top-level JSON object array."""
+
+        digest = hashlib.sha256()
+        byte_count = 0
+        row_count = 0
+        started = False
+        completed = False
+        expect_value = True
+        after_comma = False
+        depth = 0
+        in_string = False
+        escaped = False
+        whitespace = {9, 10, 13, 32}
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            byte_count += len(chunk)
+            for character in chunk:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif character == 92:
+                        escaped = True
+                    elif character == 34:
+                        in_string = False
+                    continue
+                if completed:
+                    if character not in whitespace:
+                        raise RuntimeError(
+                            "QUERY_RESULT_PENDING_ROWS_JSON_INVALID"
+                        )
+                    continue
+                if not started:
+                    if character in whitespace:
+                        continue
+                    if character != 91:
+                        raise RuntimeError(
+                            "QUERY_RESULT_PENDING_ROWS_JSON_INVALID"
+                        )
+                    started = True
+                    continue
+                if depth:
+                    if character == 34:
+                        in_string = True
+                    elif character in {91, 123}:
+                        depth += 1
+                    elif character in {93, 125}:
+                        depth -= 1
+                        if depth == 0:
+                            expect_value = False
+                    continue
+                if character in whitespace:
+                    continue
+                if expect_value:
+                    if character == 93 and row_count == 0 and not after_comma:
+                        completed = True
+                        continue
+                    if character != 123:
+                        raise RuntimeError(
+                            "QUERY_RESULT_PENDING_ROWS_JSON_INVALID"
+                        )
+                    row_count += 1
+                    depth = 1
+                    after_comma = False
+                    continue
+                if character == 44:
+                    expect_value = True
+                    after_comma = True
+                    continue
+                if character == 93:
+                    completed = True
+                    continue
+                raise RuntimeError(
+                    "QUERY_RESULT_PENDING_ROWS_JSON_INVALID"
+                )
+        if (
+            not started
+            or not completed
+            or depth
+            or in_string
+            or escaped
+            or expect_value and row_count > 0
+        ):
+            raise RuntimeError("QUERY_RESULT_PENDING_ROWS_JSON_INVALID")
+        return digest.hexdigest(), byte_count, row_count
+
+    @staticmethod
+    def _write_all(descriptor: int, content: bytes) -> None:
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("short artifact publication write")
+            remaining = remaining[written:]
 
     @staticmethod
     def _private_artifact_receipt(
@@ -2611,11 +4285,30 @@ class GroundedQueryExecutionKernel:
     def _artifact_snapshot_identity(
         data_snapshot: DataSnapshotContract,
     ) -> dict[str, Any]:
+        # Cache eligibility and artifact identity are different concerns.
+        # ``cache_identity()`` intentionally returns an empty mapping when the
+        # datasource cannot promise a reusable epoch.  The publication gate
+        # must nevertheless bind every server-observed datasource and
+        # semantic identity so an UNSUPPORTED snapshot cannot cross an
+        # activation or datasource boundary.
         return {
-            **data_snapshot.cache_identity(),
+            "datasourceFingerprint": str(
+                data_snapshot.datasource_fingerprint or ""
+            ),
+            "datasourceEnvironment": str(
+                data_snapshot.datasource_environment or ""
+            ),
+            "dataEpoch": str(data_snapshot.data_epoch or ""),
             "consistencyMode": str(
                 data_snapshot.consistency_mode or "UNSUPPORTED"
             ),
+            "semanticActivationFingerprint": str(
+                data_snapshot.semantic_activation_fingerprint or ""
+            ),
+            "cacheGeneration": str(
+                data_snapshot.cache_generation or ""
+            ),
+            "capturedAt": str(data_snapshot.captured_at or ""),
             "unsupportedReason": str(
                 data_snapshot.unsupported_reason or ""
             ),
@@ -2631,6 +4324,19 @@ class GroundedQueryExecutionKernel:
             default=str,
         )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _canonical_json_sha256(value: Any) -> str:
+        digest = hashlib.sha256()
+        encoder = json.JSONEncoder(
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        for chunk in encoder.iterencode(value):
+            digest.update(chunk.encode("utf-8"))
+        return digest.hexdigest()
 
     @staticmethod
     def _detail_display_limit(intent: Any) -> int:

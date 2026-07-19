@@ -9,9 +9,12 @@ from typing import Any, Callable, Optional
 from langchain_core.messages import HumanMessage
 
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.grounded_runtime_kernel import (
+    verified_query_artifact_integrity_valid,
+)
 
 
-RECOVERY_SCHEMA_VERSION = 1
+RECOVERY_SCHEMA_VERSION = 2
 
 
 def _canonical_json(value: Any) -> str:
@@ -308,9 +311,30 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
     for artifact in list(
         getattr(runtime, "verified_query_ledger", None) or []
     ):
+        if not verified_query_artifact_integrity_valid(artifact):
+            continue
         run_result = getattr(artifact, "run_result", None)
         bundle = getattr(run_result, "merged_query_bundle", None)
         artifact_id = str(getattr(artifact, "artifact_id", "") or "")
+        publication_status = str(
+            getattr(artifact, "publication_status", "") or ""
+        )
+        published_result_artifacts = (
+            [
+                dict(item)
+                for item in list(
+                    getattr(
+                        artifact,
+                        "result_artifact_receipts",
+                        None,
+                    )
+                    or []
+                )
+                if isinstance(item, dict)
+            ]
+            if publication_status == "PUBLISHED"
+            else []
+        )
         receipts.append(
             {
                 "queryArtifactId": artifact_id,
@@ -325,6 +349,31 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
                 "executionMode": str(
                     getattr(artifact, "execution_mode", "") or ""
                 ),
+                "semanticActivationFingerprint": str(
+                    getattr(
+                        artifact,
+                        "semantic_activation_fingerprint",
+                        "",
+                    )
+                    or ""
+                ),
+                "semanticActivationSealFingerprint": str(
+                    getattr(
+                        artifact,
+                        "semantic_activation_seal_fingerprint",
+                        "",
+                    )
+                    or ""
+                ),
+                "semanticActivationTopics": list(
+                    getattr(
+                        artifact,
+                        "semantic_activation_topics",
+                        [],
+                    )
+                    or []
+                ),
+                "publicationStatus": publication_status,
                 "goalIds": sorted(
                     {
                         str(item)
@@ -341,7 +390,7 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
                 "storedRowCount": len(
                     list(getattr(bundle, "rows", None) or [])
                 ),
-                "resultArtifacts": _result_artifact_receipts(run_result),
+                "resultArtifacts": published_result_artifacts,
             }
         )
     return sorted(
@@ -375,6 +424,9 @@ def build_grounded_recovery_payload(
     ]
     active_contract = _model_payload(
         getattr(runtime, "active_contract", None)
+    )
+    semantic_activation = _model_payload(
+        getattr(runtime, "semantic_activation_seal", None)
     )
     branches: list[Any] = []
     for branch_id, context in sorted(
@@ -469,6 +521,16 @@ def build_grounded_recovery_payload(
             "contract": goal_contract,
         },
         "semanticReceipts": _semantic_receipts(session),
+        "semanticActivation": {
+            "seal": semantic_activation,
+            "executionStarted": bool(
+                getattr(
+                    runtime,
+                    "semantic_activation_execution_started",
+                    False,
+                )
+            ),
+        },
         "executionGraph": {
             "generation": int(
                 getattr(session, "execution_graph_generation", 0) or 0

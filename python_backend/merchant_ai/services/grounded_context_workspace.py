@@ -146,6 +146,54 @@ def _atomic_write_at(
             pass
 
 
+def _atomic_create_at(
+    directory_descriptor: int,
+    name: str,
+    encoded: bytes,
+    *,
+    mode: int,
+    error_code: str,
+) -> None:
+    component = _validate_component(name)
+    temporary = ".%s.%s.tmp" % (component, uuid.uuid4().hex)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
+            dir_fd=directory_descriptor,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(
+            temporary,
+            component,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+    except OSError as exc:
+        raise GroundedContextWorkspaceError(error_code) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
 def _stable_hash(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -238,6 +286,12 @@ def validated_grounded_query_artifact_roots(
             _open_directory_beneath(
                 trusted_workspace,
                 publication_components,
+            )
+        )
+        descriptors.append(
+            _open_directory_beneath(
+                trusted_workspace,
+                (*publication_components, "query_results"),
             )
         )
         descriptors.append(
@@ -337,6 +391,7 @@ class GroundedContextWorkspace:
 
         directory_components = (
             ("artifacts",),
+            ("artifacts", "query_results"),
             ("staging", "query_results"),
             ("scratch", "core"),
             ("scratch", "subagents"),
@@ -446,6 +501,197 @@ class GroundedContextWorkspace:
             raise GroundedContextWorkspaceError(
                 "GROUNDED_SUBAGENT_WORKSPACE_OUTSIDE_ROOT"
             ) from exc
+
+    def write_subagent_file(
+        self,
+        workspace: Path,
+        relative_path: str,
+        content: str,
+        *,
+        immutable: bool = False,
+    ) -> Path:
+        components = self._subagent_workspace_components(workspace)
+        file_name = self._subagent_file_name(relative_path)
+        encoded = str(content or "").encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        marker_name = ".context-immutable-%s.sha256" % hashlib.sha256(
+            file_name.encode("utf-8")
+        ).hexdigest()
+        workspace_descriptor = -1
+        lock_descriptor = -1
+        try:
+            workspace_descriptor = _open_directory_beneath(
+                self.subagents_root,
+                components,
+            )
+            lock_descriptor = os.open(
+                ".context-files.lock",
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=workspace_descriptor,
+            )
+            if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+                raise GroundedContextWorkspaceError(
+                    "GROUNDED_SUBAGENT_FILE_LOCK_INVALID"
+                )
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            if immutable:
+                try:
+                    existing = _read_regular_file_at(
+                        workspace_descriptor,
+                        file_name,
+                    )
+                except FileNotFoundError:
+                    existing = b""
+                if existing:
+                    if existing != encoded:
+                        raise GroundedContextWorkspaceError(
+                            "GROUNDED_SUBAGENT_IMMUTABLE_FILE_CONFLICT"
+                        )
+                else:
+                    _atomic_create_at(
+                        workspace_descriptor,
+                        file_name,
+                        encoded,
+                        mode=0o400,
+                        error_code=(
+                            "GROUNDED_SUBAGENT_IMMUTABLE_FILE_WRITE_FAILED"
+                        ),
+                    )
+                try:
+                    marker = _read_regular_file_at(
+                        workspace_descriptor,
+                        marker_name,
+                    ).decode("ascii").strip()
+                except FileNotFoundError:
+                    marker = ""
+                if marker and marker != digest:
+                    raise GroundedContextWorkspaceError(
+                        "GROUNDED_SUBAGENT_IMMUTABLE_MARKER_CONFLICT"
+                    )
+                if not marker:
+                    _atomic_write_at(
+                        workspace_descriptor,
+                        marker_name,
+                        ("%s\n" % digest).encode("ascii"),
+                        error_code=(
+                            "GROUNDED_SUBAGENT_IMMUTABLE_MARKER_WRITE_FAILED"
+                        ),
+                    )
+                immutable_descriptor = os.open(
+                    file_name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=workspace_descriptor,
+                )
+                try:
+                    os.fchmod(immutable_descriptor, 0o400)
+                finally:
+                    os.close(immutable_descriptor)
+            else:
+                _atomic_write_at(
+                    workspace_descriptor,
+                    file_name,
+                    encoded,
+                    error_code="GROUNDED_SUBAGENT_FILE_WRITE_FAILED",
+                )
+            return self.subagents_root.joinpath(
+                *components,
+                file_name,
+            )
+        except GroundedContextWorkspaceError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise GroundedContextWorkspaceError(
+                "GROUNDED_SUBAGENT_FILE_WRITE_FAILED"
+            ) from exc
+        finally:
+            if lock_descriptor >= 0:
+                try:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_descriptor)
+            if workspace_descriptor >= 0:
+                os.close(workspace_descriptor)
+
+    def read_subagent_file(
+        self,
+        workspace: Path,
+        relative_path: str,
+        *,
+        require_immutable: bool = False,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> str:
+        components = self._subagent_workspace_components(workspace)
+        file_name = self._subagent_file_name(relative_path)
+        descriptor = _open_directory_beneath(
+            self.subagents_root,
+            components,
+        )
+        try:
+            encoded = _read_regular_file_at(descriptor, file_name)
+            if len(encoded) > max(1, int(max_bytes or 1)):
+                raise GroundedContextWorkspaceError(
+                    "GROUNDED_SUBAGENT_FILE_BUDGET_EXCEEDED"
+                )
+            if require_immutable:
+                marker_name = (
+                    ".context-immutable-%s.sha256"
+                    % hashlib.sha256(
+                        file_name.encode("utf-8")
+                    ).hexdigest()
+                )
+                marker = _read_regular_file_at(
+                    descriptor,
+                    marker_name,
+                ).decode("ascii").strip()
+                if marker != hashlib.sha256(encoded).hexdigest():
+                    raise GroundedContextWorkspaceError(
+                        "GROUNDED_SUBAGENT_IMMUTABLE_FILE_INVALID"
+                    )
+            return encoded.decode("utf-8")
+        except GroundedContextWorkspaceError:
+            raise
+        except (FileNotFoundError, OSError, UnicodeError) as exc:
+            raise GroundedContextWorkspaceError(
+                "GROUNDED_SUBAGENT_FILE_READ_FAILED"
+            ) from exc
+        finally:
+            os.close(descriptor)
+
+    def _subagent_workspace_components(
+        self,
+        workspace: Path,
+    ) -> tuple[str, str]:
+        lexical = Path(os.path.abspath(str(workspace)))
+        try:
+            components = lexical.relative_to(self.subagents_root).parts
+        except ValueError as exc:
+            raise GroundedContextWorkspaceError(
+                "GROUNDED_SUBAGENT_WORKSPACE_OUTSIDE_ROOT"
+            ) from exc
+        if len(components) != 2:
+            raise GroundedContextWorkspaceError(
+                "GROUNDED_SUBAGENT_WORKSPACE_INVALID"
+            )
+        return (
+            _validate_component(components[0]),
+            _validate_component(components[1]),
+        )
+
+    @staticmethod
+    def _subagent_file_name(relative_path: str) -> str:
+        path = Path(str(relative_path or ""))
+        if (
+            path.is_absolute()
+            or len(path.parts) != 1
+            or str(path.name).startswith(".context-")
+        ):
+            raise GroundedContextWorkspaceError(
+                "GROUNDED_SUBAGENT_FILE_PATH_INVALID"
+            )
+        return _validate_component(path.name)
 
     def write_core_scratch(self, relative_path: str, content: str) -> Path:
         raw = str(relative_path or "").strip().replace("\\", "/").lstrip("/")

@@ -18,7 +18,20 @@ from merchant_ai.services.grounded_deep_agent_runtime import GroundedDeepAgentRu
 from merchant_ai.services.grounded_conversation_state import (
     GroundedConversationStateStore,
 )
+from merchant_ai.services.grounded_conversation_online_authority import (
+    GroundedConversationOnlineAuthorityFacade,
+    grounded_conversation_authority_fingerprint,
+)
+from merchant_ai.services.grounded_conversation_semantic_provider import (
+    StructuredConversationSemanticProvider,
+)
 from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
+from merchant_ai.services.grounded_population_online_gate import (
+    StructuredPopulationSemanticModelProvider,
+)
+from merchant_ai.services.grounded_population_runtime_gate import (
+    GroundedPopulationExecutionGate,
+)
 from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
 from merchant_ai.services.llm import LlmClient
 from merchant_ai.services.memory import create_memory_store
@@ -278,9 +291,110 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
 
     keyword_service = KeywordExtractService(topic_assets)
     topic_router = SemanticTopicRouterService(settings, topic_assets)
+    population_model_name = str(
+        settings.llm_balanced_model
+        or settings.llm_fast_model
+        or settings.openai_model
+    )
+    population_timeout_seconds = max(
+        1,
+        int(settings.llm_analysis_timeout_seconds or 0),
+    )
+    population_deployment = {
+        "model": population_model_name,
+        "baseUrl": str(settings.openai_base_url or "").rstrip("/"),
+        "protocol": "population_semantic_reviewer.v1",
+    }
+    semantic_authority = (
+        GroundedPopulationExecutionGate.authority_fingerprint(
+            "population_semantic_reviewer",
+            population_deployment,
+        )
+    )
+    population_provider = StructuredPopulationSemanticModelProvider(
+        LlmClient(
+            settings,
+            model_name=population_model_name,
+        ).chat_model(timeout_seconds=population_timeout_seconds),
+        authority_fingerprint=semantic_authority,
+    )
+    population_gate = GroundedPopulationExecutionGate(
+        settings=settings,
+        semantic_provider=population_provider,
+        declaration_author_fingerprint=(
+            GroundedPopulationExecutionGate.authority_fingerprint(
+                "core_goal_declaration",
+                {
+                    "model": str(settings.openai_model),
+                    "protocol": "grounded_core_goal_contract.v1",
+                },
+            )
+        ),
+        semantic_authority_fingerprint=semantic_authority,
+        lineage_authority_fingerprint=(
+            GroundedPopulationExecutionGate.authority_fingerprint(
+                "validated_sql_ast_lineage",
+                {"protocol": "grounded_sql_lineage.v1"},
+            )
+        ),
+        artifact_authority_fingerprint=(
+            GroundedPopulationExecutionGate.authority_fingerprint(
+                "immutable_result_artifact",
+                {"protocol": "grounded_result_artifact.v2"},
+            )
+        ),
+        ledger_authority_fingerprint=(
+            GroundedPopulationExecutionGate.authority_fingerprint(
+                "published_query_ledger",
+                {"protocol": "grounded_query_ledger.v1"},
+            )
+        ),
+        semantic_timeout_seconds=population_timeout_seconds,
+    )
+    conversation_deployment = {
+        "model": population_model_name,
+        "baseUrl": str(settings.openai_base_url or "").rstrip("/"),
+        "protocol": "conversation_semantic_resolver.v1",
+    }
+    conversation_semantic_authority = (
+        grounded_conversation_authority_fingerprint(
+            "conversation_semantic_reviewer",
+            conversation_deployment,
+        )
+    )
+    conversation_provider = StructuredConversationSemanticProvider(
+        LlmClient(
+            settings,
+            model_name=population_model_name,
+        ).chat_model(timeout_seconds=population_timeout_seconds),
+        authority_fingerprint=conversation_semantic_authority,
+    )
+    conversation_online_authority = (
+        GroundedConversationOnlineAuthorityFacade(
+            workspace_root=settings.resolved_workspace_path,
+            semantic_provider=conversation_provider,
+            trusted_reviewer_authority_fingerprints=(
+                conversation_semantic_authority,
+            ),
+            core_authority_fingerprint=(
+                grounded_conversation_authority_fingerprint(
+                    "grounded_core",
+                    {
+                        "model": str(settings.openai_model),
+                        "baseUrl": str(
+                            settings.openai_base_url or ""
+                        ).rstrip("/"),
+                        "protocol": "grounded_core_goal_contract.v1",
+                    },
+                )
+            ),
+            review_timeout_seconds=population_timeout_seconds,
+        )
+    )
     query_executor = GroundedQueryExecutionKernel(
         doris_repository,
         settings,
+        population_execution_gate=population_gate,
     )
     answer_service = AnswerComposeService(LlmClient(settings))
     merchant_service = MerchantService(
@@ -322,6 +436,9 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         parallel_max_workers=int(settings.tool_max_concurrency or 4),
         settings=settings,
         conversation_state_store=GroundedConversationStateStore(settings),
+        conversation_online_authority=conversation_online_authority,
+        population_execution_gate=population_gate,
+        population_gate_enforced=True,
     )
     return GroundedApplicationRuntime(
         settings=settings,

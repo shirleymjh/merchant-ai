@@ -51,6 +51,8 @@ POPULATION_FP = "full-population-fingerprint"
 QUERY_CONTRACT_FP = "query-contract-fingerprint"
 SQL_AST_FP = "validated-sql-ast-fingerprint"
 SNAPSHOT_FP = "data-snapshot-fingerprint"
+GENERATION = 7
+ATTEMPT_ID = "query-attempt"
 
 
 def _declaration_scope(
@@ -172,6 +174,12 @@ def _lineage_proof(
         mechanism=mechanism,
         verifier_fingerprint=LINEAGE_VERIFIER,
         verified=True,
+        graph_fingerprint=GRAPH_FP,
+        query_node_id="node-ranking",
+        generation=GENERATION,
+        attempt_id=ATTEMPT_ID,
+        query_contract_fingerprint=QUERY_CONTRACT_FP,
+        sql_ast_fingerprint=SQL_AST_FP,
         source_population_fingerprint=required.population_fingerprint,
         result_population_fingerprint=effective.population_fingerprint,
         source_goal_ids=required.source_goal_ids,
@@ -217,6 +225,8 @@ def _pre_gate(
                 PopulationExecutionClaim(
                     consumer_goal_id=CONSUMER_GOAL,
                     query_node_id="node-ranking",
+                    generation=GENERATION,
+                    attempt_id=ATTEMPT_ID,
                     declaration_scope_fingerprint=declaration_fp,
                     required_scope=required,
                     effective_scope=effective,
@@ -362,6 +372,56 @@ def test_pre_execution_blocks_time_filter_copy_that_loses_entity_population() ->
         result
     )
     assert PopulationGapCode.ENTITY_MAPPING_REQUIRED.value in _gap_codes(result)
+
+
+@pytest.mark.parametrize(
+    ("proof_override", "expected_gap"),
+    [
+        (
+            {"graph_fingerprint": "replayed-graph"},
+            PopulationGapCode.LINEAGE_GRAPH_MISMATCH,
+        ),
+        (
+            {"query_node_id": "replayed-node"},
+            PopulationGapCode.LINEAGE_QUERY_NODE_MISMATCH,
+        ),
+        (
+            {"generation": GENERATION + 1},
+            PopulationGapCode.LINEAGE_GENERATION_MISMATCH,
+        ),
+        (
+            {"attempt_id": "replayed-attempt"},
+            PopulationGapCode.LINEAGE_ATTEMPT_MISMATCH,
+        ),
+        (
+            {"query_contract_fingerprint": "replayed-query-contract"},
+            PopulationGapCode.LINEAGE_QUERY_CONTRACT_MISMATCH,
+        ),
+        (
+            {"sql_ast_fingerprint": "replayed-sql-ast"},
+            PopulationGapCode.LINEAGE_SQL_AST_MISMATCH,
+        ),
+        (
+            {"source_snapshot_fingerprint": "replayed-source-snapshot"},
+            PopulationGapCode.LINEAGE_SOURCE_SNAPSHOT_MISMATCH,
+        ),
+        (
+            {"result_snapshot_fingerprint": "replayed-result-snapshot"},
+            PopulationGapCode.LINEAGE_RESULT_SNAPSHOT_MISMATCH,
+        ),
+    ],
+)
+def test_pre_execution_rejects_replayed_lineage_proof_bindings(
+    proof_override,
+    expected_gap: PopulationGapCode,
+) -> None:
+    goal_result = _goal_gate()
+    proof = _lineage_proof().model_copy(update=proof_override)
+
+    result = _pre_gate(goal_result, proof=proof)
+
+    assert result.passed is False
+    assert expected_gap.value in _gap_codes(result)
 
 
 def test_pre_execution_accepts_verified_entity_set_artifact() -> None:

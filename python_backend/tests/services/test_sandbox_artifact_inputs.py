@@ -22,6 +22,7 @@ def _settings(tmp_path: Path, *, backend: str = "local") -> Settings:
     return Settings(
         harness_workspace_path=str(tmp_path / "runtime"),
         sandbox_backend=backend,
+        sandbox_unsafe_local_test_mode=True,
         sandbox_container_runtime="docker",
     )
 
@@ -145,6 +146,10 @@ def _artifact_access(
         preview_chars=0,
         immutable=True,
     )
+    sandbox_staging_root = (
+        settings.resolved_workspace_path / ".sandbox_inputs"
+    )
+    sandbox_staging_root.mkdir(parents=True, exist_ok=True)
     access = SandboxArtifactAccess(
         run_artifact_root=artifact_root,
         allowlist_manifest_path=Path(allowlist["path"]),
@@ -160,6 +165,8 @@ def _artifact_access(
                 result_coverage=coverage,
             ),
         ),
+        trusted_workspace_root=settings.resolved_workspace_path.resolve(),
+        sandbox_staging_root=sandbox_staging_root.resolve(),
     )
     return access, Path(rows_artifact["path"]), {
         "rows": rows_artifact,
@@ -582,3 +589,75 @@ def test_allowlist_content_address_is_required_even_when_sha_matches(
 
     assert result.returncode == 126
     assert result.stderr == "SANDBOX_ARTIFACT_CONTENT_ADDRESS_INVALID"
+
+
+def test_artifact_staging_parent_symlink_is_rejected_without_external_write(
+    tmp_path: Path,
+) -> None:
+    sandbox, script, settings = _approved_sandbox(tmp_path)
+    access, _, _ = _artifact_access(
+        settings,
+        coverage="ALL_ROWS",
+        population_use="COMPLETE_POPULATION",
+    )
+    staging_root = Path(access.sandbox_staging_root)
+    staging_root.rmdir()
+    outside = tmp_path / "outside-staging"
+    outside.mkdir()
+    staging_root.symlink_to(outside, target_is_directory=True)
+
+    result = sandbox.run_python(
+        script,
+        [],
+        settings.resolved_workspace_path / "scratch" / "analysis-link",
+        5,
+        artifact_access=access,
+    )
+
+    assert result.returncode == 126
+    assert result.stderr == "SANDBOX_STAGING_ROOT_INVALID"
+    assert list(outside.iterdir()) == []
+
+
+def test_local_backend_requires_explicit_test_only_capability(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "runtime"),
+        sandbox_backend="local",
+        sandbox_unsafe_local_test_mode=False,
+    )
+    sandbox = MerchantAnalysisSandbox(settings)
+    skill_root = tmp_path / "approved"
+    skill_root.mkdir()
+    script = skill_root / "safe.py"
+    script.write_text("print('ok')", encoding="utf-8")
+    sandbox.skill_root = skill_root.resolve()
+
+    result = sandbox.run_python(
+        script,
+        [],
+        settings.resolved_workspace_path / "scratch" / "analysis",
+        5,
+    )
+
+    assert result.returncode == 126
+    assert result.stderr == "SANDBOX_HARDENED_BACKEND_REQUIRED"
+
+
+def test_local_test_backend_redacts_host_paths_from_output(
+    tmp_path: Path,
+) -> None:
+    sandbox, _, settings = _approved_sandbox(tmp_path)
+    script = sandbox.skill_root / "print_path.py"
+    script.write_text(
+        "from pathlib import Path\nprint(Path.cwd())",
+        encoding="utf-8",
+    )
+    output = settings.resolved_workspace_path / "scratch" / "path-output"
+
+    result = sandbox.run_python(script, [], output, 5)
+
+    assert result.returncode == 0
+    assert str(output.resolve()) not in result.stdout
+    assert "[SANDBOX_PATH_REDACTED]" in result.stdout

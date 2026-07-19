@@ -148,7 +148,14 @@ class Settings(BaseSettings):
     skill_reuse_suggestion_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_REUSE_SUGGESTION_ENABLED")
     skill_worker_enabled: bool = Field(True, validation_alias="YSHOPPING_SKILL_WORKER_ENABLED")
     skill_worker_timeout_seconds: int = Field(10, validation_alias="YSHOPPING_SKILL_WORKER_TIMEOUT_SECONDS")
-    sandbox_backend: str = Field("local", validation_alias="YSHOPPING_SANDBOX_BACKEND")
+    sandbox_backend: str = Field(
+        "container",
+        validation_alias="YSHOPPING_SANDBOX_BACKEND",
+    )
+    sandbox_unsafe_local_test_mode: bool = Field(
+        False,
+        validation_alias="YSHOPPING_SANDBOX_UNSAFE_LOCAL_TEST_MODE",
+    )
     sandbox_container_runtime: str = Field("docker", validation_alias="YSHOPPING_SANDBOX_CONTAINER_RUNTIME")
     sandbox_container_image: str = Field(
         "python:3.11-slim-bookworm", validation_alias="YSHOPPING_SANDBOX_CONTAINER_IMAGE"
@@ -336,6 +343,18 @@ class Settings(BaseSettings):
     context_file_inline_max_chars: int = Field(12000, validation_alias="YSHOPPING_AGENT_CONTEXT_FILE_INLINE_MAX_CHARS")
     context_artifact_inline_max_rows: int = Field(
         20, validation_alias="YSHOPPING_AGENT_CONTEXT_ARTIFACT_INLINE_MAX_ROWS"
+    )
+    grounded_result_stream_fetch_batch_rows: int = Field(
+        500,
+        validation_alias="YSHOPPING_GROUNDED_RESULT_STREAM_FETCH_BATCH_ROWS",
+    )
+    grounded_result_stream_max_rows: int = Field(
+        1_000_000,
+        validation_alias="YSHOPPING_GROUNDED_RESULT_STREAM_MAX_ROWS",
+    )
+    grounded_result_stream_max_bytes: int = Field(
+        512 * 1024 * 1024,
+        validation_alias="YSHOPPING_GROUNDED_RESULT_STREAM_MAX_BYTES",
     )
     context_compaction_threshold_ratio: float = Field(
         0.85, validation_alias="YSHOPPING_CONTEXT_COMPACTION_THRESHOLD_RATIO"

@@ -245,6 +245,9 @@ def test_run_filesystem_mounts_immutable_artifacts_read_only_and_scratch_rw(
         root_kind="artifacts",
         read_only=True,
         settings=settings,
+        allowed_artifact_digests={
+            artifact["relativePath"]: artifact["sha256"]
+        },
     )
     scratch = GroundedRunFilesystemBackend(
         root_kind="scratch",
@@ -285,3 +288,74 @@ def test_run_filesystem_mounts_immutable_artifacts_read_only_and_scratch_rw(
         assert artifacts.read(
             "/artifacts/%s" % artifact["relativePath"]
         ).error == WorkspaceArtifactStore.IMMUTABLE_STATE_INVALID
+
+
+def test_subagent_files_are_nofollow_atomic_and_immutable_when_requested(
+    tmp_path: Path,
+) -> None:
+    workspace = GroundedContextWorkspace.open(
+        _settings(tmp_path / "runtime"),
+        thread_id="thread-files",
+        run_id="run-files",
+        merchant_id="merchant-files",
+        access_role="merchant_analyst",
+        user_scope={"userId": "user-files"},
+        question="question",
+    )
+    job = workspace.subagent_workspace("skill", "job-files")
+    input_path = workspace.write_subagent_file(
+        job,
+        "input.json",
+        '{"verified":true}',
+        immutable=True,
+    )
+
+    assert input_path.stat().st_mode & 0o777 == 0o400
+    assert workspace.read_subagent_file(
+        job,
+        "input.json",
+        require_immutable=True,
+    ) == '{"verified":true}'
+
+    outside = tmp_path / "outside-result.json"
+    outside.write_text("outside", encoding="utf-8")
+    (job / "result.json").symlink_to(outside)
+    workspace.write_subagent_file(
+        job,
+        "result.json",
+        '{"status":"done"}',
+    )
+
+    assert outside.read_text(encoding="utf-8") == "outside"
+    assert not (job / "result.json").is_symlink()
+    assert workspace.read_subagent_file(job, "result.json") == (
+        '{"status":"done"}'
+    )
+
+
+def test_subagent_immutable_write_rejects_prepositioned_symlink(
+    tmp_path: Path,
+) -> None:
+    workspace = GroundedContextWorkspace.open(
+        _settings(tmp_path / "runtime"),
+        thread_id="thread-link",
+        run_id="run-link",
+        merchant_id="merchant-link",
+        access_role="merchant_analyst",
+        user_scope={"userId": "user-link"},
+        question="question",
+    )
+    job = workspace.subagent_workspace("skill", "job-link")
+    outside = tmp_path / "outside-input.json"
+    outside.write_text("outside", encoding="utf-8")
+    (job / "input.json").symlink_to(outside)
+
+    with pytest.raises(GroundedContextWorkspaceError):
+        workspace.write_subagent_file(
+            job,
+            "input.json",
+            '{"verified":true}',
+            immutable=True,
+        )
+
+    assert outside.read_text(encoding="utf-8") == "outside"

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -9,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
+from sqlglot.tokens import Tokenizer
 
 from merchant_ai.models import NodeExecutionContext, PlanningAssetPack, QuestionIntent
 
@@ -30,12 +30,12 @@ def normalize_inclusive_relative_window_sql(sql: str, days: Any) -> str:
     if requested_days <= 0:
         return text
     inclusive_interval = inclusive_day_interval(requested_days)
-    pattern = re.compile(
-        r"DATE_SUB\(\s*(CURDATE\(\)|CURRENT_DATE(?:\(\))?)\s*,\s*INTERVAL\s+'?%d'?\s+DAY\s*\)"
-        % requested_days,
-        flags=re.I,
+    replacements = _date_sub_replacements(
+        text,
+        expected_days=requested_days,
+        replacement_days=inclusive_interval,
     )
-    return pattern.sub(lambda match: "DATE_SUB(%s, INTERVAL %d DAY)" % (match.group(1), inclusive_interval), text)
+    return _apply_text_replacements(text, replacements)
 
 
 @dataclass(frozen=True)
@@ -127,7 +127,14 @@ def build_split_detail_sql_plan(
 
     text = str(sql or "").strip()
     partition_column = normalize_identifier(time_column)
-    if not text or re.search(r"\b(group\s+by|union|join)\b", text, flags=re.I):
+    parsed = parse_sql_for_binding(text)
+    if (
+        not text
+        or parsed is None
+        or parsed.find(exp.Group) is not None
+        or parsed.find(exp.Union) is not None
+        or parsed.find(exp.Join) is not None
+    ):
         return None
     if not partition_column or not sql_references_column(text, partition_column):
         return None
@@ -416,22 +423,38 @@ def split_detail_sql_by_time_windows(
 
 def add_sql_where_condition(sql: str, condition: str) -> str:
     text = str(sql or "").strip()
-    match = re.search(r"\s+(group\s+by|having|order\s+by|limit)\b", text, flags=re.I)
-    tail = text[match.start() :] if match else ""
-    head = text[: match.start()] if match else text
-    if re.search(r"\swhere\s", head, flags=re.I):
-        updated = "%s AND %s" % (head.rstrip(), condition)
+    parsed = parse_sql_for_binding(text)
+    try:
+        restriction = sqlglot.parse_one(
+            str(condition or "").strip(),
+            read="doris",
+            into=exp.Condition,
+        )
+    except Exception as exc:
+        raise ValueError("SQL_AST_RESTRICTION_PARSE_FAILED") from exc
+    if parsed is None or restriction is None:
+        raise ValueError("SQL_AST_WHERE_BINDING_PARSE_FAILED")
+    where = parsed.args.get("where")
+    if isinstance(where, exp.Where):
+        predicate = exp.and_(where.this.copy(), restriction.copy())
     else:
-        updated = "%s WHERE %s" % (head.rstrip(), condition)
-    return (updated + tail).strip()
+        predicate = restriction.copy()
+    parsed.set("where", exp.Where(this=predicate))
+    return normalize_ast_bound_sql_text(
+        parsed.sql(dialect="mysql", identify=True).replace("?", "%s")
+    )
 
 
 def replace_sql_limit(sql: str, limit: int) -> str:
     text = str(sql or "").strip()
     value = max(1, int(limit or 1))
-    if re.search(r"\s+limit\s+\d+\s*$", text, flags=re.I):
-        return re.sub(r"\s+limit\s+\d+\s*$", " LIMIT %d" % value, text, flags=re.I)
-    return "%s LIMIT %d" % (text, value)
+    parsed = parse_sql_for_binding(text)
+    if parsed is None:
+        raise ValueError("SQL_AST_LIMIT_BINDING_PARSE_FAILED")
+    parsed.set("limit", exp.Limit(expression=exp.Literal.number(value)))
+    return normalize_ast_bound_sql_text(
+        parsed.sql(dialect="mysql", identify=True).replace("?", "%s")
+    )
 
 
 def quote_identifier(column: str) -> str:
@@ -459,7 +482,10 @@ def split_filter_values(value: Any, max_values: int = 200) -> List[Any]:
         raw = str(value or "").strip()
         if not raw:
             return []
-        raw_values = [item.strip() for item in re.split(r"[,，]", raw)] if re.search(r"[,，]", raw) else [raw]
+        raw_values = [
+            item.strip()
+            for item in raw.replace("，", ",").split(",")
+        ]
     values: List[Any] = []
     for item in raw_values:
         if blank_entity_value(item):
@@ -475,18 +501,18 @@ def parse_sql_literal(value: str) -> Any:
     text = str(value or "").strip()
     if not text:
         return ""
-    if text in {"%s", "?"} or re.match(r"^:[A-Za-z_][A-Za-z0-9_]*$", text):
+    if text in {"%s", "?"} or _is_named_placeholder(text):
         return ""
     if text.upper() == "NULL":
         return None
     if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
         return text[1:-1].replace("''", "'")
-    if re.match(r"^-?\d+$", text):
+    if _is_ascii_integer(text):
         try:
             return int(text)
         except ValueError:
             return text
-    if re.match(r"^-?\d+\.\d+$", text):
+    if _is_ascii_decimal(text):
         try:
             return float(text)
         except ValueError:
@@ -731,18 +757,6 @@ def parse_partition_date(value: str) -> Optional[date]:
         except Exception:
             continue
     return None
-
-
-def bindable_predicate_pattern(columns: List[str]) -> Optional[re.Pattern[str]]:
-    names = [normalize_identifier(column) for column in columns if normalize_identifier(column)]
-    if not names:
-        return None
-    column_pattern = "|".join(re.escape(column) for column in sorted(set(names), key=len, reverse=True))
-    rhs_pattern = r"\([^)]*\)|%s|\?|:[A-Za-z_][A-Za-z0-9_]*|'(?:''|[^'])*'|-?\d+(?:\.\d+)?"
-    return re.compile(
-        r"(?P<prefix>`?(?P<column>%s)`?\s*)(?P<op>=|IN)\s*(?P<rhs>%s)" % (column_pattern, rhs_pattern),
-        re.IGNORECASE,
-    )
 
 
 def predicate_column_name(expression: Any) -> str:
@@ -994,8 +1008,7 @@ def has_merchant_filter_predicate(sql: str, columns: set) -> bool:
         for predicate in list(parsed.find_all(exp.EQ)) + list(parsed.find_all(exp.In)):
             if predicate_column_name(predicate.this) in merchant_columns:
                 return True
-    pattern = bindable_predicate_pattern(merchant_columns)
-    return bool(pattern.search(sql or "")) if pattern else False
+    return False
 
 
 def sql_has_bound_merchant_filter(sql: str, columns: set) -> bool:
@@ -1010,13 +1023,6 @@ def sql_has_bound_merchant_filter(sql: str, columns: set) -> bool:
         for predicate in parsed.find_all(exp.In):
             if predicate_column_name(predicate.this) in merchant_columns and any(sql_expression_is_placeholder(item) for item in predicate.expressions):
                 return True
-    pattern = bindable_predicate_pattern(merchant_columns)
-    if not pattern:
-        return False
-    for match in pattern.finditer(sql or ""):
-        rhs = str(match.group("rhs") or "").strip()
-        if "%s" in rhs or rhs == "?" or re.match(r"^:[A-Za-z_][A-Za-z0-9_]*$", rhs):
-            return True
     return False
 
 
@@ -1032,10 +1038,7 @@ def sql_has_bound_column_filter(sql: str, column: str) -> bool:
             expressions = [predicate.expression] if isinstance(predicate, exp.EQ) else list(predicate.expressions or [])
             if any(sql_expression_is_placeholder(item) for item in expressions):
                 return True
-    pattern = bindable_predicate_pattern([normalized])
-    if not pattern:
-        return False
-    return any("%s" in str(match.group("rhs") or "") or "?" in str(match.group("rhs") or "") for match in pattern.finditer(sql or ""))
+    return False
 
 
 def predicate_references_column(expression: Any, column: str) -> bool:
@@ -1055,7 +1058,7 @@ def sql_references_column(sql: str, column: str) -> bool:
     parsed = parse_sql_for_binding(sql)
     if parsed is not None:
         return any(normalize_identifier(item.name) == normalized for item in parsed.find_all(exp.Column))
-    return bool(re.search(r"(?:`%s`|\b%s\b)" % (re.escape(normalized), re.escape(normalized)), sql or "", flags=re.I))
+    return False
 
 
 def bind_node_sql_parameters_ast(
@@ -1153,24 +1156,15 @@ def parse_ast_literal_values(expressions: List[Any]) -> List[Any]:
 
 
 def normalize_ast_bound_sql_text(sql: str) -> str:
-    text = re.sub(
-        r"DATE_SUB\(CURRENT_DATE, INTERVAL '(\d+)' DAY\)",
-        r"DATE_SUB(CURDATE(), INTERVAL \1 DAY)",
-        sql or "",
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"NOT\s+((?:`[^`]+`\.)?`[^`]+`|[A-Za-z_][A-Za-z0-9_.]*)\s+IS\s+NULL",
-        r"\1 IS NOT NULL",
+    text = str(sql or "")
+    text = _apply_text_replacements(
         text,
-        flags=re.IGNORECASE,
+        _date_sub_replacements(text),
     )
-    text = re.sub(
-        r"((?:`[^`]+`\.)?`[^`]+`|[A-Za-z_][A-Za-z0-9_.]*)\s+<>\s+''",
-        r"\1 != ''",
+    return _apply_text_replacements(
         text,
+        _null_and_empty_string_replacements(text),
     )
-    return text
 
 
 def bind_node_sql_parameters(
@@ -1195,39 +1189,233 @@ def bind_node_sql_parameters(
             )
     columns = {normalize_identifier(column) for column in asset_pack.known_columns(intent.preferred_table)}
     values_by_column = node_bind_values_by_column(intent, asset_pack, columns, context)
-    pattern = bindable_predicate_pattern(list(values_by_column.keys()))
-    if not pattern:
-        return sql, [], ""
-    params: List[Any] = []
     merchant_columns = {declared_tenant_column(intent, asset_pack, context, columns)} - {""}
+    if not values_by_column and not merchant_columns:
+        return sql, [], ""
     ast_sql, ast_params, ast_error, ast_used = bind_node_sql_parameters_ast(sql, values_by_column, merchant_columns, context)
     if ast_used:
         return ast_sql, ast_params, ast_error
-    merchant_bound = not merchant_columns
+    return sql, [], "SQL_AST_BINDING_PARSE_FAILED"
 
-    def replace(match: re.Match[str]) -> str:
-        nonlocal merchant_bound
-        column = normalize_identifier(match.group("column"))
-        rhs = str(match.group("rhs") or "")
-        values = list(values_by_column.get(column) or [])
-        if not values:
-            values = parse_sql_literal_values(rhs)
-        values = [value for value in values if not blank_entity_value(value)]
-        if not values:
-            return match.group(0)
-        if column in merchant_columns:
-            values = [context.merchant_id]
-            merchant_bound = True
-        if len(values) > 1:
-            params.extend(values)
-            return "%sIN (%s)" % (match.group("prefix"), ", ".join(["%s"] * len(values)))
-        params.append(values[0])
-        return "%s= %%s" % match.group("prefix")
 
-    bound_sql = pattern.sub(replace, sql or "")
-    if merchant_columns and not merchant_bound:
-        return bound_sql, params, "SQL 缺少语义资产声明的租户过滤字段"
-    return bound_sql, params, ""
+def _is_named_placeholder(value: str) -> bool:
+    if not value.startswith(":") or len(value) < 2:
+        return False
+    name = value[1:]
+    if not (
+        "A" <= name[0] <= "Z"
+        or "a" <= name[0] <= "z"
+        or name[0] == "_"
+    ):
+        return False
+    return all(
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character == "_"
+        for character in name[1:]
+    )
+
+
+def _is_ascii_integer(value: str) -> bool:
+    digits = value[1:] if value.startswith("-") else value
+    return bool(digits) and all("0" <= character <= "9" for character in digits)
+
+
+def _is_ascii_decimal(value: str) -> bool:
+    unsigned = value[1:] if value.startswith("-") else value
+    whole, separator, fraction = unsigned.partition(".")
+    return bool(
+        separator
+        and whole
+        and fraction
+        and all("0" <= character <= "9" for character in whole)
+        and all("0" <= character <= "9" for character in fraction)
+    )
+
+
+def _date_sub_replacements(
+    text: str,
+    *,
+    expected_days: int | None = None,
+    replacement_days: int | None = None,
+) -> List[Tuple[int, int, str]]:
+    try:
+        tokens = Tokenizer().tokenize(text)
+    except Exception:
+        return []
+    replacements: List[Tuple[int, int, str]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.text.upper() != "DATE_SUB":
+            index += 1
+            continue
+        cursor = index + 1
+        if not _token_text_is(tokens, cursor, "("):
+            index += 1
+            continue
+        cursor += 1
+        current_date = _token_upper(tokens, cursor)
+        if current_date not in {"CURDATE", "CURRENT_DATE"}:
+            index += 1
+            continue
+        cursor += 1
+        if _token_text_is(tokens, cursor, "("):
+            if not _token_text_is(tokens, cursor + 1, ")"):
+                index += 1
+                continue
+            cursor += 2
+        if not _token_text_is(tokens, cursor, ","):
+            index += 1
+            continue
+        cursor += 1
+        if _token_upper(tokens, cursor) != "INTERVAL":
+            index += 1
+            continue
+        cursor += 1
+        if cursor >= len(tokens):
+            break
+        raw_days = str(tokens[cursor].text or "").strip()
+        if not _is_ascii_integer(raw_days):
+            index += 1
+            continue
+        observed_days = int(raw_days)
+        if expected_days is not None and observed_days != expected_days:
+            index += 1
+            continue
+        cursor += 1
+        if _token_upper(tokens, cursor) != "DAY":
+            index += 1
+            continue
+        cursor += 1
+        if not _token_text_is(tokens, cursor, ")"):
+            index += 1
+            continue
+        rendered_days = (
+            observed_days
+            if replacement_days is None
+            else int(replacement_days)
+        )
+        replacements.append(
+            (
+                token.start,
+                tokens[cursor].end + 1,
+                "DATE_SUB(CURDATE(), INTERVAL %d DAY)" % rendered_days,
+            )
+        )
+        index = cursor + 1
+    return replacements
+
+
+def _null_and_empty_string_replacements(
+    text: str,
+) -> List[Tuple[int, int, str]]:
+    try:
+        tokens = Tokenizer().tokenize(text)
+    except Exception:
+        return []
+    replacements: List[Tuple[int, int, str]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        upper = token.text.upper()
+        if upper == "NOT":
+            is_index = _qualified_identifier_end(tokens, index + 1)
+            if (
+                is_index > index + 1
+                and _token_upper(tokens, is_index) == "IS"
+                and _token_upper(tokens, is_index + 1) == "NULL"
+            ):
+                identifier = text[
+                    tokens[index + 1].start : tokens[is_index].start
+                ].rstrip()
+                replacements.append(
+                    (
+                        token.start,
+                        tokens[is_index + 1].end + 1,
+                        "%s IS NOT NULL" % identifier,
+                    )
+                )
+                index = is_index + 2
+                continue
+        if (
+            upper == "<>"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].text == ""
+        ):
+            replacements.append((token.start, token.end + 1, "!="))
+        index += 1
+    return replacements
+
+
+def _qualified_identifier_end(tokens: List[Any], start: int) -> int:
+    cursor = start
+    observed_name = False
+    while cursor < len(tokens):
+        text = tokens[cursor].text
+        upper = text.upper()
+        if upper == "IS":
+            return cursor if observed_name else start
+        if text in {"`", "."}:
+            cursor += 1
+            continue
+        if _is_identifier_token(text):
+            observed_name = True
+            cursor += 1
+            continue
+        return start
+    return start
+
+
+def _is_identifier_token(value: str) -> bool:
+    if not value:
+        return False
+    first = value[0]
+    if not (
+        "A" <= first <= "Z"
+        or "a" <= first <= "z"
+        or first == "_"
+    ):
+        return False
+    return all(
+        "A" <= character <= "Z"
+        or "a" <= character <= "z"
+        or "0" <= character <= "9"
+        or character == "_"
+        for character in value[1:]
+    )
+
+
+def _token_text_is(tokens: List[Any], index: int, expected: str) -> bool:
+    return bool(
+        0 <= index < len(tokens)
+        and str(tokens[index].text or "") == expected
+    )
+
+
+def _token_upper(tokens: List[Any], index: int) -> str:
+    if index < 0 or index >= len(tokens):
+        return ""
+    return str(tokens[index].text or "").upper()
+
+
+def _apply_text_replacements(
+    text: str,
+    replacements: List[Tuple[int, int, str]],
+) -> str:
+    result = text
+    last_start = len(text) + 1
+    for start, end, replacement in sorted(
+        replacements,
+        key=lambda item: item[0],
+        reverse=True,
+    ):
+        if start < 0 or end < start or end > len(text) or end > last_start:
+            continue
+        result = result[:start] + replacement + result[end:]
+        last_start = start
+    return result
 
 
 def blank_entity_value(value: Any) -> bool:

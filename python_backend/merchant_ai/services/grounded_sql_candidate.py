@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
@@ -948,11 +947,9 @@ class GroundedSqlCandidateValidator:
             for state in context.scope_states.values()
         }
         for proof, join_state in context.join_proofs:
-            policy = re.sub(
-                r"[^A-Z0-9]+",
-                "_",
-                str(proof.relationship.fanout_policy or "").upper(),
-            ).strip("_")
+            policy = _normalize_ascii_token(
+                proof.relationship.fanout_policy
+            )
             cardinality = _normalize_cardinality(proof.relationship.cardinality)
             for obligation in context.metric_formula_obligations:
                 formula_states = [
@@ -1752,7 +1749,7 @@ def _literal_positive_integer(expression: exp.Expression | None) -> int | None:
     if not isinstance(current, exp.Literal) or current.is_string:
         return None
     raw = str(current.this or "").strip()
-    if not re.fullmatch(r"[0-9]+", raw):
+    if not raw or any(character < "0" or character > "9" for character in raw):
         return None
     value = int(raw)
     return value if value > 0 else None
@@ -2421,7 +2418,7 @@ def _join_type(join: exp.Join) -> str:
 
 
 def _normalize_join_type(value: Any) -> str:
-    text = re.sub(r"\s+", "_", str(value or "").strip().upper())
+    text = "_".join(str(value or "").strip().upper().split())
     text = text.removesuffix("_JOIN").removesuffix("JOIN").strip("_")
     if text in {"", "DEFAULT"}:
         return ""
@@ -2437,7 +2434,7 @@ def _reverse_join_type(value: str) -> str:
 
 
 def _normalize_cardinality(value: Any) -> str:
-    text = re.sub(r"[^A-Z0-9]+", "_", str(value or "").strip().upper()).strip("_")
+    text = _normalize_ascii_token(value)
     return {
         "1_N": "ONE_TO_MANY",
         "1_M": "ONE_TO_MANY",
@@ -2453,6 +2450,16 @@ def _normalize_cardinality(value: Any) -> str:
         "M_M": "MANY_TO_MANY",
         "MANY_MANY": "MANY_TO_MANY",
     }.get(text, text)
+
+
+def _normalize_ascii_token(value: Any) -> str:
+    characters: list[str] = []
+    for character in str(value or "").strip().upper():
+        if "A" <= character <= "Z" or "0" <= character <= "9":
+            characters.append(character)
+        elif characters and characters[-1] != "_":
+            characters.append("_")
+    return "".join(characters).strip("_")
 
 
 def _fanout_duplicated_tables(

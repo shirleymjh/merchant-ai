@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from typing import Any, Mapping, Sequence
 
 from pydantic import ConfigDict, Field, ValidationError
@@ -143,6 +142,15 @@ class AnswerCoverageVerifier:
             )
 
         goal_map = parsed.goal_map()
+        required_goal_kinds = {
+            goal_map[goal_id].kind
+            for goal_id in coverage.required_goal_ids
+            if goal_id in goal_map
+        }
+        mixed_rule_query_answer = bool(
+            "RULE" in required_goal_kinds
+            and any(kind != "RULE" for kind in required_goal_kinds)
+        )
         binding_by_goal_id: dict[str, GoalAnswerBinding] = {}
         for binding in parsed_bindings:
             if binding.goal_id in binding_by_goal_id:
@@ -179,6 +187,7 @@ class AnswerCoverageVerifier:
                     coverage,
                     answer,
                     source=source,
+                    mixed_rule_query_answer=mixed_rule_query_answer,
                 )
             )
 
@@ -501,6 +510,7 @@ def _binding_issues(
     answer_markdown: str,
     *,
     source: str,
+    mixed_rule_query_answer: bool,
 ) -> list[AnswerCoverageIssue]:
     issues: list[AnswerCoverageIssue] = []
 
@@ -558,10 +568,21 @@ def _binding_issues(
             expectedRenderer=expected_renderer,
             actualRenderer=binding.renderer,
         )
-    if goal.kind == "RULE" and source != "compose_verified_rule_answer":
+    rule_source_allowed = bool(
+        source == "compose_verified_rule_answer"
+        or (
+            source == "compose_verified_answer"
+            and mixed_rule_query_answer
+        )
+    )
+    if goal.kind == "RULE" and not rule_source_allowed:
         add(
             "RULE_ANSWER_RENDERER_BOUNDARY_VIOLATION",
-            "RULE goals may only be finalized by compose_verified_rule_answer",
+            (
+                "RULE goals require the verified rule renderer; a mixed "
+                "RULE/query contract may use compose_verified_answer only "
+                "when the same attestation covers every required goal"
+            ),
         )
     proof_types = {
         str(item or "").strip().upper()
@@ -689,11 +710,9 @@ def _expected_goal_renderer(
 def _artifact_can_render_goal(goal: QuestionGoal, artifact: Any) -> bool:
     if goal.kind != "COMPARISON":
         return True
-    comparison_type = re.sub(
-        r"[^A-Z0-9]+",
-        "_",
-        str(getattr(goal, "comparison_type", "") or "").upper(),
-    ).strip("_")
+    comparison_type = _ascii_token(
+        str(getattr(goal, "comparison_type", "") or "")
+    )
     if comparison_type.startswith("ANOMAL"):
         return False
     contract = getattr(artifact, "contract", None)
@@ -786,8 +805,8 @@ def _value_is_rendered(answer_markdown: str, value: Any) -> bool:
         return False
     if text in answer:
         return True
-    compact_answer = re.sub(r"[,_\s]", "", answer).lower()
-    compact_value = re.sub(r"[,_\s]", "", text).lower()
+    compact_answer = _compact_value_text(answer)
+    compact_value = _compact_value_text(text)
     if compact_value and compact_value in compact_answer:
         return True
     try:
@@ -810,9 +829,7 @@ def _markdown_cell(value: Any) -> str:
 
 
 def _canonical_resolution(value: Any) -> str:
-    normalized = re.sub(
-        r"[^A-Z0-9]+", "_", str(value or "").strip().upper()
-    ).strip("_")
+    normalized = _ascii_token(str(value or ""))
     aliases = {
         "PROVED": "PROVED",
         "VERIFIED": "PROVED",
@@ -827,7 +844,29 @@ def _canonical_resolution(value: Any) -> str:
 
 
 def _normalized_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip())
+    return " ".join(str(value or "").split())
+
+
+def _ascii_token(value: str) -> str:
+    characters: list[str] = []
+    separator_pending = False
+    for character in str(value or "").strip().upper():
+        if character.isascii() and character.isalnum():
+            if separator_pending and characters:
+                characters.append("_")
+            characters.append(character)
+            separator_pending = False
+        elif characters:
+            separator_pending = True
+    return "".join(characters).strip("_")
+
+
+def _compact_value_text(value: str) -> str:
+    return "".join(
+        character.lower()
+        for character in str(value or "")
+        if not character.isspace() and character not in {",", "_"}
+    )
 
 
 def _dedupe_strings(values: Sequence[Any]) -> list[str]:

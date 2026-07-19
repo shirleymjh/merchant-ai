@@ -98,12 +98,22 @@ class PopulationGapCode(str, Enum):
     EXECUTION_CLAIM_UNEXPECTED = "EXECUTION_CLAIM_UNEXPECTED"
     EXECUTION_CLAIM_DUPLICATE = "EXECUTION_CLAIM_DUPLICATE"
     QUERY_NODE_REQUIRED = "QUERY_NODE_REQUIRED"
+    QUERY_GENERATION_REQUIRED = "QUERY_GENERATION_REQUIRED"
+    QUERY_ATTEMPT_REQUIRED = "QUERY_ATTEMPT_REQUIRED"
     QUERY_CONTRACT_FINGERPRINT_REQUIRED = "QUERY_CONTRACT_FINGERPRINT_REQUIRED"
     SQL_AST_FINGERPRINT_REQUIRED = "SQL_AST_FINGERPRINT_REQUIRED"
     POPULATION_FINGERPRINT_REQUIRED = "POPULATION_FINGERPRINT_REQUIRED"
     LINEAGE_PROOF_REQUIRED = "LINEAGE_PROOF_REQUIRED"
     LINEAGE_PROOF_UNTRUSTED = "LINEAGE_PROOF_UNTRUSTED"
     LINEAGE_PROOF_UNVERIFIED = "LINEAGE_PROOF_UNVERIFIED"
+    LINEAGE_GRAPH_MISMATCH = "LINEAGE_GRAPH_MISMATCH"
+    LINEAGE_QUERY_NODE_MISMATCH = "LINEAGE_QUERY_NODE_MISMATCH"
+    LINEAGE_GENERATION_MISMATCH = "LINEAGE_GENERATION_MISMATCH"
+    LINEAGE_ATTEMPT_MISMATCH = "LINEAGE_ATTEMPT_MISMATCH"
+    LINEAGE_QUERY_CONTRACT_MISMATCH = "LINEAGE_QUERY_CONTRACT_MISMATCH"
+    LINEAGE_SQL_AST_MISMATCH = "LINEAGE_SQL_AST_MISMATCH"
+    LINEAGE_SOURCE_SNAPSHOT_MISMATCH = "LINEAGE_SOURCE_SNAPSHOT_MISMATCH"
+    LINEAGE_RESULT_SNAPSHOT_MISMATCH = "LINEAGE_RESULT_SNAPSHOT_MISMATCH"
     LINEAGE_MECHANISM_INVALID = "LINEAGE_MECHANISM_INVALID"
     LINEAGE_SOURCE_POPULATION_MISMATCH = "LINEAGE_SOURCE_POPULATION_MISMATCH"
     LINEAGE_RESULT_POPULATION_MISMATCH = "LINEAGE_RESULT_POPULATION_MISMATCH"
@@ -286,6 +296,12 @@ class PopulationLineageProof(_StrictFrozenModel):
     mechanism: PopulationLineageMechanism
     verifier_fingerprint: str
     verified: bool
+    graph_fingerprint: str = ""
+    query_node_id: str = ""
+    generation: int = Field(default=0, ge=0)
+    attempt_id: str = ""
+    query_contract_fingerprint: str = ""
+    sql_ast_fingerprint: str = ""
     source_population_fingerprint: str
     result_population_fingerprint: str
     source_goal_ids: tuple[str, ...] = ()
@@ -321,6 +337,8 @@ class PopulationLineageProof(_StrictFrozenModel):
 class PopulationExecutionClaim(_StrictFrozenModel):
     consumer_goal_id: str
     query_node_id: str
+    generation: int = Field(default=0, ge=0)
+    attempt_id: str = ""
     declaration_scope_fingerprint: str
     required_scope: PopulationScopeDescriptor
     effective_scope: PopulationScopeDescriptor
@@ -364,6 +382,8 @@ class PopulationScopeAttestation(_StrictFrozenModel):
     constraint_fingerprints: tuple[str, ...] = ()
     complete_membership_required: bool = False
     query_node_id: str = ""
+    generation: int = Field(default=0, ge=0)
+    attempt_id: str = ""
     query_contract_fingerprint: str = ""
     sql_ast_fingerprint: str = ""
     snapshot_fingerprint: str = ""
@@ -426,6 +446,7 @@ class PreExecutionPopulationVerificationInput(_StrictFrozenModel):
     trusted_lineage_verifier_fingerprints: tuple[str, ...]
     trusted_artifact_verifier_fingerprints: tuple[str, ...] = ()
     required_consumer_goal_ids: tuple[str, ...] = ()
+    consumer_scope_selection_explicit: bool = False
     claims: tuple[PopulationExecutionClaim, ...] = ()
 
 
@@ -438,6 +459,7 @@ class PostResultPopulationVerificationInput(_StrictFrozenModel):
     pre_execution_attestation: PopulationVerificationAttestation | None = None
     trusted_artifact_verifier_fingerprints: tuple[str, ...]
     required_consumer_goal_ids: tuple[str, ...] = ()
+    consumer_scope_selection_explicit: bool = False
     results: tuple[PopulationResultEvidence, ...] = ()
 
 
@@ -851,20 +873,34 @@ class PopulationSemanticVerifier:
             item.consumer_goal_id: item
             for item in prior.accepted_scopes
         } if prior is not None else {}
-        required_consumers = set(prior_scopes)
+        attested_consumers = set(prior_scopes)
         requested_consumers = set(request.required_consumer_goal_ids)
-        if requested_consumers and requested_consumers != required_consumers:
+        explicit_selection = bool(
+            request.consumer_scope_selection_explicit
+        )
+        selection_mismatch = (
+            not requested_consumers.issubset(attested_consumers)
+            if explicit_selection
+            else bool(requested_consumers)
+            and requested_consumers != attested_consumers
+        )
+        if selection_mismatch:
             gaps.append(
                 _gap(
                     PopulationGapCode.PRIOR_ATTESTATION_SCOPE_MISMATCH,
                     stage,
-                    "A caller cannot remove or add population gates accepted at Goal declaration.",
+                    "A node cannot add population gates absent from Goal declaration.",
                     details={
-                        "attestedConsumerGoalIds": sorted(required_consumers),
+                        "attestedConsumerGoalIds": sorted(attested_consumers),
                         "requestedConsumerGoalIds": sorted(requested_consumers),
                     },
                 )
             )
+        required_consumers = (
+            requested_consumers
+            if explicit_selection
+            else attested_consumers
+        )
         claim_map, duplicate_consumers = _unique_by_consumer(
             request.claims,
             lambda item: item.consumer_goal_id,
@@ -1007,6 +1043,26 @@ class PopulationSemanticVerifier:
                         consumer_goal_id=consumer_goal_id,
                     )
                 )
+            if claim.generation < 1:
+                claim_gaps.append(
+                    _gap(
+                        PopulationGapCode.QUERY_GENERATION_REQUIRED,
+                        stage,
+                        "A population execution claim requires its query-node generation.",
+                        consumer_goal_id=consumer_goal_id,
+                        query_node_id=claim.query_node_id,
+                    )
+                )
+            if not _text(claim.attempt_id):
+                claim_gaps.append(
+                    _gap(
+                        PopulationGapCode.QUERY_ATTEMPT_REQUIRED,
+                        stage,
+                        "A population execution claim requires its query-node attempt identity.",
+                        consumer_goal_id=consumer_goal_id,
+                        query_node_id=claim.query_node_id,
+                    )
+                )
             if not _text(claim.query_contract_fingerprint):
                 claim_gaps.append(
                     _gap(
@@ -1124,6 +1180,7 @@ class PopulationSemanticVerifier:
                 proof_gaps = _verify_lineage_proof(
                     claim,
                     proof,
+                    graph_fingerprint=request.graph_fingerprint,
                     trusted_lineage_verifiers=request.trusted_lineage_verifier_fingerprints,
                     trusted_artifact_verifiers=request.trusted_artifact_verifier_fingerprints,
                 )
@@ -1183,6 +1240,8 @@ class PopulationSemanticVerifier:
                         claim.required_scope.complete_membership_required
                     ),
                     query_node_id=claim.query_node_id,
+                    generation=claim.generation,
+                    attempt_id=claim.attempt_id,
                     query_contract_fingerprint=claim.query_contract_fingerprint,
                     sql_ast_fingerprint=claim.sql_ast_fingerprint,
                     snapshot_fingerprint=(
@@ -1224,20 +1283,34 @@ class PopulationSemanticVerifier:
             item.consumer_goal_id: item
             for item in prior.accepted_scopes
         } if prior is not None else {}
-        required_consumers = set(prior_scopes)
+        attested_consumers = set(prior_scopes)
         requested_consumers = set(request.required_consumer_goal_ids)
-        if requested_consumers and requested_consumers != required_consumers:
+        explicit_selection = bool(
+            request.consumer_scope_selection_explicit
+        )
+        selection_mismatch = (
+            not requested_consumers.issubset(attested_consumers)
+            if explicit_selection
+            else bool(requested_consumers)
+            and requested_consumers != attested_consumers
+        )
+        if selection_mismatch:
             gaps.append(
                 _gap(
                     PopulationGapCode.PRIOR_ATTESTATION_SCOPE_MISMATCH,
                     stage,
-                    "A caller cannot remove or add population gates accepted before execution.",
+                    "A node cannot add population gates absent from its PRE attestation.",
                     details={
-                        "attestedConsumerGoalIds": sorted(required_consumers),
+                        "attestedConsumerGoalIds": sorted(attested_consumers),
                         "requestedConsumerGoalIds": sorted(requested_consumers),
                     },
                 )
             )
+        required_consumers = (
+            requested_consumers
+            if explicit_selection
+            else attested_consumers
+        )
         result_map, duplicates = _unique_by_consumer(
             request.results,
             lambda item: item.consumer_goal_id,
@@ -1466,6 +1539,7 @@ def _verify_lineage_proof(
     claim: PopulationExecutionClaim,
     proof: PopulationLineageProof,
     *,
+    graph_fingerprint: str,
     trusted_lineage_verifiers: Sequence[str],
     trusted_artifact_verifiers: Sequence[str],
 ) -> list[PopulationVerificationGap]:
@@ -1495,6 +1569,54 @@ def _verify_lineage_proof(
                 **common,
             )
         )
+    execution_bindings = (
+        (
+            PopulationGapCode.LINEAGE_GRAPH_MISMATCH,
+            proof.graph_fingerprint,
+            graph_fingerprint,
+            "frozen execution graph",
+        ),
+        (
+            PopulationGapCode.LINEAGE_QUERY_NODE_MISMATCH,
+            proof.query_node_id,
+            claim.query_node_id,
+            "query node",
+        ),
+        (
+            PopulationGapCode.LINEAGE_GENERATION_MISMATCH,
+            proof.generation,
+            claim.generation,
+            "query generation",
+        ),
+        (
+            PopulationGapCode.LINEAGE_ATTEMPT_MISMATCH,
+            proof.attempt_id,
+            claim.attempt_id,
+            "query attempt",
+        ),
+        (
+            PopulationGapCode.LINEAGE_QUERY_CONTRACT_MISMATCH,
+            proof.query_contract_fingerprint,
+            claim.query_contract_fingerprint,
+            "frozen Query Contract",
+        ),
+        (
+            PopulationGapCode.LINEAGE_SQL_AST_MISMATCH,
+            proof.sql_ast_fingerprint,
+            claim.sql_ast_fingerprint,
+            "validated SQL AST",
+        ),
+    )
+    for code, actual, expected, label in execution_bindings:
+        if not actual or actual != expected:
+            gaps.append(
+                _gap(
+                    code,
+                    stage,
+                    "The lineage proof is not bound to the active %s." % label,
+                    **common,
+                )
+            )
     allowed = _MECHANISMS_BY_SCOPE.get(str(claim.required_scope.kind), set())
     if str(proof.mechanism) not in allowed:
         gaps.append(
@@ -1615,14 +1737,26 @@ def _verify_lineage_proof(
                 **common,
             )
         )
-    source_snapshot = (
-        proof.source_snapshot_fingerprint
-        or claim.required_scope.snapshot_fingerprint
-    )
-    result_snapshot = (
-        proof.result_snapshot_fingerprint
-        or claim.effective_scope.snapshot_fingerprint
-    )
+    source_snapshot = proof.source_snapshot_fingerprint
+    result_snapshot = proof.result_snapshot_fingerprint
+    if source_snapshot != claim.required_scope.snapshot_fingerprint:
+        gaps.append(
+            _gap(
+                PopulationGapCode.LINEAGE_SOURCE_SNAPSHOT_MISMATCH,
+                stage,
+                "The lineage proof source snapshot differs from the required population snapshot.",
+                **common,
+            )
+        )
+    if result_snapshot != claim.effective_scope.snapshot_fingerprint:
+        gaps.append(
+            _gap(
+                PopulationGapCode.LINEAGE_RESULT_SNAPSHOT_MISMATCH,
+                stage,
+                "The lineage proof result snapshot differs from the effective population snapshot.",
+                **common,
+            )
+        )
     if source_snapshot != result_snapshot and not proof.snapshot_alignment_fingerprint:
         gaps.append(
             _gap(

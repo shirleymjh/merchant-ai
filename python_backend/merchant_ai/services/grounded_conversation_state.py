@@ -4,19 +4,22 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 from merchant_ai.config import Settings
-from merchant_ai.services.time_semantics import (
-    has_explicit_time_expression,
-    resolve_time_range,
+from merchant_ai.models import ResultCoverage
+from merchant_ai.services.grounded_conversation_semantic_resolver import (
+    ConversationDownstreamOperation,
+    ConversationReferenceType,
+    ConversationReferentCandidate,
+    ConversationSemanticReview,
+    build_conversation_semantic_resolver_request,
 )
 
 
@@ -47,30 +50,14 @@ class GroundedConversationState:
 StateUpdater = Callable[[Optional[dict[str, Any]]], Mapping[str, Any]]
 
 
-_REFERENCE_PATTERN = re.compile(
-    r"(?:这里面|这里边|其中|上述|前面(?:的|提到的)?|刚才(?:的|查到的|那些)?|"
-    r"上一轮|上一次|上面(?:的)?|该(?:批|组|范围|结果|数据|订单)|"
-    r"这(?:些|几)(?:个|笔|条|张|单|订单|商品|退款|记录|结果|数据)?|"
-    r"那(?:些|几)(?:个|笔|条|张|单|订单|商品|退款|记录|结果|数据)?|"
-    r"在此基础上|沿用(?:这个|上述|前面)?范围|"
-    r"\b(?:these|those|them|the above|previous results?|same (?:set|scope|period)|"
-    r"within (?:that|those|the results?)|among (?:these|those|them))\b)",
-    re.IGNORECASE,
-)
-_IMPLICIT_CONTINUATION_PATTERN = re.compile(
-    r"^(?:再|然后|接着|继续|还有|顺便|另外).{0,80}$|.{1,80}(?:呢|又如何|怎么样)$",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class GroundedConversationResolution:
     """Server-side interpretation of one turn before Topic routing.
 
-    The effective question may inherit only constraints retained from a
-    verified server-owned scope (or, during rollout, an explicit time phrase
-    from server-reconstructed user history). Assistant prose and client tool
-    messages are never treated as scope authority.
+    ``effective_question`` remains byte-semantically equal to the normalized
+    current user utterance. Cross-turn authority travels only through the
+    typed reference Contract and trace fields; display labels are never
+    appended to model instructions.
     """
 
     original_question: str
@@ -86,6 +73,17 @@ class GroundedConversationResolution:
     source: str = ""
     clarification_question: str = ""
     clarification_options: tuple[str, ...] = ()
+    clarification_type: str = ""
+    semantic_authority_fingerprint: str = ""
+    semantic_request_fingerprint: str = ""
+    semantic_decision_fingerprint: str = ""
+    semantic_candidate_set_fingerprint: str = ""
+    semantic_issue_codes: tuple[str, ...] = ()
+    pending_clarification_stage: str = ""
+    pending_clarification_type: str = ""
+    pending_clarification_question: str = ""
+    pending_clarification_answer: str = ""
+    pending_clarification_options: tuple[str, ...] = ()
     reference_contract: "GroundedReferenceContractResolution" = field(
         default_factory=lambda: GroundedReferenceContractResolution()
     )
@@ -108,6 +106,19 @@ class GroundedConversationResolution:
             "originalQuestion": self.original_question,
             "effectiveQuestion": self.effective_question,
             "needsClarification": self.needs_clarification,
+            "clarificationType": self.clarification_type,
+            "semanticAuthorityFingerprint": self.semantic_authority_fingerprint,
+            "semanticRequestFingerprint": self.semantic_request_fingerprint,
+            "semanticDecisionFingerprint": self.semantic_decision_fingerprint,
+            "semanticCandidateSetFingerprint": self.semantic_candidate_set_fingerprint,
+            "semanticIssueCodes": list(self.semantic_issue_codes),
+            "pendingClarification": {
+                "stage": self.pending_clarification_stage,
+                "type": self.pending_clarification_type,
+                "question": self.pending_clarification_question,
+                "answer": self.pending_clarification_answer,
+                "options": list(self.pending_clarification_options),
+            },
             "referenceContract": self.reference_contract.trace(),
         }
 
@@ -116,11 +127,10 @@ class GroundedConversationResolution:
 class GroundedReferenceContractResolution:
     """Typed meaning of a cross-turn BI reference.
 
-    A conversational antecedent is not always a row population.  It can be a
-    predicate scope, an exact entity set, a result artifact, a metric value or
-    a comparison baseline.  Keeping the distinction here prevents downstream
-    query planning from treating every phrase such as ``这里面`` as an ``IN``
-    list or as a repeated time filter.
+    A conversational antecedent is not always a row population. Keeping
+    predicate scopes, exact entity sets, result artifacts and metric values
+    distinct prevents downstream planning from coercing every reference into
+    an entity list or a repeated time filter.
     """
 
     status: str = "NONE"
@@ -142,6 +152,7 @@ class GroundedReferenceContractResolution:
     membership_handle_type: str = ""
     membership_handle_id: str = ""
     membership_values_hash: str = ""
+    current_turn_replaces_time_scope: bool = False
     reason: str = ""
 
     @property
@@ -169,6 +180,7 @@ class GroundedReferenceContractResolution:
             "membershipHandleType": self.membership_handle_type,
             "membershipHandleId": self.membership_handle_id,
             "membershipValuesHash": self.membership_values_hash,
+            "currentTurnReplacesTimeScope": self.current_turn_replaces_time_scope,
             "reason": self.reason,
         }
 
@@ -207,197 +219,537 @@ def grounded_conversation_principal_fingerprint(
 def resolve_grounded_conversation_turn(
     question: str,
     *,
+    semantic_review: ConversationSemanticReview | None = None,
+    verified_candidates: Sequence[ConversationReferentCandidate] = (),
     persisted_snapshot: Mapping[str, Any] | None = None,
     persisted_revision: int = 0,
     message_history: Sequence[Any] | None = None,
     request_context: Any = None,
 ) -> GroundedConversationResolution:
-    """Resolve clarification replies and cross-turn references before routing.
+    """Resolve one turn only from a trusted structured semantic review.
 
-    A reference such as ``这里面`` inherits the complete prior query scope,
-    never the visible preview rows. If the previous turn contained multiple
-    incompatible result scopes, the resolver asks the user instead of choosing
-    one silently.
+    Persisted assistant prose, visible previews and untyped message history are
+    never candidate authority. The provider decides natural-language meaning;
+    this function only validates fingerprints, performs an exact artifact-id
+    lookup and projects retained structured fields into a reference Contract.
     """
 
     original = str(question or "").strip()
     if not original:
         raise ValueError("conversation question is required")
+    del message_history
     snapshot = dict(persisted_snapshot or {})
+    revision = max(0, int(persisted_revision or 0))
+    antecedent = _server_retained_antecedent(snapshot)
     pending = _pending_clarification(snapshot, request_context)
     if pending:
         pending_question = str(pending.get("pendingQuestion") or "").strip()
         if pending_question:
-            effective = "%s\n\n用户对上一轮澄清的回答：%s" % (pending_question, original)
             return GroundedConversationResolution(
                 original_question=original,
-                effective_question=effective,
+                effective_question=original,
                 status="CLARIFICATION_RESUMED",
                 antecedent_question=pending_question,
-                source_revision=max(0, int(persisted_revision or 0)),
+                source_revision=revision,
                 source="SERVER_PENDING_CLARIFICATION",
+                pending_clarification_stage=str(
+                    pending.get("stage") or ""
+                ).strip(),
+                pending_clarification_type=str(
+                    pending.get("type") or ""
+                ).strip(),
+                pending_clarification_question=pending_question,
+                pending_clarification_answer=original,
+                pending_clarification_options=_text_tuple(
+                    pending.get("options") or ()
+                ),
             )
 
-    explicit_matches = tuple(dict.fromkeys(match.group(0) for match in _REFERENCE_PATTERN.finditer(original)))
-    implicit = bool(_IMPLICIT_CONTINUATION_PATTERN.search(original))
-    reference_detected = bool(explicit_matches or implicit)
-    if not reference_detected:
+    candidates = tuple(verified_candidates or ())
+    if any(
+        not isinstance(candidate, ConversationReferentCandidate)
+        for candidate in candidates
+    ):
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_CANDIDATE_SET_INVALID",
+            clarification_type="CONVERSATION_CANDIDATE_SET_INVALID",
+            clarification_question=(
+                "服务端保留的上一轮结果范围无法通过完整性校验。"
+                "请重新说明本轮所需的数据范围。"
+            ),
+            revision=revision,
+            antecedent=antecedent,
+            review=semantic_review,
+        )
+    try:
+        request = build_conversation_semantic_resolver_request(
+            original,
+            candidates,
+        )
+    except (TypeError, ValueError):
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_CANDIDATE_SET_INVALID",
+            clarification_type="CONVERSATION_CANDIDATE_SET_INVALID",
+            clarification_question=(
+                "服务端保留的上一轮结果范围无法通过完整性校验。"
+                "请重新说明本轮所需的数据范围。"
+            ),
+            revision=revision,
+            antecedent=antecedent,
+            review=semantic_review,
+        )
+
+    semantic_fields = _semantic_trace_fields(semantic_review, request)
+    if semantic_review is None:
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_REVIEW_UNAVAILABLE",
+            clarification_type="CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE",
+            clarification_question=(
+                "本轮的跨轮语义复核暂不可用。为避免沿用错误范围，"
+                "请明确说明是否需要基于上一轮结果继续。"
+            ),
+            revision=revision,
+            antecedent=antecedent,
+            review=None,
+            request=request,
+        )
+    decision = semantic_review.decision
+    if (
+        not semantic_review.accepted
+        or decision is None
+        or semantic_review.issues
+    ):
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_REVIEW_REJECTED",
+            clarification_type="CONVERSATION_SEMANTIC_REVIEW_REJECTED",
+            clarification_question=(
+                "本轮的跨轮语义复核没有形成可信结论。"
+                "请明确说明要沿用的上一轮结果范围。"
+            ),
+            revision=revision,
+            antecedent=antecedent,
+            review=semantic_review,
+            request=request,
+        )
+    if not _review_matches_request(semantic_review, request):
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_REVIEW_BINDING_MISMATCH",
+            clarification_type="CONVERSATION_SEMANTIC_REVIEW_BINDING_MISMATCH",
+            clarification_question=(
+                "跨轮语义结论与当前问题或候选结果不一致。"
+                "请重新说明本轮所需的数据范围。"
+            ),
+            revision=revision,
+            antecedent=antecedent,
+            review=semantic_review,
+            request=request,
+        )
+
+    if not decision.reference_detected:
+        if not _non_reference_decision_is_clean(decision):
+            return _semantic_clarification(
+                original,
+                status="SEMANTIC_REVIEW_BINDING_MISMATCH",
+                clarification_type=(
+                    "CONVERSATION_SEMANTIC_REVIEW_BINDING_MISMATCH"
+                ),
+                clarification_question=(
+                    "跨轮语义结论包含互相冲突的结构字段。"
+                    "请重新说明本轮问题。"
+                ),
+                revision=revision,
+                antecedent=antecedent,
+                review=semantic_review,
+                request=request,
+            )
         return GroundedConversationResolution(
             original_question=original,
             effective_question=original,
+            status="STANDALONE",
+            source_revision=revision,
+            source="VERIFIED_CONVERSATION_SEMANTIC_REVIEW",
+            **semantic_fields,
         )
 
-    active_scope = dict(snapshot.get("activeScope") or {})
-    antecedent = str(
-        (snapshot.get("lastTurn") or {}).get("originalQuestion")
-        or _latest_prior_user_question(message_history or (), original)
-        or ""
-    ).strip()
-    result_sets = _unique_result_sets(
-        item
-        for item in active_scope.get("resultSets") or []
-        if isinstance(item, Mapping)
-    )
-    selected_result_set = _select_reference_result_set(original, result_sets)
-    active_artifact_ids = _dedupe_strings(active_scope.get("artifactIds") or [])
-    if (
-        selected_result_set is not None
-        and not str(selected_result_set.get("queryArtifactId") or "").strip()
-        and len(active_artifact_ids) == 1
-    ):
-        selected_result_set = {
-            **selected_result_set,
-            "queryArtifactId": active_artifact_ids[0],
-        }
-    if bool(active_scope.get("ambiguous")) or (
-        result_sets and selected_result_set is None
-    ):
-        labels = _result_scope_labels(result_sets)
+    if decision.ambiguous:
         return GroundedConversationResolution(
             original_question=original,
             effective_question=original,
             status="AMBIGUOUS_REFERENCE",
             reference_detected=True,
-            reference_phrases=explicit_matches,
+            reference_phrases=tuple(decision.reference_phrases),
             antecedent_question=antecedent,
-            source_revision=max(0, int(persisted_revision or 0)),
-            source="VERIFIED_CONVERSATION_SCOPE",
+            source_revision=revision,
+            source="VERIFIED_CONVERSATION_SEMANTIC_REVIEW",
             clarification_question=(
-                "你说的“%s”可能对应上一轮的多个结果范围，请确认要基于哪一个继续。"
-                % (explicit_matches[0] if explicit_matches else "上一轮结果")
+                "本轮引用可能对应多个已验证结果，请选择要继续使用的结果。"
             ),
-            clarification_options=tuple(labels[:4]),
+            clarification_options=_candidate_options(candidates),
+            clarification_type="CONVERSATION_REFERENCE_AMBIGUOUS",
             reference_contract=GroundedReferenceContractResolution(
                 status="AMBIGUOUS",
                 referent_type="AMBIGUOUS",
-                downstream_operation=_classify_downstream_operation(original),
-                reason="MULTIPLE_VERIFIED_RESULT_ARTIFACTS",
+                downstream_operation=_protocol_value(
+                    decision.downstream_operation
+                ),
+                population_required=decision.population_required,
+                complete_membership_required=(
+                    decision.complete_membership_required
+                ),
+                current_turn_replaces_time_scope=(
+                    decision.current_turn_replaces_time_scope
+                ),
+                reason="SEMANTIC_REVIEW_AMBIGUOUS",
             ),
+            **semantic_fields,
         )
 
-    reference_contract = _resolve_reference_contract(
-        original,
-        selected_result_set,
-    )
-    if reference_contract.status == "UNSUPPORTED":
-        label = _result_scope_labels([selected_result_set] if selected_result_set else [])
-        return GroundedConversationResolution(
-            original_question=original,
-            effective_question=original,
-            status="AMBIGUOUS_REFERENCE",
-            reference_detected=True,
-            reference_phrases=explicit_matches,
-            antecedent_question=antecedent,
-            source_revision=max(0, int(persisted_revision or 0)),
-            source="VERIFIED_CONVERSATION_SCOPE",
+    candidates_by_id = {
+        candidate.artifact_id: candidate for candidate in candidates
+    }
+    candidate = candidates_by_id.get(decision.selected_artifact_id)
+    if candidate is None:
+        return _semantic_clarification(
+            original,
+            status="SEMANTIC_REVIEW_BINDING_MISMATCH",
+            clarification_type="CONVERSATION_SELECTED_ARTIFACT_UNVERIFIED",
             clarification_question=(
-                "上一轮结果不能安全地作为这次分析的完整对象（%s）。"
-                "请确认要沿用上一轮筛选范围，还是只分析已展示的结果。"
-                % (reference_contract.reason or "结果范围不完整")
+                "跨轮语义结论引用了不在服务端已验证集合中的结果。"
+                "请重新选择上一轮结果范围。"
             ),
-            clarification_options=tuple(
-                [
-                    "沿用上一轮完整筛选范围",
-                    "只分析上一轮已展示结果",
-                    *label[:1],
-                ]
-            ),
-            reference_contract=reference_contract,
+            revision=revision,
+            antecedent=antecedent,
+            review=semantic_review,
+            request=request,
+            reference_detected=True,
+            reference_phrases=tuple(decision.reference_phrases),
         )
 
-    time_expressions = _dedupe_strings(active_scope.get("timeExpressions") or [])
-    filters = _dedupe_strings(active_scope.get("filterSummaries") or [])
-    artifact_ids = _dedupe_strings(
-        [
-            str((selected_result_set or {}).get("queryArtifactId") or "")
-        ]
-        if selected_result_set is not None
-        else active_artifact_ids
+    referent_type = _contract_referent_type(decision.referent_type)
+    if not referent_type:
+        return _unsafe_reference_clarification(
+            original,
+            decision=decision,
+            candidate=candidate,
+            revision=revision,
+            antecedent=antecedent,
+            semantic_fields=semantic_fields,
+            reason="REFERENT_TYPE_NOT_EXECUTABLE",
+        )
+    unsafe_reason = _reference_candidate_failure(
+        referent_type,
+        decision.population_required,
+        decision.complete_membership_required,
+        candidate,
     )
-    source = "VERIFIED_CONVERSATION_SCOPE" if active_scope else ""
-    if not time_expressions and not filters and not reference_contract.bound:
-        history_time = _explicit_time_from_question(antecedent)
-        if history_time:
-            time_expressions = [history_time]
-            source = "SERVER_USER_HISTORY"
-
-    if len(time_expressions) > 1 and not has_explicit_time_expression(original):
-        return GroundedConversationResolution(
-            original_question=original,
-            effective_question=original,
-            status="AMBIGUOUS_REFERENCE",
-            reference_detected=True,
-            reference_phrases=explicit_matches,
-            antecedent_question=antecedent,
-            source_revision=max(0, int(persisted_revision or 0)),
-            source=source,
-            clarification_question="上一轮包含多个时间范围，请确认这次要沿用哪一个。",
-            clarification_options=tuple(time_expressions[:4]),
-            reference_contract=reference_contract,
-        )
-    if not time_expressions and not filters and not reference_contract.bound:
-        return GroundedConversationResolution(
-            original_question=original,
-            effective_question=original,
-            status="AMBIGUOUS_REFERENCE",
-            reference_detected=True,
-            reference_phrases=explicit_matches,
-            antecedent_question=antecedent,
-            source_revision=max(0, int(persisted_revision or 0)),
-            source=source or "NO_VERIFIED_SCOPE",
-            clarification_question=(
-                "我无法安全确定“%s”指的是哪个数据范围。请补充时间范围或筛选条件。"
-                % (explicit_matches[0] if explicit_matches else "这个追问")
-            ),
-            reference_contract=reference_contract,
+    if unsafe_reason:
+        return _unsafe_reference_clarification(
+            original,
+            decision=decision,
+            candidate=candidate,
+            revision=revision,
+            antecedent=antecedent,
+            semantic_fields=semantic_fields,
+            reason=unsafe_reason,
         )
 
-    inherited_time = "" if has_explicit_time_expression(original) else (time_expressions[0] if time_expressions else "")
-    constraints: list[str] = []
-    if inherited_time:
-        constraints.append("时间范围=%s" % inherited_time)
-    constraints.extend(filters[:12])
-    scope_text = "；".join(constraints)
-    effective = original
-    if scope_text:
-        effective = (
-            "%s\n\n【服务端已解析的上一轮数据范围】%s。"
-            "必须复用上一轮完整查询范围，不得把预览行或截断行误当作完整集合。"
-        ) % (original, scope_text)
+    reference_contract = GroundedReferenceContractResolution(
+        status="BOUND",
+        referent_type=referent_type,
+        downstream_operation=_protocol_value(
+            decision.downstream_operation
+        ),
+        source_artifact_id=candidate.artifact_id,
+        source_contract_fingerprint=candidate.contract_fingerprint,
+        source_sql_fingerprint=candidate.sql_fingerprint,
+        source_query_shape=candidate.query_shape,
+        source_topics=tuple(candidate.topic_ids),
+        source_tables=tuple(candidate.table_ids),
+        source_goal_ids=tuple(candidate.goal_ids),
+        source_entity_identities=tuple(candidate.entity_identities),
+        source_data_grains=tuple(candidate.data_grains),
+        coverage_status=candidate.coverage_status,
+        snapshot_semantics=(
+            candidate.snapshot_semantics
+            or "ABSOLUTE_PREDICATE_SNAPSHOT"
+        ),
+        population_required=decision.population_required,
+        complete_membership_required=(
+            decision.complete_membership_required
+        ),
+        membership_handle_type=candidate.membership_handle_type,
+        membership_handle_id=candidate.membership_handle_id,
+        membership_values_hash=candidate.membership_values_hash,
+        current_turn_replaces_time_scope=(
+            decision.current_turn_replaces_time_scope
+        ),
+        reason="VERIFIED_SEMANTIC_REVIEW_BINDING",
+    )
+    inherited_times = (
+        ()
+        if decision.current_turn_replaces_time_scope
+        else tuple(candidate.time_scope_labels)
+    )
     return GroundedConversationResolution(
         original_question=original,
-        effective_question=effective,
+        effective_question=original,
         status="RESOLVED_REFERENCE",
         reference_detected=True,
-        reference_phrases=explicit_matches,
+        reference_phrases=tuple(decision.reference_phrases),
         antecedent_question=antecedent,
-        inherited_time_expression=inherited_time,
-        inherited_filters=tuple(filters[:12]),
-        source_revision=max(0, int(persisted_revision or 0)),
-        source_artifact_ids=tuple(artifact_ids),
-        source=source,
+        inherited_time_expression=(
+            inherited_times[0] if len(inherited_times) == 1 else ""
+        ),
+        inherited_filters=tuple(candidate.filter_scope_labels),
+        source_revision=revision,
+        source_artifact_ids=(candidate.artifact_id,),
+        source="VERIFIED_CONVERSATION_SEMANTIC_REVIEW",
         reference_contract=reference_contract,
+        **semantic_fields,
     )
+
+
+def _semantic_trace_fields(
+    review: ConversationSemanticReview | None,
+    request: Any,
+) -> dict[str, Any]:
+    return {
+        "semantic_authority_fingerprint": (
+            str(review.authority_fingerprint or "") if review else ""
+        ),
+        "semantic_request_fingerprint": request.request_fingerprint,
+        "semantic_decision_fingerprint": (
+            str(review.decision_fingerprint or "") if review else ""
+        ),
+        "semantic_candidate_set_fingerprint": (
+            request.candidate_set_fingerprint
+        ),
+        "semantic_issue_codes": tuple(
+            _protocol_value(issue.code)
+            for issue in (review.issues if review else ())
+        ),
+    }
+
+
+def _semantic_clarification(
+    original: str,
+    *,
+    status: str,
+    clarification_type: str,
+    clarification_question: str,
+    revision: int,
+    antecedent: str,
+    review: ConversationSemanticReview | None,
+    request: Any = None,
+    reference_detected: bool = False,
+    reference_phrases: tuple[str, ...] = (),
+) -> GroundedConversationResolution:
+    semantic_fields = (
+        _semantic_trace_fields(review, request)
+        if request is not None
+        else {
+            "semantic_authority_fingerprint": (
+                str(review.authority_fingerprint or "") if review else ""
+            ),
+            "semantic_decision_fingerprint": (
+                str(review.decision_fingerprint or "") if review else ""
+            ),
+            "semantic_issue_codes": tuple(
+                _protocol_value(issue.code) for issue in (
+                    review.issues if review else ()
+                )
+            ),
+        }
+    )
+    return GroundedConversationResolution(
+        original_question=original,
+        effective_question=original,
+        status=status,
+        reference_detected=reference_detected,
+        reference_phrases=reference_phrases,
+        antecedent_question=antecedent,
+        source_revision=revision,
+        source="CONVERSATION_SEMANTIC_REVIEW",
+        clarification_question=clarification_question,
+        clarification_type=clarification_type,
+        **semantic_fields,
+    )
+
+
+def _review_matches_request(
+    review: ConversationSemanticReview,
+    request: Any,
+) -> bool:
+    decision = review.decision
+    if decision is None:
+        return False
+    return bool(
+        review.authority_fingerprint
+        and review.decision_fingerprint
+        and review.request_fingerprint == request.request_fingerprint
+        and decision.complete
+        and decision.request_fingerprint == request.request_fingerprint
+        and decision.question_fingerprint == request.question_fingerprint
+        and decision.candidate_set_fingerprint
+        == request.candidate_set_fingerprint
+    )
+
+
+def _non_reference_decision_is_clean(decision: Any) -> bool:
+    return not any(
+        (
+            decision.ambiguous,
+            bool(decision.selected_artifact_id),
+            decision.referent_type != ConversationReferenceType.NONE,
+            decision.downstream_operation
+            != ConversationDownstreamOperation.UNSPECIFIED,
+            decision.population_required,
+            decision.complete_membership_required,
+            decision.current_turn_replaces_time_scope,
+            bool(decision.reference_phrases),
+        )
+    )
+
+
+def _contract_referent_type(
+    referent_type: ConversationReferenceType,
+) -> str:
+    mappings = {
+        ConversationReferenceType.PREDICATE_SCOPE.value: "PREDICATE_SCOPE",
+        ConversationReferenceType.VERIFIED_ENTITY_SET.value: "ENTITY_SET",
+        ConversationReferenceType.RESULT_ARTIFACT.value: "RESULT_ARTIFACT",
+        ConversationReferenceType.METRIC_VALUE.value: "METRIC_VALUE",
+    }
+    return mappings.get(_protocol_value(referent_type), "")
+
+
+def _protocol_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _reference_candidate_failure(
+    referent_type: str,
+    population_required: bool,
+    complete_membership_required: bool,
+    candidate: ConversationReferentCandidate,
+) -> str:
+    if referent_type == "METRIC_VALUE" and population_required:
+        return "METRIC_VALUE_DOES_NOT_DEFINE_POPULATION"
+    membership_population = bool(
+        population_required
+        and referent_type in {"ENTITY_SET", "RESULT_ARTIFACT"}
+    )
+    if membership_population and not complete_membership_required:
+        return "COMPLETE_MEMBERSHIP_REQUIREMENT_MISSING"
+    membership_required = bool(
+        referent_type == "ENTITY_SET" or complete_membership_required
+    )
+    if not membership_required:
+        return ""
+    complete_coverages = {
+        ResultCoverage.ALL_ROWS.value,
+        ResultCoverage.TOP_N.value,
+        "COMPLETE",
+        "EXACT_ENTITY_SET",
+    }
+    if candidate.coverage_status not in complete_coverages:
+        return "REFERENCED_RESULT_MEMBERSHIP_NOT_COMPLETE"
+    if not (
+        candidate.membership_handle_type
+        and candidate.membership_handle_id
+        and candidate.membership_values_hash
+    ):
+        return "REFERENCE_MEMBERSHIP_HANDLE_INCOMPLETE"
+    return ""
+
+
+def _unsafe_reference_clarification(
+    original: str,
+    *,
+    decision: Any,
+    candidate: ConversationReferentCandidate,
+    revision: int,
+    antecedent: str,
+    semantic_fields: Mapping[str, Any],
+    reason: str,
+) -> GroundedConversationResolution:
+    return GroundedConversationResolution(
+        original_question=original,
+        effective_question=original,
+        status="UNSAFE_REFERENCE",
+        reference_detected=True,
+        reference_phrases=tuple(decision.reference_phrases),
+        antecedent_question=antecedent,
+        source_revision=revision,
+        source_artifact_ids=(candidate.artifact_id,),
+        source="VERIFIED_CONVERSATION_SEMANTIC_REVIEW",
+        clarification_question=(
+            "已选择的上一轮结果不能安全满足本轮引用要求。"
+            "请改为明确的数据范围或重新选择结果。"
+        ),
+        clarification_options=(candidate.label or candidate.artifact_id,),
+        clarification_type="CONVERSATION_REFERENCE_UNSAFE",
+        reference_contract=GroundedReferenceContractResolution(
+            status="UNSUPPORTED",
+                referent_type=(
+                    _contract_referent_type(decision.referent_type)
+                    or _protocol_value(decision.referent_type)
+                ),
+            downstream_operation=_protocol_value(
+                decision.downstream_operation
+            ),
+            source_artifact_id=candidate.artifact_id,
+            source_contract_fingerprint=candidate.contract_fingerprint,
+            source_sql_fingerprint=candidate.sql_fingerprint,
+            source_query_shape=candidate.query_shape,
+            coverage_status=candidate.coverage_status,
+            population_required=decision.population_required,
+            complete_membership_required=(
+                decision.complete_membership_required
+            ),
+            membership_handle_type=candidate.membership_handle_type,
+            membership_handle_id=candidate.membership_handle_id,
+            membership_values_hash=candidate.membership_values_hash,
+            current_turn_replaces_time_scope=(
+                decision.current_turn_replaces_time_scope
+            ),
+            reason=reason,
+        ),
+        **dict(semantic_fields),
+    )
+
+
+def _candidate_options(
+    candidates: Sequence[ConversationReferentCandidate],
+) -> tuple[str, ...]:
+    return _text_tuple(
+        candidate.label or candidate.artifact_id
+        for candidate in candidates
+    )
+
+
+def _text_tuple(values: Any) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, bytearray)):
+        values = (values,)
+    return tuple(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in (values or ())
+            if str(value or "").strip()
+        )
+    )
+
+
+def _server_retained_antecedent(snapshot: Mapping[str, Any]) -> str:
+    last_turn = snapshot.get("lastTurn")
+    if not isinstance(last_turn, Mapping):
+        return ""
+    return str(last_turn.get("originalQuestion") or "").strip()
 
 
 def _pending_clarification(snapshot: Mapping[str, Any], request_context: Any) -> dict[str, Any]:
@@ -416,269 +768,6 @@ def _pending_clarification(snapshot: Mapping[str, Any], request_context: Any) ->
         "type": str(getattr(request_context, "pending_clarification_type", "") or ""),
         "options": list(getattr(request_context, "pending_clarification_options", None) or []),
     }
-
-
-def _latest_prior_user_question(messages: Sequence[Any], current_question: str) -> str:
-    current = str(current_question or "").strip()
-    for item in reversed(list(messages or [])):
-        if isinstance(item, Mapping):
-            role = str(item.get("role") or "").lower()
-            text = str(item.get("text") or item.get("content") or "").strip()
-        else:
-            role = str(getattr(item, "role", "") or "").lower()
-            text = str(getattr(item, "text", "") or "").strip()
-        if role != "user" or not text or text == current:
-            continue
-        return text
-    return ""
-
-
-def _explicit_time_from_question(question: str) -> str:
-    text = str(question or "").strip()
-    if not text or not has_explicit_time_expression(text):
-        return ""
-    resolved = resolve_time_range(text)
-    return str(resolved.label or "").strip()
-
-
-def _incompatible_result_scopes(result_sets: Sequence[Mapping[str, Any]]) -> bool:
-    """Return whether a bare reference has more than one artifact antecedent.
-
-    Equal time/topic/filter predicates do *not* make two result artifacts the
-    same referent.  A DETAIL order set and a RANKED refund set can share all of
-    those attributes while having different entity, grain and row membership.
-    """
-
-    return len(_unique_result_sets(result_sets)) > 1
-
-
-def _unique_result_sets(
-    result_sets: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    unique: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for raw in result_sets:
-        item = dict(raw)
-        identity = str(item.get("queryArtifactId") or "").strip()
-        if not identity:
-            identity = str(item.get("contractFingerprint") or "").strip()
-        if not identity:
-            identity = hashlib.sha256(
-                json.dumps(
-                    item,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-        if identity in seen:
-            continue
-        seen.add(identity)
-        unique.append(item)
-    return unique
-
-
-def _select_reference_result_set(
-    question: str,
-    result_sets: Sequence[Mapping[str, Any]],
-) -> Optional[dict[str, Any]]:
-    if not result_sets:
-        return None
-    if len(result_sets) == 1:
-        return dict(result_sets[0])
-    text = str(question or "").strip().casefold()
-    ordinal_patterns = [
-        (0, r"(?:第\s*(?:一|1)\s*(?:个|张|组|份)|\bfirst\b)"),
-        (1, r"(?:第\s*(?:二|2|两)\s*(?:个|张|组|份)|\bsecond\b)"),
-        (2, r"(?:第\s*(?:三|3)\s*(?:个|张|组|份)|\bthird\b)"),
-    ]
-    for index, pattern in ordinal_patterns:
-        if index < len(result_sets) and re.search(pattern, text, re.IGNORECASE):
-            return dict(result_sets[index])
-
-    matched: list[dict[str, Any]] = []
-    for raw in result_sets:
-        item = dict(raw)
-        candidates = _dedupe_strings(
-            [
-                item.get("label"),
-                item.get("queryShape"),
-                *(item.get("topics") or []),
-                *(item.get("tables") or []),
-                *(item.get("entityIdentities") or []),
-            ]
-        )
-        # Require a meaningful business token.  Matching generic shape words
-        # such as DETAIL or RANKED would make a bare reference accidentally
-        # select an artifact.
-        if any(
-            len(candidate) >= 2
-            and candidate.casefold() not in {"detail", "ranked", "grouped", "scalar", "trend"}
-            and candidate.casefold() in text
-            for candidate in candidates
-        ):
-            matched.append(item)
-    return matched[0] if len(matched) == 1 else None
-
-
-def _classify_downstream_operation(question: str) -> str:
-    text = str(question or "").strip()
-    patterns = [
-        ("RANK", r"(?:最多|最少|最高|最低|排名|排行|前\s*[一二三四五六七八九十\d]+|后\s*[一二三四五六七八九十\d]+|\btop\s*\d*|\bbottom\s*\d*)"),
-        ("DETAIL_DRILLDOWN", r"(?:明细|详情|逐笔|逐单|列出|展开|下钻|drill\s*down|details?)"),
-        ("TREND", r"(?:趋势|走势|按[日周月季年]|变化曲线|trend|over\s+time)"),
-        ("COMPARE", r"(?:同比|环比|对比|比较|差异|相比|versus|\bvs\.?\b|compare)"),
-        ("EXPLAIN", r"(?:为什么|为何|原因|根因|归因|异常|怎么回事|why|root\s*cause)"),
-        ("AGGREGATE", r"(?:多少|合计|总计|总额|数量|平均|占比|汇总|aggregate|total|average|share)"),
-    ]
-    for operation, pattern in patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return operation
-    return "FOLLOW_UP"
-
-
-def _resolve_reference_contract(
-    question: str,
-    result_set: Optional[Mapping[str, Any]],
-) -> GroundedReferenceContractResolution:
-    operation = _classify_downstream_operation(question)
-    if result_set is None:
-        return GroundedReferenceContractResolution(
-            status="UNVERIFIED_HISTORY",
-            referent_type="PREDICATE_SCOPE",
-            downstream_operation=operation,
-            population_required=_operation_requires_population(operation),
-            reason="NO_VERIFIED_RESULT_ARTIFACT",
-        )
-
-    item = dict(result_set)
-    shape = str(item.get("queryShape") or "").strip().upper()
-    coverage = str(
-        item.get("coverageStatus")
-        or item.get("resultCoverage")
-        or item.get("coverage")
-        or ("TOP_N" if shape == "RANKED" else "UNKNOWN")
-    ).strip().upper()
-    question_text = str(question or "")
-    population_required = _operation_requires_population(operation)
-    explicit_scope_reference = bool(
-        re.search(
-            r"(?:范围|筛选条件|时间段|期间|这批数据|same\s+(?:scope|range)|within\s+that\s+range)",
-            question_text,
-            re.IGNORECASE,
-        )
-    )
-    scalar_reference = bool(
-        re.search(r"(?:这个数|该指标|这个指标|这个值|that\s+(?:number|metric|value))", question_text, re.IGNORECASE)
-    )
-    if scalar_reference or shape == "SCALAR":
-        referent_type = "METRIC_VALUE"
-    elif explicit_scope_reference or shape == "DETAIL":
-        # DETAIL commonly renders only a preview.  Its verified query Contract
-        # still defines the complete predicate scope, so reuse that scope and
-        # never turn visible rows into the population by accident.
-        referent_type = "PREDICATE_SCOPE"
-    elif shape == "ENTITY_LOOKUP":
-        referent_type = "ENTITY_SET"
-    elif shape in {"RANKED", "GROUPED", "TREND"}:
-        referent_type = "RESULT_ARTIFACT"
-    else:
-        referent_type = "RESULT_ARTIFACT"
-
-    complete_membership_required = bool(
-        population_required and referent_type in {"ENTITY_SET", "RESULT_ARTIFACT"}
-    )
-    complete_coverages = {"ALL_ROWS", "TOP_N", "COMPLETE", "EXACT_ENTITY_SET"}
-    membership_handle_type = str(
-        item.get("membershipHandleType")
-        or ("VERIFIED_ENTITY_SET" if item.get("entitySetArtifactId") else "")
-        or ("RESULT_RELATION" if item.get("resultRelationHandle") else "")
-    ).strip().upper()
-    membership_handle_id = str(
-        item.get("membershipHandleId")
-        or item.get("entitySetArtifactId")
-        or item.get("resultRelationHandle")
-        or ""
-    ).strip()
-    membership_values_hash = str(item.get("membershipValuesHash") or "").strip()
-    status = "BOUND"
-    reason = "VERIFIED_ARTIFACT_REFERENCE"
-    if referent_type == "METRIC_VALUE" and population_required:
-        status = "UNSUPPORTED"
-        reason = "SCALAR_DOES_NOT_DEFINE_A_ROW_POPULATION"
-    elif complete_membership_required and coverage not in complete_coverages:
-        status = "UNSUPPORTED"
-        reason = "REFERENCED_RESULT_MEMBERSHIP_NOT_COMPLETE"
-    elif complete_membership_required and not membership_handle_id:
-        status = "UNSUPPORTED"
-        reason = "REFERENCE_MEMBERSHIP_HANDLE_MISSING"
-
-    entity_identities = item.get("entityIdentities") or item.get(
-        "outputEntityIdentities"
-    ) or []
-    if isinstance(entity_identities, Mapping):
-        entity_identities = list(entity_identities.values())
-    return GroundedReferenceContractResolution(
-        status=status,
-        referent_type=referent_type,
-        downstream_operation=operation,
-        source_artifact_id=str(item.get("queryArtifactId") or "").strip(),
-        source_contract_fingerprint=str(
-            item.get("contractFingerprint") or ""
-        ).strip(),
-        source_sql_fingerprint=str(item.get("sqlFingerprint") or "").strip(),
-        source_query_shape=shape,
-        source_topics=tuple(_dedupe_strings(item.get("topics") or [])),
-        source_tables=tuple(_dedupe_strings(item.get("tables") or [])),
-        source_goal_ids=tuple(_dedupe_strings(item.get("goalIds") or [])),
-        source_entity_identities=tuple(_dedupe_strings(entity_identities)),
-        source_data_grains=tuple(_dedupe_strings(item.get("dataGrains") or [])),
-        coverage_status=coverage,
-        snapshot_semantics=str(
-            item.get("snapshotSemantics") or "ABSOLUTE_PREDICATE_SNAPSHOT"
-        ),
-        population_required=population_required,
-        complete_membership_required=complete_membership_required,
-        membership_handle_type=membership_handle_type,
-        membership_handle_id=membership_handle_id,
-        membership_values_hash=membership_values_hash,
-        reason=reason,
-    )
-
-
-def _operation_requires_population(operation: str) -> bool:
-    return str(operation or "").upper() in {
-        "RANK",
-        "DETAIL_DRILLDOWN",
-        "TREND",
-        "COMPARE",
-        "EXPLAIN",
-        "AGGREGATE",
-        "FOLLOW_UP",
-    }
-
-
-def _result_scope_labels(result_sets: Sequence[Mapping[str, Any]]) -> list[str]:
-    labels: list[str] = []
-    for index, item in enumerate(result_sets, start=1):
-        label = str(item.get("label") or item.get("queryShape") or "").strip()
-        times = _dedupe_strings(item.get("timeExpressions") or [])
-        topics = _dedupe_strings(item.get("topics") or [])
-        pieces = [label, "/".join(topics), "/".join(times)]
-        rendered = " · ".join(piece for piece in pieces if piece)
-        labels.append(rendered or "上一轮结果 %d" % index)
-    return list(dict.fromkeys(labels))
-
-
-def _dedupe_strings(values: Iterable[Any]) -> list[str]:
-    return list(
-        dict.fromkeys(
-            str(item).strip()
-            for item in values
-            if str(item).strip()
-        )
-    )
 
 
 class GroundedConversationStateStore:
@@ -931,7 +1020,15 @@ class GroundedConversationStateStore:
 
     @staticmethod
     def _thread_file_stem(thread_id: str) -> str:
-        safe_prefix = re.sub(r"[^a-zA-Z0-9_.-]+", "_", thread_id).strip("._-")[:80] or "thread"
+        safe_prefix = "".join(
+            character
+            if (
+                character.isascii()
+                and (character.isalnum() or character in "_.-")
+            )
+            else "_"
+            for character in thread_id
+        ).strip("._-")[:80] or "thread"
         digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16]
         return "%s--%s" % (safe_prefix, digest)
 

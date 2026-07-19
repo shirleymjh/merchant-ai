@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,9 +9,11 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from merchant_ai.config import Settings
 from merchant_ai.models import (
     AgentRunResult,
     ClarificationRequest,
+    DataSnapshotContract,
     ExtractedKeywords,
     MerchantInfo,
     QueryBundle,
@@ -20,6 +23,13 @@ from merchant_ai.models import (
     RecallItem,
     TopicRoutingDecision,
     VerifiedEvidence,
+)
+from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.grounded_context_workspace import (
+    GroundedContextWorkspace,
+)
+from merchant_ai.services.grounded_conversation_state import (
+    GroundedConversationResolution,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRunContext,
@@ -53,6 +63,7 @@ from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeSession,
     GroundedRuntimeSqlCandidateAttempt,
     GroundedVerifiedQueryArtifact,
+    verified_query_artifact_integrity_fingerprint,
 )
 from merchant_ai.services.grounded_goal_contract import (
     AnalysisQuestionGoal,
@@ -65,6 +76,191 @@ from merchant_ai.services.grounded_sql_candidate import (
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
+
+
+def _stable_test_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _publish_skill_test_artifact(
+    settings: Settings,
+    runtime: GroundedRuntimeSession,
+    *,
+    thread_id: str,
+    run_id: str,
+) -> GroundedContextWorkspace:
+    workspace = GroundedContextWorkspace.open(
+        settings,
+        thread_id=thread_id,
+        run_id=run_id,
+        merchant_id=runtime.merchant_id,
+        access_role=runtime.access_role,
+        user_scope=runtime.user_scope,
+        question=runtime.question,
+    )
+    store = WorkspaceArtifactStore(settings, workspace.artifacts_root)
+    rows = list(runtime.answer_run_result.merged_query_bundle.rows)
+    rows_artifact = store.write_json(
+        "query_results",
+        "skill-test.rows.json",
+        rows,
+        preview_chars=0,
+        immutable=True,
+    )
+    sql_text = "SELECT governed_columns FROM verified_source"
+    sql_artifact = store.write_text(
+        "query_results",
+        "skill-test.sql",
+        sql_text,
+        preview_chars=0,
+        immutable=True,
+    )
+    attempt_id = "skill-test-attempt"
+    generation = 1
+    contract = runtime.active_contract
+    assert contract is not None
+    contract_fingerprint = grounded_query_contract_fingerprint(contract)
+    sql_fingerprint = hashlib.sha256(b"skill-test-sql-evidence").hexdigest()
+    semantic_fingerprint = hashlib.sha256(
+        b"skill-test-semantic-activation"
+    ).hexdigest()
+    datasource_fingerprint = hashlib.sha256(
+        b"skill-test-datasource"
+    ).hexdigest()
+    verified = runtime.answer_verified_evidence
+    assert verified is not None and verified.passed
+    verified_payload = verified.model_dump(by_alias=True, mode="json")
+    verified_sha256 = _stable_test_hash(verified_payload)
+    snapshot_contract = DataSnapshotContract(
+        datasource_fingerprint=datasource_fingerprint,
+        datasource_environment="test",
+        consistency_mode="UNSUPPORTED",
+        semantic_activation_fingerprint=semantic_fingerprint,
+        cache_generation="test-generation",
+        captured_at="2026-07-19T00:00:00Z",
+        unsupported_reason="TEST_DATASOURCE_SNAPSHOT_UNAVAILABLE",
+    )
+    runtime.answer_run_result.merged_query_bundle.data_snapshot = (
+        snapshot_contract.model_copy(deep=True)
+    )
+    data_snapshot = snapshot_contract.model_dump(
+        by_alias=True,
+        mode="json",
+    )
+    artifact_fingerprint = hashlib.sha256(
+        ("%s:%s" % (thread_id, run_id)).encode("utf-8")
+    ).hexdigest()
+    manifest_payload = {
+        "schemaVersion": 2,
+        "artifactKind": "GROUNDED_QUERY_RESULT",
+        "publicationStatus": "VERIFIED",
+        "artifactFingerprint": artifact_fingerprint,
+        "executionGeneration": generation,
+        "executionAttemptId": attempt_id,
+        "contractFingerprint": contract_fingerprint,
+        "sqlEvidenceFingerprint": sql_fingerprint,
+        "sqlSha256": sql_artifact["sha256"],
+        "contextOwnerFingerprint": workspace.owner_fingerprint,
+        "semanticActivationFingerprint": semantic_fingerprint,
+        "dataSnapshot": data_snapshot,
+        "resultCoverage": "ALL_ROWS",
+        "resultIsTruncated": False,
+        "storedRowCount": len(rows),
+        "exactResultRowCount": len(rows),
+        "verifiedEvidence": verified_payload,
+        "verifiedEvidenceSha256": verified_sha256,
+        "rowsArtifact": {
+            key: rows_artifact[key]
+            for key in (
+                "relativePath",
+                "merchantUri",
+                "sha256",
+                "contentAddress",
+                "bytes",
+            )
+        },
+        "sqlArtifact": {
+            key: sql_artifact[key]
+            for key in (
+                "relativePath",
+                "merchantUri",
+                "sha256",
+                "contentAddress",
+                "bytes",
+            )
+        },
+    }
+    manifest_artifact = store.write_json(
+        "query_results",
+        "skill-test.manifest.json",
+        manifest_payload,
+        preview_chars=0,
+        immutable=True,
+    )
+    receipt = {
+        "artifactFingerprint": artifact_fingerprint,
+        "queryManifestSha256": manifest_artifact["sha256"],
+        "rowsSha256": rows_artifact["sha256"],
+        "sqlSha256": sql_artifact["sha256"],
+        "manifestContentAddress": manifest_artifact["contentAddress"],
+        "rowsContentAddress": rows_artifact["contentAddress"],
+        "sqlContentAddress": sql_artifact["contentAddress"],
+        "manifestRelativePath": manifest_artifact["relativePath"],
+        "rowsRelativePath": rows_artifact["relativePath"],
+        "sqlRelativePath": sql_artifact["relativePath"],
+        "manifestRef": manifest_artifact["merchantUri"],
+        "rowsRef": rows_artifact["merchantUri"],
+        "sqlRef": sql_artifact["merchantUri"],
+        "storedRowCount": len(rows),
+        "exactResultRowCount": len(rows),
+        "resultCoverage": "ALL_ROWS",
+        "resultIsTruncated": False,
+        "executionGeneration": generation,
+        "attemptFingerprint": hashlib.sha256(
+            attempt_id.encode("utf-8")
+        ).hexdigest(),
+        "contractFingerprint": contract_fingerprint,
+        "sqlEvidenceFingerprint": sql_fingerprint,
+        "contextOwnerFingerprint": workspace.owner_fingerprint,
+        "semanticActivationFingerprint": semantic_fingerprint,
+        "dataSnapshotFingerprint": _stable_test_hash(data_snapshot),
+        "verifiedEvidenceSha256": verified_sha256,
+    }
+    artifact_id = "query-artifact-%s" % artifact_fingerprint[:16]
+    published_artifact = GroundedVerifiedQueryArtifact(
+        artifact_id=artifact_id,
+        generation=generation,
+        attempt_id=attempt_id,
+        contract_fingerprint=contract_fingerprint,
+        sql_fingerprint=sql_fingerprint,
+        contract=contract.model_copy(deep=True),
+        plan=runtime.answer_plan.model_copy(deep=True),
+        run_result=runtime.answer_run_result.model_copy(deep=True),
+        verified_evidence=verified.model_copy(deep=True),
+        publication_status="PUBLISHED",
+        result_artifact_receipts=[receipt],
+        output_columns=[
+            str(key)
+            for row in rows
+            for key in row
+            if not str(key).startswith("__")
+        ],
+    )
+    published_artifact.ledger_fingerprint = (
+        verified_query_artifact_integrity_fingerprint(
+            published_artifact
+        )
+    )
+    runtime.verified_query_ledger = [published_artifact]
+    runtime.answer_artifact_ids = [artifact_id]
+    return workspace
 
 
 class FakeSemanticCatalog:
@@ -260,12 +456,49 @@ class CapturingFactory:
         return self.graph
 
 
+class StandaloneConversationAuthority:
+    def resolve(
+        self,
+        question: str,
+        **kwargs: Any,
+    ) -> GroundedConversationResolution:
+        del kwargs
+        normalized = str(question or "").strip()
+        return GroundedConversationResolution(
+            original_question=normalized,
+            effective_question=normalized,
+            status="STANDALONE",
+            source="TEST_STRUCTURED_CONVERSATION_REVIEW",
+        )
+
+
+class ClarifyingConversationAuthority:
+    def resolve(
+        self,
+        question: str,
+        **kwargs: Any,
+    ) -> GroundedConversationResolution:
+        del kwargs
+        normalized = str(question or "").strip()
+        return GroundedConversationResolution(
+            original_question=normalized,
+            effective_question=normalized,
+            status="SEMANTIC_REVIEW_UNAVAILABLE",
+            source="TEST_STRUCTURED_CONVERSATION_REVIEW",
+            clarification_question="请明确是否沿用上一轮结果。",
+            clarification_type=(
+                "CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE"
+            ),
+        )
+
+
 def runtime(factory: CapturingFactory, kernel: FakeKernel | None = None) -> GroundedDeepAgentRuntime:
     return GroundedDeepAgentRuntime(
         kernel or FakeKernel(),
         lead_model=object(),
         semantic_catalog=FakeSemanticCatalog(),
         agent_factory=factory,
+        conversation_online_authority=StandaloneConversationAuthority(),
     )
 
 
@@ -318,7 +551,6 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "declare_original_question_goals",
         "propose_grounded_execution_graph",
         "reopen_grounded_execution_graph_discovery",
-        "declare_grounded_query_branches",
         "retrieve_knowledge",
         "publish_verified_rule_evidence",
         "compose_verified_rule_answer",
@@ -359,6 +591,9 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     visible_names = {item.name for item in visible}
     assert "propose_grounded_execution_graph" in visible_names
     assert "declare_grounded_query_branches" not in visible_names
+    assert "declare_grounded_query_branches" not in {
+        item.name for item in factory.kwargs["tools"]
+    }
     contract_tool = next(
         item
         for item in factory.kwargs["tools"]
@@ -584,6 +819,25 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
     }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
+
+
+def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
+    factory = CapturingFactory()
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    outer.conversation_online_authority = (
+        ClarifyingConversationAuthority()
+    )
+
+    response = outer.run("这里面退款最多的三单", "m-1")
+
+    assert kernel.route_calls == 0
+    assert kernel.recall_queries == []
+    assert factory.graph.invocations == []
+    assert response.clarification is not None
+    assert response.clarification.type == (
+        "CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE"
+    )
 
 
 def test_provider_timeout_is_returned_as_controlled_operational_failure() -> None:
@@ -1956,6 +2210,7 @@ def test_checkpoint_config_factory_is_used_without_rewriting_namespace() -> None
             **expected,
             "observed": {"threadId": thread_id, "runId": run_id},
         },
+        conversation_online_authority=StandaloneConversationAuthority(),
         agent_factory=factory,
     )
 
@@ -2203,6 +2458,9 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
 ) -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "runtime")
+    )
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),
@@ -2213,6 +2471,7 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
         },
         skill_root="python_backend/resources/runtime/agent_skills",
         skill_run_root=str(tmp_path / "skill-runs"),
+        settings=settings,
         agent_factory=factory,
     )
 
@@ -2267,8 +2526,15 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     kernel_session.answer_plan = kernel_session.active_plan
     kernel_session.answer_run_result = kernel_session.run_result
     kernel_session.answer_verified_evidence = kernel_session.verified_evidence
+    workspace = _publish_skill_test_artifact(
+        settings,
+        kernel_session,
+        thread_id="thread-skill",
+        run_id="run-parent",
+    )
     session = GroundedDeepAgentSession(
         runtime=kernel_session,
+        context_workspace=workspace,
         analysis_skill_headers_disclosed=True,
         data_collection_sealed=True,
     )
@@ -2295,7 +2561,24 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert result["executionConfidence"] == 0.88
     assert "artifact" not in result
     assert "workspace" not in result
-    assert len(list((tmp_path / "skill-runs").glob("*/result.json"))) == 1
+    skill_workspaces = list(
+        workspace.subagents_root.glob("skill/*")
+    )
+    assert len(skill_workspaces) == 1
+    assert (skill_workspaces[0] / "result.json").is_file()
+    skill_input = json.loads(
+        (skill_workspaces[0] / "input.json").read_text(encoding="utf-8")
+    )
+    assert "dataRows" not in skill_input
+    assert skill_input["verifiedArtifactAccess"]["inlineRows"] is False
+    assert "sqlArtifact" not in json.dumps(
+        skill_input["verifiedArtifactAccess"],
+        ensure_ascii=False,
+    )
+    assert str(workspace.artifacts_root) not in json.dumps(
+        skill_input,
+        ensure_ascii=False,
+    )
     assert result["checkpoint"]["threadId"].startswith("thread-skill__skill_")
     assert isolated.job.skills == []
     assert isolated.job.user_payload["mountedSkill"] == "/skills/risk-analysis/SKILL.md"
@@ -2486,6 +2769,9 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
 ) -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "runtime")
+    )
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),
@@ -2493,6 +2779,7 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
         checkpointer=object(),
         skill_root="python_backend/resources/runtime/agent_skills",
         skill_run_root=str(tmp_path / "skill-runs"),
+        settings=settings,
         agent_factory=factory,
     )
 
@@ -2548,8 +2835,15 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
     kernel_session.answer_plan = kernel_session.active_plan
     kernel_session.answer_run_result = kernel_session.run_result
     kernel_session.answer_verified_evidence = kernel_session.verified_evidence
+    workspace = _publish_skill_test_artifact(
+        settings,
+        kernel_session,
+        thread_id="thread-skill-repair",
+        run_id="run-skill-repair",
+    )
     deep_session = GroundedDeepAgentSession(
         runtime=kernel_session,
+        context_workspace=workspace,
         analysis_skill_headers_disclosed=True,
         data_collection_sealed=True,
     )
@@ -2595,6 +2889,9 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
 
     factory = CapturingFactory(action="none")
     kernel = FallbackKernel()
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "runtime")
+    )
     outer = GroundedDeepAgentRuntime(
         kernel,
         lead_model=object(),
@@ -2602,6 +2899,7 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
         checkpointer=object(),
         skill_root="python_backend/resources/runtime/agent_skills",
         skill_run_root=str(tmp_path / "skill-runs"),
+        settings=settings,
         agent_factory=factory,
     )
 
@@ -2638,8 +2936,15 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
     kernel_session.answer_plan = kernel_session.active_plan
     kernel_session.answer_run_result = kernel_session.run_result
     kernel_session.answer_verified_evidence = kernel_session.verified_evidence
+    workspace = _publish_skill_test_artifact(
+        settings,
+        kernel_session,
+        thread_id="thread-skill-fallback",
+        run_id="run-skill-fallback",
+    )
     deep_session = GroundedDeepAgentSession(
         runtime=kernel_session,
+        context_workspace=workspace,
         analysis_skill_headers_disclosed=True,
         data_collection_sealed=True,
     )

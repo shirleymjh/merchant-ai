@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
 
 from pydantic import Field
 
@@ -29,6 +29,7 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
     RecallBundle,
+    ResultCoverage,
     TaskRole,
     TopicRoutingDecision,
     VerifiedEvidence,
@@ -70,6 +71,20 @@ from merchant_ai.services.grounded_rule_artifact import (
 from merchant_ai.services.grounded_context_workspace import (
     grounded_context_owner_fingerprint,
 )
+from merchant_ai.services.grounded_semantic_activation import (
+    GroundedSemanticActivationSeal,
+    build_semantic_activation_seal,
+    canonical_semantic_topics,
+    semantic_activation_seal_valid,
+    valid_semantic_activation_fingerprint,
+)
+
+if TYPE_CHECKING:
+    from merchant_ai.services.grounded_population_runtime_gate import (
+        PopulationPreExecutionReference,
+    )
+else:
+    PopulationPreExecutionReference = Any
 
 
 class GroundedRuntimeAttempt(APIModel):
@@ -129,6 +144,12 @@ class GroundedVerifiedQueryArtifact(APIModel):
     result_artifact_receipts: list[dict[str, Any]] = Field(
         default_factory=list
     )
+    plan_fingerprint: str = ""
+    run_result_fingerprint: str = ""
+    semantic_activation_fingerprint: str = ""
+    semantic_activation_seal_fingerprint: str = ""
+    semantic_activation_topics: list[str] = Field(default_factory=list)
+    ledger_fingerprint: str = ""
     created_at: str = ""
 
 
@@ -139,6 +160,8 @@ class GroundedPendingQueryPublication(APIModel):
     generation: int
     attempt_id: str
     receipt: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    receipt_fingerprint: str = ""
+    run_result_fingerprint: str = ""
     status: str = "PENDING"
 
 
@@ -195,10 +218,15 @@ class GroundedRuntimeSession(APIModel):
     keywords: ExtractedKeywords = Field(default_factory=ExtractedKeywords)
     routing: TopicRoutingDecision = Field(default_factory=TopicRoutingDecision)
     workspace_topics: list[str] = Field(default_factory=list)
+    semantic_activation_seal: Optional[
+        GroundedSemanticActivationSeal
+    ] = None
+    semantic_activation_execution_started: bool = False
     recall: RecallBundle = Field(default_factory=RecallBundle)
     attempts: list[GroundedRuntimeAttempt] = Field(default_factory=list)
     active_generation: int = 0
     active_attempt_id: str = ""
+    active_goal_contract_fingerprint: str = ""
     active_execution_mode: GroundedExecutionMode = GroundedExecutionMode.UNDECIDED
     active_execution_reason_codes: list[str] = Field(default_factory=list)
     active_contract: Optional[GroundedQueryContract] = None
@@ -231,6 +259,16 @@ class GroundedRuntimeSession(APIModel):
     )
     defer_artifact_publication: bool = Field(
         default=False,
+        exclude=True,
+        repr=False,
+    )
+    publication_authority_run_result: Optional[AgentRunResult] = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    publication_authority_fingerprint: str = Field(
+        default="",
         exclude=True,
         repr=False,
     )
@@ -290,6 +328,17 @@ class GroundedRuntimeKernel:
         self.executor = executor
         self.verifier = verifier
         self.answer_composer = answer_composer
+        executor_settings = getattr(executor, "settings", None)
+        configured_preview_rows = getattr(
+            executor_settings,
+            "context_artifact_inline_max_rows",
+            None,
+        )
+        self._result_preview_rows = (
+            max(0, int(configured_preview_rows))
+            if configured_preview_rows is not None
+            else None
+        )
         self._lock = RLock()
 
     def new_session(
@@ -356,6 +405,10 @@ class GroundedRuntimeKernel:
             raise ValueError(
                 "parallel query branch_id must be a typed ASCII identifier"
             )
+        self.seal_semantic_activation(
+            session,
+            session.workspace_topics,
+        )
         branch = self.new_session(
             str(objective or session.question).strip(),
             session.merchant_id,
@@ -372,7 +425,31 @@ class GroundedRuntimeKernel:
         branch.workspace_topics = _dedupe(
             workspace_topics or session.workspace_topics
         )
+        with self._lock:
+            parent_semantic_seal = (
+                session.semantic_activation_seal.model_copy(deep=True)
+                if session.semantic_activation_seal is not None
+                else None
+            )
+            parent_execution_started = bool(
+                session.semantic_activation_execution_started
+            )
+        if parent_semantic_seal is not None:
+            if any(
+                topic not in set(parent_semantic_seal.exact_topics)
+                for topic in branch.workspace_topics
+            ):
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_BRANCH_TOPIC_SCOPE_MISMATCH"
+                )
+            branch.semantic_activation_seal = parent_semantic_seal
+            branch.semantic_activation_execution_started = (
+                parent_execution_started
+            )
         branch.recall = session.recall.model_copy(deep=True)
+        branch.active_goal_contract_fingerprint = str(
+            session.active_goal_contract_fingerprint or ""
+        )
         requested_entity_set_ids = _dedupe(inherit_entity_set_ids or [])
         if requested_entity_set_ids:
             with self._lock:
@@ -429,6 +506,9 @@ class GroundedRuntimeKernel:
         answer composition and a later serial entity-chain query can continue.
         """
 
+        if self.semantic_activation_authority_available():
+            self.revalidate_semantic_activation(session)
+
         with self._lock:
             verified_branches = [
                 branch
@@ -439,62 +519,260 @@ class GroundedRuntimeKernel:
             ]
             if not verified_branches:
                 return []
-
-            # Snapshot postflight is performed by the graph runtime before
-            # this call. Publication remains deferred until this adoption
-            # gate, so a failed postflight leaves only unmounted staging.
-            publication_batches: list[
-                tuple[GroundedRuntimeSession, list[dict[str, Any]]]
-            ] = []
+            parent_semantic_seal = (
+                session.semantic_activation_seal.model_copy(deep=True)
+                if session.semantic_activation_seal is not None
+                else None
+            )
+            branch_semantic_seals = [
+                branch.semantic_activation_seal.model_copy(deep=True)
+                for branch in verified_branches
+                if branch.semantic_activation_seal is not None
+            ]
+            if self.semantic_activation_authority_available():
+                if (
+                    parent_semantic_seal is None
+                    or not semantic_activation_seal_valid(
+                        parent_semantic_seal
+                    )
+                    or len(branch_semantic_seals)
+                    != len(verified_branches)
+                    or any(
+                        not semantic_activation_seal_valid(item)
+                        or item.seal_fingerprint
+                        != parent_semantic_seal.seal_fingerprint
+                        for item in branch_semantic_seals
+                    )
+                ):
+                    raise RuntimeError(
+                        "VERIFIED_BRANCH_SEMANTIC_ACTIVATION_MISMATCH"
+                    )
+            elif branch_semantic_seals and any(
+                item.seal_fingerprint
+                != branch_semantic_seals[0].seal_fingerprint
+                for item in branch_semantic_seals[1:]
+            ):
+                raise RuntimeError(
+                    "VERIFIED_BRANCH_SEMANTIC_ACTIVATION_MISMATCH"
+                )
+            parent_cas = {
+                "generation": session.active_generation,
+                "revision": session.revision,
+                "ledgerIds": tuple(
+                    item.artifact_id
+                    for item in session.verified_query_ledger
+                ),
+            }
+            branch_snapshots: list[dict[str, Any]] = []
             for branch in verified_branches:
-                if branch.run_result is None:
-                    raise RuntimeError(
-                        "VERIFIED_BRANCH_RUN_RESULT_REQUIRED"
-                    )
-                try:
-                    receipts = self._publish_pending_receipts_locked(
-                        branch,
-                        generation=branch.active_generation,
-                        run_result=branch.run_result,
-                        verified=branch.verified_evidence,
-                    )
-                except Exception as exc:
-                    # No parent allowlist/ledger mutation has happened. Files
-                    # possibly written by an earlier batch are inert because
-                    # filesystem presence is never a visibility capability.
-                    raise RuntimeError(
-                        "VERIFIED_BRANCH_ARTIFACT_PUBLICATION_FAILED:%s:%s"
-                        % (type(exc).__name__, str(exc)[:300])
-                    ) from exc
-                publication_batches.append((branch, receipts))
+                if branch.run_result is None or branch.verified_evidence is None:
+                    raise RuntimeError("VERIFIED_BRANCH_RUN_RESULT_REQUIRED")
+                generation = branch.active_generation
+                branch_snapshots.append(
+                    {
+                        "branch": branch,
+                        "generation": generation,
+                        "attemptId": branch.active_attempt_id,
+                        "verified": branch.verified_evidence.model_copy(
+                            deep=True
+                        ),
+                        "verifiedFingerprint": _stable_json_hash(
+                            branch.verified_evidence.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            )
+                        ),
+                        "publication": self._publication_snapshot_locked(
+                            branch,
+                            generation,
+                        ),
+                        "ledgerRefs": list(branch.verified_query_ledger),
+                        "ledgerToken": tuple(
+                            (
+                                id(item),
+                                item.artifact_id,
+                                item.publication_status,
+                                item.ledger_fingerprint,
+                            )
+                            for item in branch.verified_query_ledger
+                        ),
+                    }
+                )
 
-            for branch, receipts in publication_batches:
-                if receipts and branch.run_result is not None:
+        # Snapshot postflight is performed by the graph runtime before this
+        # call. All hash/copy/publish work remains outside the global lock.
+        publication_batches: list[dict[str, Any]] = []
+        for snapshot in branch_snapshots:
+            try:
+                source_integrity = tuple(
+                    (
+                        id(source),
+                        verified_query_artifact_integrity_fingerprint(
+                            source
+                        ),
+                    )
+                    for source in snapshot["ledgerRefs"]
+                )
+                if any(
+                    source.ledger_fingerprint
+                    and source.ledger_fingerprint != observed
+                    for source, (_identity, observed) in zip(
+                        snapshot["ledgerRefs"],
+                        source_integrity,
+                    )
+                ):
+                    raise RuntimeError("VERIFIED_BRANCH_LEDGER_CORRUPT")
+                requests = self._pending_publication_requests(
+                    snapshot["publication"],
+                    snapshot["verified"],
+                )
+                receipts = self._publish_requests(requests) if requests else []
+                published_run_result = snapshot["publication"][
+                    "runResult"
+                ].model_copy(deep=True)
+                published_run_result.verified_evidence = snapshot[
+                    "verified"
+                ].model_copy(deep=True)
+                if receipts:
                     self._attach_published_receipts(
-                        branch.run_result,
-                        branch.pending_query_publications,
+                        published_run_result,
+                        snapshot["publication"]["pending"],
                         receipts,
                     )
-                    for artifact in branch.verified_query_ledger:
-                        if (
-                            artifact.generation == branch.active_generation
-                            and artifact.publication_status == "PENDING"
-                        ):
-                            artifact.publication_status = "PUBLISHED"
-                            artifact.result_artifact_receipts = [
-                                dict(item) for item in receipts
-                            ]
-                            artifact.run_result = (
-                                branch.run_result.model_copy(deep=True)
-                            )
-                    for pending in branch.pending_query_publications:
-                        if pending.generation == branch.active_generation:
-                            pending.status = "PUBLISHED"
+                parent_ledger: list[GroundedVerifiedQueryArtifact] = []
+                for source in snapshot["ledgerRefs"]:
+                    if source.generation != snapshot["generation"]:
+                        continue
+                    artifact = self._copy_verified_artifact_with_run_result(
+                        source,
+                        published_run_result,
+                    )
+                    if (
+                        artifact.publication_status == "PENDING"
+                        and receipts
+                    ):
+                        artifact.publication_status = "PUBLISHED"
+                        artifact.result_artifact_receipts = [
+                            dict(item) for item in receipts
+                        ]
+                    artifact.ledger_fingerprint = (
+                        verified_query_artifact_integrity_fingerprint(
+                            artifact
+                        )
+                    )
+                    parent_ledger.append(artifact)
+                branch_public_result = self._bounded_run_result_projection(
+                    published_run_result
+                )
+                branch_audit_ledger = [
+                    self._copy_verified_artifact_with_run_result(
+                        item,
+                        branch_public_result,
+                    )
+                    for item in parent_ledger
+                ]
+                for item in branch_audit_ledger:
+                    item.run_result_fingerprint = (
+                        _query_run_result_fingerprint(item.run_result)
+                    )
+                    item.ledger_fingerprint = (
+                        verified_query_artifact_integrity_fingerprint(item)
+                    )
+                source_integrity_post = tuple(
+                    (
+                        id(source),
+                        verified_query_artifact_integrity_fingerprint(
+                            source
+                        ),
+                    )
+                    for source in snapshot["ledgerRefs"]
+                )
+                if source_integrity_post != source_integrity:
+                    raise RuntimeError("VERIFIED_BRANCH_STATE_STALE")
+                publication_batches.append(
+                    {
+                        **snapshot,
+                        "requests": requests,
+                        "receipts": receipts,
+                        "runResult": branch_public_result,
+                        "parentRunResult": branch_public_result.model_copy(
+                            deep=True
+                        ),
+                        "preparedLedger": branch_audit_ledger,
+                        "parentLedger": parent_ledger,
+                    }
+                )
+            except Exception as exc:
+                # No parent allowlist/ledger mutation has happened. Any files
+                # already written are inert without the atomic commit below.
+                raise RuntimeError(
+                    "VERIFIED_BRANCH_ARTIFACT_PUBLICATION_FAILED:%s:%s"
+                    % (type(exc).__name__, str(exc)[:300])
+                ) from exc
 
+        with self._lock:
+            if (
+                session.active_generation != parent_cas["generation"]
+                or session.revision != parent_cas["revision"]
+                or tuple(
+                    item.artifact_id
+                    for item in session.verified_query_ledger
+                )
+                != parent_cas["ledgerIds"]
+            ):
+                raise RuntimeError("PARENT_VERIFIED_LEDGER_STALE")
+            for batch in publication_batches:
+                branch = batch["branch"]
+                generation = int(batch["generation"])
+                if (
+                    branch.active_generation != generation
+                    or branch.active_attempt_id != batch["attemptId"]
+                    or branch.verified_evidence is None
+                    or _stable_json_hash(
+                        branch.verified_evidence.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
+                    )
+                    != batch["verifiedFingerprint"]
+                    or tuple(
+                        (
+                            id(item),
+                            item.artifact_id,
+                            item.publication_status,
+                            item.ledger_fingerprint,
+                        )
+                        for item in branch.verified_query_ledger
+                    )
+                    != batch["ledgerToken"]
+                ):
+                    raise RuntimeError("VERIFIED_BRANCH_STATE_STALE")
+                if batch["requests"]:
+                    self._assert_pending_publication_cas_locked(
+                        branch,
+                        generation,
+                        batch["requests"],
+                    )
+
+            # One short commit makes every branch receipt and the parent
+            # allowlist ledger visible together.
+            for batch in publication_batches:
+                branch = batch["branch"]
+                branch.run_result = batch["runResult"]
+                branch.verified_query_ledger = batch["preparedLedger"]
+                for pending in branch.pending_query_publications:
+                    if pending.generation == batch["generation"]:
+                        pending.status = "PUBLISHED"
+                self._scrub_pending_publication_receipts(
+                    branch,
+                    int(batch["generation"]),
+                )
+                branch.publication_authority_run_result = None
+                branch.publication_authority_fingerprint = ""
             artifacts = [
-                artifact.model_copy(deep=True)
-                for branch in verified_branches
-                for artifact in branch.verified_query_ledger
+                artifact
+                for batch in publication_batches
+                for artifact in batch["parentLedger"]
                 if artifact.verified_evidence.passed
                 and artifact.publication_status
                 in {"PUBLISHED", "VERIFIED_IN_MEMORY"}
@@ -511,7 +789,17 @@ class GroundedRuntimeKernel:
                 return []
             session.verified_query_ledger.extend(adopted)
             last = verified_branches[-1]
+            last_batch = publication_batches[-1]
             session.active_generation += 1
+            if (
+                session.semantic_activation_seal is None
+                and branch_semantic_seals
+            ):
+                session.semantic_activation_seal = (
+                    branch_semantic_seals[0].model_copy(deep=True)
+                )
+            if branch_semantic_seals:
+                session.semantic_activation_execution_started = True
             session.active_attempt_id = last.active_attempt_id
             session.active_execution_mode = last.active_execution_mode
             session.active_execution_reason_codes = list(
@@ -543,11 +831,7 @@ class GroundedRuntimeKernel:
                 if last.active_sql_validation is not None
                 else None
             )
-            session.run_result = (
-                last.run_result.model_copy(deep=True)
-                if last.run_result is not None
-                else None
-            )
+            session.run_result = last_batch["parentRunResult"]
             session.verified_evidence = (
                 last.verified_evidence.model_copy(deep=True)
                 if last.verified_evidence is not None
@@ -565,7 +849,17 @@ class GroundedRuntimeKernel:
                 "branches=%d;artifacts=%d"
                 % (len(verified_branches), len(adopted)),
             )
-        return [item.model_copy(deep=True) for item in adopted]
+        adopted_projection: list[GroundedVerifiedQueryArtifact] = []
+        for item in adopted:
+            projected = self._copy_verified_artifact_with_run_result(
+                item,
+                self._bounded_run_result_projection(item.run_result),
+            )
+            projected.ledger_fingerprint = (
+                verified_query_artifact_integrity_fingerprint(projected)
+            )
+            adopted_projection.append(projected)
+        return adopted_projection
 
     def route_topic(
         self,
@@ -1141,6 +1435,7 @@ class GroundedRuntimeKernel:
             session.active_attempt_id = attempt_id
             session.active_generation = next_generation
             session.run_result = None
+            self._reset_publication_state(session)
             session.verified_evidence = None
             self._clear_answer_snapshot(session)
             session.clarification = None
@@ -1478,6 +1773,7 @@ class GroundedRuntimeKernel:
             session.active_sql_candidate = candidate
             session.active_sql_validation = validation
             session.run_result = None
+            self._reset_publication_state(session)
             session.verified_evidence = None
             self._clear_answer_snapshot(session)
             session.phase = "ACTIVE_CORE_SQL_VALIDATED"
@@ -1491,23 +1787,257 @@ class GroundedRuntimeKernel:
             )
         return attempt
 
+    def semantic_activation_authority_available(self) -> bool:
+        return callable(
+            getattr(self.topic_assets, "semantic_source_hash", None)
+        )
+
+    def seal_semantic_activation(
+        self,
+        session: GroundedRuntimeSession,
+        topics: Sequence[str],
+        *,
+        allow_topic_expansion: bool = False,
+    ) -> GroundedSemanticActivationSeal | None:
+        """Seal the exact governed Topic source set with optimistic CAS.
+
+        A missing provider is supported only for narrow injected test kernels.
+        The production ``TopicAssetService`` always provides this authority.
+        Once any query has started or verified evidence exists, neither the
+        Topic set nor a changed source digest may be silently re-sealed.
+        """
+
+        source_hash = getattr(
+            self.topic_assets,
+            "semantic_source_hash",
+            None,
+        )
+        if not callable(source_hash):
+            return None
+        requested_topics = canonical_semantic_topics(topics)
+        if not requested_topics:
+            raise RuntimeError("SEMANTIC_ACTIVATION_TOPIC_SET_REQUIRED")
+        active_topic_names = getattr(
+            self.topic_assets,
+            "all_topic_names",
+            None,
+        )
+        if callable(active_topic_names):
+            active_topics = set(
+                canonical_semantic_topics(active_topic_names())
+            )
+            missing_topics = [
+                topic
+                for topic in requested_topics
+                if topic not in active_topics
+            ]
+            if missing_topics:
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_TOPIC_NOT_ACTIVE:%s"
+                    % ",".join(missing_topics)
+                )
+
+        with self._lock:
+            existing = (
+                session.semantic_activation_seal.model_copy(deep=True)
+                if session.semantic_activation_seal is not None
+                else None
+            )
+            if existing is not None and not semantic_activation_seal_valid(
+                existing
+            ):
+                raise RuntimeError("SEMANTIC_ACTIVATION_SEAL_CORRUPT")
+            existing_topics = set(
+                existing.exact_topics if existing is not None else []
+            )
+            added_topics = [
+                topic
+                for topic in requested_topics
+                if topic not in existing_topics
+            ]
+            if added_topics and existing is not None:
+                if not allow_topic_expansion:
+                    raise RuntimeError(
+                        "SEMANTIC_ACTIVATION_TOPIC_EXPANSION_REQUIRES_RESEAL"
+                    )
+                if (
+                    session.semantic_activation_execution_started
+                    or session.verified_query_ledger
+                ):
+                    raise RuntimeError(
+                        "SEMANTIC_ACTIVATION_TOPIC_EXPANSION_AFTER_EXECUTION_FORBIDDEN"
+                    )
+            target_topics = canonical_semantic_topics(
+                [
+                    *(existing.exact_topics if existing is not None else []),
+                    *requested_topics,
+                ]
+            )
+            cas_seal_fingerprint = (
+                existing.seal_fingerprint if existing is not None else ""
+            )
+            cas_execution_started = bool(
+                session.semantic_activation_execution_started
+            )
+            cas_ledger_ids = tuple(
+                item.artifact_id
+                for item in session.verified_query_ledger
+            )
+
+        if existing is not None:
+            observed_existing_fingerprint = str(
+                source_hash(existing.exact_topics) or ""
+            ).strip()
+            if not valid_semantic_activation_fingerprint(
+                observed_existing_fingerprint
+            ):
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_REVALIDATION_UNAVAILABLE"
+                )
+            if (
+                observed_existing_fingerprint
+                != existing.semantic_activation_fingerprint
+            ):
+                raise RuntimeError("SEMANTIC_ACTIVATION_STALE")
+        observed_source_fingerprint = str(
+            source_hash(target_topics) or ""
+        ).strip()
+        if not valid_semantic_activation_fingerprint(
+            observed_source_fingerprint
+        ):
+            raise RuntimeError(
+                "SEMANTIC_ACTIVATION_SOURCE_FINGERPRINT_UNAVAILABLE"
+            )
+        next_version = (
+            int(existing.version) + 1 if existing is not None else 1
+        )
+        candidate = build_semantic_activation_seal(
+            topics=target_topics,
+            semantic_activation_fingerprint=(
+                observed_source_fingerprint
+            ),
+            version=next_version,
+        )
+
+        with self._lock:
+            current = session.semantic_activation_seal
+            current_fingerprint = (
+                current.seal_fingerprint if current is not None else ""
+            )
+            current_ledger_ids = tuple(
+                item.artifact_id
+                for item in session.verified_query_ledger
+            )
+            if (
+                current_fingerprint != cas_seal_fingerprint
+                or bool(session.semantic_activation_execution_started)
+                != cas_execution_started
+                or current_ledger_ids != cas_ledger_ids
+            ):
+                if (
+                    current is not None
+                    and semantic_activation_seal_valid(current)
+                    and current.exact_topics == target_topics
+                    and current.semantic_activation_fingerprint
+                    == observed_source_fingerprint
+                ):
+                    return current.model_copy(deep=True)
+                raise RuntimeError("SEMANTIC_ACTIVATION_SEAL_CAS_STALE")
+            if (
+                existing is not None
+                and existing.exact_topics == target_topics
+                and existing.semantic_activation_fingerprint
+                == observed_source_fingerprint
+            ):
+                return existing.model_copy(deep=True)
+            session.semantic_activation_seal = candidate.model_copy(
+                deep=True
+            )
+            session.revision += 1
+            self._event(
+                session,
+                "seal_semantic_activation",
+                "SEALED",
+                "version=%d;topics=%d;activation=%s"
+                % (
+                    candidate.version,
+                    len(candidate.exact_topics),
+                    candidate.semantic_activation_fingerprint[:16],
+                ),
+                session.active_attempt_id,
+            )
+            return candidate.model_copy(deep=True)
+
+    def revalidate_semantic_activation(
+        self,
+        session: GroundedRuntimeSession,
+    ) -> GroundedSemanticActivationSeal | None:
+        source_hash = getattr(
+            self.topic_assets,
+            "semantic_source_hash",
+            None,
+        )
+        if not callable(source_hash):
+            return None
+        with self._lock:
+            seal = (
+                session.semantic_activation_seal.model_copy(deep=True)
+                if session.semantic_activation_seal is not None
+                else None
+            )
+        if seal is None:
+            raise RuntimeError("SEMANTIC_ACTIVATION_SEAL_REQUIRED")
+        if not semantic_activation_seal_valid(seal):
+            raise RuntimeError("SEMANTIC_ACTIVATION_SEAL_CORRUPT")
+        observed = str(
+            source_hash(seal.exact_topics) or ""
+        ).strip()
+        if not valid_semantic_activation_fingerprint(observed):
+            raise RuntimeError(
+                "SEMANTIC_ACTIVATION_REVALIDATION_UNAVAILABLE"
+            )
+        if observed != seal.semantic_activation_fingerprint:
+            raise RuntimeError("SEMANTIC_ACTIVATION_STALE")
+        with self._lock:
+            current = session.semantic_activation_seal
+            if (
+                current is None
+                or current.seal_fingerprint != seal.seal_fingerprint
+            ):
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_SEAL_CAS_STALE"
+                )
+        return seal
+
     def capture_data_snapshot(
         self,
         semantic_activation_fingerprint: str,
     ) -> DataSnapshotContract:
+        semantic_fingerprint = str(
+            semantic_activation_fingerprint or ""
+        ).strip()
         if self.executor is None:
             return DataSnapshotContract(
+                semantic_activation_fingerprint=semantic_fingerprint,
                 unsupported_reason="GROUNDED_EXECUTOR_NOT_CONFIGURED"
             )
         capture = getattr(self.executor, "capture_data_snapshot", None)
         if not callable(capture):
             return DataSnapshotContract(
+                semantic_activation_fingerprint=semantic_fingerprint,
                 unsupported_reason="DATA_SNAPSHOT_CAPABILITY_UNAVAILABLE"
             )
-        snapshot = capture(str(semantic_activation_fingerprint or "").strip())
-        if isinstance(snapshot, DataSnapshotContract):
-            return snapshot
-        return DataSnapshotContract.model_validate(snapshot)
+        snapshot = capture(semantic_fingerprint)
+        if not isinstance(snapshot, DataSnapshotContract):
+            snapshot = DataSnapshotContract.model_validate(snapshot)
+        observed = str(
+            snapshot.semantic_activation_fingerprint or ""
+        ).strip()
+        if observed != semantic_fingerprint:
+            raise RuntimeError(
+                "DATA_SNAPSHOT_SEMANTIC_ACTIVATION_MISMATCH"
+            )
+        return snapshot
 
     def execute_active(
         self,
@@ -1519,6 +2049,11 @@ class GroundedRuntimeKernel:
         context_owner_fingerprint: str = "",
         runtime_budget: Any = None,
         data_snapshot_contract: DataSnapshotContract | None = None,
+        goal_contract_fingerprint: str = "",
+        population_pre_execution_reference: (
+            PopulationPreExecutionReference | None
+        ) = None,
+        population_query_node_id: str = "",
     ) -> AgentRunResult:
         with self._lock:
             execution_mode = session.active_execution_mode
@@ -1585,10 +2120,85 @@ class GroundedRuntimeKernel:
                 "grounded executor must implement execute_contract; "
                 "legacy execute_plan/NodeAgent execution is forbidden"
             )
+        semantic_seal = self.seal_semantic_activation(
+            session,
+            contract.topics or session.workspace_topics,
+        )
+        if self.semantic_activation_authority_available():
+            semantic_seal = self.revalidate_semantic_activation(
+                session
+            )
+            if semantic_seal is None:
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_SEAL_REQUIRED"
+                )
+        semantic_activation_fingerprint = (
+            semantic_seal.semantic_activation_fingerprint
+            if semantic_seal is not None
+            else ""
+        )
+        semantic_seal_fingerprint = (
+            semantic_seal.seal_fingerprint
+            if semantic_seal is not None
+            else ""
+        )
+        normalized_goal_contract_fingerprint = str(
+            goal_contract_fingerprint
+            or session.active_goal_contract_fingerprint
+            or ""
+        ).strip()
+        if artifact_root and not _valid_sha256_hex(
+            normalized_goal_contract_fingerprint
+        ):
+            raise RuntimeError(
+                "QUERY_EXECUTION_GOAL_CONTRACT_FINGERPRINT_INVALID"
+            )
+        if data_snapshot_contract is not None and semantic_seal is not None:
+            if (
+                str(
+                    data_snapshot_contract.semantic_activation_fingerprint
+                    or ""
+                ).strip()
+                != semantic_activation_fingerprint
+            ):
+                raise RuntimeError(
+                    "DATA_SNAPSHOT_SEMANTIC_ACTIVATION_MISMATCH"
+                )
+        with self._lock:
+            self._require_generation(session, generation)
+            current_seal = session.semantic_activation_seal
+            if semantic_seal is not None and (
+                current_seal is None
+                or current_seal.seal_fingerprint
+                != semantic_seal_fingerprint
+            ):
+                raise RuntimeError(
+                    "SEMANTIC_ACTIVATION_SEAL_CAS_STALE"
+                )
+            if not session.semantic_activation_execution_started:
+                session.semantic_activation_execution_started = True
+                session.revision += 1
+                self._event(
+                    session,
+                    "semantic_activation_execution_gate",
+                    "PASSED",
+                    "activation=%s"
+                    % semantic_activation_fingerprint[:16],
+                    session.active_attempt_id,
+                )
         execution_kwargs = {
             "run_id": run_id,
             "access_role": session.access_role,
             "user_scope": dict(session.user_scope),
+            "execution_reference_scope": (
+                session.reference_scope.model_copy(deep=True)
+            ),
+            "execution_goal_contract_fingerprint": (
+                normalized_goal_contract_fingerprint
+            ),
+            "expected_semantic_activation_fingerprint": (
+                semantic_activation_fingerprint
+            ),
             "execution_preparation": runtime_preparation,
         }
         if artifact_root:
@@ -1607,6 +2217,13 @@ class GroundedRuntimeKernel:
             execution_kwargs["runtime_budget"] = runtime_budget
         if data_snapshot_contract is not None:
             execution_kwargs["data_snapshot_contract"] = data_snapshot_contract
+        if population_pre_execution_reference is not None:
+            execution_kwargs["population_pre_execution_reference"] = (
+                population_pre_execution_reference
+            )
+            execution_kwargs["population_query_node_id"] = str(
+                population_query_node_id or ""
+            ).strip()
         run_result = execute_contract(
             session.merchant_id,
             contract,
@@ -1617,7 +2234,50 @@ class GroundedRuntimeKernel:
         )
         if not isinstance(run_result, AgentRunResult):
             run_result = AgentRunResult.model_validate(run_result)
+        if semantic_seal is not None:
+            seen_bundles: set[int] = set()
+            for bundle in self._all_result_bundles(run_result):
+                if id(bundle) in seen_bundles:
+                    continue
+                seen_bundles.add(id(bundle))
+                observed_semantic_fingerprint = str(
+                    bundle.data_snapshot.semantic_activation_fingerprint
+                    or ""
+                ).strip()
+                if (
+                    not observed_semantic_fingerprint
+                    and data_snapshot_contract is not None
+                ):
+                    bundle.data_snapshot = (
+                        data_snapshot_contract.model_copy(deep=True)
+                    )
+                    observed_semantic_fingerprint = str(
+                        bundle.data_snapshot.semantic_activation_fingerprint
+                        or ""
+                    ).strip()
+                if not observed_semantic_fingerprint and bundle.failed:
+                    continue
+                if not observed_semantic_fingerprint:
+                    raise RuntimeError(
+                        "DATA_SNAPSHOT_SEMANTIC_ACTIVATION_REQUIRED"
+                    )
+                if (
+                    observed_semantic_fingerprint
+                    != semantic_activation_fingerprint
+                ):
+                    raise RuntimeError(
+                        "DATA_SNAPSHOT_SEMANTIC_ACTIVATION_MISMATCH"
+                    )
         pending_receipts = self._extract_pending_result_artifacts(run_result)
+        # The executor result becomes the single private full-result
+        # authority.  Core receives a separate, configuration-bounded
+        # projection, so the session does not retain two full row populations
+        # while it waits for independent verification.
+        publication_authority = run_result
+        publication_authority_fingerprint = (
+            _query_run_result_fingerprint(publication_authority)
+        )
+        core_run_result = self._bounded_run_result_projection(run_result)
         access_terminal_codes = {
             "ACCESS_DENIED",
             "ACL_POLICY_UNAVAILABLE",
@@ -1639,6 +2299,16 @@ class GroundedRuntimeKernel:
         )
         with self._lock:
             self._require_generation(session, generation)
+            if semantic_seal is not None:
+                current_seal = session.semantic_activation_seal
+                if (
+                    current_seal is None
+                    or current_seal.seal_fingerprint
+                    != semantic_seal_fingerprint
+                ):
+                    raise RuntimeError(
+                        "SEMANTIC_ACTIVATION_SEAL_CAS_STALE"
+                    )
             if (
                 active_sql_execution_fingerprint
                 and active_sql_execution_fingerprint
@@ -1649,7 +2319,16 @@ class GroundedRuntimeKernel:
                 )
             session.active_plan = runtime_preparation.plan.model_copy(deep=True)
             session.active_preparation = runtime_preparation
-            session.run_result = run_result
+            session.active_goal_contract_fingerprint = (
+                normalized_goal_contract_fingerprint
+            )
+            session.run_result = core_run_result
+            session.publication_authority_run_result = (
+                publication_authority
+            )
+            session.publication_authority_fingerprint = (
+                publication_authority_fingerprint
+            )
             session.artifact_publication_required = bool(artifact_root)
             session.pending_query_publications = [
                 GroundedPendingQueryPublication(
@@ -1659,6 +2338,10 @@ class GroundedRuntimeKernel:
                     generation=generation,
                     attempt_id=session.active_attempt_id,
                     receipt=dict(item),
+                    receipt_fingerprint=_stable_json_hash(dict(item)),
+                    run_result_fingerprint=(
+                        publication_authority_fingerprint
+                    ),
                 )
                 for item in pending_receipts
                 if str(item.get("pendingArtifactId") or "").strip()
@@ -1676,7 +2359,7 @@ class GroundedRuntimeKernel:
                 "tasks=%d" % len(run_result.task_results),
                 session.active_attempt_id,
             )
-        return run_result
+        return core_run_result
 
     def verify_active(self, session: GroundedRuntimeSession) -> VerifiedEvidence:
         if self.verifier is None:
@@ -1687,79 +2370,136 @@ class GroundedRuntimeKernel:
             generation, plan, _pack = self._active_snapshot(session)
             if session.run_result is None:
                 raise RuntimeError("active grounded query has not executed")
-            run_result = session.run_result.model_copy(deep=True)
-        verified = self.verifier.verify(session.question, plan, run_result)
+            run_result_source = session.publication_authority_run_result
+            if run_result_source is None:
+                raise RuntimeError("QUERY_RESULT_PUBLICATION_AUTHORITY_REQUIRED")
+            authority_fingerprint = str(
+                session.publication_authority_fingerprint or ""
+            )
+            defer_publication = bool(session.defer_artifact_publication)
+            publication_required = bool(
+                session.artifact_publication_required
+            )
+        if self.semantic_activation_authority_available():
+            self.revalidate_semantic_activation(session)
+        verifier_run_result = run_result_source.model_copy(deep=True)
+        if (
+            authority_fingerprint
+            and _query_run_result_fingerprint(verifier_run_result)
+            != authority_fingerprint
+        ):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_AUTHORITY_CORRUPT")
+        verified = self.verifier.verify(
+            session.question,
+            plan,
+            verifier_run_result,
+        )
         if not isinstance(verified, VerifiedEvidence):
             verified = VerifiedEvidence.model_validate(verified)
-        with self._lock:
-            self._require_generation(session, generation)
-            published_receipts: list[dict[str, Any]] = []
-            publication_error = ""
-            if verified.passed and not session.defer_artifact_publication:
+        if (
+            authority_fingerprint
+            and _query_run_result_fingerprint(verifier_run_result)
+            != authority_fingerprint
+        ):
+            raise RuntimeError("QUERY_RESULT_VERIFIER_MUTATED_AUTHORITY")
+        publication_requests: list[dict[str, Any]] = []
+        published_receipts: list[dict[str, Any]] = []
+        publication_error = ""
+        if verified.passed and not defer_publication:
+            with self._lock:
                 try:
-                    published_receipts = self._publish_pending_receipts_locked(
-                        session,
-                        generation=generation,
-                        run_result=session.run_result or run_result,
-                        verified=verified,
+                    publication_snapshot = (
+                        self._publication_snapshot_locked(
+                            session,
+                            generation,
+                        )
                     )
                 except Exception as exc:
                     publication_error = "%s:%s" % (
                         type(exc).__name__,
                         str(exc)[:400],
                     )
-                    verified = VerifiedEvidence(
-                        passed=False,
-                        gaps=[
-                            EvidenceGap(
-                                code="QUERY_RESULT_ARTIFACT_PUBLICATION_FAILED",
-                                evidence=str(
-                                    session.active_attempt_id or ""
-                                ),
-                                reason=publication_error,
-                                severity="blocking",
-                            )
-                        ],
-                        blocking_gaps=[
-                            EvidenceGap(
-                                code="QUERY_RESULT_ARTIFACT_PUBLICATION_FAILED",
-                                evidence=str(
-                                    session.active_attempt_id or ""
-                                ),
-                                reason=publication_error,
-                                severity="blocking",
-                            )
-                        ],
-                        answer_guard_required=True,
-                        partial_answer_reason=(
-                            "Verified rows could not be committed to the "
-                            "artifact allowlist ledger."
-                        ),
+                    publication_snapshot = {}
+            if publication_snapshot and not publication_error:
+                try:
+                    publication_requests = (
+                        self._pending_publication_requests(
+                            publication_snapshot,
+                            verified,
+                        )
                     )
-            if verified.passed and published_receipts:
-                active_run_result = session.run_result or run_result
-                self._attach_published_receipts(
-                    active_run_result,
-                    session.pending_query_publications,
-                    published_receipts,
+                except Exception as exc:
+                    publication_error = "%s:%s" % (
+                        type(exc).__name__,
+                        str(exc)[:400],
+                    )
+            if publication_requests and not publication_error:
+                try:
+                    # Potentially large hashing/copying is deliberately
+                    # outside the global kernel lock and runtime budget clock.
+                    published_receipts = self._publish_requests(
+                        publication_requests
+                    )
+                except Exception as exc:
+                    publication_error = "%s:%s" % (
+                        type(exc).__name__,
+                        str(exc)[:400],
+                    )
+        with self._lock:
+            self._require_generation(session, generation)
+            if publication_requests:
+                self._assert_pending_publication_cas_locked(
+                    session,
+                    generation,
+                    publication_requests,
                 )
+            if publication_error:
+                verified = self._publication_failure_evidence(
+                    session.active_attempt_id,
+                    publication_error,
+                )
+            if verified.passed and published_receipts:
                 for pending in session.pending_query_publications:
                     if pending.generation == generation:
                         pending.status = "PUBLISHED"
             session.verified_evidence = verified
-            if session.run_result is not None:
-                session.run_result.verified_evidence = verified.model_copy(deep=True)
+            public_run_result = session.run_result
+            private_run_result = session.publication_authority_run_result
+            if public_run_result is None or private_run_result is None:
+                raise RuntimeError("QUERY_RESULT_PUBLICATION_STATE_STALE")
+            if published_receipts:
+                self._attach_published_receipts(
+                    public_run_result,
+                    publication_snapshot.get("pending") or [],
+                    published_receipts,
+                )
+            public_run_result.verified_evidence = verified.model_copy(
+                deep=True
+            )
             if verified.passed:
+                deferred_publication = bool(
+                    defer_publication and publication_required
+                )
+                if not deferred_publication:
+                    if published_receipts:
+                        self._attach_published_receipts(
+                            private_run_result,
+                            publication_snapshot.get("pending") or [],
+                            published_receipts,
+                        )
+                    private_run_result.verified_evidence = (
+                        verified.model_copy(deep=True)
+                    )
                 self._record_verified_query_artifact(
                     session,
                     generation=generation,
                     plan=plan,
-                    run_result=session.run_result or run_result,
+                    run_result=private_run_result,
                     verified=verified,
                     publication_status=(
                         "PENDING"
-                        if session.defer_artifact_publication
-                        and session.artifact_publication_required
+                        if defer_publication
+                        and publication_required
                         else "PUBLISHED"
                         if published_receipts
                         else "VERIFIED_IN_MEMORY"
@@ -1770,6 +2510,21 @@ class GroundedRuntimeKernel:
                 for pending in session.pending_query_publications:
                     if pending.generation == generation:
                         pending.status = "PUBLICATION_FAILED"
+            elif not verified.passed:
+                for pending in session.pending_query_publications:
+                    if pending.generation == generation:
+                        pending.status = "VERIFICATION_FAILED"
+            if not (
+                verified.passed
+                and defer_publication
+                and publication_required
+            ):
+                self._scrub_pending_publication_receipts(
+                    session,
+                    generation,
+                )
+            session.publication_authority_run_result = None
+            session.publication_authority_fingerprint = ""
             session.phase = "VERIFIED" if verified.passed else "VERIFICATION_GAPPED"
             session.revision += 1
             self._event(
@@ -1805,6 +2560,41 @@ class GroundedRuntimeKernel:
         ]
         return bundles
 
+    def _bounded_run_result_projection(
+        self,
+        run_result: AgentRunResult,
+    ) -> AgentRunResult:
+        """Return the Core-visible result without duplicating a full population."""
+
+        projection = run_result.model_copy(deep=True)
+        limit = self._result_preview_rows
+        if limit is None:
+            return projection
+        seen_bundles: set[int] = set()
+        for bundle in self._all_result_bundles(projection):
+            if id(bundle) in seen_bundles:
+                continue
+            seen_bundles.add(id(bundle))
+            if len(bundle.rows) <= limit:
+                continue
+            bundle.rows = [dict(row) for row in bundle.rows[:limit]]
+            bundle.is_truncated = True
+            bundle.result_coverage = ResultCoverage.PREVIEW
+        for task_result in projection.task_results:
+            entity_set = task_result.entity_set
+            if entity_set is None:
+                continue
+            values_were_truncated = len(entity_set.values) > limit
+            entity_set.values = list(entity_set.values[:limit])
+            for column, values in list(entity_set.column_values.items()):
+                if len(values) > limit:
+                    values_were_truncated = True
+                entity_set.column_values[column] = list(values[:limit])
+            entity_set.truncated = bool(
+                entity_set.truncated or values_were_truncated
+            )
+        return projection
+
     @classmethod
     def _extract_pending_result_artifacts(
         cls,
@@ -1838,25 +2628,272 @@ class GroundedRuntimeKernel:
             bundle.source_artifact_refs = {}
         return pending
 
-    def _publish_pending_receipts_locked(
+    @staticmethod
+    def _scrub_pending_publication_receipts(
+        session: GroundedRuntimeSession,
+        generation: int,
+    ) -> None:
+        """Release private capabilities once no future publish may use them."""
+
+        for pending in session.pending_query_publications:
+            if pending.generation != generation:
+                continue
+            pending.receipt = {}
+            pending.receipt_fingerprint = ""
+            pending.run_result_fingerprint = ""
+
+    def _publication_snapshot_locked(
         self,
         session: GroundedRuntimeSession,
-        *,
         generation: int,
-        run_result: AgentRunResult,
+    ) -> dict[str, Any]:
+        self._require_generation(session, generation)
+        authority_run_result = session.publication_authority_run_result
+        authority_fingerprint = str(
+            session.publication_authority_fingerprint or ""
+        )
+        authority_artifact_id = ""
+        if authority_run_result is None:
+            authority_artifact = next(
+                (
+                    artifact
+                    for artifact in reversed(session.verified_query_ledger)
+                    if artifact.generation == generation
+                    and artifact.publication_status
+                    in {"PENDING", "VERIFIED_IN_MEMORY"}
+                ),
+                None,
+            )
+            if authority_artifact is not None:
+                authority_run_result = authority_artifact.run_result
+                authority_fingerprint = str(
+                    authority_artifact.run_result_fingerprint or ""
+                )
+                if (
+                    not authority_fingerprint
+                    and authority_artifact.publication_status
+                    == "VERIFIED_IN_MEMORY"
+                ):
+                    authority_fingerprint = _query_run_result_fingerprint(
+                        authority_run_result
+                    )
+                authority_artifact_id = authority_artifact.artifact_id
+        if (
+            authority_run_result is None
+            and not session.artifact_publication_required
+            and session.run_result is not None
+        ):
+            authority_run_result = session.run_result
+            authority_fingerprint = _query_run_result_fingerprint(
+                authority_run_result
+            )
+        if authority_run_result is None or session.active_contract is None:
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_STATE_REQUIRED")
+        semantic_seal = session.semantic_activation_seal
+        if self.semantic_activation_authority_available() and (
+            semantic_seal is None
+            or not semantic_activation_seal_valid(semantic_seal)
+        ):
+            raise RuntimeError(
+                "QUERY_RESULT_SEMANTIC_ACTIVATION_SEAL_REQUIRED"
+            )
+        return {
+            "generation": generation,
+            "attemptId": session.active_attempt_id,
+            "goalContractFingerprint": str(
+                session.active_goal_contract_fingerprint or ""
+            ),
+            "merchantId": session.merchant_id,
+            "accessRole": session.access_role,
+            "userScope": dict(session.user_scope),
+            "referenceScope": session.reference_scope.model_copy(deep=True),
+            "contract": session.active_contract.model_copy(deep=True),
+            "sqlValidation": (
+                session.active_sql_validation.model_copy(deep=True)
+                if session.active_sql_validation is not None
+                else None
+            ),
+            "semanticActivationFingerprint": str(
+                semantic_seal.semantic_activation_fingerprint
+                if semantic_seal is not None
+                else ""
+                or ""
+            ),
+            "semanticActivationSealFingerprint": str(
+                semantic_seal.seal_fingerprint
+                if semantic_seal is not None
+                else ""
+            ),
+            "semanticActivationTopics": list(
+                semantic_seal.exact_topics
+                if semantic_seal is not None
+                else []
+            ),
+            # This private deep copy was sealed when execute_active accepted
+            # the result. Core only receives session.run_result, never this
+            # publication authority object.
+            "runResult": authority_run_result,
+            "runResultToken": id(authority_run_result),
+            "runResultFingerprint": authority_fingerprint,
+            "runResultArtifactId": authority_artifact_id,
+            "publicationRequired": bool(
+                session.artifact_publication_required
+            ),
+            "pending": [
+                item.model_copy(deep=True)
+                for item in session.pending_query_publications
+                if item.generation == generation
+            ],
+        }
+
+    def _pending_publication_requests(
+        self,
+        snapshot: dict[str, Any],
         verified: VerifiedEvidence,
     ) -> list[dict[str, Any]]:
-        if not session.artifact_publication_required:
+        if not bool(snapshot.get("publicationRequired")):
             return []
+        generation = int(snapshot.get("generation") or 0)
+        attempt_id = str(snapshot.get("attemptId") or "")
         pending = [
             item
-            for item in session.pending_query_publications
+            for item in snapshot.get("pending") or []
             if item.generation == generation
-            and item.attempt_id == session.active_attempt_id
+            and item.attempt_id == attempt_id
             and item.status == "PENDING"
         ]
         if not pending:
             raise RuntimeError("QUERY_RESULT_PENDING_RECEIPT_REQUIRED")
+        if not callable(
+            getattr(
+                self.executor,
+                "publish_pending_result_artifact",
+                None,
+            )
+        ):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_GATE_UNAVAILABLE")
+        contract = snapshot.get("contract")
+        if not isinstance(contract, GroundedQueryContract):
+            raise RuntimeError("QUERY_RESULT_ACTIVE_CONTRACT_REQUIRED")
+        run_result = snapshot.get("runResult")
+        if not isinstance(run_result, AgentRunResult):
+            raise RuntimeError("QUERY_RESULT_RUN_RESULT_REQUIRED")
+        authority_fingerprint = str(
+            snapshot.get("runResultFingerprint") or ""
+        )
+        if (
+            not authority_fingerprint
+            or _query_run_result_fingerprint(run_result)
+            != authority_fingerprint
+        ):
+            raise RuntimeError("QUERY_RESULT_PUBLICATION_AUTHORITY_MISMATCH")
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        sql_fingerprint = self._sql_evidence_fingerprint(
+            snapshot.get("sqlValidation"),
+            contract_fingerprint,
+            run_result,
+        )
+        semantic_activation_fingerprint = str(
+            snapshot.get("semanticActivationFingerprint") or ""
+        ).strip()
+        if not semantic_activation_fingerprint:
+            raise RuntimeError(
+                "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
+            )
+        bundle = run_result.merged_query_bundle
+        if (
+            str(
+                bundle.data_snapshot.semantic_activation_fingerprint
+                or ""
+            ).strip()
+            != semantic_activation_fingerprint
+        ):
+            raise RuntimeError(
+                "QUERY_RESULT_DATA_SNAPSHOT_ACTIVATION_MISMATCH"
+            )
+        context_owner_fingerprint = grounded_context_owner_fingerprint(
+            str(snapshot.get("merchantId") or ""),
+            str(snapshot.get("accessRole") or ""),
+            dict(snapshot.get("userScope") or {}),
+        )
+        rows_canonical_sha256 = _stable_json_hash(bundle.rows or [])
+        requests: list[dict[str, Any]] = []
+        for item in pending:
+            private_receipt = dict(item.receipt)
+            receipt_fingerprint = _stable_json_hash(private_receipt)
+            if (
+                not item.receipt_fingerprint
+                or item.receipt_fingerprint != receipt_fingerprint
+                or item.run_result_fingerprint != authority_fingerprint
+            ):
+                raise RuntimeError("QUERY_RESULT_PENDING_AUTHORITY_MISMATCH")
+            requests.append(
+                {
+                    "pendingArtifactId": item.pending_artifact_id,
+                    "generation": generation,
+                    "attemptId": attempt_id,
+                    "runResultToken": int(
+                        snapshot.get("runResultToken") or 0
+                    ),
+                    "runResultArtifactId": str(
+                        snapshot.get("runResultArtifactId") or ""
+                    ),
+                    "pendingReceiptFingerprint": receipt_fingerprint,
+                    "runResultFingerprint": authority_fingerprint,
+                    "receipt": private_receipt,
+                    "publishKwargs": {
+                        "verified_evidence": verified.model_copy(deep=True),
+                        "expected_generation": generation,
+                        "expected_attempt_id": attempt_id,
+                        "expected_contract_fingerprint": contract_fingerprint,
+                        "expected_goal_contract_fingerprint": str(
+                            snapshot.get("goalContractFingerprint") or ""
+                        ),
+                        "expected_merchant_id": str(
+                            snapshot.get("merchantId") or ""
+                        ),
+                        "expected_access_role": str(
+                            snapshot.get("accessRole") or ""
+                        ),
+                        "expected_user_scope": dict(
+                            snapshot.get("userScope") or {}
+                        ),
+                        "expected_reference_scope": snapshot[
+                            "referenceScope"
+                        ].model_copy(deep=True),
+                        "expected_sql_fingerprint": sql_fingerprint,
+                        "expected_context_owner_fingerprint": (
+                            context_owner_fingerprint
+                        ),
+                        "expected_semantic_activation_fingerprint": (
+                            semantic_activation_fingerprint
+                        ),
+                        "expected_data_snapshot": (
+                            bundle.data_snapshot.model_copy(deep=True)
+                        ),
+                        "expected_result_coverage": str(
+                            bundle.result_coverage or ""
+                        ),
+                        "expected_result_is_truncated": bool(
+                            bundle.is_truncated
+                        ),
+                        "expected_stored_row_count": len(bundle.rows),
+                        "expected_exact_result_row_count": max(
+                            0,
+                            int(bundle.original_row_count or 0),
+                        ),
+                        "expected_rows_canonical_sha256": (
+                            rows_canonical_sha256
+                        ),
+                    },
+                }
+            )
+        return requests
+
+    def _publish_requests(
+        self,
+        requests: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
         publish = getattr(
             self.executor,
             "publish_pending_result_artifact",
@@ -1864,80 +2901,92 @@ class GroundedRuntimeKernel:
         )
         if not callable(publish):
             raise RuntimeError("QUERY_RESULT_PUBLICATION_GATE_UNAVAILABLE")
-        if session.active_contract is None:
-            raise RuntimeError("QUERY_RESULT_ACTIVE_CONTRACT_REQUIRED")
-        contract = session.active_contract
-        contract_fingerprint = grounded_query_contract_fingerprint(contract)
-        sql_fingerprint = self._active_sql_evidence_fingerprint(
-            session,
-            contract_fingerprint,
-            run_result,
-        )
-        semantic_activation_fingerprint = str(
-            getattr(
-                session.active_preparation,
-                "asset_pack_fingerprint",
-                "",
-            )
-            or ""
-        ).strip()
-        if not semantic_activation_fingerprint:
-            raise RuntimeError(
-                "QUERY_RESULT_SEMANTIC_ACTIVATION_FINGERPRINT_REQUIRED"
-            )
-        context_owner_fingerprint = grounded_context_owner_fingerprint(
-            session.merchant_id,
-            session.access_role,
-            session.user_scope,
-        )
-        bundle = run_result.merged_query_bundle
-        rows_canonical_sha256 = hashlib.sha256(
-            json.dumps(
-                list(bundle.rows or []),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
         published: list[dict[str, Any]] = []
-        for item in pending:
+        for request in requests:
             receipt = publish(
-                dict(item.receipt),
-                verified_evidence=verified,
-                expected_generation=generation,
-                expected_attempt_id=session.active_attempt_id,
-                expected_contract_fingerprint=contract_fingerprint,
-                expected_sql_fingerprint=sql_fingerprint,
-                expected_context_owner_fingerprint=(
-                    context_owner_fingerprint
-                ),
-                expected_semantic_activation_fingerprint=(
-                    semantic_activation_fingerprint
-                ),
-                expected_data_snapshot=bundle.data_snapshot,
-                expected_result_coverage=str(
-                    bundle.result_coverage or ""
-                ),
-                expected_result_is_truncated=bool(bundle.is_truncated),
-                expected_stored_row_count=len(bundle.rows),
-                expected_exact_result_row_count=max(
-                    0,
-                    int(bundle.original_row_count or 0),
-                ),
-                expected_rows_canonical_sha256=rows_canonical_sha256,
+                dict(request.get("receipt") or {}),
+                **dict(request.get("publishKwargs") or {}),
             )
             self._validate_published_receipt(receipt)
+            if str(receipt.get("pendingArtifactId") or "") != str(
+                request.get("pendingArtifactId") or ""
+            ):
+                raise RuntimeError(
+                    "QUERY_RESULT_PUBLICATION_PENDING_ID_MISMATCH"
+                )
             published.append(dict(receipt))
         return published
 
     @staticmethod
-    def _active_sql_evidence_fingerprint(
+    def _assert_pending_publication_cas_locked(
         session: GroundedRuntimeSession,
+        generation: int,
+        requests: Sequence[dict[str, Any]],
+    ) -> None:
+        if session.active_generation != generation:
+            raise RuntimeError("stale grounded runtime generation")
+        for request in requests:
+            artifact_id = str(
+                request.get("runResultArtifactId") or ""
+            )
+            if artifact_id:
+                artifact = next(
+                    (
+                        item
+                        for item in session.verified_query_ledger
+                        if item.artifact_id == artifact_id
+                        and item.generation == generation
+                        and item.publication_status == "PENDING"
+                    ),
+                    None,
+                )
+                authority = artifact.run_result if artifact is not None else None
+                authority_fingerprint = (
+                    artifact.run_result_fingerprint
+                    if artifact is not None
+                    else ""
+                )
+            else:
+                authority = session.publication_authority_run_result
+                authority_fingerprint = (
+                    session.publication_authority_fingerprint
+                )
+            if (
+                session.active_attempt_id
+                != str(request.get("attemptId") or "")
+                or id(authority)
+                != int(request.get("runResultToken") or 0)
+                or authority_fingerprint
+                != str(request.get("runResultFingerprint") or "")
+            ):
+                raise RuntimeError("QUERY_RESULT_PUBLICATION_STATE_STALE")
+        current = {
+            item.pending_artifact_id: item
+            for item in session.pending_query_publications
+            if item.generation == generation
+        }
+        for request in requests:
+            pending_id = str(request.get("pendingArtifactId") or "")
+            item = current.get(pending_id)
+            if (
+                item is None
+                or item.status != "PENDING"
+                or item.attempt_id != str(request.get("attemptId") or "")
+                or item.receipt_fingerprint
+                != str(request.get("pendingReceiptFingerprint") or "")
+                or item.run_result_fingerprint
+                != str(request.get("runResultFingerprint") or "")
+                or _stable_json_hash(dict(item.receipt))
+                != item.receipt_fingerprint
+            ):
+                raise RuntimeError("QUERY_RESULT_PENDING_RECEIPT_STALE")
+
+    @staticmethod
+    def _sql_evidence_fingerprint(
+        validation: GroundedSqlValidationResult | None,
         contract_fingerprint: str,
         run_result: AgentRunResult,
     ) -> str:
-        validation = session.active_sql_validation
         if validation is not None and validation.ast_fingerprint:
             return str(validation.ast_fingerprint)
         return hashlib.sha256(
@@ -1993,6 +3042,28 @@ class GroundedRuntimeKernel:
                 raise RuntimeError(
                     "QUERY_RESULT_PUBLICATION_ABSOLUTE_PATH_FORBIDDEN"
                 )
+
+    @staticmethod
+    def _publication_failure_evidence(
+        attempt_id: str,
+        reason: str,
+    ) -> VerifiedEvidence:
+        gap = EvidenceGap(
+            code="QUERY_RESULT_ARTIFACT_PUBLICATION_FAILED",
+            evidence=str(attempt_id or ""),
+            reason=str(reason or "")[:500],
+            severity="blocking",
+        )
+        return VerifiedEvidence(
+            passed=False,
+            gaps=[gap.model_copy(deep=True)],
+            blocking_gaps=[gap.model_copy(deep=True)],
+            answer_guard_required=True,
+            partial_answer_reason=(
+                "Verified rows could not be committed to the artifact "
+                "allowlist ledger."
+            ),
+        )
 
     @classmethod
     def _attach_published_receipts(
@@ -2069,6 +3140,23 @@ class GroundedRuntimeKernel:
             )
         if not source.verified_evidence.passed:
             raise RuntimeError("VERIFIED_QUERY_ARTIFACT_REQUIRED")
+        source_bundle = source.run_result.merged_query_bundle
+        source_coverage = str(
+            source_bundle.result_coverage or ResultCoverage.UNKNOWN.value
+        )
+        if (
+            source.sealed_entity_values_truncated
+            or source_bundle.is_truncated
+            or source_coverage
+            not in {
+                ResultCoverage.ALL_ROWS.value,
+                ResultCoverage.TOP_N.value,
+            }
+        ):
+            raise RuntimeError(
+                "VERIFIED_ENTITY_SET_INCOMPLETE_COVERAGE:%s"
+                % source_coverage
+            )
         if not column or column not in source.output_columns:
             raise RuntimeError(
                 "VERIFIED_ENTITY_OUTPUT_COLUMN_NOT_FOUND:%s" % column
@@ -2169,6 +3257,11 @@ class GroundedRuntimeKernel:
     ) -> GroundedVerifiedQueryArtifact:
         if session.active_contract is None:
             raise RuntimeError("verified query has no active grounded Contract")
+        semantic_seal = session.semantic_activation_seal
+        if semantic_seal is not None and not semantic_activation_seal_valid(
+            semantic_seal
+        ):
+            raise RuntimeError("SEMANTIC_ACTIVATION_SEAL_CORRUPT")
         contract = session.active_contract.model_copy(deep=True)
         contract_fingerprint = grounded_query_contract_fingerprint(contract)
         validation = session.active_sql_validation
@@ -2212,7 +3305,16 @@ class GroundedRuntimeKernel:
             )
         )
         sealed_entity_values: dict[str, list[Any]] = {}
-        sealed_values_truncated = False
+        result_bundle = run_result.merged_query_bundle
+        result_coverage = str(result_bundle.result_coverage or "UNKNOWN")
+        sealed_values_truncated = bool(
+            result_bundle.is_truncated
+            or result_coverage
+            not in {
+                ResultCoverage.ALL_ROWS.value,
+                ResultCoverage.TOP_N.value,
+            }
+        )
         for task_result in run_result.task_results:
             entity_set = task_result.entity_set
             if entity_set is None:
@@ -2242,7 +3344,10 @@ class GroundedRuntimeKernel:
             sql_fingerprint=sql_fingerprint,
             contract=contract,
             plan=plan.model_copy(deep=True),
-            run_result=run_result.model_copy(deep=True),
+            # ``run_result`` is a kernel-owned sealed object at this point.
+            # Taking ownership avoids retaining another complete row
+            # population beside the verified ledger.
+            run_result=run_result,
             verified_evidence=verified.model_copy(deep=True),
             execution_mode=str(session.active_execution_mode or ""),
             sql_validation=(
@@ -2273,9 +3378,72 @@ class GroundedRuntimeKernel:
             result_artifact_receipts=[
                 dict(item) for item in result_artifact_receipts
             ],
+            plan_fingerprint=_stable_json_hash(
+                plan.model_dump(by_alias=True, mode="json")
+            ),
+            run_result_fingerprint=_query_run_result_fingerprint(run_result),
+            semantic_activation_fingerprint=(
+                semantic_seal.semantic_activation_fingerprint
+                if semantic_seal is not None
+                else ""
+            ),
+            semantic_activation_seal_fingerprint=(
+                semantic_seal.seal_fingerprint
+                if semantic_seal is not None
+                else ""
+            ),
+            semantic_activation_topics=(
+                list(semantic_seal.exact_topics)
+                if semantic_seal is not None
+                else []
+            ),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
+        artifact.ledger_fingerprint = (
+            verified_query_artifact_integrity_fingerprint(artifact)
+        )
         session.verified_query_ledger.append(artifact)
+        return artifact
+
+    @staticmethod
+    def _copy_verified_artifact_with_run_result(
+        source: GroundedVerifiedQueryArtifact,
+        run_result: AgentRunResult,
+    ) -> GroundedVerifiedQueryArtifact:
+        """Copy ledger metadata without first copying its full row payload."""
+
+        artifact = source.model_copy(deep=False)
+        artifact.contract = source.contract.model_copy(deep=True)
+        artifact.plan = source.plan.model_copy(deep=True)
+        artifact.run_result = run_result
+        artifact.verified_evidence = source.verified_evidence.model_copy(
+            deep=True
+        )
+        artifact.sql_validation = (
+            source.sql_validation.model_copy(deep=True)
+            if source.sql_validation is not None
+            else None
+        )
+        artifact.output_columns = list(source.output_columns)
+        artifact.output_semantic_refs = dict(source.output_semantic_refs)
+        artifact.output_entity_identities = dict(
+            source.output_entity_identities
+        )
+        artifact.output_lineage = {
+            key: list(values)
+            for key, values in source.output_lineage.items()
+        }
+        artifact.sealed_entity_values = {
+            key: list(values)
+            for key, values in source.sealed_entity_values.items()
+        }
+        artifact.result_artifact_receipts = [
+            dict(item) for item in source.result_artifact_receipts
+        ]
+        artifact.run_result_fingerprint = _query_run_result_fingerprint(
+            run_result
+        )
+        artifact.ledger_fingerprint = ""
         return artifact
 
     def compose_answer(
@@ -2797,6 +3965,7 @@ class GroundedRuntimeKernel:
         session.active_attempt_id = attempt.attempt_id
         session.active_generation = generation
         session.run_result = None
+        GroundedRuntimeKernel._reset_publication_state(session)
         session.verified_evidence = None
         GroundedRuntimeKernel._clear_answer_snapshot(session)
         session.clarification = None
@@ -2813,6 +3982,7 @@ class GroundedRuntimeKernel:
         session.active_sql_candidate = None
         session.active_sql_validation = None
         session.run_result = None
+        GroundedRuntimeKernel._reset_publication_state(session)
         session.verified_evidence = None
         GroundedRuntimeKernel._clear_answer_snapshot(session)
 
@@ -2823,6 +3993,13 @@ class GroundedRuntimeKernel:
         session.answer_run_result = None
         session.answer_verified_evidence = None
         session.answer_artifact_ids = []
+
+    @staticmethod
+    def _reset_publication_state(session: GroundedRuntimeSession) -> None:
+        session.publication_authority_run_result = None
+        session.publication_authority_fingerprint = ""
+        session.pending_query_publications = []
+        session.artifact_publication_required = False
 
     @staticmethod
     def _active_snapshot(
@@ -2868,15 +4045,109 @@ class GroundedRuntimeKernel:
 
 
 def _stable_json_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    for chunk in encoder.iterencode(value):
+        digest.update(chunk.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _query_run_result_fingerprint(run_result: AgentRunResult) -> str:
+    return _stable_json_hash(
+        run_result.model_dump(by_alias=True, mode="json")
+    )
+
+
+def verified_query_artifact_integrity_fingerprint(
+    artifact: GroundedVerifiedQueryArtifact,
+) -> str:
+    """Return the complete content seal for a verified query ledger item.
+
+    ``ledger_fingerprint`` is deliberately excluded from its own seal.  The
+    declared run-result fingerprint and the observed payload fingerprint are
+    both included so mutating nested rows cannot be hidden by leaving the
+    declaration unchanged.
+    """
+
+    return _stable_json_hash(
+        {
+            "artifactId": artifact.artifact_id,
+            "generation": artifact.generation,
+            "attemptId": artifact.attempt_id,
+            "contractFingerprint": artifact.contract_fingerprint,
+            "observedContractFingerprint": (
+                grounded_query_contract_fingerprint(artifact.contract)
+            ),
+            "sqlFingerprint": artifact.sql_fingerprint,
+            "planFingerprint": artifact.plan_fingerprint,
+            "observedPlanFingerprint": _stable_json_hash(
+                artifact.plan.model_dump(by_alias=True, mode="json")
+            ),
+            "runResultFingerprint": artifact.run_result_fingerprint,
+            "observedRunResultFingerprint": _query_run_result_fingerprint(
+                artifact.run_result
+            ),
+            "semanticActivationFingerprint": (
+                artifact.semantic_activation_fingerprint
+            ),
+            "semanticActivationSealFingerprint": (
+                artifact.semantic_activation_seal_fingerprint
+            ),
+            "semanticActivationTopics": list(
+                artifact.semantic_activation_topics
+            ),
+            "verifiedEvidenceFingerprint": _stable_json_hash(
+                artifact.verified_evidence.model_dump(
+                    by_alias=True,
+                    mode="json",
+                )
+            ),
+            "executionMode": artifact.execution_mode,
+            "sqlValidation": (
+                artifact.sql_validation.model_dump(
+                    by_alias=True,
+                    mode="json",
+                )
+                if artifact.sql_validation is not None
+                else None
+            ),
+            "rankingSemanticsVerified": (
+                artifact.ranking_semantics_verified
+            ),
+            "outputColumns": list(artifact.output_columns),
+            "outputSemanticRefs": dict(artifact.output_semantic_refs),
+            "outputEntityIdentities": dict(
+                artifact.output_entity_identities
+            ),
+            "outputLineage": dict(artifact.output_lineage),
+            "sealedEntityValues": dict(artifact.sealed_entity_values),
+            "sealedEntityValuesTruncated": bool(
+                artifact.sealed_entity_values_truncated
+            ),
+            "publicationStatus": artifact.publication_status,
+            "resultArtifactReceipts": [
+                dict(item) for item in artifact.result_artifact_receipts
+            ],
+        }
+    )
+
+
+def verified_query_artifact_integrity_valid(
+    artifact: GroundedVerifiedQueryArtifact,
+) -> bool:
+    """Fail closed unless a ledger item matches its complete content seal."""
+
+    declared = str(artifact.ledger_fingerprint or "").strip()
+    return bool(
+        declared
+        and declared
+        == verified_query_artifact_integrity_fingerprint(artifact)
+    )
 
 
 def _contract_output_columns(contract: GroundedQueryContract) -> list[str]:
@@ -3307,6 +4578,17 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result
+
+
+def _valid_sha256_hex(value: Any) -> bool:
+    normalized = str(value or "").strip()
+    return bool(
+        len(normalized) == 64
+        and all(
+            character in "0123456789abcdef"
+            for character in normalized
+        )
+    )
 
 
 def _merge_recall_bundles(primary: RecallBundle, secondary: RecallBundle) -> RecallBundle:

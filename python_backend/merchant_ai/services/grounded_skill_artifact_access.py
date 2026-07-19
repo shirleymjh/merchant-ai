@@ -8,6 +8,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from merchant_ai.models import ResultCoverage
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.grounded_runtime_kernel import (
+    verified_query_artifact_integrity_valid,
+)
 from merchant_ai.services.sandbox import (
     SANDBOX_INPUT_ALLOWLIST_VERSION,
     SandboxArtifactAccess,
@@ -121,11 +124,93 @@ def _artifact_attempt_fingerprint(artifact: Any) -> str:
     return hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()
 
 
+def _artifact_data_snapshot_identity(artifact: Any) -> dict[str, str]:
+    run_result = _object_value(artifact, "run_result", "runResult")
+    bundle = _object_value(
+        run_result,
+        "merged_query_bundle",
+        "mergedQueryBundle",
+    )
+    snapshot = _object_value(bundle, "data_snapshot", "dataSnapshot")
+    if snapshot is None:
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_DATA_SNAPSHOT_REQUIRED"
+        )
+    identity = {
+        "datasourceFingerprint": str(
+            _object_value(
+                snapshot,
+                "datasource_fingerprint",
+                "datasourceFingerprint",
+            )
+            or ""
+        ),
+        "datasourceEnvironment": str(
+            _object_value(
+                snapshot,
+                "datasource_environment",
+                "datasourceEnvironment",
+            )
+            or ""
+        ),
+        "dataEpoch": str(
+            _object_value(snapshot, "data_epoch", "dataEpoch") or ""
+        ),
+        "consistencyMode": str(
+            _object_value(
+                snapshot,
+                "consistency_mode",
+                "consistencyMode",
+            )
+            or "UNSUPPORTED"
+        ),
+        "semanticActivationFingerprint": str(
+            _object_value(
+                snapshot,
+                "semantic_activation_fingerprint",
+                "semanticActivationFingerprint",
+            )
+            or ""
+        ),
+        "cacheGeneration": str(
+            _object_value(
+                snapshot,
+                "cache_generation",
+                "cacheGeneration",
+            )
+            or ""
+        ),
+        "capturedAt": str(
+            _object_value(snapshot, "captured_at", "capturedAt") or ""
+        ),
+        "unsupportedReason": str(
+            _object_value(
+                snapshot,
+                "unsupported_reason",
+                "unsupportedReason",
+            )
+            or ""
+        ),
+    }
+    if (
+        not _valid_sha256(identity["datasourceFingerprint"])
+        or not _valid_sha256(
+            identity["semanticActivationFingerprint"]
+        )
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_DATA_SNAPSHOT_IDENTITY_INVALID"
+        )
+    return identity
+
+
 def _validated_receipt(
     artifact: Any,
     raw_receipt: Any,
     *,
     expected_owner_fingerprint: str,
+    expected_semantic_activation_fingerprint: str = "",
+    expected_semantic_activation_seal_fingerprint: str = "",
 ) -> dict[str, Any]:
     if not isinstance(raw_receipt, Mapping):
         raise GroundedSkillArtifactAccessError(
@@ -139,6 +224,9 @@ def _validated_receipt(
         "sqlSha256",
         "verifiedEvidenceSha256",
         "dataSnapshotFingerprint",
+        "attemptFingerprint",
+        "contractFingerprint",
+        "sqlEvidenceFingerprint",
     )
     if any(not _valid_sha256(receipt.get(key)) for key in digest_fields):
         raise GroundedSkillArtifactAccessError(
@@ -177,6 +265,13 @@ def _validated_receipt(
         raise GroundedSkillArtifactAccessError(
             "SKILL_PUBLISHED_ARTIFACT_SEMANTIC_ACTIVATION_INVALID"
         )
+    if (
+        expected_semantic_activation_fingerprint
+        and semantic != expected_semantic_activation_fingerprint
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_ACTIVE_SEMANTIC_MISMATCH"
+        )
     coverage = str(receipt.get("resultCoverage") or "")
     if coverage not in {item.value for item in ResultCoverage}:
         raise GroundedSkillArtifactAccessError(
@@ -196,6 +291,10 @@ def _validated_receipt(
             raise GroundedSkillArtifactAccessError(
                 "SKILL_PUBLISHED_ARTIFACT_COUNT_INVALID"
             )
+    if int(receipt.get("executionGeneration") or 0) <= 0:
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_GENERATION_INVALID"
+        )
 
     artifact_contract = str(
         _object_value(
@@ -227,30 +326,90 @@ def _validated_receipt(
         raise GroundedSkillArtifactAccessError(
             "SKILL_PUBLISHED_ARTIFACT_LEDGER_BINDING_MISMATCH"
         )
+    data_snapshot = _artifact_data_snapshot_identity(artifact)
+    if (
+        str(receipt.get("dataSnapshotFingerprint") or "")
+        != _stable_hash(data_snapshot)
+        or str(receipt.get("semanticActivationFingerprint") or "")
+        != data_snapshot["semanticActivationFingerprint"]
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_DATA_SNAPSHOT_BINDING_MISMATCH"
+        )
+    artifact_semantic = str(
+        _object_value(
+            artifact,
+            "semantic_activation_fingerprint",
+            "semanticActivationFingerprint",
+        )
+        or ""
+    )
+    artifact_semantic_seal = str(
+        _object_value(
+            artifact,
+            "semantic_activation_seal_fingerprint",
+            "semanticActivationSealFingerprint",
+        )
+        or ""
+    )
+    if artifact_semantic and artifact_semantic != semantic:
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_LEDGER_SEMANTIC_MISMATCH"
+        )
+    if expected_semantic_activation_fingerprint and (
+        artifact_semantic
+        != expected_semantic_activation_fingerprint
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_ACTIVE_SEMANTIC_MISMATCH"
+        )
+    if expected_semantic_activation_seal_fingerprint and (
+        artifact_semantic_seal
+        != expected_semantic_activation_seal_fingerprint
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_PUBLISHED_ARTIFACT_ACTIVE_SEAL_MISMATCH"
+        )
+    receipt["_serverDataSnapshot"] = data_snapshot
     return receipt
 
 
 def build_grounded_skill_artifact_access(
     *,
     settings: Any,
+    trusted_workspace_root: Path,
     artifact_root: Path,
+    sandbox_staging_root: Path,
     owner_fingerprint: str,
     verified_query_artifacts: Sequence[Any],
     selected_artifact_ids: Iterable[str],
     skill_run_id: str,
+    expected_semantic_activation_fingerprint: str = "",
+    expected_semantic_activation_seal_fingerprint: str = "",
 ) -> GroundedSkillArtifactAccessBundle:
     if settings is None:
         raise GroundedSkillArtifactAccessError(
             "SKILL_ARTIFACT_SETTINGS_REQUIRED"
         )
     root = Path(artifact_root).resolve(strict=True)
-    configured_root = settings.resolved_workspace_path.resolve()
+    configured_root = Path(trusted_workspace_root).resolve(strict=True)
     try:
         root.relative_to(configured_root)
     except ValueError as exc:
         raise GroundedSkillArtifactAccessError(
             "SKILL_ARTIFACT_ROOT_OUTSIDE_WORKSPACE"
         ) from exc
+    staging_root = Path(sandbox_staging_root).resolve(strict=True)
+    try:
+        staging_root.relative_to(configured_root)
+    except ValueError as exc:
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_SANDBOX_STAGING_ROOT_OUTSIDE_WORKSPACE"
+        ) from exc
+    if not staging_root.is_dir() or staging_root == root:
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_SANDBOX_STAGING_ROOT_INVALID"
+        )
     selected = tuple(
         dict.fromkeys(
             str(item).strip()
@@ -280,6 +439,10 @@ def build_grounded_skill_artifact_access(
     observed_fingerprints: set[str] = set()
     for artifact_id in selected:
         artifact = ledger[artifact_id]
+        if not verified_query_artifact_integrity_valid(artifact):
+            raise GroundedSkillArtifactAccessError(
+                "SKILL_SELECTED_ARTIFACT_LEDGER_INTEGRITY_INVALID"
+            )
         verified = _object_value(
             artifact,
             "verified_evidence",
@@ -317,6 +480,12 @@ def build_grounded_skill_artifact_access(
                 artifact,
                 raw_receipt,
                 expected_owner_fingerprint=owner_fingerprint,
+                expected_semantic_activation_fingerprint=(
+                    expected_semantic_activation_fingerprint
+                ),
+                expected_semantic_activation_seal_fingerprint=(
+                    expected_semantic_activation_seal_fingerprint
+                ),
             )
             fingerprint = str(receipt["artifactFingerprint"])
             if fingerprint in observed_fingerprints:
@@ -368,12 +537,37 @@ def build_grounded_skill_artifact_access(
                     ),
                     rows_sha256=str(receipt["rowsSha256"]),
                     result_coverage=str(receipt["resultCoverage"]),
+                    data_snapshot_fingerprint=str(
+                        receipt["dataSnapshotFingerprint"]
+                    ),
+                    datasource_fingerprint=str(
+                        receipt["_serverDataSnapshot"][
+                            "datasourceFingerprint"
+                        ]
+                    ),
+                    datasource_environment=str(
+                        receipt["_serverDataSnapshot"][
+                            "datasourceEnvironment"
+                        ]
+                    ),
+                    semantic_activation_fingerprint=str(
+                        receipt["_serverDataSnapshot"][
+                            "semanticActivationFingerprint"
+                        ]
+                    ),
+                    cache_generation=str(
+                        receipt["_serverDataSnapshot"][
+                            "cacheGeneration"
+                        ]
+                    ),
                 )
             )
+            # SQL remains a server-side verification input only. It can carry
+            # tenant predicates or row-policy literals, so analysis workers
+            # receive the verified manifest and rows but never the SQL bytes.
             for path_key, digest_key in (
                 ("manifestRelativePath", "queryManifestSha256"),
                 ("rowsRelativePath", "rowsSha256"),
-                ("sqlRelativePath", "sqlSha256"),
             ):
                 allowed_digests[str(receipt[path_key])] = str(
                     receipt[digest_key]
@@ -400,13 +594,10 @@ def build_grounded_skill_artifact_access(
                         receipt["manifestRef"]
                     ),
                     "rowsRef": _merchant_ref(receipt["rowsRef"]),
-                    "sqlRef": _merchant_ref(receipt["sqlRef"]),
                     "manifestArtifact": "/artifacts/%s"
                     % receipt["manifestRelativePath"],
                     "rowsArtifact": "/artifacts/%s"
                     % receipt["rowsRelativePath"],
-                    "sqlArtifact": "/artifacts/%s"
-                    % receipt["sqlRelativePath"],
                 }
             )
     if len(semantic_fingerprints) != 1:
@@ -414,6 +605,14 @@ def build_grounded_skill_artifact_access(
             "SKILL_ARTIFACT_SEMANTIC_ACTIVATION_CONFLICT"
         )
     semantic_fingerprint = next(iter(semantic_fingerprints))
+    if (
+        expected_semantic_activation_fingerprint
+        and semantic_fingerprint
+        != expected_semantic_activation_fingerprint
+    ):
+        raise GroundedSkillArtifactAccessError(
+            "SKILL_ARTIFACT_ACTIVE_SEMANTIC_MISMATCH"
+        )
     allowlist_payload = {
         "schemaVersion": SANDBOX_INPUT_ALLOWLIST_VERSION,
         "manifestKind": "SANDBOX_INPUT_ALLOWLIST",
@@ -450,6 +649,8 @@ def build_grounded_skill_artifact_access(
         expected_owner_fingerprint=owner_fingerprint,
         expected_semantic_activation_fingerprint=semantic_fingerprint,
         verified_query_artifact_commits=tuple(commits),
+        trusted_workspace_root=configured_root,
+        sandbox_staging_root=staging_root,
     )
     return GroundedSkillArtifactAccessBundle(
         access=access,
@@ -457,4 +658,3 @@ def build_grounded_skill_artifact_access(
         artifact_catalog=tuple(catalog),
         allowed_artifact_digests=dict(allowed_digests),
     )
-

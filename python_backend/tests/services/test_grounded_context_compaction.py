@@ -43,6 +43,7 @@ from merchant_ai.services.grounded_query_contract import GroundedQueryContract
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeSession,
     GroundedVerifiedQueryArtifact,
+    verified_query_artifact_integrity_fingerprint,
 )
 
 
@@ -97,7 +98,7 @@ def _query_artifact() -> GroundedVerifiedQueryArtifact:
         result_coverage="ALL_ROWS",
         runtime_events=[{"resultArtifact": receipt}],
     )
-    return GroundedVerifiedQueryArtifact(
+    artifact = GroundedVerifiedQueryArtifact(
         artifact_id="query-artifact-context",
         generation=2,
         attempt_id="attempt-context",
@@ -110,6 +111,10 @@ def _query_artifact() -> GroundedVerifiedQueryArtifact:
         execution_mode="CORE_SQL_REQUIRED",
         output_columns=["value"],
     )
+    artifact.ledger_fingerprint = (
+        verified_query_artifact_integrity_fingerprint(artifact)
+    )
+    return artifact
 
 
 def _session(settings: Settings) -> GroundedDeepAgentSession:
@@ -338,6 +343,57 @@ def test_token_counter_prefers_current_model_counter_and_labels_fallback() -> No
     assert fallback.fallback_used is True
 
 
+def test_recovery_never_turns_unpublished_runtime_events_into_authority(
+    tmp_path: Path,
+) -> None:
+    session = _session(_settings(tmp_path))
+    artifact = session.runtime.verified_query_ledger[0]
+
+    unpublished = build_grounded_recovery_payload(
+        session,
+        thread_id="thread-context",
+        run_id="run-context",
+    )["queryArtifactReceipts"][0]
+
+    assert unpublished["publicationStatus"] == "VERIFIED_IN_MEMORY"
+    assert unpublished["resultArtifacts"] == []
+
+    committed_receipt = dict(
+        artifact.run_result.merged_query_bundle.runtime_events[0][
+            "resultArtifact"
+        ]
+    )
+    artifact.publication_status = "PUBLISHED"
+    artifact.result_artifact_receipts = [committed_receipt]
+    artifact.ledger_fingerprint = (
+        verified_query_artifact_integrity_fingerprint(artifact)
+    )
+    published = build_grounded_recovery_payload(
+        session,
+        thread_id="thread-context",
+        run_id="run-context",
+    )["queryArtifactReceipts"][0]
+
+    assert published["publicationStatus"] == "PUBLISHED"
+    assert published["resultArtifacts"] == [committed_receipt]
+
+
+def test_recovery_omits_a_query_artifact_after_ledger_tampering(
+    tmp_path: Path,
+) -> None:
+    session = _session(_settings(tmp_path))
+    artifact = session.runtime.verified_query_ledger[0]
+    artifact.contract_fingerprint = "0" * 64
+
+    recovery = build_grounded_recovery_payload(
+        session,
+        thread_id="thread-context",
+        run_id="run-context",
+    )
+
+    assert recovery["queryArtifactReceipts"] == []
+
+
 def test_frozen_graph_reopens_only_artifact_filesystem_after_verified_query(
     tmp_path: Path,
 ) -> None:
@@ -425,6 +481,9 @@ def test_artifact_backend_pages_only_verified_immutable_files(
         root_kind="artifacts",
         read_only=True,
         settings=settings,
+        allowed_artifact_digests={
+            artifact["relativePath"]: artifact["sha256"]
+        },
     )
     scope = GroundedSemanticBackend(object())
 
@@ -443,7 +502,7 @@ def test_artifact_backend_pages_only_verified_immutable_files(
         ).matches
         assert backend.read(
             "/artifacts/query_results/unverified.txt"
-        ).error == WorkspaceArtifactStore.IMMUTABLE_STATE_INVALID
+        ).error == "GROUNDED_CONTEXT_FILE_NOT_ALLOWED"
 
         first = backend.read(
             "/artifacts/%s" % artifact["relativePath"],

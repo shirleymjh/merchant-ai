@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import Event, RLock, Thread
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from merchant_ai.config import Settings, jdbc_to_pymysql_kwargs
 from merchant_ai.models import DataSnapshotContract, MerchantInfo, PendingAnswer
@@ -16,6 +16,20 @@ from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
 
 
 logger = logging.getLogger(__name__)
+
+
+class DatabaseStreamError(RuntimeError):
+    CANCELLED = "DATABASE_STREAM_CANCELLED"
+    TIMEOUT = "DATABASE_STREAM_TIMEOUT"
+    FAILED = "DATABASE_STREAM_FAILED"
+
+    def __init__(self, code: str, *, cause_type: str = "") -> None:
+        self.code = str(code or self.FAILED)
+        self.cause_type = str(cause_type or "")
+        message = self.code
+        if self.cause_type:
+            message = "%s:%s" % (message, self.cause_type)
+        super().__init__(message)
 
 
 def degraded_reason(component: str, operation: str, exc: Exception) -> Dict[str, Any]:
@@ -108,6 +122,123 @@ class DatabaseClient:
             finally:
                 stop_monitor.set()
 
+    def stream_query_batches(
+        self,
+        sql: str,
+        params: Optional[Iterable[Any]] = None,
+        *,
+        batch_size: int,
+        cancel_events: Optional[Iterable[Any]] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Yield bounded batches from a server-side PyMySQL cursor.
+
+        The connection remains owned by this iterator and is closed on EOF,
+        cancellation, timeout, source error, or consumer ``close()``. No
+        ``fetchall`` path is used, so result size does not determine process
+        memory usage.
+        """
+
+        size = max(1, int(batch_size or 1))
+        cancellation_events = tuple(
+            event for event in (cancel_events or ()) if event is not None
+        )
+        timeout = max(
+            1,
+            int(timeout_seconds or self.read_timeout_seconds or 1),
+        )
+        deadline = time.monotonic() + timeout
+        with self.connection() as conn:
+            try:
+                from pymysql.cursors import SSDictCursor
+            except Exception as exc:
+                raise DatabaseStreamError(
+                    DatabaseStreamError.FAILED,
+                    cause_type=type(exc).__name__,
+                ) from exc
+
+            stop_monitor = Event()
+            interruption: Dict[str, str] = {"code": ""}
+
+            def cancellation_requested() -> bool:
+                return any(
+                    bool(getattr(event, "is_set", lambda: False)())
+                    for event in cancellation_events
+                )
+
+            def interrupt_if_required() -> None:
+                code = str(interruption.get("code") or "")
+                if not code and cancellation_requested():
+                    code = DatabaseStreamError.CANCELLED
+                    interruption["code"] = code
+                if not code and time.monotonic() >= deadline:
+                    code = DatabaseStreamError.TIMEOUT
+                    interruption["code"] = code
+                if code:
+                    raise DatabaseStreamError(code)
+
+            def monitor_query() -> None:
+                while not stop_monitor.wait(0.05):
+                    code = ""
+                    if cancellation_requested():
+                        code = DatabaseStreamError.CANCELLED
+                    elif time.monotonic() >= deadline:
+                        code = DatabaseStreamError.TIMEOUT
+                    if not code:
+                        continue
+                    interruption["code"] = code
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+
+            monitor = Thread(
+                target=monitor_query,
+                name="doris-stream-query-cancel",
+                daemon=True,
+            )
+            monitor.start()
+            cursor = None
+            try:
+                interrupt_if_required()
+                cursor = conn.cursor(SSDictCursor)
+                if params:
+                    cursor.execute(sql, tuple(params))
+                else:
+                    cursor.execute(sql)
+                while True:
+                    interrupt_if_required()
+                    rows = cursor.fetchmany(size)
+                    interrupt_if_required()
+                    if not rows:
+                        break
+                    yield [dict(row) for row in rows]
+            except DatabaseStreamError:
+                raise
+            except Exception as exc:
+                code = str(interruption.get("code") or "")
+                if not code and cancellation_requested():
+                    code = DatabaseStreamError.CANCELLED
+                if not code and time.monotonic() >= deadline:
+                    code = DatabaseStreamError.TIMEOUT
+                raise DatabaseStreamError(
+                    code or DatabaseStreamError.FAILED,
+                    cause_type=type(exc).__name__,
+                ) from exc
+            finally:
+                stop_monitor.set()
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                monitor.join(timeout=0.2)
+
     def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> int:
         with self.connection() as conn:
             with conn.cursor() as cursor:
@@ -184,6 +315,49 @@ class DorisRepository:
     def query_one(self, sql: str, params: Optional[Iterable[Any]] = None) -> Dict[str, Any]:
         rows = self.query(sql, params)
         return rows[0] if rows else {}
+
+    def stream_query_batches(
+        self,
+        sql: str,
+        params: Optional[Iterable[Any]] = None,
+        *,
+        batch_size: int,
+        cancel_events: Optional[Iterable[Any]] = None,
+        timeout_seconds: Optional[int] = None,
+        data_snapshot_contract: Optional[DataSnapshotContract] = None,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Stream an uncached Doris result while retaining snapshot identity."""
+
+        self.last_cache_hit = False
+        self.last_cache_key = ""
+        snapshot = data_snapshot_contract or DataSnapshotContract(
+            unsupported_reason="DATA_SNAPSHOT_CONTRACT_NOT_SUPPLIED"
+        )
+        self.last_data_snapshot = snapshot.model_copy(deep=True)
+        self._snapshot_is_current(snapshot)
+        params_list = list(params or [])
+        stream: Iterator[List[Dict[str, Any]]] | None = None
+        try:
+            stream = self.db.stream_query_batches(
+                sql,
+                params_list or None,
+                batch_size=max(1, int(batch_size or 1)),
+                cancel_events=cancel_events,
+                timeout_seconds=timeout_seconds,
+            )
+            for batch in stream:
+                yield batch
+        except Exception as exc:
+            self.last_degraded_reason = log_degraded(
+                "doris_repository",
+                "stream_query_batches",
+                exc,
+            )
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
     def datasource_fingerprint(self) -> str:
         connection = jdbc_to_pymysql_kwargs(
@@ -303,6 +477,43 @@ class DorisRepository:
                 "DATA_SNAPSHOT_STALE: data, semantic or cache generation changed before query"
             )
         return True
+
+    def revalidate_data_snapshot(
+        self,
+        snapshot: DataSnapshotContract,
+    ) -> DataSnapshotContract:
+        """Recheck a shared snapshot immediately before business execution."""
+
+        if snapshot.cache_identity_complete():
+            self._snapshot_is_current(snapshot)
+            return snapshot.model_copy(deep=True)
+        if (
+            snapshot.datasource_fingerprint
+            and snapshot.datasource_fingerprint != self.datasource_fingerprint()
+        ):
+            raise RuntimeError(
+                "DATA_SNAPSHOT_DATASOURCE_MISMATCH: snapshot belongs to another datasource"
+            )
+        current = self.capture_data_snapshot(
+            snapshot.semantic_activation_fingerprint
+        )
+        fields = (
+            "datasource_fingerprint",
+            "datasource_environment",
+            "data_epoch",
+            "consistency_mode",
+            "semantic_activation_fingerprint",
+            "cache_generation",
+        )
+        if any(
+            str(getattr(current, field_name, "") or "")
+            != str(getattr(snapshot, field_name, "") or "")
+            for field_name in fields
+        ):
+            raise RuntimeError(
+                "DATA_SNAPSHOT_STALE: snapshot authority changed before query"
+            )
+        return snapshot.model_copy(deep=True)
 
     def show_full_columns(self, table_name: str) -> List[Dict[str, Any]]:
         safe_table = safe_identifier(table_name)

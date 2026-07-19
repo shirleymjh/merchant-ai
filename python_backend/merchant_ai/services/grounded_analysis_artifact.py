@@ -378,8 +378,9 @@ def build_grounded_analysis_skill_input(
     requested_artifact_ids: Sequence[str],
     verified_query_artifacts: Sequence[Any],
     artifact_goal_ids: Mapping[str, Sequence[str]],
+    include_rows: bool = True,
 ) -> GroundedAnalysisSkillInput:
-    """Mount verified rows/lineage for one typed derived-analysis goal."""
+    """Build typed inputs; online workers may receive artifact refs only."""
 
     contract, goal, analysis_type = _derived_analysis_goal(
         goal_contract,
@@ -389,6 +390,7 @@ def build_grounded_analysis_skill_input(
         requested_artifact_ids,
         verified_query_artifacts,
         artifact_goal_ids,
+        include_rows=include_rows,
     )
     _require_goal_inputs(goal, inputs)
     return GroundedAnalysisSkillInput(
@@ -1106,6 +1108,8 @@ def _verified_analysis_inputs(
     requested_artifact_ids: Sequence[str],
     verified_query_artifacts: Sequence[Any],
     artifact_goal_ids: Mapping[str, Sequence[str]],
+    *,
+    include_rows: bool = True,
 ) -> list[GroundedVerifiedAnalysisInput]:
     requested = _dedupe_strings(requested_artifact_ids)
     if not requested:
@@ -1139,11 +1143,19 @@ def _verified_analysis_inputs(
             declared_columns = _dedupe_strings(
                 key for row in raw_rows if isinstance(row, Mapping) for key in row if not str(key).startswith("__")
             )
-        rows = [
-            {column: row[column] for column in declared_columns if column in row}
-            for row in raw_rows
-            if isinstance(row, Mapping)
-        ]
+        rows = (
+            [
+                {
+                    column: row[column]
+                    for column in declared_columns
+                    if column in row
+                }
+                for row in raw_rows
+                if isinstance(row, Mapping)
+            ]
+            if include_rows
+            else []
+        )
         lineage_raw = (
             _object_value(
                 artifact,
@@ -1159,12 +1171,41 @@ def _verified_analysis_inputs(
             for column, refs in dict(lineage_raw).items()
             if str(column) in declared_columns
         }
-        rows_hash = _stable_hash(rows)
+        if include_rows:
+            rows_hash = _stable_hash(rows)
+            row_ref = "query:%s:rows:%s" % (
+                artifact_id,
+                rows_hash[:16],
+            )
+        else:
+            receipts = list(
+                _object_value(
+                    artifact,
+                    "result_artifact_receipts",
+                    "resultArtifactReceipts",
+                )
+                or []
+            )
+            published_rows = [
+                {
+                    "sha256": str(item.get("rowsSha256") or ""),
+                    "ref": str(item.get("rowsRef") or ""),
+                }
+                for item in receipts
+                if isinstance(item, Mapping)
+                and str(item.get("rowsSha256") or "")
+            ]
+            rows_hash = _stable_hash(published_rows)
+            row_ref = str(
+                (published_rows[0] if published_rows else {}).get("ref")
+                or "query:%s:published-rows:%s"
+                % (artifact_id, rows_hash[:16])
+            )
         results.append(
             GroundedVerifiedAnalysisInput(
                 artifact_id=artifact_id,
                 goal_ids=_dedupe_strings(artifact_goal_ids.get(artifact_id) or []),
-                row_ref="query:%s:rows:%s" % (artifact_id, rows_hash[:16]),
+                row_ref=row_ref,
                 rows_hash=rows_hash,
                 rows=rows,
                 output_columns=declared_columns,

@@ -101,6 +101,9 @@ class GroundedExecutionGraphReceipt(APIModel):
     node_ids: dict[str, str] = Field(default_factory=dict)
     parallel_frontier: list[str] = Field(default_factory=list)
     waiting_artifact_nodes: list[str] = Field(default_factory=list)
+    semantic_activation_fingerprint: str = ""
+    semantic_activation_seal_fingerprint: str = ""
+    semantic_activation_topics: list[str] = Field(default_factory=list)
 
 
 def discovery_evidence_snapshot_fingerprint(
@@ -443,6 +446,9 @@ def build_grounded_execution_graph_receipt(
     proposal: GroundedExecutionGraphProposal,
     *,
     version: int,
+    semantic_activation_fingerprint: str = "",
+    semantic_activation_seal_fingerprint: str = "",
+    semantic_activation_topics: list[str] | None = None,
 ) -> GroundedExecutionGraphReceipt:
     fingerprint = grounded_execution_graph_fingerprint(proposal)
     node_ids = {
@@ -469,4 +475,13 @@ def build_grounded_execution_graph_receipt(
             if node.client_key not in waiting
         ],
         waiting_artifact_nodes=[node_ids[key] for key in sorted(waiting)],
+        semantic_activation_fingerprint=str(
+            semantic_activation_fingerprint or ""
+        ),
+        semantic_activation_seal_fingerprint=str(
+            semantic_activation_seal_fingerprint or ""
+        ),
+        semantic_activation_topics=list(
+            semantic_activation_topics or []
+        ),
     )

@@ -238,6 +238,93 @@ def test_rule_goal_cannot_be_rendered_by_query_compose_source() -> None:
     assert rule_result.passed is True
 
 
+def test_mixed_rule_and_query_answer_accepts_one_verified_attestation() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "说明适用规则，并返回已验证数据指标",
+            "goals": [
+                {
+                    "goalId": "rule.policy",
+                    "kind": "rule",
+                    "label": "适用规则",
+                    "ruleRefIds": ["rule:policy"],
+                },
+                {
+                    "goalId": "metric.value",
+                    "kind": "metric",
+                    "label": "数据指标",
+                    "metricRefId": "metric:value",
+                },
+            ],
+        }
+    )
+    fingerprint = original_question_goal_contract_fingerprint(contract)
+    coverage = GoalCoverageVerifier().require_complete(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="rule-artifact",
+                goal_contract_fingerprint=fingerprint,
+                covered_goal_ids=["rule.policy"],
+                verification_passed=True,
+                evidence_refs=["rule:policy"],
+                goal_resolutions=[
+                    {
+                        "goalId": "rule.policy",
+                        "goalKind": "rule",
+                        "resolution": "proved",
+                        "proofType": "VERIFIED_RULE_ARTIFACT",
+                        "evidenceRefs": ["rule:policy"],
+                        "ruleRefIds": ["rule:policy"],
+                        "citationRefs": ["rule:policy"],
+                    }
+                ],
+            ),
+            VerifiedArtifactGoalCoverage(
+                artifact_id="query-artifact",
+                goal_contract_fingerprint=fingerprint,
+                covered_goal_ids=["metric.value"],
+                verification_passed=True,
+                evidence_refs=["metric:value"],
+                goal_resolutions=[
+                    {
+                        "goalId": "metric.value",
+                        "goalKind": "metric",
+                        "resolution": "proved",
+                        "proofType": "VERIFIED_QUERY_RESULT",
+                        "evidenceRefs": ["metric:value"],
+                        "metricRefIds": ["metric:value"],
+                        "valueRefs": ["query-artifact"],
+                    }
+                ],
+            ),
+        ],
+    )
+    rule_text = "根据已发布规则：仅采用已验证的规则依据。"
+    answer = f"数据指标为 12。\n\n{rule_text}"
+    result = AnswerCoverageVerifier().require_complete(
+        contract,
+        coverage,
+        answer,
+        [
+            {
+                "goalId": "rule.policy",
+                "resolution": "PROVED",
+                "answerText": rule_text,
+                "artifactIds": ["rule-artifact"],
+                "evidenceRefs": ["rule:policy"],
+                "renderer": "VERIFIED_RULE_ARTIFACT_RENDERER",
+            }
+        ],
+        source="compose_verified_answer",
+        auto_bind_verified_primitives=True,
+    )
+
+    assert result.passed is True
+    assert result.mapped_goal_ids == ["rule.policy", "metric.value"]
+    assert answer_attestation_matches(answer, result) is True
+
+
 def test_detail_goal_rejects_ordinary_text_renderer() -> None:
     contract = parse_original_question_goal_contract(
         {
