@@ -184,6 +184,12 @@ def test_store_summary_owns_bare_order_and_gmv_aliases_while_detail_aliases_rema
     assert "订单量" not in detail_order["aliases"]
     assert {"商品订单量", "按商品订单量", "订单明细下单数"} <= set(detail_order["aliases"])
 
+    profile = assets.load_table_asset("经营画像", "ads_merchant_profile")
+    profile_order = metric_by_key(profile, "order_cnt_1d")
+    assert {"订单量", "订单数", "订单总量", "订单总数"} <= set(
+        profile_order["aliases"]
+    )
+
     detail_gmv = metric_by_key(order_detail, "pay_amt")
     assert "GMV" not in detail_gmv["aliases"]
     assert {"订单GMV", "商品GMV", "按商品GMV", "订单明细支付金额"} <= set(detail_gmv["aliases"])
@@ -211,6 +217,7 @@ def test_store_summary_owns_bare_order_and_gmv_aliases_while_detail_aliases_rema
 
     assert top_metric("最近30天 GMV 是多少") == "order_gmv_amt_1d"
     assert top_metric("最近30天订单量是多少") == "order_cnt_1d"
+    assert top_metric("最近30天订单总数是多少") == "order_cnt_1d"
     assert top_metric("最近30天按商品 GMV") == "pay_amt"
     assert top_metric("最近30天按商品订单量") == "order_detail_cnt"
 

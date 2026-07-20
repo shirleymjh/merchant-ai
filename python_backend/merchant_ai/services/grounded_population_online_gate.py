@@ -61,6 +61,7 @@ from merchant_ai.services.grounded_population_verifier import (
     PopulationArtifactEvidence,
     PopulationArtifactKind,
     PopulationExecutionClaim,
+    PopulationScopeKind,
     PopulationVerificationAttestation,
     PopulationVerificationStage,
     population_attestation_fingerprint,
@@ -137,7 +138,13 @@ class StructuredPopulationSemanticModelProvider:
 
     _SYSTEM_PROMPT = """You are an isolated population-semantics reviewer.
 You receive the exact original question and a population-blind Goal skeleton.
-For every Goal, decide whether a population gate is structurally required. When it is required, return one typed scope kind and any source Goal IDs needed by that kind.
+For every Goal, decide whether a population gate is structurally required.
+A population gate is required only when that Goal must consume or preserve a row/entity population defined by another Goal, a verified predicate scope, or a verified result artifact.
+Do not create a population gate merely because a Goal is a metric, has a time window, is grouped by a dimension, participates in a comparison, or is referenced by answer-composition fields. In particular, TIME_WINDOW.appliesToGoalIds, RANKING.metricGoalIds/dimensionGoalIds, COMPARISON.leftGoalIds/rightGoalIds, and ANALYSIS.inputGoalIds/baselineGoalIds do not by themselves mean population dependence.
+For a standalone metric such as "最近7天订单总数", both the METRIC Goal and TIME_WINDOW Goal must return gateRequired=false with no scopeKind and no sourceGoalIds.
+For a dependent request such as "先找销量最高的3个商品，再查这些商品的退款量", the downstream Goal is population-gated and must reference the upstream entity-producing Goal.
+UNIVERSE is not a distinct declaration in this protocol. A standalone query over all matching rows is not gated. If a direct non-dependent scope truly must be tracked, use INDEPENDENT rather than UNIVERSE.
+When a gate is required, return one typed scope kind and only the source Goal IDs required by that kind.
 Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, execution nodes, query topology, row values, or business rules. Return only the strict structured decision schema."""
 
     def __init__(self, model: Any, *, authority_fingerprint: str) -> None:
@@ -192,8 +199,35 @@ Use only supplied Goal IDs. Do not infer tables, fields, formulas, SQL, assets, 
             question_fingerprint=request.question_fingerprint,
             goal_skeleton_fingerprint=(request.goal_skeleton_fingerprint),
             complete=decision.complete,
-            decisions=decision.decisions,
+            decisions=self._canonical_decisions(decision.decisions),
         )
+
+    @staticmethod
+    def _canonical_decisions(
+        decisions: Sequence[PopulationSemanticProviderDecision],
+    ) -> tuple[PopulationSemanticProviderDecision, ...]:
+        """Translate model vocabulary into the Goal declaration vocabulary.
+
+        Goal Contracts represent a direct all-matching-rows scope as
+        ``ALL_MATCHING_ROWS``, which the population verifier projects to
+        ``INDEPENDENT``.  The model schema historically also exposed
+        ``UNIVERSE`` even though Core cannot declare that value.  Both scopes
+        use direct-scope lineage at execution time, so retaining ``UNIVERSE``
+        would create a protocol-only mismatch and reject an otherwise safe
+        query.  Canonicalize that alias before sealing the provider output.
+        """
+
+        canonical: list[PopulationSemanticProviderDecision] = []
+        for item in decisions:
+            if (
+                item.gate_required
+                and item.scope_kind == PopulationScopeKind.UNIVERSE
+            ):
+                item = item.model_copy(
+                    update={"scope_kind": PopulationScopeKind.INDEPENDENT}
+                )
+            canonical.append(item)
+        return tuple(canonical)
 
     @staticmethod
     def _parse_decision(value: Any) -> PopulationZeroToolModelDecision:

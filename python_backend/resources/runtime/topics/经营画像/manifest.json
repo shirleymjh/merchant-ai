@@ -1,8 +1,8 @@
 [
   {
     "tableName": "ads_merchant_profile",
-    "tableComment": "",
-    "businessSummary": "商家经营概览快照表，覆盖交易、售后、客服、履约和商品等多域汇总信息；适合商家级概览与趋势，不提供商品、工单等明细维度。",
+    "tableComment": "商家经营核心指标日汇总表",
+    "businessSummary": "商家经营核心指标日汇总表，按商家-日期粒度预聚合订单量、GMV、支付订单量、退款金额、退货量、工单量、赔付金额、优惠金额、履约超时和商品经营等重要指标；适合商家级单日或周期汇总、趋势分析和多指标对比，不提供订单、商品、退款单、工单等实体明细，也不适合细粒度排行和下钻。",
     "dataGrain": "商家-日期粒度经营指标画像",
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",
@@ -16,6 +16,53 @@
       "GROUP_AGG",
       "RULE_REFERENCE"
     ],
+    "navigationHints": {
+      "metrics": [
+        {
+          "key": "order_cnt_1d",
+          "aliases": ["订单量", "订单数", "订单总量", "订单总数", "总订单量", "总订单数", "下单量", "下单数"]
+        },
+        {
+          "key": "order_gmv_amt_1d",
+          "aliases": ["GMV", "成交额", "销售额", "交易流水", "销售金额"]
+        },
+        {
+          "key": "pay_order_cnt_1d",
+          "aliases": ["支付订单量", "支付订单数", "付款订单量", "付款订单数"]
+        },
+        {
+          "key": "refund_amt_1d",
+          "aliases": ["退款金额", "退款总额", "退款额", "售后金额"]
+        },
+        {
+          "key": "return_cnt_1d",
+          "aliases": ["退货量", "退货数", "退货订单量"]
+        },
+        {
+          "key": "cs_ticket_cnt_1d",
+          "aliases": ["工单量", "工单数", "客服工单量", "咨询工单量"]
+        },
+        {
+          "key": "seller_repay_amt_1d",
+          "aliases": ["赔付金额", "赔付额", "商家赔付金额"]
+        },
+        {
+          "key": "ship_timeout_order_cnt_1d",
+          "aliases": ["发货超时订单量", "发货超时订单数"]
+        }
+      ],
+      "columns": [
+        {
+          "key": "pt",
+          "aliases": ["日期", "业务日期", "统计日期"]
+        },
+        {
+          "key": "merchant_id",
+          "aliases": ["商家", "店铺", "商家ID"]
+        }
+      ],
+      "rules": []
+    },
     "metricCount": 51,
     "ruleCount": 3
   }

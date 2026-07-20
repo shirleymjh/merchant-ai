@@ -1912,8 +1912,11 @@ class SemanticTopicRouterService:
         if llm is not None:
             self.llm = llm
         else:
+            explicit_topic_model = str(
+                getattr(settings, "topic_semantic_route_model", "") or ""
+            ).strip()
             model = (
-                str(getattr(settings, "topic_semantic_route_model", "") or "")
+                explicit_topic_model
                 or str(getattr(settings, "llm_fast_model", "") or "")
                 or str(getattr(settings, "preflight_semantic_route_model", "") or "")
                 or str(getattr(settings, "openai_model", "") or "")
@@ -1921,10 +1924,35 @@ class SemanticTopicRouterService:
             try:
                 from merchant_ai.services.llm import LlmClient
 
-                route_base_url = (
-                    str(getattr(settings, "preflight_llm_base_url", "") or "")
-                    or str(getattr(settings, "openai_base_url", "") or "")
-                )
+                explicit_topic_base_url = str(
+                    getattr(settings, "topic_semantic_route_base_url", "")
+                    or ""
+                ).strip()
+                explicit_topic_api_key = str(
+                    getattr(settings, "topic_semantic_route_api_key", "")
+                    or ""
+                ).strip()
+                # An explicitly configured Topic model belongs to the Topic
+                # provider. If it has no dedicated endpoint/key, inherit the
+                # main provider instead of pairing it with preflight/Kimi.
+                if explicit_topic_model or explicit_topic_base_url or explicit_topic_api_key:
+                    route_base_url = (
+                        explicit_topic_base_url
+                        or str(getattr(settings, "openai_base_url", "") or "")
+                    )
+                    route_api_key = (
+                        explicit_topic_api_key
+                        or str(getattr(settings, "openai_api_key", "") or "")
+                    )
+                else:
+                    route_base_url = (
+                        str(getattr(settings, "preflight_llm_base_url", "") or "")
+                        or str(getattr(settings, "openai_base_url", "") or "")
+                    )
+                    route_api_key = (
+                        str(getattr(settings, "preflight_llm_api_key", "") or "")
+                        or str(getattr(settings, "openai_api_key", "") or "")
+                    )
                 extra_body = (
                     {"thinking": {"type": "disabled"}}
                     if model.lower().startswith("kimi-for-coding")
@@ -1934,8 +1962,8 @@ class SemanticTopicRouterService:
                 self.llm = LlmClient(
                     settings,
                     model_name=model,
-                    api_key=str(getattr(settings, "preflight_llm_api_key", "") or ""),
-                    base_url=str(getattr(settings, "preflight_llm_base_url", "") or ""),
+                    api_key=route_api_key,
+                    base_url=route_base_url,
                     extra_body=extra_body,
                     max_tokens=400,
                 )
@@ -2382,6 +2410,10 @@ class SemanticTopicRouterService:
             "Topic 中检索语义资产。Topic 只是检索范围，不代表主表、事实锚点或执行顺序。"
             "必须阅读完整 Topic Directory 的业务能力和边界，不得按关键词命中次数做分类。"
             "可以选择一个或多个 Topic；问题跨域时把所有相关 Topic 放进同一个 relevantTopics 数组。"
+            "当问题询问商家级汇总指标、经营趋势或多个经营指标，且不要求商品、订单、工单等明细维度时，"
+            "如果目录中存在明确承载商家-日期聚合指标的画像或汇总 Topic，必须将其加入 relevantTopics；"
+            "相关业务事实 Topic 可以同时保留作为语义补充。反之，当问题要求明细、实体下钻、维度拆分或排行时，"
+            "画像或汇总 Topic 不能替代承载该粒度的事实 Topic。"
             "不要解析或输出指标、维度、时间范围、聚合方式、排行方式、表、字段、JOIN、Contract 或 SQL。"
             "只能返回目录中真实存在的 Topic 名称，不能翻译、缩写或创造 Topic。"
             "如果有多个合理范围，返回 AMBIGUOUS 并包含所有合理 Topic；如果目录完全不支持，返回 UNSUPPORTED。"

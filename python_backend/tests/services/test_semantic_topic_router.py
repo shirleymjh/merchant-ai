@@ -4,7 +4,9 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+from merchant_ai.config import get_settings
 from merchant_ai.models import ExtractedKeywords, QuestionCategory
+from merchant_ai.services.assets import TopicAssetService
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
     GroundedRuntimeBudgetLimits,
@@ -149,6 +151,74 @@ def settings(**updates: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def test_explicit_topic_model_uses_main_provider_credentials_by_default() -> None:
+    configured = get_settings().model_copy(
+        update={
+            "topic_semantic_route_model": "gpt-5.5",
+            "topic_semantic_route_base_url": "",
+            "topic_semantic_route_api_key": "",
+            "llm_model": "gpt-5.5",
+            "llm_base_url": "https://www.ydata.space/v1",
+            "llm_api_key": "ydata-key",
+            "preflight_semantic_route_model": "kimi-for-coding",
+            "preflight_llm_base_url": "https://api.kimi.com/coding/v1",
+            "preflight_llm_api_key": "kimi-key",
+        }
+    )
+    router = SemanticTopicRouterService(
+        configured,
+        FakeTopicAssets(),
+    )
+
+    assert router.llm.model_name == "gpt-5.5"
+    assert router.llm.base_url == "https://www.ydata.space/v1"
+    assert router.llm.api_key == "ydata-key"
+    assert router.llm.extra_body_override == {}
+
+
+def test_topic_provider_can_override_main_provider_credentials() -> None:
+    configured = get_settings().model_copy(
+        update={
+            "topic_semantic_route_model": "topic-model",
+            "topic_semantic_route_base_url": "https://topic.example/v1",
+            "topic_semantic_route_api_key": "topic-key",
+            "llm_model": "main-model",
+            "llm_base_url": "https://main.example/v1",
+            "llm_api_key": "main-key",
+            "preflight_semantic_route_model": "kimi-for-coding",
+            "preflight_llm_base_url": "https://api.kimi.com/coding/v1",
+            "preflight_llm_api_key": "kimi-key",
+        }
+    )
+    router = SemanticTopicRouterService(
+        configured,
+        FakeTopicAssets(),
+    )
+
+    assert router.llm.model_name == "topic-model"
+    assert router.llm.base_url == "https://topic.example/v1"
+    assert router.llm.api_key == "topic-key"
+
+
+def test_profile_topic_card_exposes_representative_summary_metrics() -> None:
+    configured = get_settings()
+    assets = TopicAssetService(configured)
+    router = SemanticTopicRouterService(
+        configured,
+        assets,
+        llm=UnavailableLlm(),
+    )
+
+    card = next(
+        item for item in router.topic_cards() if item["topic"] == "经营画像"
+    )
+
+    assert "商家经营核心指标日汇总表" in card["capabilitySummaries"][0]
+    assert {"订单总数", "GMV", "退款金额", "工单量", "赔付金额"} <= set(
+        card["metricAliases"]
+    )
+
+
 def test_router_reads_complete_topic_cards_and_returns_only_scope() -> None:
     assets = FakeTopicAssets()
     llm = FakeLlm(
@@ -176,6 +246,8 @@ def test_router_reads_complete_topic_cards_and_returns_only_scope() -> None:
     prompt = llm.calls[0]
     assert [item["topic"] for item in prompt["user"]["topicDirectory"]] == assets.all_topic_names()
     assert "覆盖这些能力的全部 Topic" in prompt["system"]
+    assert "商家级汇总指标" in prompt["system"]
+    assert "画像或汇总 Topic" in prompt["system"]
     assert "最近10天卖得最多的商品" not in prompt["system"]
     assert "不代表主表" in prompt["system"]
     assert set(prompt["tool"]["function"]["parameters"]["properties"]) == {

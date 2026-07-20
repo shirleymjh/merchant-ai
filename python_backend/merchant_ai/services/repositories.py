@@ -84,7 +84,19 @@ class DatabaseClient:
         try:
             yield conn
         finally:
-            conn.close()
+            # PyMySQL raises ``Error('Already closed')`` on a second close.
+            # Cancellation monitors may close the socket before this owner
+            # exits, so connection cleanup must be idempotent.
+            try:
+                if bool(getattr(conn, "open", True)):
+                    conn.close()
+            except Exception as exc:
+                if "already closed" not in str(exc).lower():
+                    logger.warning(
+                        "database connection close failed: %s: %s",
+                        type(exc).__name__,
+                        str(exc)[:300],
+                    )
 
     def query(
         self,
@@ -236,10 +248,10 @@ class DatabaseClient:
                         cursor.close()
                     except Exception:
                         pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                # The connection context manager is the sole normal owner of
+                # connection shutdown.  The monitor may still close it early
+                # for timeout/cancellation, which that owner handles
+                # idempotently.
                 monitor.join(timeout=0.2)
 
     def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> int:

@@ -311,6 +311,9 @@ def test_zero_tool_provider_exposes_only_exact_question_and_blind_skeleton() -> 
     assert model.schema is PopulationZeroToolModelDecision
     assert model.method == "json_schema"
     assert model.strict is True
+    assert "最近7天订单总数" in model.messages[0][1]
+    assert "appliesToGoalIds" in model.messages[0][1]
+    assert "use INDEPENDENT rather than UNIVERSE" in model.messages[0][1]
     supplied = json.loads(model.messages[1][1])
     assert set(supplied) == {"question", "goalSkeleton"}
     assert supplied["question"] == QUESTION
@@ -333,6 +336,61 @@ def test_zero_tool_provider_exposes_only_exact_question_and_blind_skeleton() -> 
     assert output.goal_skeleton_fingerprint == (
         request.goal_skeleton_fingerprint
     )
+
+
+def test_zero_tool_provider_canonicalizes_universe_to_independent() -> None:
+    question = "最近7天订单总数是多少？"
+    contract = {
+        "question": question,
+        "goals": [
+            {
+                "goalId": "metric.order_count",
+                "kind": "METRIC",
+                "label": "订单总数",
+                "sourceSpans": ["订单总数"],
+            },
+            {
+                "goalId": "time.last_7_days",
+                "kind": "TIME_WINDOW",
+                "label": "最近7天",
+                "sourceSpans": ["最近7天"],
+                "timeExpression": "最近7天",
+                "appliesToGoalIds": ["metric.order_count"],
+            },
+        ],
+    }
+    request = build_population_semantic_reviewer_request(question, contract)
+    model = _StructuredModel(
+        PopulationZeroToolModelDecision(
+            complete=True,
+            decisions=(
+                PopulationSemanticProviderDecision(
+                    goal_id="metric.order_count",
+                    gate_required=True,
+                    scope_kind=PopulationScopeKind.UNIVERSE,
+                ),
+                PopulationSemanticProviderDecision(
+                    goal_id="time.last_7_days",
+                    gate_required=False,
+                ),
+            ),
+        )
+    )
+    provider = StructuredPopulationSemanticModelProvider(
+        model,
+        authority_fingerprint=SEMANTIC_AUTHORITY,
+    )
+
+    output = provider.review_population_semantics(
+        request,
+        timeout_seconds=2.0,
+    )
+
+    metric = next(
+        item for item in output.decisions if item.goal_id == "metric.order_count"
+    )
+    assert metric.gate_required is True
+    assert metric.scope_kind == PopulationScopeKind.INDEPENDENT
 
 
 def test_workspace_store_recovers_after_restart_and_keeps_attestation_immutable(

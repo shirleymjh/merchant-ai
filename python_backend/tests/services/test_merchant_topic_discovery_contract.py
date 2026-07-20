@@ -200,6 +200,24 @@ def test_order_and_refund_summary_keeps_business_owners_separate_from_serving_to
     assert "业务归属仍保留为 电商交易、电商退货" in decision.reason
 
 
+def test_order_total_synonym_routes_to_profile_summary(topic_runtime) -> None:
+    question = "最近7天订单总数是多少？"
+    keywords = topic_runtime.keywords.extract(question)
+    decision = topic_runtime.router.route(question, keywords)
+
+    assert decision.recall_topics() == [QuestionCategory("经营画像")]
+    assert decision.selection_evidence["queryShape"] == "summary_or_total"
+    assert decision.selection_evidence["sameTableSummaryCandidate"] is True
+    assert decision.selection_evidence["servingTopics"] == ["经营画像"]
+    assert decision.selection_evidence["servingTables"] == [
+        "ads_merchant_profile"
+    ]
+    assert {
+        item["metricKey"]
+        for item in decision.selection_evidence["matchedMetrics"]
+    } == {"order_cnt_1d"}
+
+
 def test_business_clarification_never_asks_merchant_to_choose_internal_topic() -> None:
     harness = SimpleNamespace()
 

@@ -502,6 +502,39 @@ def test_database_client_uses_server_cursor_and_fetchmany(
     assert connection.closed is True
 
 
+def test_database_stream_has_one_normal_connection_close_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_server_cursor_module(monkeypatch)
+    cursor = FakeServerCursor([{"value": 1}])
+
+    class StrictCloseConnection(FakeConnection):
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls > 1:
+                raise RuntimeError("Already closed")
+            super().close()
+
+    connection = StrictCloseConnection(cursor)
+    client = DatabaseClient(
+        "jdbc:mysql://localhost:9030/db",
+        "user",
+        "password",
+    )
+    bind_connection(client, connection)
+
+    assert list(
+        client.stream_query_batches(
+            "SELECT value FROM source",
+            batch_size=10,
+            timeout_seconds=5,
+        )
+    ) == [[{"value": 1}]]
+    assert connection.close_calls == 1
+
+
 def test_database_stream_cancellation_closes_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

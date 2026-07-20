@@ -284,6 +284,58 @@ def test_successful_review_adapts_to_the_goal_declaration_population_gate() -> N
     assert result.passed is True, [gap.model_dump() for gap in result.gaps]
 
 
+def test_metric_with_explicit_time_window_needs_no_population_gate() -> None:
+    question = "最近7天订单总数是多少？"
+    metric_goal_id = "metric.order_count"
+    time_goal_id = "time.last_7_days"
+    contract = {
+        "question": question,
+        "goals": [
+            {
+                "goalId": metric_goal_id,
+                "kind": "METRIC",
+                "label": "订单总数",
+                "sourceSpans": ["订单总数"],
+            },
+            {
+                "goalId": time_goal_id,
+                "kind": "TIME_WINDOW",
+                "label": "最近7天",
+                "sourceSpans": ["最近7天"],
+                "timeExpression": "最近7天",
+                "appliesToGoalIds": [metric_goal_id],
+            },
+        ],
+    }
+    provider = StructuredProvider(
+        decisions=(
+            _decision(metric_goal_id, gate_required=False),
+            _decision(time_goal_id, gate_required=False),
+        )
+    )
+
+    outcome = _review(provider, contract=contract, question=question)
+
+    assert outcome.passed is True, [
+        issue.model_dump() for issue in outcome.issues
+    ]
+    assert all(decision.gate_required is False for decision in provider.decisions)
+    assert outcome.review is not None
+    assert outcome.review.expectations == ()
+
+    gate_input = goal_declaration_population_input_from_review(
+        contract,
+        outcome,
+        declaration_author_fingerprint=CORE_AUTHORITY,
+        trusted_semantic_verifier_fingerprints=(REVIEWER_AUTHORITY,),
+    )
+    result = PopulationSemanticVerifier().verify_goal_declaration(gate_input)
+
+    assert gate_input.declarations == ()
+    assert result.passed is True, [gap.model_dump() for gap in result.gaps]
+    assert result.attestation.gate_open is True
+
+
 @pytest.mark.parametrize(
     ("scope_kind", "source_goal_ids", "complete_membership"),
     [

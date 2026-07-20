@@ -134,6 +134,12 @@ class Settings(BaseSettings):
         0.86, validation_alias="YSHOPPING_PREFLIGHT_SEMANTIC_ROUTE_HIGH_CONFIDENCE"
     )
     topic_semantic_route_model: str = Field("", validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_MODEL")
+    topic_semantic_route_base_url: str = Field(
+        "", validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_BASE_URL"
+    )
+    topic_semantic_route_api_key: str = Field(
+        "", validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_API_KEY"
+    )
     topic_semantic_route_timeout_seconds: int = Field(
         12, validation_alias="YSHOPPING_TOPIC_SEMANTIC_ROUTE_TIMEOUT_SECONDS"
     )

@@ -3578,12 +3578,15 @@ def _phase_visible_tools(
         except (RuntimeError, TypeError, ValueError):
             finalization_ready = False
     allowed: set[str]
-    if session.operational_failure:
-        allowed = {"ask_human"}
-    elif session.runtime.clarification is not None:
+    if session.runtime.clarification is not None:
         # A typed clarification is a terminal result for this turn.  Keep the
         # model from issuing more tools if the agent framework performs an
         # unnecessary tail call after ask_human.
+        allowed = set()
+    elif session.operational_failure:
+        # Internal execution/publication failures are never missing business
+        # input.  Stop the ReAct tool loop and let the governed response expose
+        # the typed operational failure instead of repeatedly asking the user.
         allowed = set()
     elif finalization_ready:
         # Once every required Goal has a typed verified resolution, further
@@ -5382,12 +5385,36 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                         goal_contract=parsed,
                     )
                     if not population_goal_result.accepted:
+                        semantic_review_issues = []
+                        if population_goal_result.semantic_review is not None:
+                            semantic_review_issues = [
+                                item.model_dump(by_alias=True, mode="json")
+                                for item in population_goal_result.semantic_review.issues
+                            ]
+                        verification_gaps = []
+                        coordinator_issues = []
+                        if population_goal_result.transition is not None:
+                            coordinator_issues = [
+                                item.model_dump(by_alias=True, mode="json")
+                                for item in population_goal_result.transition.issues
+                            ]
+                            verification = (
+                                population_goal_result.transition.verification
+                            )
+                            if verification is not None:
+                                verification_gaps = [
+                                    item.model_dump(by_alias=True, mode="json")
+                                    for item in verification.gaps
+                                ]
                         return json.dumps(
                             {
                                 "status": "REJECTED",
                                 "code": "POPULATION_GOAL_REJECTED",
                                 "populationGateCode": (population_goal_result.code),
                                 "message": population_goal_result.message,
+                                "semanticReviewIssues": semantic_review_issues,
+                                "verificationGaps": verification_gaps,
+                                "coordinatorIssues": coordinator_issues,
                                 "nextAction": "REVISE_GOAL_CONTRACT",
                             },
                             ensure_ascii=False,
