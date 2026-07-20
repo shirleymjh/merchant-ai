@@ -505,6 +505,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         skill_run_root=str(settings.resolved_workspace_path / "skill_runs"),
         parallel_max_workers=int(settings.tool_max_concurrency or 4),
         settings=settings,
+        memory_store=memory_store,
         conversation_state_store=GroundedConversationStateStore(settings),
         conversation_online_authority=conversation_online_authority,
         population_execution_gate=population_gate,

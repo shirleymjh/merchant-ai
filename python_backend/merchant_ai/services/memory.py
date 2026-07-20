@@ -3280,6 +3280,7 @@ def memory_query_hash(merchant_id: str, context: Dict[str, Any]) -> str:
         "userId": str(context.get("userId") or ""),
         "storeIds": sorted(str(item) for item in context.get("storeIds") or []),
         "permissions": sorted(str(item) for item in context.get("permissions") or []),
+        "principalOnly": bool(context.get("principalOnly")),
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
@@ -6012,6 +6013,7 @@ def retrieval_context_from_state(state: AgentState) -> Dict[str, Any]:
         "userId": str(identity.get("userId") or identity.get("user_id") or ""),
         "storeIds": unique_strings(identity.get("storeIds") or identity.get("store_ids") or []),
         "permissions": unique_strings(identity.get("permissions") or []),
+        "principalOnly": bool(state.get("memory_principal_only")),
     }
 
 
@@ -6032,11 +6034,21 @@ def rank_memory_candidates(memory: Dict[str, Any], context: Dict[str, Any]) -> T
                 str(context.get("accessRole") or default_memory_access_role()),
             )
             principal_permitted = memory_visible_to_principal(item, context)
+            explicit_principal_permitted = (
+                not bool(context.get("principalOnly"))
+                or memory_explicitly_scoped_to_principal(item, context)
+            )
             # Authorization is a hard boundary, not a ranking/filtering hint. Do
             # not retain unauthorized IDs or payloads in candidates because the
             # candidate list is also emitted in the retrieval trace.
-            if not permitted or not principal_permitted:
-                filtered_reasons["role_filtered" if not permitted else "principal_scope_filtered"] += 1
+            if not permitted or not principal_permitted or not explicit_principal_permitted:
+                filtered_reasons[
+                    "role_filtered"
+                    if not permitted
+                    else "principal_scope_filtered"
+                    if not principal_permitted
+                    else "explicit_principal_scope_required"
+                ] += 1
                 continue
             expired = is_memory_expired(item)
             invalid = float(item.get("confidence") or 0) <= 0.05
@@ -6912,6 +6924,23 @@ def memory_visible_to_principal(item: Dict[str, Any], context: Dict[str, Any]) -
     return True
 
 
+def memory_explicitly_scoped_to_principal(
+    item: Dict[str, Any],
+    context: Dict[str, Any],
+) -> bool:
+    """Require an explicit user binding for online personal-context use."""
+
+    scope = memory_scope_payload(item)
+    scoped_user = str(scope.get("userId") or scope.get("user_id") or "").strip()
+    principal_user = str(context.get("userId") or context.get("user_id") or "").strip()
+    return bool(
+        scoped_user
+        and principal_user
+        and scoped_user == principal_user
+        and memory_visible_to_principal(item, context)
+    )
+
+
 def memory_visible_to_context(memory: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     """Return the memory aggregate that the current principal may receive.
 
@@ -6929,6 +6958,10 @@ def memory_visible_to_context(memory: Dict[str, Any], context: Dict[str, Any]) -
             if isinstance(item, dict)
             and memory_visible_to_role(item, access_role)
             and memory_visible_to_principal(item, context)
+            and (
+                not bool(context.get("principalOnly"))
+                or memory_explicitly_scoped_to_principal(item, context)
+            )
             and not memory_is_pending(item)
             and not memory_is_inactive(item)
             and not is_memory_expired(item)

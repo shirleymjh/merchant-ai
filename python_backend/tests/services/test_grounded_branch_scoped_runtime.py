@@ -459,6 +459,16 @@ def _propose_test_execution_graph(
 
 def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None:
     runtime, kernel, _ = _runtime()
+    subagent_calls = {"count": 0}
+
+    class UnexpectedSubagentRuntime:
+        def run(self, *_args: Any, **_kwargs: Any) -> Any:
+            subagent_calls["count"] += 1
+            raise AssertionError(
+                "ordinary query branches must remain no-LLM execution units"
+            )
+
+    runtime.subagent_runtime = UnexpectedSubagentRuntime()
     context = _context(kernel, "订单量和退款金额分别是多少")
     tools = {item.name: item for item in runtime.tools}
     goal_result = json.loads(
@@ -574,6 +584,7 @@ def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None
     assert refunds.status == "VERIFIED"
     assert orders.budget.report()["usage"]["dorisQueries"] == 1
     assert refunds.budget.report()["usage"]["dorisQueries"] == 1
+    assert subagent_calls["count"] == 0
 
 
 def test_entity_chain_downstream_waits_before_contract_preparation() -> None:

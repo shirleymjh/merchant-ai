@@ -23,6 +23,8 @@ from merchant_ai.services.grounded_context_workspace import (
     GroundedContextWorkspace,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
+    _build_graph_revision_base_session_checkpoint,
+    _execution_graph_node_runtime_states,
     _authorized_verified_query_artifacts,
     _published_query_artifact_digests,
 )
@@ -56,6 +58,14 @@ from merchant_ai.services.grounded_population_gate_coordinator import (
 )
 from merchant_ai.services.grounded_graph_revision_journal import (
     GroundedGraphRevisionTransactionJournal,
+)
+from merchant_ai.services.grounded_subagent_runtime import (
+    GroundedSubagentBudget,
+    GroundedSubagentDispatchPlan,
+    GroundedSubagentEvidenceRequirement,
+    GroundedSubagentGoalContract,
+    GroundedSubagentTaskOutcome,
+    issue_grounded_subagent_capability_grant,
 )
 from tests.services.test_grounded_branch_scoped_runtime import (
     _context,
@@ -1009,6 +1019,115 @@ def test_new_runtime_rolls_forward_each_graph_revision_crash_window(
     assert restarted_context.session.execution_graph_receipt.fingerprint == recovered["receipt"]["fingerprint"]
     assert len(population_gate.revision_calls) == expected_population_calls
     assert GroundedGraphRevisionTransactionJournal(restarted_workspace).discover_pending() == ()
+
+
+def test_recovery_hydrates_subgoal_generation_without_promoting_advisory_coverage() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(kernel, "two independent metrics")
+    _two_node_graph(runtime, context)
+    population_receipt = _install_population_revision_base(
+        context,
+        {
+            "receipt": context.session.execution_graph_receipt.model_dump(
+                by_alias=True,
+                mode="json",
+            ),
+            "clientNodeIds": dict(
+                context.session.execution_graph_receipt.node_ids
+            ),
+        },
+    )
+    sub_goal = GroundedSubagentGoalContract(
+        sub_goal_id="subgoal.recovery.audit",
+        parent_goal_ids=["metric.first"],
+        objective="Inspect one bounded recovery hypothesis.",
+        required_outputs=["finding"],
+        input_artifact_refs=[],
+        evidence_requirements=[
+            GroundedSubagentEvidenceRequirement(
+                requirement_id="recovery.refs",
+                description="Return exact refs for Root review.",
+                accepted_ref_types=["SEMANTIC_REF"],
+            )
+        ],
+        allowed_capabilities=["READ_CONTEXT"],
+        budget=GroundedSubagentBudget(
+            max_tool_calls=2,
+            timeout_seconds=10,
+        ),
+        generation=1,
+    )
+    grant = issue_grounded_subagent_capability_grant(
+        sub_goal,
+        allowed_tool_names=["grep", "ls", "read_file"],
+    )
+    outcome = GroundedSubagentTaskOutcome(
+        sub_goal_id=sub_goal.sub_goal_id,
+        generation=1,
+        status="COMPLETED",
+        grant=grant,
+        advisory_output={
+            "summary": "advisory only",
+            "finding": "semantic:topic-a:metric",
+            "evidenceRefs": ["semantic:topic-a:metric"],
+            "gaps": [],
+            "recommendedNextAction": "ROOT_REVIEW",
+            "proposedSubGoals": [],
+            "evidenceGaps": [],
+        },
+    )
+    context.session.subagent_dispatches = [
+        {
+            "dispatchId": "subdispatch.recovery",
+            "parallel": False,
+            "status": "COMPLETED",
+            "tasks": [
+                outcome.model_dump(by_alias=True, mode="json")
+            ],
+        }
+    ]
+    proposal = context.session.execution_graph_proposal
+    receipt = context.session.execution_graph_receipt
+    assert proposal is not None and receipt is not None
+    checkpoint = _build_graph_revision_base_session_checkpoint(
+        context.session,
+        execution_proposal=proposal,
+        execution_receipt=receipt,
+        population_receipt=population_receipt,
+        node_states=_execution_graph_node_runtime_states(
+            context.session,
+            receipt,
+        ),
+    )
+
+    restarted_runtime, restarted_kernel, _ = _runtime(
+        require_parallel_overlap=False
+    )
+    restarted_context = _context(
+        restarted_kernel,
+        "two independent metrics",
+    )
+    restored = restarted_runtime._restore_graph_revision_base_session(
+        restarted_context.session,
+        checkpoint,
+        runtime_budget=None,
+    )
+
+    assert restored is True
+    assert restarted_context.session.subagent_dispatches == (
+        context.session.subagent_dispatches
+    )
+    assert restarted_context.session.goal_coverage_result == {}
+    assert restarted_context.session.runtime.verified_query_ledger == []
+    repeated = json.loads(
+        _tools(restarted_runtime)["delegate_grounded_tasks"].func(
+            plan=GroundedSubagentDispatchPlan(tasks=[sub_goal]),
+            runtime=SimpleNamespace(context=restarted_context),
+        )
+    )
+    assert repeated["code"] == "SUBAGENT_GOAL_GENERATION_INVALID"
+    assert repeated["issues"][0]["expectedGeneration"] == 2
+    assert restarted_context.session.goal_coverage_result == {}
 
 
 def test_spawned_process_restores_unseeded_session_and_continues_local_replan(

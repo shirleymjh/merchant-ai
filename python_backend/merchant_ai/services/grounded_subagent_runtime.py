@@ -4,6 +4,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Callable, Literal, Optional, Sequence
 
@@ -17,7 +18,6 @@ from merchant_ai.models import APIModel
 GroundedSubagentCapability = Literal[
     "READ_CONTEXT",
     "QUERY_BRANCH",
-    "RUN_SKILL",
 ]
 
 
@@ -33,6 +33,82 @@ class GroundedSubagentEvidenceRequirement(APIModel):
     required: bool = True
 
 
+class GroundedSkillRunContract(APIModel):
+    """Root-authored contract for one authoritative isolated Skill run."""
+
+    sub_goal_id: str
+    parent_goal_ids: list[str]
+    skill_name: str
+    objective: str
+    required_outputs: list[str]
+    input_artifact_ids: list[str]
+    evidence_requirements: list[GroundedSubagentEvidenceRequirement]
+    budget: GroundedSubagentBudget
+    input_snapshot_generation: int = Field(ge=1, le=1000)
+    generation: int = Field(ge=1, le=1000)
+
+    def contract_payload(self) -> dict[str, Any]:
+        return self.model_dump(by_alias=True, mode="json")
+
+    def contract_fingerprint(self) -> str:
+        return _stable_fingerprint(self.contract_payload())
+
+
+class GroundedVerifiedSkillArtifact(APIModel):
+    """Immutable verified Skill result; never a final answer or knowledge write."""
+
+    artifact_type: str = "grounded_verified_skill.v1"
+    artifact_id: str
+    skill_name: str
+    skill_run_id: str
+    sub_goal_id: str
+    parent_goal_ids: list[str]
+    generation: int
+    skill_contract_fingerprint: str
+    skill_definition_sha256: str
+    input_artifact_ids: list[str]
+    input_artifact_fingerprints: dict[str, str]
+    semantic_activation_fingerprint: str = ""
+    semantic_activation_seal_fingerprint: str = ""
+    derived_analysis_artifact_ids: list[str]
+    structured_output_fingerprint: str
+    observations: list[Any] = Field(default_factory=list)
+    semantic_disclosures: list[Any] = Field(default_factory=list)
+    derived_facts: list[Any] = Field(default_factory=list)
+    hypotheses: list[Any] = Field(default_factory=list)
+    recommendations: list[Any] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    gaps: list[Any] = Field(default_factory=list)
+    execution_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    verification_status: Literal["VERIFIED"] = "VERIFIED"
+    created_at: str = ""
+    ledger_fingerprint: str = ""
+
+    def canonical_payload(self) -> dict[str, Any]:
+        payload = self.model_dump(by_alias=True, mode="json")
+        payload.pop("ledgerFingerprint", None)
+        return payload
+
+    def with_ledger_fingerprint(self) -> "GroundedVerifiedSkillArtifact":
+        created_at = self.created_at or datetime.now(timezone.utc).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+        updated = self.model_copy(update={"created_at": created_at})
+        return updated.model_copy(
+            update={
+                "ledger_fingerprint": _stable_fingerprint(
+                    updated.canonical_payload()
+                )
+            }
+        )
+
+    def integrity_valid(self) -> bool:
+        return bool(self.ledger_fingerprint) and self.ledger_fingerprint == (
+            _stable_fingerprint(self.canonical_payload())
+        )
+
+
 class GroundedSubagentGoalContract(APIModel):
     """One immutable child Goal authored and accepted by the Root Core.
 
@@ -42,18 +118,14 @@ class GroundedSubagentGoalContract(APIModel):
     """
 
     sub_goal_id: str
-    parent_goal_ids: list[str] = Field(default_factory=list)
+    parent_goal_ids: list[str]
     objective: str
-    required_outputs: list[str] = Field(default_factory=list)
-    input_artifact_refs: list[str] = Field(default_factory=list)
-    evidence_requirements: list[GroundedSubagentEvidenceRequirement] = Field(
-        default_factory=list
-    )
-    allowed_capabilities: list[GroundedSubagentCapability] = Field(
-        default_factory=list
-    )
-    budget: GroundedSubagentBudget = Field(default_factory=GroundedSubagentBudget)
-    generation: int = Field(default=1, ge=1, le=1000)
+    required_outputs: list[str]
+    input_artifact_refs: list[str]
+    evidence_requirements: list[GroundedSubagentEvidenceRequirement]
+    allowed_capabilities: list[GroundedSubagentCapability]
+    budget: GroundedSubagentBudget
+    generation: int = Field(ge=1, le=1000)
     query_branch_ids: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
     skill_names: list[str] = Field(default_factory=list)

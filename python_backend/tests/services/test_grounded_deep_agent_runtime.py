@@ -39,6 +39,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedCoreToolBoundaryMiddleware,
     GroundedRuntimeBudgetMiddleware,
     GroundedSemanticBackend,
+    GroundedTrustedSessionContextMiddleware,
     _core_visible_binding_hints,
     _grounded_contract_sql_obligations,
     _grounded_semantic_read_control,
@@ -87,6 +88,7 @@ from merchant_ai.services.grounded_subagent_runtime import (
     GroundedSubagentDispatchPlan,
     GroundedSubagentEvidenceRequirement,
     GroundedSubagentGoalContract,
+    GroundedSkillRunContract,
 )
 
 
@@ -254,6 +256,54 @@ def _publish_skill_test_artifact(
     runtime.verified_query_ledger = [published_artifact]
     runtime.answer_artifact_ids = [artifact_id]
     return workspace
+
+
+def _verified_skill_contract(
+    session: GroundedDeepAgentSession,
+    *,
+    skill_name: str = "risk-analysis",
+    sub_goal_id: str = "skill.risk",
+    generation: int = 1,
+    snapshot_generation: int = 1,
+) -> GroundedSkillRunContract:
+    artifact_ids = list(session.runtime.answer_artifact_ids)
+    assert artifact_ids
+    session.question_goal_contract = OriginalQuestionGoalContract(
+        question=session.runtime.question,
+        goals=[
+            MetricQuestionGoal(
+                goal_id="metric.skill.input",
+                label="Skill verified input",
+            )
+        ],
+    )
+    session.artifact_goal_ids = {
+        artifact_id: ["metric.skill.input"] for artifact_id in artifact_ids
+    }
+    session.analysis_skill_headers_disclosed = True
+    session.skill_input_snapshot_generation = snapshot_generation
+    session.data_collection_sealed = False
+    return GroundedSkillRunContract(
+        sub_goal_id=sub_goal_id,
+        parent_goal_ids=["metric.skill.input"],
+        skill_name=skill_name,
+        objective="基于已验证证据执行正式分析 Skill",
+        required_outputs=["observations", "gaps"],
+        input_artifact_ids=artifact_ids,
+        evidence_requirements=[
+            GroundedSubagentEvidenceRequirement(
+                requirement_id="verified.skill.inputs",
+                description="Use only selected verified query artifacts.",
+                accepted_ref_types=["VERIFIED_QUERY_ARTIFACT"],
+            )
+        ],
+        budget=GroundedSubagentBudget(
+            max_tool_calls=8,
+            timeout_seconds=45,
+        ),
+        input_snapshot_generation=snapshot_generation,
+        generation=generation,
+    )
 
 
 class FakeSemanticCatalog:
@@ -599,20 +649,25 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert compose_tool.return_direct is True
     assert factory.kwargs["backend"] is not None
     assert [item.name for item in factory.kwargs["middleware"]] == [
+        "GroundedTrustedSessionContextMiddleware",
         "GroundedContextManagementMiddleware",
         "GroundedRuntimeBudgetMiddleware",
         "GroundedCoreToolBoundaryMiddleware",
     ]
     assert isinstance(
         factory.kwargs["middleware"][0],
-        GroundedContextManagementMiddleware,
+        GroundedTrustedSessionContextMiddleware,
     )
     assert isinstance(
         factory.kwargs["middleware"][1],
-        GroundedRuntimeBudgetMiddleware,
+        GroundedContextManagementMiddleware,
     )
     assert isinstance(
         factory.kwargs["middleware"][2],
+        GroundedRuntimeBudgetMiddleware,
+    )
+    assert isinstance(
+        factory.kwargs["middleware"][3],
         GroundedCoreToolBoundaryMiddleware,
     )
     assert [item["name"] for item in factory.kwargs["subagents"]] == ["general-purpose"]
@@ -785,11 +840,16 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
         "lifecyclePhase": "post_query_analysis",
         "requiresGroundedContract": True,
         "requiresExecutedQuery": True,
-        "requiresVerifiedEvidence": True,
-        "mayInfluenceSemanticBindings": False,
-        "mayExecuteSql": False,
-        "headersDisclosedAfterEvidenceFinalizationOnly": True,
-    }
+            "requiresVerifiedEvidence": True,
+            "mayInfluenceSemanticBindings": False,
+            "mayExecuteSql": False,
+            "headersDisclosedAfterVerifiedInputSnapshot": True,
+            "queryCollectionClosedBySkill": False,
+            "authoritativeSkillExecution": "SERIAL_ONLY",
+            "maxVerifiedSkillArtifacts": 4,
+            "skillProseCountsAsGoalCoverage": False,
+            "retryRule": "SAME_SUB_GOAL_NEXT_GENERATION",
+        }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
 
@@ -2514,7 +2574,7 @@ def test_run_skill_is_rejected_before_query_execution_and_verification() -> None
         )
     )
 
-    assert result["status"] == "EVIDENCE_COLLECTION_NOT_SEALED"
+    assert result["status"] == "SKILL_RUN_CONTRACT_REQUIRED"
     assert kernel_session.run_result is None
     assert context.session.skill_runs == []
 
@@ -2663,9 +2723,10 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
         )
     )
 
-    assert finalized["status"] == "EVIDENCE_COLLECTION_SEALED"
+    assert finalized["status"] == "SKILL_INPUT_SNAPSHOT_READY"
     assert deep_session.analysis_skill_headers_disclosed is True
-    assert deep_session.data_collection_sealed is True
+    assert deep_session.data_collection_sealed is False
+    assert deep_session.skill_input_snapshot_generation == 1
     assert any(item["name"] == "refund-rate-diagnosis" for item in finalized["availableAnalysisSkillHeaders"])
     assert all(item["lifecyclePhase"] == "post_query_analysis" for item in finalized["availableAnalysisSkillHeaders"])
 
@@ -2800,13 +2861,12 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
 
     result = json.loads(
         tools["run_skill"].func(
-            skill_name="risk-analysis",
-            objective="基于已验证证据输出风险优先级",
+            contract=_verified_skill_contract(session),
             runtime=SimpleNamespace(context=context),
         )
     )
 
-    assert result["status"] == "SKILL_COMPLETED"
+    assert result["status"] == "VERIFIED_SKILL_ARTIFACT_PUBLISHED"
     assert result["executionConfidence"] == 0.88
     assert "artifact" not in result
     assert "workspace" not in result
@@ -2830,8 +2890,114 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert "generic isolated subagent" in isolated.job.system_prompt
     assert [item[0] for item in events] == ["skill.progress"] * len(events)
     assert any(item[2]["stage"] == "subagent_step" for item in events)
-    assert kernel_session.answer == "基于已验证证据完成风险分析。"
+    assert kernel_session.answer == ""
+    assert len(session.verified_skill_ledger) == 1
+    assert session.verified_skill_ledger[0].integrity_valid()
+    assert set(session.goal_coverage_result["artifactIds"]) == set(
+        kernel_session.answer_artifact_ids
+    )
+    assert result["verifiedSkillArtifactId"] not in str(
+        session.goal_coverage_result
+    )
     assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == ("core_llm_skill_header")
+
+    base_contract = _verified_skill_contract(session)
+    stale_snapshot = json.loads(
+        tools["run_skill"].func(
+            contract=base_contract.model_copy(
+                update={
+                    "sub_goal_id": "skill.stale.snapshot",
+                    "input_snapshot_generation": 2,
+                }
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    outside_snapshot = json.loads(
+        tools["run_skill"].func(
+            contract=base_contract.model_copy(
+                update={
+                    "sub_goal_id": "skill.outside.snapshot",
+                    "input_artifact_ids": ["query-artifact-not-frozen"],
+                }
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert stale_snapshot["status"] == "SKILL_INPUT_SNAPSHOT_STALE"
+    assert outside_snapshot["status"] == "SKILL_INPUT_SNAPSHOT_SCOPE_MISMATCH"
+
+    session.skill_execution_in_progress = True
+    concurrent = json.loads(
+        tools["run_skill"].func(
+            contract=_verified_skill_contract(
+                session,
+                skill_name="ratio-analysis",
+                sub_goal_id="skill.concurrent",
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    session.skill_execution_in_progress = False
+    assert concurrent["status"] == "SKILL_EXECUTION_IN_PROGRESS"
+
+    # Simulate a Root query/local replan followed by a refreshed immutable
+    # Skill-input snapshot. The next Skill generation must bind snapshot 2.
+    session.skill_input_snapshot_generation = 2
+    generation_two = json.loads(
+        tools["run_skill"].func(
+            contract=_verified_skill_contract(
+                session,
+                generation=2,
+                snapshot_generation=2,
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    skill_b = json.loads(
+        tools["run_skill"].func(
+            contract=_verified_skill_contract(
+                session,
+                skill_name="merchant-daily-briefing",
+                sub_goal_id="skill.briefing",
+                snapshot_generation=2,
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    skill_c = json.loads(
+        tools["run_skill"].func(
+            contract=_verified_skill_contract(
+                session,
+                skill_name="gmv-drop-diagnosis",
+                sub_goal_id="skill.gmv",
+                snapshot_generation=2,
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    skill_limit = json.loads(
+        tools["run_skill"].func(
+            contract=_verified_skill_contract(
+                session,
+                skill_name="refund-rate-diagnosis",
+                sub_goal_id="skill.refund",
+                snapshot_generation=2,
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert generation_two["status"] == "VERIFIED_SKILL_ARTIFACT_PUBLISHED"
+    assert skill_b["status"] == "VERIFIED_SKILL_ARTIFACT_PUBLISHED"
+    assert skill_c["status"] == "VERIFIED_SKILL_ARTIFACT_PUBLISHED"
+    assert skill_limit["status"] == "VERIFIED_SKILL_ARTIFACT_LIMIT_REACHED"
+    assert len(session.verified_skill_ledger) == 4
+    assert all(item.integrity_valid() for item in session.verified_skill_ledger)
+    assert kernel_session.answer == ""
+    assert all(
+        item.artifact_id not in str(session.goal_coverage_result)
+        for item in session.verified_skill_ledger
+    )
 
 
 def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() -> None:
@@ -3085,25 +3251,24 @@ def test_skill_repairs_once_inside_isolation_without_query_mutation(
 
     result = json.loads(
         tools["run_skill"].func(
-            skill_name="risk-analysis",
-            objective="基于已验证证据分析风险",
+            contract=_verified_skill_contract(deep_session),
             runtime=SimpleNamespace(context=context),
         )
     )
 
-    assert result["status"] == "SKILL_COMPLETED"
+    assert result["status"] == "VERIFIED_SKILL_ARTIFACT_PUBLISHED"
     assert result["repairAttempted"] is True
     assert result["queryMutationAllowed"] is False
     assert len(repairing.jobs) == 2
     assert repairing.jobs[1].user_payload["repairAttempt"] == 1
-    blocked = json.loads(
+    continued = json.loads(
         tools["retrieve_knowledge"].func(
             query="再查更多指标",
             reason="修复 Skill",
             runtime=SimpleNamespace(context=context),
         )
     )
-    assert blocked["status"] == "POST_QUERY_SKILL_BOUNDARY_CLOSED"
+    assert continued["status"] != "SKILL_EXECUTION_IN_PROGRESS"
 
 
 def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
@@ -3184,14 +3349,12 @@ def test_skill_second_failure_returns_verified_fallback_without_third_attempt(
 
     result = json.loads(
         tools["run_skill"].func(
-            skill_name="risk-analysis",
-            objective="基于已验证证据分析风险",
+            contract=_verified_skill_contract(deep_session),
             runtime=SimpleNamespace(context=context),
         )
     )
 
-    assert result["status"] == "SKILL_FALLBACK_ANSWERED"
-    assert result["answerMarkdown"] == "已返回确定性已验证查询结果。"
+    assert result["status"] == "SKILL_VERIFICATION_FAILED"
     assert result["queryMutationAllowed"] is False
     assert len(invalid.jobs) == 2
-    assert kernel_session.answer == result["answerMarkdown"]
+    assert kernel_session.answer == ""

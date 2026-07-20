@@ -263,6 +263,17 @@ def test_memory_suggestion_publish_uses_atomic_authority_and_is_immediately_reca
 
 def test_approval_immediately_activates_for_current_and_new_recall_sessions(tmp_path):
     runtime = _setup_runtime(tmp_path)
+    preexisting_assets = TopicAssetService(runtime["settings"])
+    preexisting_session_provider = HybridRecallService(runtime["settings"], preexisting_assets)
+    preexisting_asset = preexisting_assets.load_table_asset(runtime["topic"], runtime["table"])
+    assert not any(
+        item.get("sourceSuggestionId") == "ks_open_rule"
+        for item in preexisting_asset.get("knowledgeRules") or []
+    )
+    assert not any(
+        "异常成交需要人工复核" in item.content
+        for item in preexisting_session_provider._load_documents()
+    )
     memory = runtime["store"].load("seller_100")
     memory["knowledgeSuggestions"][0]["status"] = "candidate"
     runtime["store"].save("seller_100", memory)
@@ -282,6 +293,27 @@ def test_approval_immediately_activates_for_current_and_new_recall_sessions(tmp_
     assert result["reviewStatus"] == "approved"
     assert result["activationStatus"] == "INDEXED"
     assert result["suggestion"]["status"] == "indexed"
+
+    refreshed_preexisting_asset = preexisting_assets.load_table_asset(
+        runtime["topic"],
+        runtime["table"],
+    )
+    assert any(
+        item.get("sourceSuggestionId") == "ks_open_rule"
+        for item in refreshed_preexisting_asset["knowledgeRules"]
+    )
+    preexisting_session = preexisting_session_provider.recall(
+        "异常成交需要人工复核",
+        ExtractedKeywords(keywords=["异常成交", "人工复核"]),
+        [],
+        "",
+        "seller_100",
+        [QuestionCategory(runtime["topic"])],
+    )
+    assert any(
+        item.topic == runtime["topic"] and item.table == runtime["table"]
+        for item in preexisting_session.items
+    )
 
     current_session = runtime["recallProvider"].recall(
         "异常成交需要人工复核",
