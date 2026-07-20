@@ -130,6 +130,24 @@ def test_trade_l1_exposes_compact_exact_leaf_navigation_without_binding_evidence
         assert exact["kind"] in {"METRIC", "COLUMN"}
 
 
+def test_metric_l1_navigation_preserves_published_natural_name() -> None:
+    catalog = _catalog()
+    detail = catalog.read(
+        path="topics/电商退货/tables/dwm_trade_refund_detail_di/detail.json",
+        max_chars=20_000,
+    )
+
+    assert detail["success"] is True
+    payload = json.loads(str(detail["content"]))
+    refund_metric = next(
+        item
+        for item in payload["semanticNavigation"]["metricLeaves"]
+        if item["key"] == "refund_bill_cnt"
+    )
+    assert "退款单量" in refund_metric["aliases"]
+    assert refund_metric["path"].endswith("/metrics/refund_bill_cnt.json")
+
+
 def test_every_published_table_l1_has_bounded_asset_derived_exact_navigation() -> None:
     catalog = _catalog()
     checked_tables = 0

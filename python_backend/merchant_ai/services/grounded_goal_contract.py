@@ -118,7 +118,10 @@ class DetailQuestionGoal(QuestionGoalBase):
 
 class RankingQuestionGoal(QuestionGoalBase):
     kind: Literal["RANKING"] = "RANKING"
-    population_scope: PopulationScope
+    # A ranking over the rows selected by its own current query is the safe,
+    # ordinary case.  External/history-backed populations must be opted into
+    # explicitly with one of the VERIFIED_* scopes below.
+    population_scope: PopulationScope = "ALL_MATCHING_ROWS"
     metric_goal_ids: list[str] = Field(default_factory=list)
     dimension_goal_ids: list[str] = Field(default_factory=list)
     direction: str = "DESC"
@@ -1996,7 +1999,6 @@ def _goal_resolution_issues(
                 ("end", goal.end, resolution.end),
                 ("timezone", goal.timezone, resolution.timezone),
                 ("anchorPolicy", goal.anchor_policy, resolution.anchor_policy),
-                ("windowRole", goal.window_role, resolution.window_role),
                 ("timeRangeKind", goal.time_range_kind, resolution.time_range_kind),
             ):
                 _add_time_value_mismatch(
@@ -2007,6 +2009,19 @@ def _goal_resolution_issues(
                     actual=actual,
                     code="TIME_WINDOW_PROOF_%s_MISMATCH"
                     % _canonical_ascii_symbol(field_name),
+                )
+            if not _time_window_roles_equivalent(
+                goal.window_role,
+                resolution.window_role,
+                goal_map=goal_map,
+            ):
+                _add_time_value_mismatch(
+                    add,
+                    goal_id=goal.goal_id,
+                    field_name="windowRole",
+                    expected=goal.window_role,
+                    actual=resolution.window_role,
+                    code="TIME_WINDOW_PROOF_WINDOWROLE_MISMATCH",
                 )
             # ``ResolvedTimeRange`` does not carry an executed day/week/month
             # grain.  TREND query shape proves only that a series was
@@ -2344,6 +2359,35 @@ def _add_time_value_mismatch(
         rejectedRefIds=["time:%s" % field_name],
         readNext="read the executed query time contract before retrying",
     )
+
+
+def _time_window_roles_equivalent(
+    expected: Any,
+    actual: Any,
+    *,
+    goal_map: Mapping[str, QuestionGoal],
+) -> bool:
+    """Compare Goal and execution window roles without conflating vocabularies.
+
+    Core may describe the only ordinary window by its query usage (``filter``),
+    while the executable time contract describes the same window by position
+    (``primary``).  With exactly one declared time window that distinction is
+    not semantic.  Once multiple windows exist, roles bind proofs to windows
+    and remain exact so comparison/baseline evidence cannot be swapped.
+    """
+
+    expected_role = _canonical_time_value(expected)
+    actual_role = _canonical_time_value(actual)
+    if expected_role == actual_role:
+        return True
+    time_goal_count = sum(
+        isinstance(candidate, TimeWindowQuestionGoal)
+        for candidate in goal_map.values()
+    )
+    return time_goal_count == 1 and {
+        expected_role,
+        actual_role,
+    } == {"filter", "primary"}
 
 
 def _canonical_time_value(value: Any) -> str:

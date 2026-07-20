@@ -77,6 +77,10 @@ class GroundedTableBinding(APIModel):
     time_column: str = ""
     merchant_filter_column: str = ""
     detail_ref_id: str = ""
+    supports_detail: bool | None = None
+    supports_metrics: bool | None = None
+    supported_intents: list[str] = Field(default_factory=list)
+    preferred_for: list[str] = Field(default_factory=list)
 
 
 class GroundedMetricBinding(APIModel):
@@ -431,6 +435,16 @@ class GroundedQueryContractBuilder:
             *hints.label_refs.keys(),
             *([hints.group_by_ref] if hints.group_by_ref else []),
         }
+        # Core models sometimes shorten a table-detail ref to
+        # ``semantic:<topic>:<table>`` even though the exact ``:detail`` leaf
+        # was already read and supplied with this proposal.  Expand only the
+        # evidence lookup set here; executable canonicalization below still
+        # succeeds solely when the exact detail ref exists in the trusted read
+        # ledger.
+        for ref_id in hints.table_refs:
+            table_detail_ref = _table_detail_ref_candidate(ref_id)
+            if table_detail_ref:
+                requested_refs.add(table_detail_ref)
         for ref_id in list(requested_refs):
             if ":column:" in ref_id:
                 requested_refs.add(ref_id.replace(":column:", ":field:", 1))
@@ -746,6 +760,11 @@ class GroundedQueryContractBuilder:
             if document.ref.kind != "TABLE_DETAIL" or not isinstance(document.payload, dict):
                 continue
             payload = document.payload
+            usage_profile = (
+                payload.get("tableUsageProfile")
+                if isinstance(payload.get("tableUsageProfile"), dict)
+                else {}
+            )
             table = str(payload.get("tableName") or document.ref.table or "").strip()
             if not table:
                 continue
@@ -761,6 +780,24 @@ class GroundedQueryContractBuilder:
                     or ""
                 ),
                 detail_ref_id=document.ref.ref_id,
+                supports_detail=(
+                    bool(payload.get("supportsDetail"))
+                    if payload.get("supportsDetail") is not None
+                    else None
+                ),
+                supports_metrics=(
+                    bool(payload.get("supportsMetrics"))
+                    if payload.get("supportsMetrics") is not None
+                    else None
+                ),
+                supported_intents=_dedupe(
+                    str(item or "").strip().upper()
+                    for item in usage_profile.get("supportedIntents") or []
+                ),
+                preferred_for=_dedupe(
+                    str(item or "").strip().upper()
+                    for item in payload.get("preferredFor") or []
+                ),
             )
         return details
 
@@ -1579,6 +1616,64 @@ class GroundedQueryContractValidator:
                 )
             )
         table_by_name = {table.table: table for table in contract.tables}
+        grouped_dimensions = [
+            item
+            for item in contract.dimensions
+            if str(item.usage or "").strip().lower() == "group_by"
+        ]
+        if detail_shape:
+            unsupported_detail_tables = [
+                table
+                for table in contract.tables
+                if table.supports_detail is False
+            ]
+            for table in unsupported_detail_tables:
+                gaps.append(
+                    _gap(
+                        "TABLE_DETAIL_QUERY_UNSUPPORTED",
+                        "Table %s explicitly declares supportsDetail=false and cannot serve a detail projection"
+                        % table.table,
+                        "TABLE_DETAIL",
+                        table.topic,
+                        table.table,
+                        resolution=(
+                            "Remove unrequested selectedFields or choose a formally read table "
+                            "that declares detail-query capability."
+                        ),
+                        required_capability={"supportsDetail": True},
+                        rejected_ref_ids=[table.detail_ref_id],
+                    )
+                )
+        if (
+            contract.metrics
+            and contract.selected_fields
+            and not grouped_dimensions
+            and contract.query_shape != "RANKED"
+        ):
+            gaps.append(
+                _gap(
+                    "AGGREGATE_DETAIL_GRAIN_CONFLICT",
+                    (
+                        "Aggregate metric outputs and raw selected fields cannot share "
+                        "one ungrouped query Contract"
+                    ),
+                    resolution=(
+                        "Remove the raw selected fields when the question asks only for "
+                        "metrics, or split explicitly requested detail and aggregate outputs "
+                        "into separate query nodes."
+                    ),
+                    required_capability={
+                        "allowedRepairs": [
+                            "REMOVE_SELECTED_FIELDS",
+                            "SPLIT_AGGREGATE_AND_DETAIL_QUERIES",
+                        ]
+                    },
+                    rejected_ref_ids=[
+                        item.semantic_ref_id
+                        for item in contract.selected_fields
+                    ],
+                )
+            )
         if contract.time_field.semantic_ref_id:
             time_field = contract.time_field
             if time_field.semantic_ref_id not in evidence_refs:
@@ -3725,9 +3820,16 @@ def _canonicalize_binding_hints(
             alternates.append(value.replace(":field:", ":column:", 1))
         return next((item for item in alternates if item in available_refs), value)
 
+    def canonical_table(ref_id: str) -> str:
+        value = canonical(ref_id)
+        if value in available_refs:
+            return value
+        detail_ref = _table_detail_ref_candidate(value)
+        return detail_ref if detail_ref in available_refs else value
+
     return hints.model_copy(
         update={
-            "table_refs": _dedupe(canonical(item) for item in hints.table_refs),
+            "table_refs": _dedupe(canonical_table(item) for item in hints.table_refs),
             "metric_refs": _dedupe(canonical(item) for item in hints.metric_refs),
             "field_aggregations": [
                 item.model_copy(update={"field_ref": canonical(item.field_ref)})
@@ -3757,6 +3859,20 @@ def _canonicalize_binding_hints(
             },
         }
     )
+
+
+def _table_detail_ref_candidate(ref_id: str) -> str:
+    value = str(ref_id or "").strip()
+    parts = value.split(":")
+    if (
+        len(parts) == 3
+        and parts[0] == "semantic"
+        and parts[1]
+        and parts[2]
+        and parts[2] not in {"manifest", "relationships", "relationship_index"}
+    ):
+        return "%s:detail" % value
+    return ""
 
 
 def _missing_binding_ref_gaps(

@@ -15,6 +15,7 @@ from merchant_ai.services.grounded_goal_contract import (
     TimeWindowQuestionGoal,
     VerifiedArtifactGoalCoverage,
     original_question_goal_contract_fingerprint,
+    parse_original_question_goal_contract,
 )
 from merchant_ai.services.grounded_goal_proofs import (
     derive_query_artifact_goal_resolutions,
@@ -242,6 +243,149 @@ def test_time_proof_uses_executed_range_and_rejects_goal_range_mismatch() -> Non
     assert {issue.code for issue in result.issues} >= {
         "TIME_WINDOW_PROOF_EXPRESSION_MISMATCH",
         "TIME_WINDOW_PROOF_DAYS_MISMATCH",
+    }
+
+
+def test_single_filter_time_goal_accepts_primary_execution_role() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "最近7天订单数",
+            "goals": [
+                {
+                    "goalId": "time.7d",
+                    "kind": "TIME_WINDOW",
+                    "label": "最近7天",
+                    "timeExpression": "最近7天",
+                    "days": 7,
+                    "windowRole": "filter",
+                }
+            ],
+        }
+    )
+    query_artifact = SimpleNamespace(
+        artifact_id="artifact-time",
+        verified_evidence=SimpleNamespace(passed=True),
+        contract=SimpleNamespace(
+            evidence_refs=[],
+            binding_hints=SimpleNamespace(time_expression="最近7天"),
+            time_range=SimpleNamespace(
+                kind="rolling",
+                label="最近7天",
+                days=7,
+                start_date="2026-07-14",
+                end_date="2026-07-20",
+                timezone="Asia/Shanghai",
+                anchor_policy="calendar",
+                window_role="primary",
+                explicit=True,
+            ),
+        ),
+        run_result=SimpleNamespace(merged_query_bundle=QueryBundle()),
+        output_columns=[],
+        output_lineage={},
+    )
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["time.7d"],
+        artifact_goal_ids={"artifact-time": ["time.7d"]},
+        all_artifacts=[query_artifact],
+    )
+
+    assert contract.goals[0].window_role == "filter"
+    assert resolutions[0]["windowRole"] == "primary"
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-time",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["time.7d"],
+                verification_passed=True,
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is True
+    assert "TIME_WINDOW_PROOF_WINDOWROLE_MISMATCH" not in {
+        issue.code for issue in result.issues
+    }
+
+
+def test_multi_window_roles_remain_strict_for_filter_and_baseline_windows() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="比较最近7天和基线7天订单数",
+        goals=[
+            TimeWindowQuestionGoal(
+                goal_id="time.current",
+                label="最近7天",
+                time_expression="最近7天",
+                days=7,
+                window_role="filter",
+            ),
+            TimeWindowQuestionGoal(
+                goal_id="time.baseline",
+                label="基线7天",
+                time_expression="基线7天",
+                days=7,
+                window_role="baseline",
+            ),
+        ],
+    )
+    resolutions = [
+        {
+            "goalId": "time.current",
+            "goalKind": "TIME_WINDOW",
+            "resolution": "PROVED",
+            "proofType": "VERIFIED_QUERY_TIME_RANGE",
+            "timeExpression": "最近7天",
+            "start": "2026-07-14",
+            "end": "2026-07-20",
+            "days": 7,
+            "explicit": True,
+            "windowRole": "primary",
+        },
+        {
+            "goalId": "time.baseline",
+            "goalKind": "TIME_WINDOW",
+            "resolution": "PROVED",
+            "proofType": "VERIFIED_QUERY_TIME_RANGE",
+            "timeExpression": "基线7天",
+            "start": "2026-07-07",
+            "end": "2026-07-13",
+            "days": 7,
+            "explicit": True,
+            "windowRole": "comparison",
+        },
+    ]
+
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-multi-window",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["time.current", "time.baseline"],
+                verification_passed=True,
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    role_mismatches = [
+        issue
+        for issue in result.issues
+        if issue.code == "TIME_WINDOW_PROOF_WINDOWROLE_MISMATCH"
+    ]
+    assert result.finalization_allowed is False
+    assert {issue.goal_id for issue in role_mismatches} == {
+        "time.current",
+        "time.baseline",
     }
 
 

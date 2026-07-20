@@ -244,6 +244,138 @@ def test_separate_partition_pruning_column_requires_correctness_proof() -> None:
     }
 
 
+def test_table_declared_without_detail_capability_rejects_detail_projection() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = core_read(
+        "semantic:%s:%s:detail" % (topic, table),
+        "TABLE_DETAIL",
+        topic,
+        table,
+        {
+            "topic": topic,
+            "tableName": table,
+            "title": "商家经营核心指标日汇总表",
+            "dataGrain": "merchant_day_summary",
+            "timeColumn": "pt",
+            "merchantFilterColumn": "merchant_id",
+            "supportsDetail": False,
+            "supportsMetrics": True,
+            "preferredFor": ["METRIC", "GROUP_AGG"],
+            "tableUsageProfile": {
+                "supportedIntents": ["METRIC", "GROUP_AGG"],
+            },
+        },
+    )
+    raw_metric_field = column_read(
+        topic,
+        table,
+        "order_cnt_1d",
+        "总订单量",
+        ["订单数"],
+        role="METRIC",
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "返回最近7天订单数原始字段",
+        [topic],
+        [detail, raw_metric_field],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "selectedFields": [{"fieldRef": raw_metric_field["refId"]}],
+            "analysisMode": "DETAIL",
+            "timeExpression": "最近7天",
+        },
+        now=datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.tables[0].supports_detail is False
+    assert contract.tables[0].supports_metrics is True
+    assert contract.tables[0].supported_intents == ["METRIC", "GROUP_AGG"]
+    assert "TABLE_DETAIL_QUERY_UNSUPPORTED" in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
+def test_aggregate_metric_and_raw_field_require_separate_query_grains() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = table_detail(topic, table)
+    metric = metric_read(
+        topic,
+        table,
+        "order_cnt_1d",
+        "总订单量",
+        ["订单总数"],
+        "SUM(order_cnt_1d)",
+        ["order_cnt_1d"],
+    )
+    raw_metric_field = column_read(
+        topic,
+        table,
+        "order_cnt_1d",
+        "总订单量",
+        ["订单数"],
+        role="METRIC",
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近7天订单总数",
+        [topic],
+        [detail, metric, raw_metric_field],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [metric["refId"]],
+            "selectedFields": [
+                {
+                    "fieldRef": raw_metric_field["refId"],
+                    "outputAlias": "order_cnt_1d_source",
+                }
+            ],
+            "timeExpression": "最近7天",
+        },
+        now=datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.query_shape == "DETAIL"
+    assert "AGGREGATE_DETAIL_GRAIN_CONFLICT" in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
+def test_read_table_detail_allows_unambiguous_short_table_ref() -> None:
+    topic = "电商交易"
+    table = "dwm_trade_order_detail_di"
+    detail = table_detail(topic, table, merchant_column="seller_id")
+    order_id = column_read(
+        topic,
+        table,
+        "order_id",
+        "订单ID",
+        ["订单号"],
+        role="ENTITY_UNIQUE_KEY",
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "给我最近10天的订单明细",
+        [topic],
+        [detail, order_id],
+        binding_hints={
+            "tableRefs": ["semantic:%s:%s" % (topic, table)],
+            "selectedFields": [{"fieldRef": order_id["refId"]}],
+            "analysisMode": "DETAIL",
+            "timeExpression": "最近10天",
+        },
+        now=datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.binding_hints.table_refs == [detail["refId"]]
+    assert "TABLE_BINDING_REF_NOT_READ" not in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+    assert contract.tables[0].detail_ref_id == detail["refId"]
+
+
 def entity_lookup_evidence() -> tuple[list[dict[str, object]], dict[str, object]]:
     order_topic = "电商交易"
     goods_topic = "商品管理"

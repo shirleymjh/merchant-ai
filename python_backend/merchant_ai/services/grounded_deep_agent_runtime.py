@@ -244,6 +244,9 @@ from merchant_ai.services.grounded_population_verifier import (
     PopulationVerificationStage,
     population_attestation_fingerprint,
 )
+from merchant_ai.services.grounded_population_semantic_reviewer import (
+    population_semantic_model_required,
+)
 from merchant_ai.services.grounded_semantic_activation import (
     GroundedSemanticActivationSeal,
     semantic_activation_seal_valid,
@@ -800,10 +803,11 @@ def _goal_assignment_contract_issues(
     goal_contract = session.question_goal_contract
     if goal_contract is None:
         return [{"code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED"}]
+    goal_map = goal_contract.goal_map()
     selected_refs = set(getattr(contract, "evidence_refs", ()) or ())
     issues: list[dict[str, Any]] = []
     for goal_id in goal_ids:
-        goal = goal_contract.goal_map().get(goal_id)
+        goal = goal_map.get(goal_id)
         if goal is None:
             continue
         declared_refs = set(getattr(goal, "semantic_ref_ids", ()) or ())
@@ -829,7 +833,90 @@ def _goal_assignment_contract_issues(
                         "goalId": goal_id,
                     }
                 )
+
+    assigned_goals = [
+        goal_map[goal_id]
+        for goal_id in goal_ids
+        if goal_id in goal_map
+    ]
+    assigned_goal_kinds = {
+        str(getattr(goal, "kind", "") or "").strip().upper()
+        for goal in assigned_goals
+    }
+    metric_goal_ids = [
+        goal.goal_id
+        for goal in assigned_goals
+        if str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC"
+    ]
+    scalar_metric_assignment = bool(metric_goal_ids) and assigned_goal_kinds <= {
+        "METRIC",
+        "TIME_WINDOW",
+    }
+    if scalar_metric_assignment:
+        hints = getattr(contract, "binding_hints", None)
+        selected_field_refs = [
+            str(getattr(item, "field_ref", "") or "").strip()
+            for item in (getattr(hints, "selected_fields", ()) or ())
+            if str(getattr(item, "field_ref", "") or "").strip()
+        ]
+        metric_refs = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in (getattr(hints, "metric_refs", ()) or ())
+                if str(item or "").strip()
+            )
+        )
+        field_aggregation_refs = [
+            str(getattr(item, "field_ref", "") or "").strip()
+            for item in (getattr(hints, "field_aggregations", ()) or ())
+            if str(getattr(item, "field_ref", "") or "").strip()
+        ]
+        submitted_metric_output_count = len(metric_refs) + len(
+            field_aggregation_refs
+        )
+        extra_metric_outputs = (
+            submitted_metric_output_count > len(metric_goal_ids)
+        )
+        mixed_metric_binding_modes = bool(
+            metric_refs and field_aggregation_refs
+        )
+        if (
+            selected_field_refs
+            or mixed_metric_binding_modes
+            or extra_metric_outputs
+        ):
+            issues.append(
+                {
+                    "code": "SCALAR_METRIC_EXTRA_OUTPUT_NOT_REQUESTED",
+                    "goalIds": [goal.goal_id for goal in assigned_goals],
+                    "assignedMetricGoalIds": metric_goal_ids,
+                    "unexpectedSelectedFieldRefs": selected_field_refs,
+                    "metricRefs": metric_refs,
+                    "fieldAggregationRefs": field_aggregation_refs,
+                    "mixedMetricBindingModes": mixed_metric_binding_modes,
+                    "expectedMetricOutputCount": len(metric_goal_ids),
+                    "submittedMetricOutputCount": submitted_metric_output_count,
+                    "nextAction": "REMOVE_EXTRA_OUTPUT_BINDINGS_AND_RESUBMIT",
+                    "instruction": (
+                        "A scalar metric branch may bind only one metric output per "
+                        "assigned METRIC goal plus necessary time semantics. Remove "
+                        "selectedFields; when a published metricRef already covers the "
+                        "goal, do not also project or aggregate its source field."
+                    ),
+                }
+            )
     return issues
+
+
+def _goal_assignment_repair_action(issues: Sequence[Mapping[str, Any]]) -> str:
+    return next(
+        (
+            str(issue.get("nextAction") or "").strip()
+            for issue in issues
+            if str(issue.get("nextAction") or "").strip()
+        ),
+        "REVISE_BINDINGS_OR_GOAL_ASSIGNMENT",
+    )
 
 
 @dataclass
@@ -5733,19 +5820,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             },
                             ensure_ascii=False,
                         )
-                    population_model_required = any(
-                        str(goal.kind or "").upper() == "DEPENDENCY"
-                        or bool(goal.population_goal_ids)
-                        or str(
-                            getattr(
-                                goal.population_scope,
-                                "value",
-                                goal.population_scope,
-                            )
-                            or ""
-                        ).upper()
-                        not in {"", "ALL_MATCHING_ROWS"}
-                        for goal in parsed.goals
+                    population_model_required = (
+                        population_semantic_model_required(parsed)
                     )
                     budget = runtime.context.budget
                     if budget is not None and population_model_required:
@@ -7918,7 +7994,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "status": "BLOCKED",
                             "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
                             "issues": assignment_issues,
-                            "nextAction": "REVISE_BINDINGS_OR_GOAL_ASSIGNMENT",
+                            "nextAction": _goal_assignment_repair_action(
+                                assignment_issues
+                            ),
                         },
                         ensure_ascii=False,
                     )
@@ -8349,6 +8427,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                     "status": "BLOCKED",
                                     "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
                                     "issues": assignment_issues,
+                                    "nextAction": _goal_assignment_repair_action(
+                                        assignment_issues
+                                    ),
                                     "replanEvidence": (
                                         _execution_graph_replan_evidence_report(replan_evidence)
                                         if replan_evidence is not None
@@ -8585,6 +8666,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "status": "BLOCKED",
                                 "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
                                 "issues": assignment_issues,
+                                "nextAction": _goal_assignment_repair_action(
+                                    assignment_issues
+                                ),
                             }
                         )
                         continue

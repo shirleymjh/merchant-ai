@@ -560,7 +560,7 @@ def population_attestation_fingerprint(
 def population_declarations_from_goal_contract(
     contract: OriginalQuestionGoalContract | Mapping[str, Any] | str,
     *,
-    consumer_goal_ids: Sequence[str] = (),
+    consumer_goal_ids: Sequence[str] | None = None,
 ) -> tuple[PopulationDeclaration, ...]:
     """Adapt existing Goal Contract population declarations without inferring prose.
 
@@ -569,7 +569,12 @@ def population_declarations_from_goal_contract(
     """
 
     parsed = parse_original_question_goal_contract(contract)
-    requested = {_text(value) for value in consumer_goal_ids if _text(value)}
+    selection_explicit = consumer_goal_ids is not None
+    requested = {
+        _text(value)
+        for value in (consumer_goal_ids or ())
+        if _text(value)
+    }
     declarations: list[PopulationDeclaration] = []
     kind_map = {
         "ALL_MATCHING_ROWS": PopulationScopeKind.INDEPENDENT,
@@ -581,7 +586,7 @@ def population_declarations_from_goal_contract(
     for goal in parsed.goals:
         include = (
             goal.goal_id in requested
-            if requested
+            if selection_explicit
             else isinstance(goal, RankingQuestionGoal)
             or bool(goal.population_goal_ids)
             or str(goal.population_scope) != "ALL_MATCHING_ROWS"
@@ -614,7 +619,7 @@ def goal_population_verification_input(
     semantic_review: PopulationSemanticReview,
     declaration_author_fingerprint: str,
     trusted_semantic_verifier_fingerprints: Sequence[str],
-    consumer_goal_ids: Sequence[str] = (),
+    consumer_goal_ids: Sequence[str] | None = None,
 ) -> GoalDeclarationPopulationVerificationInput:
     parsed = parse_original_question_goal_contract(contract)
     return GoalDeclarationPopulationVerificationInput(

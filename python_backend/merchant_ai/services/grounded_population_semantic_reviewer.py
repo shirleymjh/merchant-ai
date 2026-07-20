@@ -48,6 +48,33 @@ class PopulationSemanticReviewerIssueCode(str, Enum):
     PROVIDER_SOURCE_GOAL_SELF_REFERENCE = "PROVIDER_SOURCE_GOAL_SELF_REFERENCE"
 
 
+_EXTERNAL_POPULATION_SCOPES = {
+    "VERIFIED_ENTITY_SET",
+    "VERIFIED_PREDICATE_SCOPE",
+    "VERIFIED_RESULT_ARTIFACT",
+}
+
+
+def population_semantic_model_required(
+    contract: OriginalQuestionGoalContract | Mapping[str, Any] | str,
+) -> bool:
+    """Return whether the Goal ledger claims an external verified population.
+
+    Ordinary rankings over their own current-query rows (ALL_MATCHING_ROWS)
+    and typed same-query Goal lineage (SAME_AS_GOAL) are verified
+    deterministically by the runtime and SQL lineage gates.  Only scopes that
+    claim a verified external entity, predicate, or result artifact need the
+    isolated semantic model.
+    """
+
+    parsed = parse_original_question_goal_contract(contract)
+    return any(
+        _text(getattr(goal, "population_scope", "")).upper()
+        in _EXTERNAL_POPULATION_SCOPES
+        for goal in parsed.goals
+    )
+
+
 class _StrictFrozenModel(APIModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -584,6 +611,121 @@ class IndependentPopulationSemanticReviewer:
                 )
                 for item in request.goal_skeleton
             ),
+        )
+        output_fingerprint = _stable_fingerprint(output)
+        review = _build_review(
+            request,
+            output,
+            authority,
+            output_fingerprint,
+        )
+        return PopulationSemanticReviewerOutcome(
+            passed=True,
+            review=review,
+            request=request,
+            request_fingerprint=request.request_fingerprint,
+            goal_skeleton_fingerprint=request.goal_skeleton_fingerprint,
+            provider_authority_fingerprint=authority,
+            provider_output_fingerprint=output_fingerprint,
+            review_fingerprint=population_semantic_review_fingerprint(review),
+            provider_invoked=False,
+            issues=(),
+        )
+
+    def attest_declared_current_query(
+        self,
+        *,
+        effective_question: str,
+        contract: OriginalQuestionGoalContract | Mapping[str, Any] | str,
+        declaration_author_fingerprint: str,
+    ) -> PopulationSemanticReviewerOutcome:
+        """Deterministically attest non-external current-query populations.
+
+        SAME_AS_GOAL remains population-gated for later graph/SQL lineage
+        verification, but it does not spend a model call: its complete source
+        Goal set is already typed and validated in the Goal Contract.  An
+        external VERIFIED_* scope is never accepted through this fast path.
+        """
+
+        try:
+            parsed = parse_original_question_goal_contract(contract)
+            request = build_population_semantic_reviewer_request(
+                effective_question,
+                parsed,
+            )
+            authority = _text(self.provider.authority_fingerprint)
+        except Exception as exc:
+            return _failed_outcome(
+                request=None,
+                provider_authority_fingerprint="",
+                provider_invoked=False,
+                issues=(
+                    _issue(
+                        PopulationSemanticReviewerIssueCode.PROVIDER_AUTHORITY_REQUIRED,
+                        "The deterministic current-query population attestation could not be bound: %s"
+                        % _bounded_error(exc),
+                    ),
+                ),
+            )
+        if population_semantic_model_required(parsed):
+            return _failed_outcome(
+                request=request,
+                provider_authority_fingerprint=authority,
+                provider_invoked=False,
+                issues=(
+                    _issue(
+                        PopulationSemanticReviewerIssueCode.PROVIDER_FAILED,
+                        "An external verified population requires the independent semantic model.",
+                    ),
+                ),
+            )
+        if (
+            not authority
+            or authority
+            not in set(self.trusted_provider_authority_fingerprints)
+            or authority == _text(declaration_author_fingerprint)
+        ):
+            return _failed_outcome(
+                request=request,
+                provider_authority_fingerprint=authority,
+                provider_invoked=False,
+                issues=(
+                    _issue(
+                        PopulationSemanticReviewerIssueCode.PROVIDER_AUTHORITY_UNTRUSTED,
+                        "The deterministic population attestation authority is not trusted or independent.",
+                    ),
+                ),
+            )
+        goal_map = parsed.goal_map()
+        decisions: list[PopulationSemanticProviderDecision] = []
+        for item in request.goal_skeleton:
+            goal = goal_map[item.goal_id]
+            same_query_population = (
+                _text(getattr(goal, "population_scope", "")).upper()
+                == PopulationScopeKind.SAME_AS_GOAL.value
+            )
+            decisions.append(
+                PopulationSemanticProviderDecision(
+                    goal_id=item.goal_id,
+                    gate_required=same_query_population,
+                    scope_kind=(
+                        PopulationScopeKind.SAME_AS_GOAL
+                        if same_query_population
+                        else None
+                    ),
+                    source_goal_ids=(
+                        tuple(getattr(goal, "population_goal_ids", ()) or ())
+                        if same_query_population
+                        else ()
+                    ),
+                )
+            )
+        output = PopulationSemanticProviderOutput(
+            request_fingerprint=request.request_fingerprint,
+            question_fingerprint=request.question_fingerprint,
+            goal_skeleton_fingerprint=request.goal_skeleton_fingerprint,
+            complete=True,
+            decisions=tuple(decisions),
         )
         output_fingerprint = _stable_fingerprint(output)
         review = _build_review(

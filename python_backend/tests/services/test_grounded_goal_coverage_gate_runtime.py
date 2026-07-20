@@ -4,7 +4,13 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
-from merchant_ai.models import AgentRunResult, QueryBundle, QueryPlan, VerifiedEvidence
+from merchant_ai.models import (
+    AgentRunResult,
+    QueryBundle,
+    QueryPlan,
+    ResolvedTimeRange,
+    VerifiedEvidence,
+)
 from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedDeepAgentRunContext,
     GroundedDeepAgentRuntime,
@@ -14,8 +20,10 @@ from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
     RankingQuestionGoal,
+    TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
     GroundedQueryContract,
     GroundedRankingBinding,
 )
@@ -110,6 +118,60 @@ class GoalGateKernel:
         raise AssertionError("a semantically mismatched Contract must not be activated")
 
 
+class ScalarBindingGoalGateKernel(GoalGateKernel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts: dict[str, GroundedRuntimeAttempt] = {}
+
+    def propose_contract(
+        self,
+        session: GroundedRuntimeSession,
+        evidence: list[dict[str, Any]],
+        hints: Any,
+        **kwargs: Any,
+    ) -> GroundedRuntimeAttempt:
+        del kwargs
+        self.propose_contract_calls += 1
+        normalized_hints = (
+            hints
+            if isinstance(hints, GroundedBindingHints)
+            else GroundedBindingHints.model_validate(hints)
+        )
+        attempt = GroundedRuntimeAttempt(
+            attempt_id="scalar-binding-attempt",
+            contract=GroundedQueryContract(
+                question=session.question,
+                status="READY",
+                query_shape=(
+                    "DETAIL" if normalized_hints.selected_fields else "SCALAR"
+                ),
+                binding_hints=normalized_hints,
+                evidence_refs=[item["refId"] for item in evidence],
+                time_range=ResolvedTimeRange(
+                    days=7,
+                    explicit=True,
+                    source="last_n_days",
+                ),
+            ),
+        )
+        self.attempts[attempt.attempt_id] = attempt
+        return attempt
+
+    def activate_contract(
+        self,
+        session: GroundedRuntimeSession,
+        attempt_id: str,
+    ) -> GroundedRuntimeAttempt:
+        del session
+        self.activate_contract_calls += 1
+        attempt = self.attempts[attempt_id]
+        attempt.activated = True
+        attempt.activation_status = "ACTIVATED"
+        attempt.active_generation = 1
+        attempt.next_action = "EXECUTE_GROUNDED_QUERY"
+        return attempt
+
+
 def _runtime(kernel: GoalGateKernel) -> GroundedDeepAgentRuntime:
     return GroundedDeepAgentRuntime(
         kernel,
@@ -136,6 +198,94 @@ def _context(
 
 def _tools(runtime: GroundedDeepAgentRuntime) -> dict[str, Any]:
     return {item.name: item for item in runtime.tools}
+
+
+def _propose_scalar_binding_contract(
+    *,
+    metric_goal_refs: list[str],
+    binding_hints: dict[str, Any],
+) -> tuple[dict[str, Any], ScalarBindingGoalGateKernel]:
+    kernel = ScalarBindingGoalGateKernel()
+    runtime = _runtime(kernel)
+    context = _context(kernel, question="最近7天查询指标")
+    tools = _tools(runtime)
+    table_ref = "semantic:经营画像:merchant_profile_daily:detail"
+    hint_refs = [
+        *list(binding_hints.get("metricRefs") or []),
+        *[
+            str(item.get("fieldRef") or "")
+            for item in (binding_hints.get("fieldAggregations") or [])
+        ],
+        *[
+            str(item.get("fieldRef") or "")
+            for item in (binding_hints.get("selectedFields") or [])
+        ],
+    ]
+    read_ref_ids = list(
+        dict.fromkeys(
+            [table_ref, *metric_goal_refs, *hint_refs]
+        )
+    )
+    context.session.core_semantic_evidence = [
+        {
+            "refId": ref_id,
+            "kind": (
+                "TABLE_DETAIL"
+                if ref_id == table_ref
+                else "METRIC"
+                if ":metric:" in ref_id
+                else "COLUMN"
+            ),
+            "topic": "经营画像",
+            "table": "merchant_profile_daily",
+            "contentSnippet": "{}",
+            "contentHash": "hash",
+        }
+        for ref_id in read_ref_ids
+    ]
+    metric_goal_ids = [
+        "metric.output_%s" % (index + 1)
+        for index in range(len(metric_goal_refs))
+    ]
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=context.session.runtime.question,
+                goals=[
+                    *[
+                        MetricQuestionGoal(
+                            goal_id=goal_id,
+                            label="指标%s" % (index + 1),
+                            metric_ref_id=metric_goal_refs[index],
+                        )
+                        for index, goal_id in enumerate(metric_goal_ids)
+                    ],
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_7_days",
+                        label="最近7天",
+                        time_expression="最近7天",
+                        days=7,
+                        applies_to_goal_ids=metric_goal_ids,
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+    result = json.loads(
+        tools["propose_grounded_contract"].func(
+            read_ref_ids=read_ref_ids,
+            binding_hints={
+                "tableRefs": [table_ref],
+                "timeExpression": "最近7天",
+                **binding_hints,
+            },
+            goal_ids=[*metric_goal_ids, "time.recent_7_days"],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    return result, kernel
 
 
 def _declare_metric_goals(
@@ -416,6 +566,133 @@ def test_proposal_is_blocked_when_assigned_goal_semantics_are_not_in_contract() 
     assert kernel.propose_contract_calls == 1
     assert kernel.activate_contract_calls == 0
     assert context.session.active_goal_ids == []
+
+
+def test_scalar_metric_proposal_rejects_unrequested_selected_field() -> None:
+    metric_ref = "semantic:经营画像:merchant_profile_daily:metric:order_cnt_1d"
+    source_field_ref = (
+        "semantic:经营画像:merchant_profile_daily:field:order_cnt_1d"
+    )
+
+    proposed, kernel = _propose_scalar_binding_contract(
+        metric_goal_refs=[metric_ref],
+        binding_hints={
+            "metricRefs": [metric_ref],
+            "selectedFields": [
+                {
+                    "fieldRef": source_field_ref,
+                    "outputAlias": "order_cnt_1d_source",
+                }
+            ],
+        },
+    )
+
+    assert proposed["status"] == "BLOCKED"
+    assert proposed["code"] == "QUERY_GOAL_ASSIGNMENT_MISMATCH"
+    assert (
+        proposed["nextAction"]
+        == "REMOVE_EXTRA_OUTPUT_BINDINGS_AND_RESUBMIT"
+    )
+    assert proposed["issues"] == [
+        {
+            "code": "SCALAR_METRIC_EXTRA_OUTPUT_NOT_REQUESTED",
+            "goalIds": ["metric.output_1", "time.recent_7_days"],
+            "assignedMetricGoalIds": ["metric.output_1"],
+            "unexpectedSelectedFieldRefs": [source_field_ref],
+            "metricRefs": [metric_ref],
+            "fieldAggregationRefs": [],
+            "mixedMetricBindingModes": False,
+            "expectedMetricOutputCount": 1,
+            "submittedMetricOutputCount": 1,
+            "nextAction": "REMOVE_EXTRA_OUTPUT_BINDINGS_AND_RESUBMIT",
+            "instruction": (
+                "A scalar metric branch may bind only one metric output per "
+                "assigned METRIC goal plus necessary time semantics. Remove "
+                "selectedFields; when a published metricRef already covers the "
+                "goal, do not also project or aggregate its source field."
+            ),
+        }
+    ]
+    assert kernel.activate_contract_calls == 0
+
+
+def test_scalar_metric_proposal_rejects_mixed_published_and_field_aggregation() -> None:
+    published_ref = (
+        "semantic:经营画像:merchant_profile_daily:metric:order_cnt_1d"
+    )
+    field_ref = "semantic:经营画像:merchant_profile_daily:field:buyer_id"
+
+    proposed, kernel = _propose_scalar_binding_contract(
+        metric_goal_refs=[published_ref, field_ref],
+        binding_hints={
+            "metricRefs": [published_ref],
+            "fieldAggregations": [
+                {
+                    "fieldRef": field_ref,
+                    "aggregation": "COUNT_DISTINCT",
+                    "requestedPhrase": "买家数",
+                }
+            ],
+        },
+    )
+
+    issue = proposed["issues"][0]
+    assert proposed["code"] == "QUERY_GOAL_ASSIGNMENT_MISMATCH"
+    assert issue["code"] == "SCALAR_METRIC_EXTRA_OUTPUT_NOT_REQUESTED"
+    assert issue["mixedMetricBindingModes"] is True
+    assert issue["expectedMetricOutputCount"] == 2
+    assert issue["submittedMetricOutputCount"] == 2
+    assert issue["metricRefs"] == [published_ref]
+    assert issue["fieldAggregationRefs"] == [field_ref]
+    assert issue["nextAction"] == "REMOVE_EXTRA_OUTPUT_BINDINGS_AND_RESUBMIT"
+    assert kernel.activate_contract_calls == 0
+
+
+def test_scalar_metric_proposal_rejects_more_metric_outputs_than_goals() -> None:
+    requested_ref = (
+        "semantic:经营画像:merchant_profile_daily:metric:order_cnt_1d"
+    )
+    extra_ref = (
+        "semantic:经营画像:merchant_profile_daily:metric:refund_order_cnt_1d"
+    )
+
+    proposed, kernel = _propose_scalar_binding_contract(
+        metric_goal_refs=[requested_ref],
+        binding_hints={"metricRefs": [requested_ref, extra_ref]},
+    )
+
+    issue = proposed["issues"][0]
+    assert issue["code"] == "SCALAR_METRIC_EXTRA_OUTPUT_NOT_REQUESTED"
+    assert issue["mixedMetricBindingModes"] is False
+    assert issue["expectedMetricOutputCount"] == 1
+    assert issue["submittedMetricOutputCount"] == 2
+    assert issue["metricRefs"] == [requested_ref, extra_ref]
+    assert kernel.activate_contract_calls == 0
+
+
+def test_scalar_metric_proposal_allows_one_field_aggregation_for_one_goal() -> None:
+    field_ref = "semantic:经营画像:merchant_profile_daily:field:buyer_id"
+
+    proposed, kernel = _propose_scalar_binding_contract(
+        metric_goal_refs=[field_ref],
+        binding_hints={
+            "fieldAggregations": [
+                {
+                    "fieldRef": field_ref,
+                    "aggregation": "COUNT_DISTINCT",
+                    "requestedPhrase": "买家数",
+                }
+            ]
+        },
+    )
+
+    assert proposed["status"] == "READY"
+    assert proposed["activated"] is True
+    assert proposed["assignedGoalIds"] == [
+        "metric.output_1",
+        "time.recent_7_days",
+    ]
+    assert kernel.activate_contract_calls == 1
 
 
 def test_goal_contract_is_once_only_and_idempotent() -> None:

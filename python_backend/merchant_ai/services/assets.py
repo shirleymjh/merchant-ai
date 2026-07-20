@@ -5980,16 +5980,20 @@ def automatic_l1_navigation_aliases(
         if section == "metrics"
         else ("businessName", "displayName", "comment", "title")
     )
-    official = next(
-        (str(value.get(field) or "").strip() for field in official_fields if str(value.get(field) or "").strip()),
-        "",
+    official_values = dedupe_strings(
+        [
+            str(value.get(field) or "").strip()
+            for field in official_fields
+            if str(value.get(field) or "").strip()
+        ]
     )
+    official = official_values[0] if official_values else ""
     raw_aliases = value.get("aliases") or []
     if isinstance(raw_aliases, str):
         raw_aliases = [raw_aliases]
     candidates = dedupe_strings(
         [
-            official,
+            *official_values,
             *[str(item or "").strip() for item in raw_aliases],
         ]
     )
