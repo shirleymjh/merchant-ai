@@ -261,27 +261,123 @@ def test_ambiguous_result_keeps_all_model_selected_topics_without_primary() -> N
     assert "销量还是库存" in decision.reason
 
 
-def test_llm_unavailable_opens_full_published_directory_without_keyword_fallback() -> None:
+def test_llm_unavailable_uses_published_semantic_keyword_fallback() -> None:
     assets = FakeTopicAssets()
     router = SemanticTopicRouterService(settings(), assets, llm=UnavailableLlm())
 
-    decision = router.route_with_budget("随便一种用户问法")
+    decision = router.route_with_budget(
+        "最近7天订单量",
+        keywords=ExtractedKeywords(
+            normalized_question="最近7天订单量",
+            topic_scores={"电商交易": 3.0},
+            topic_keywords=["订单"],
+        ),
+    )
 
-    assert decision.routing_mode == "semantic_topic_open_directory"
-    assert decision.candidate_topics == [QuestionCategory(item) for item in assets.all_topic_names()]
-    assert decision.selection_evidence["keywordRoutingUsed"] is False
-    assert "未回退关键词路由" in decision.reason
+    assert decision.routing_mode == "semantic_topic_asset_fallback"
+    assert decision.candidate_topics == [QuestionCategory("电商交易")]
+    assert decision.selection_evidence["keywordRoutingUsed"] is True
+    assert "确定性候选 Topic" in decision.reason
 
 
 def test_provider_timeout_does_not_spend_a_second_llm_call_on_format_repair() -> None:
     llm = ProviderFailureLlm()
     router = SemanticTopicRouterService(settings(), FakeTopicAssets(), llm=llm)
 
-    decision = router.route_with_budget("最近7天订单量")
+    decision = router.route_with_budget(
+        "最近7天订单量",
+        keywords=ExtractedKeywords(
+            normalized_question="最近7天订单量",
+            topic_scores={"电商交易": 3.0},
+        ),
+    )
 
     assert len(llm.calls) == 1
-    assert decision.routing_mode == "semantic_topic_open_directory"
+    assert decision.routing_mode == "semantic_topic_asset_fallback"
+    assert decision.candidate_topics == [QuestionCategory("电商交易")]
     assert "timeout" in decision.selection_evidence["detail"]
+
+
+def test_degraded_router_merges_metric_owner_from_published_topic_cards() -> None:
+    assets = FakeTopicAssets()
+    assets.manifests["电商交易"][0]["navigationHints"] = {
+        "metrics": [
+            {
+                "key": "sku_cnt",
+                "aliases": ["销量", "卖出数量", "卖得最多"],
+            }
+        ],
+        "columns": [
+            {"key": "spu_id", "aliases": ["商品", "商品ID"]}
+        ],
+    }
+    router = SemanticTopicRouterService(
+        settings(),
+        assets,
+        llm=ProviderFailureLlm(),
+    )
+
+    decision = router.route_with_budget(
+        "找到最近10天卖的最好的三个商品",
+        keywords=ExtractedKeywords(
+            normalized_question="找到最近10天卖的最好的三个商品",
+            topic_scores={"商品管理": 4.4},
+            dimension_keywords=["商品"],
+        ),
+    )
+
+    assert decision.routing_mode == "semantic_topic_asset_fallback"
+    assert decision.candidate_topics == [
+        QuestionCategory("商品管理"),
+        QuestionCategory("电商交易"),
+    ]
+    assert decision.selection_evidence["topicCardScores"]["电商交易"] > (
+        decision.selection_evidence["topicCardScores"]["商品管理"]
+    )
+
+
+def test_degraded_router_uses_topic_card_summary_without_keyword_scores() -> None:
+    assets = FakeTopicAssets()
+    assets.manifests["身份信息"] = [
+        {
+            "businessSummary": (
+                "商家主体与经营资质信息，覆盖入驻状态和资质查询。"
+            ),
+            "dataGrain": "商家主体/资质快照粒度",
+        }
+    ]
+    router = SemanticTopicRouterService(
+        settings(),
+        assets,
+        llm=UnavailableLlm(),
+    )
+
+    decision = router.route_with_budget(
+        "商家入驻资质规则是什么？",
+        keywords=ExtractedKeywords(
+            normalized_question="商家入驻资质规则是什么？"
+        ),
+    )
+
+    assert decision.candidate_topics == [QuestionCategory("身份信息")]
+    assert decision.clarification_required is False
+
+
+def test_degraded_router_requests_clarification_instead_of_empty_workspace() -> None:
+    router = SemanticTopicRouterService(
+        settings(),
+        FakeTopicAssets(),
+        llm=UnavailableLlm(),
+    )
+
+    decision = router.route_with_budget(
+        "今天天气怎么样？",
+        keywords=ExtractedKeywords(normalized_question="今天天气怎么样？"),
+    )
+
+    assert decision.candidate_topics == []
+    assert decision.clarification_required is True
+    assert decision.routing_mode == "semantic_topic_open_discovery"
 
 
 def test_kernel_does_not_feed_keyword_topic_scores_into_semantic_router() -> None:

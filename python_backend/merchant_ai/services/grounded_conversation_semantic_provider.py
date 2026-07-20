@@ -52,6 +52,7 @@ class StructuredConversationSemanticProvider:
     _SYSTEM_PROMPT = """You are an isolated semantic reference resolver.
 You receive one current user utterance and a server-retained list of prior result descriptors.
 Decide whether the utterance semantically refers to prior context. If it does, identify exactly one retained artifact or mark the reference ambiguous, classify the referent type and downstream operation, and state whether complete row-population membership is required. Decide whether an explicit scope in the current utterance replaces the retained time scope.
+The downstream operation describes only what the user wants to do with a referenced prior result; it does not describe the standalone operation in the current utterance. When reference_detected is false, return the non-reference defaults: ambiguous=false, selected_artifact_id="", referent_type=NONE, downstream_operation=UNSPECIFIED, population_required=false, complete_membership_required=false, current_turn_replaces_time_scope=false, and reference_phrases=[].
 Use only supplied artifact IDs. Do not infer tables, formulas, SQL, row values, metrics, or business rules. Do not treat a shared time label as proof that two artifacts are the same population. Do not treat preview membership as complete. Return only the strict structured decision schema."""
 
     def __init__(self, model: Any, *, authority_fingerprint: str) -> None:
@@ -106,12 +107,43 @@ Use only supplied artifact IDs. Do not infer tables, formulas, SQL, row values, 
                 ),
             ]
         )
-        decision = self._parse_decision(raw)
+        decision = self._canonicalize_decision(
+            self._parse_decision(raw)
+        )
         return ConversationSemanticProviderOutput(
             request_fingerprint=request.request_fingerprint,
             question_fingerprint=request.question_fingerprint,
             candidate_set_fingerprint=request.candidate_set_fingerprint,
             **decision.model_dump(by_alias=False, mode="python"),
+        )
+
+    @staticmethod
+    def _canonicalize_decision(
+        decision: ConversationSemanticModelDecision,
+    ) -> ConversationSemanticModelDecision:
+        """Remove conditionally irrelevant fields from a non-reference result.
+
+        The model owns the semantic decision whether a cross-turn reference is
+        present. Once it says there is no reference, reference-only fields have
+        no meaning and are deterministically projected to their protocol
+        defaults before crossing the independent review boundary.
+        """
+
+        if decision.reference_detected:
+            return decision
+        return decision.model_copy(
+            update={
+                "ambiguous": False,
+                "selected_artifact_id": "",
+                "referent_type": ConversationReferenceType.NONE,
+                "downstream_operation": (
+                    ConversationDownstreamOperation.UNSPECIFIED
+                ),
+                "population_required": False,
+                "complete_membership_required": False,
+                "current_turn_replaces_time_scope": False,
+                "reference_phrases": (),
+            }
         )
 
     @staticmethod

@@ -4,6 +4,7 @@ import json
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field as dataclass_field
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional, Set
 
 from merchant_ai.models import (
@@ -1947,15 +1948,15 @@ class SemanticTopicRouterService:
         keywords: Optional[ExtractedKeywords] = None,
         **_: Any,
     ) -> TopicRoutingDecision:
-        """Compatibility entry point; ``keywords`` is intentionally ignored."""
+        """Compatibility entry point for semantic routing with safe fallback."""
 
-        del keywords
-        return self.route_with_budget(question)
+        return self.route_with_budget(question, keywords=keywords)
 
     def route_with_budget(
         self,
         question: str,
         *,
+        keywords: Optional[ExtractedKeywords] = None,
         runtime_budget: Any = None,
     ) -> TopicRoutingDecision:
         cards = self.topic_cards()
@@ -1977,10 +1978,11 @@ class SemanticTopicRouterService:
             )
 
         if not self._llm_available():
-            return self._open_directory_decision(
-                topic_names,
+            return self._deterministic_fallback_decision(
+                question,
+                keywords,
                 status="llm_unavailable",
-                reason="Topic LLM 不可用；扩大到全部已发布 Topic，未回退关键词路由",
+                reason="Topic LLM 不可用",
             )
 
         attempts = max(
@@ -2042,14 +2044,214 @@ class SemanticTopicRouterService:
             )
 
         provider_error = str(getattr(self.llm, "last_error", "") or "")
-        return self._open_directory_decision(
-            topic_names,
+        return self._deterministic_fallback_decision(
+            question,
+            keywords,
             status="llm_failed",
             reason=(
-                "Topic LLM 返回无效结果；扩大到全部已发布 Topic，未回退关键词路由"
+                "Topic LLM 返回无效结果"
             ),
             detail=(last_error or provider_error or str(last_payload)[:300]),
         )
+
+    def _deterministic_fallback_decision(
+        self,
+        question: str,
+        keywords: Optional[ExtractedKeywords],
+        *,
+        status: str,
+        reason: str,
+        detail: str = "",
+    ) -> TopicRoutingDecision:
+        """Degrade to published semantic keyword evidence, never all Topics.
+
+        The fallback reuses the asset-generated keyword scores.  It does not
+        contain business-name conditionals and it remains only a seed search
+        scope; the Core still has to read and bind formal semantic assets.
+        """
+
+        fallback = TopicRouterService(self.topic_assets).route(
+            question,
+            keywords or ExtractedKeywords(normalized_question=question),
+        )
+        cards = self.topic_cards()
+        card_scores = self._topic_card_fallback_scores(question, cards)
+        ranked_card_topics = [
+            topic
+            for topic, score in sorted(
+                card_scores.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if score > 0
+        ]
+        if ranked_card_topics:
+            top_score = card_scores[ranked_card_topics[0]]
+            threshold = max(0.9, top_score * 0.6)
+            ranked_card_topics = [
+                topic
+                for topic in ranked_card_topics
+                if card_scores[topic] >= threshold
+            ][:3]
+        card_categories = [
+            resolve_asset_topic_category(self.topic_assets, topic)
+            for topic in ranked_card_topics
+        ]
+        card_categories = [
+            item
+            for item in card_categories
+            if item != QuestionCategory.UNKNOWN
+        ]
+        max_candidates = max(
+            1,
+            min(
+                4,
+                int(
+                    getattr(
+                        self.settings,
+                        "route_topic_max_candidates",
+                        4,
+                    )
+                    or 4
+                ),
+            ),
+        )
+        candidates = dedupe_topics(
+            [*fallback.recall_topics(), *card_categories]
+        )[:max_candidates]
+        evidence = {
+            **dict(fallback.selection_evidence or {}),
+            "router": "semantic_topic_llm",
+            "status": status,
+            "keywordRoutingUsed": True,
+            "fallbackRouter": "published_semantic_keyword_scores",
+            "topicCardScores": {
+                topic: round(score, 4)
+                for topic, score in sorted(
+                    card_scores.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:max_candidates]
+                if score > 0
+            },
+            "modelSelectedTopics": [],
+            "publishedTopicCount": len(self.topic_cards()),
+            "detail": str(detail or "")[:300],
+        }
+        return TopicRoutingDecision(
+            primary_topic=QuestionCategory.UNKNOWN,
+            candidate_topics=candidates,
+            dimension_topics=[],
+            confidence=float(fallback.confidence or 0.0),
+            clarification_required=not candidates,
+            routing_mode=(
+                "semantic_topic_asset_fallback"
+                if candidates
+                else "semantic_topic_open_discovery"
+            ),
+            workspace_topics=candidates,
+            selection_mode="semantic_llm_degraded_asset_fallback",
+            selection_evidence=evidence,
+            reason=(
+                "%s；已使用发布语义资产生成的确定性候选 Topic：%s"
+                % (reason, "、".join(str(item.value) for item in candidates))
+                if candidates
+                else "%s；没有足够的已发布语义信号，保留开放发现但不预加载全部 Topic"
+                % reason
+            ),
+        )
+
+    @staticmethod
+    def _topic_card_fallback_scores(
+        question: str,
+        cards: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        """Rank published L0 Topic cards without business-name conditionals."""
+
+        query = normalize_keyword_text(question or "")
+        if not query:
+            return {}
+        query_ngrams = {
+            query[index : index + width]
+            for width in (2, 3)
+            for index in range(max(0, len(query) - width + 1))
+            if not query[index : index + width].isdigit()
+        }
+
+        def normalized_values(values: Any) -> List[str]:
+            return list(
+                dict.fromkeys(
+                    normalize_keyword_text(value)
+                    for value in (values or [])
+                    if normalize_keyword_text(value)
+                )
+            )
+
+        def approximate_ratio(label: str) -> float:
+            if len(label) < 3 or len(query) < 2:
+                return 0.0
+            minimum = max(2, len(label) - 2)
+            maximum = min(len(query), len(label) + 2)
+            best = 0.0
+            for width in range(minimum, maximum + 1):
+                for index in range(len(query) - width + 1):
+                    best = max(
+                        best,
+                        SequenceMatcher(
+                            None,
+                            label,
+                            query[index : index + width],
+                        ).ratio(),
+                    )
+            return best
+
+        scores: Dict[str, float] = {}
+        for card in cards:
+            topic = str(card.get("topic") or "").strip()
+            if not topic:
+                continue
+            score = 0.0
+            for values, weight in (
+                (
+                    [
+                        card.get("topic"),
+                        card.get("displayName"),
+                        *(card.get("aliases") or []),
+                    ],
+                    5.0,
+                ),
+                (card.get("metricAliases") or [], 4.5),
+                (card.get("ruleAliases") or [], 3.5),
+                (card.get("columnAliases") or [], 2.0),
+            ):
+                for label in normalized_values(values):
+                    if label in query:
+                        score += weight + min(len(label), 8) * 0.15
+                        continue
+                    similarity = approximate_ratio(label)
+                    if similarity >= 0.62:
+                        score += weight * similarity * 0.7
+            searchable = normalize_keyword_text(
+                " ".join(
+                    [
+                        *(card.get("capabilitySummaries") or []),
+                        *(card.get("dataGrains") or []),
+                    ]
+                )
+            )
+            if searchable and query_ngrams:
+                card_ngrams = {
+                    searchable[index : index + width]
+                    for width in (2, 3)
+                    for index in range(
+                        max(0, len(searchable) - width + 1)
+                    )
+                }
+                score += min(
+                    4.0,
+                    len(query_ngrams.intersection(card_ngrams)) * 0.35,
+                )
+            if score > 0:
+                scores[topic] = score
+        return scores
 
     def topic_cards(self) -> List[Dict[str, Any]]:
         """Build compact, question-independent Topic cards from published L0 assets."""
@@ -2066,6 +2268,9 @@ class SemanticTopicRouterService:
                 manifest = []
             summaries: List[str] = []
             grains: List[str] = []
+            metric_aliases: List[str] = []
+            column_aliases: List[str] = []
+            rule_aliases: List[str] = []
             for item in manifest:
                 if not isinstance(item, dict):
                     continue
@@ -2075,6 +2280,26 @@ class SemanticTopicRouterService:
                     summaries.append(summary)
                 if grain and grain not in grains:
                     grains.append(grain)
+                navigation = (
+                    item.get("navigationHints")
+                    if isinstance(item.get("navigationHints"), dict)
+                    else {}
+                )
+                for key, target in (
+                    ("metrics", metric_aliases),
+                    ("columns", column_aliases),
+                    ("rules", rule_aliases),
+                ):
+                    for entry in navigation.get(key) or []:
+                        if not isinstance(entry, dict):
+                            continue
+                        for alias in [
+                            entry.get("key"),
+                            *(entry.get("aliases") or []),
+                        ]:
+                            normalized = str(alias or "").strip()
+                            if normalized and normalized not in target:
+                                target.append(normalized)
             cards.append(
                 {
                     "topic": str(topic),
@@ -2082,6 +2307,9 @@ class SemanticTopicRouterService:
                     "aliases": [str(item) for item in contract.get("aliases") or []][:8],
                     "capabilitySummaries": summaries[:6],
                     "dataGrains": grains[:6],
+                    "metricAliases": metric_aliases[:80],
+                    "columnAliases": column_aliases[:80],
+                    "ruleAliases": rule_aliases[:40],
                 }
             )
         return cards

@@ -924,6 +924,7 @@ class GroundedRuntimeKernel:
         if callable(semantic_route):
             routing = semantic_route(
                 session.question,
+                keywords=keywords,
                 runtime_budget=runtime_budget,
             )
         else:

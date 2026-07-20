@@ -955,7 +955,13 @@ class PersistedConversationPublishedCandidateReader:
             sql_fingerprint=sql_fingerprint,
             query_shape=_text(contract.query_shape) or "UNSPECIFIED",
             coverage_status=publication.result_coverage,
-            label="%s:%s" % (_text(contract.query_shape), artifact_id),
+            # The governed query question gives the semantic reviewer the
+            # previous-turn language context while the artifact id and
+            # fingerprints remain the only executable authority.
+            label=(
+                _text(contract.question)
+                or "%s:%s" % (_text(contract.query_shape), artifact_id)
+            ),
             topic_ids=topics,
             table_ids=tables,
             entity_identities=entity_identities,

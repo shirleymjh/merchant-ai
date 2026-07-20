@@ -3559,9 +3559,38 @@ def _phase_visible_tools(
         "glob",
         "write_todos",
     }
+    finalization_ready = False
+    if (
+        session.question_goal_contract is not None
+        and _authorized_verified_query_artifacts(session)
+    ):
+        try:
+            coverage = GoalCoverageVerifier().verify(
+                session.question_goal_contract,
+                GroundedDeepAgentRuntime._goal_coverage_declarations(
+                    session
+                ),
+            )
+            session.goal_coverage_result = coverage.model_dump(
+                by_alias=True
+            )
+            finalization_ready = bool(coverage.finalization_allowed)
+        except (RuntimeError, TypeError, ValueError):
+            finalization_ready = False
     allowed: set[str]
     if session.operational_failure:
         allowed = {"ask_human"}
+    elif session.runtime.clarification is not None:
+        # A typed clarification is a terminal result for this turn.  Keep the
+        # model from issuing more tools if the agent framework performs an
+        # unnecessary tail call after ask_human.
+        allowed = set()
+    elif finalization_ready:
+        # Once every required Goal has a typed verified resolution, further
+        # discovery, replanning and clarification can only make a complete
+        # query drift or loop.  Final answer composition performs the same
+        # deterministic coverage check again at the execution boundary.
+        allowed = {"compose_verified_answer"}
     elif session.skill_execution_in_progress:
         allowed = {"ask_human"}
     elif session.runtime.verified_rule_ledger and _required_goals_are_rule_only(session):
@@ -3618,6 +3647,11 @@ def _phase_visible_tools(
                 {
                     "publish_verified_entity_set",
                     "finalize_evidence_collection",
+                    # Normal verified queries must be able to finish without
+                    # first opening the optional post-query Analysis Skill
+                    # lifecycle.  Goal coverage remains deterministically
+                    # checked inside the answer tool.
+                    "compose_verified_answer",
                 }
             )
             if session.query_branch_contexts:
@@ -3635,7 +3669,7 @@ def _phase_visible_tools(
                 session.analysis_skill_headers_disclosed
                 and session.skill_input_snapshot_generation > 0
             ):
-                allowed.update({"run_skill", "compose_verified_answer"})
+                allowed.add("run_skill")
     blocked = (all_names - allowed) | always_hidden
     visible = [item for item in tools if _tool_name(item) not in blocked]
     removed = sorted({_tool_name(item) for item in tools if _tool_name(item) in blocked})
@@ -5261,20 +5295,68 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                 existing_fingerprint = ""
                 if existing is not None:
                     existing_fingerprint = original_question_goal_contract_fingerprint(existing)
-                    if existing_fingerprint != fingerprint and (
-                        deep_session.runtime.attempts
-                        or _authorized_verified_query_artifacts(
-                            deep_session
+                    if existing_fingerprint == fingerprint:
+                        existing_rule_goal_ids = [
+                            goal.goal_id
+                            for goal in existing.goals
+                            if str(goal.kind or "").upper() == "RULE"
+                        ]
+                        existing_rule_candidates = (
+                            verified_rule_candidate_refs(
+                                core_semantic_evidence=(
+                                    deep_session.core_semantic_evidence
+                                ),
+                                recall_items=(
+                                    deep_session.runtime.recall.items
+                                ),
+                            )
+                            if existing_rule_goal_ids
+                            else []
                         )
-                        or deep_session.parallel_branches
-                        or deep_session.query_branch_contexts
-                        or deep_session.execution_graph_generation > 0
-                    ):
+                        return json.dumps(
+                            {
+                                "status": "ALREADY_DECLARED",
+                                "contractId": existing.contract_id,
+                                "contractFingerprint": existing_fingerprint,
+                                "requiredGoalIds": required_goal_ids(existing),
+                                "goals": [
+                                    {
+                                        "goalId": goal.goal_id,
+                                        "kind": goal.kind,
+                                        "label": goal.label,
+                                        "required": goal.required,
+                                        "dependsOnGoalIds": list(
+                                            goal.depends_on_goal_ids
+                                        ),
+                                    }
+                                    for goal in existing.goals
+                                ],
+                                "availableRuleEvidenceRefs": (
+                                    existing_rule_candidates
+                                ),
+                                "nextAction": (
+                                    "PUBLISH_VERIFIED_RULE_EVIDENCE"
+                                    if existing_rule_goal_ids
+                                    and existing_rule_candidates
+                                    else "READ_EXACT_RULE_EVIDENCE"
+                                    if existing_rule_goal_ids
+                                    else "DISCOVER_SEMANTIC_EVIDENCE"
+                                ),
+                                "idempotentReplay": True,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    # The original-question Goal ledger is a once-only
+                    # transaction.  Parallel tool calls from one model turn
+                    # must not race to replace an already accepted ledger.
+                    if existing_fingerprint != fingerprint:
                         return json.dumps(
                             {
                                 "status": "REJECTED",
-                                "code": "GOAL_CONTRACT_IMMUTABLE_AFTER_QUERY_START",
+                                "code": "GOAL_CONTRACT_ALREADY_COMMITTED",
                                 "contractFingerprint": existing_fingerprint,
+                                "nextAction": "USE_EXISTING_GOAL_CONTRACT",
                             },
                             ensure_ascii=False,
                         )
@@ -10428,13 +10510,17 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     ensure_ascii=False,
                 )
 
-            request = runtime_owner.kernel.request_clarification(
-                runtime.context.session.runtime,
-                question,
-                stage=stage,
-                clarification_type=clarification_type,
-                options=options,
-            )
+            deep_session = runtime.context.session
+            with deep_session.lock:
+                request = deep_session.runtime.clarification
+                if request is None:
+                    request = runtime_owner.kernel.request_clarification(
+                        deep_session.runtime,
+                        question,
+                        stage=stage,
+                        clarification_type=clarification_type,
+                        options=options,
+                    )
             return json.dumps(
                 {"status": "CLARIFICATION_REQUIRED", "clarification": request.model_dump(by_alias=True)},
                 ensure_ascii=False,
@@ -14180,22 +14266,38 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     )
                 else:
                     self.kernel.route_topic(kernel_session)
-            try:
-                with budget.stage("recall.initial"):
-                    self.kernel.recall_navigation(kernel_session)
-            except GroundedRuntimeBudgetExceeded:
-                raise
-            except Exception as exc:
-                kernel_session.recall = RecallBundle()
-                kernel_session.phase = "RECALL_NAVIGATION_DEGRADED"
-                kernel_session.events.append(
-                    GroundedRuntimeEvent(
-                        sequence=len(kernel_session.events) + 1,
-                        stage="recall_navigation",
-                        status="DEGRADED",
-                        detail="%s:%s" % (type(exc).__name__, str(exc)[:500]),
-                    )
+            if (
+                kernel_session.routing.clarification_required
+                or not kernel_session.workspace_topics
+            ):
+                self.kernel.request_clarification(
+                    kernel_session,
+                    (
+                        "当前问题暂时无法收敛到可靠的业务范围。"
+                        "请补充要分析的业务对象或指标。"
+                    ),
+                    stage="topic_routing",
+                    clarification_type="TOPIC_SCOPE_REQUIRED",
+                    options=[],
                 )
+            else:
+                try:
+                    with budget.stage("recall.initial"):
+                        self.kernel.recall_navigation(kernel_session)
+                except GroundedRuntimeBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    kernel_session.recall = RecallBundle()
+                    kernel_session.phase = "RECALL_NAVIGATION_DEGRADED"
+                    kernel_session.events.append(
+                        GroundedRuntimeEvent(
+                            sequence=len(kernel_session.events) + 1,
+                            stage="recall_navigation",
+                            status="DEGRADED",
+                            detail="%s:%s"
+                            % (type(exc).__name__, str(exc)[:500]),
+                        )
+                    )
             session = GroundedDeepAgentSession(
                 runtime=kernel_session,
                 context_workspace=context_workspace,
@@ -14231,6 +14333,28 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     else {}
                 ),
             )
+            if kernel_session.clarification is not None:
+                session.runtime_budget_report = budget.finish()
+                response = self._governed_response(
+                    session,
+                    actual_thread_id,
+                    actual_run_id,
+                )
+                return self._finalize_conversation_response(
+                    response,
+                    session=session,
+                    resolution=conversation_resolution,
+                    thread_id=actual_thread_id,
+                    run_id=actual_run_id,
+                    merchant_id=merchant_id,
+                    user_scope=user_scope,
+                    previous_snapshot=(
+                        previous_conversation_snapshot or {}
+                    ),
+                    expected_revision=(
+                        expected_conversation_revision
+                    ),
+                )
             if self.population_gate_enforced:
                 if self.population_execution_gate is None or context_workspace is None:
                     raise RuntimeError("POPULATION_ONLINE_GATE_AUTHORITY_REQUIRED")

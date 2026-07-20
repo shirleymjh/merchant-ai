@@ -120,6 +120,48 @@ def test_provider_accepts_mapping_decision_but_not_free_text() -> None:
         )
 
 
+def test_provider_canonicalizes_reference_only_fields_for_standalone_turn() -> None:
+    request = build_conversation_semantic_resolver_request(
+        "最近7天订单量是多少？",
+        (),
+    )
+    model = _StructuredModel(
+        ConversationSemanticModelDecision(
+            complete=True,
+            reference_detected=False,
+            ambiguous=True,
+            selected_artifact_id="hallucinated-artifact",
+            referent_type=ConversationReferenceType.METRIC_VALUE,
+            downstream_operation=ConversationDownstreamOperation.AGGREGATE,
+            population_required=True,
+            complete_membership_required=True,
+            current_turn_replaces_time_scope=True,
+            reference_phrases=("订单量",),
+        )
+    )
+    provider = StructuredConversationSemanticProvider(
+        model,
+        authority_fingerprint="reviewer-authority",
+    )
+
+    output = provider.resolve_conversation_reference(
+        request,
+        timeout_seconds=1.0,
+    )
+
+    assert output.reference_detected is False
+    assert output.ambiguous is False
+    assert output.selected_artifact_id == ""
+    assert output.referent_type == ConversationReferenceType.NONE
+    assert output.downstream_operation == (
+        ConversationDownstreamOperation.UNSPECIFIED
+    )
+    assert output.population_required is False
+    assert output.complete_membership_required is False
+    assert output.current_turn_replaces_time_scope is False
+    assert output.reference_phrases == ()
+
+
 def test_provider_requires_model_authority_and_positive_budget() -> None:
     with pytest.raises(ValueError):
         StructuredConversationSemanticProvider(

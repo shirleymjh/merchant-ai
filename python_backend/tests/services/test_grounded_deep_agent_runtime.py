@@ -651,6 +651,8 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "timeExpression" in contract_schema
     compose_tool = next(item for item in factory.kwargs["tools"] if item.name == "compose_verified_answer")
     assert compose_tool.return_direct is True
+    ask_human_tool = next(item for item in factory.kwargs["tools"] if item.name == "ask_human")
+    assert ask_human_tool.return_direct is False
     assert factory.kwargs["backend"] is not None
     assert [item.name for item in factory.kwargs["middleware"]] == [
         "GroundedTrustedSessionContextMiddleware",
@@ -689,6 +691,69 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     ):
         assert deterministic_mode in factory.kwargs["system_prompt"]
     assert "never plan goals or impose an execution order" in factory.kwargs["system_prompt"]
+
+
+def test_verified_query_can_compose_without_analysis_skill_snapshot() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    kernel_session = GroundedRuntimeSession(
+        session_id="verified-compose-visibility",
+        question="最近7天订单总数是多少？",
+        merchant_id="merchant-1",
+    )
+    contract = GroundedQueryContract(
+        question=kernel_session.question,
+        status="READY",
+        query_shape="SCALAR",
+    )
+    kernel_session.verified_query_ledger = [
+        GroundedVerifiedQueryArtifact(
+            artifact_id="artifact.orders",
+            generation=1,
+            contract_fingerprint="contract.orders",
+            sql_fingerprint="sql.orders",
+            contract=contract,
+            plan=QueryPlan(),
+            run_result=AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    rows=[{"order_count": 12}],
+                    result_coverage="ALL_ROWS",
+                    original_row_count=1,
+                )
+            ),
+            verified_evidence=VerifiedEvidence(passed=True),
+            output_columns=["order_count"],
+        )
+    ]
+    session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=kernel_session.question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.orders",
+                    label="订单总数",
+                )
+            ],
+        ),
+        artifact_goal_ids={"artifact.orders": ["metric.orders"]},
+    )
+
+    visible, _ = _phase_visible_tools(session, outer.tools)
+    visible_names = {item.name for item in visible}
+
+    assert visible_names == {"compose_verified_answer"}
+
+    session.runtime.clarification = ClarificationRequest(
+        question="请选择统计口径",
+        stage="metric_scope",
+        type="METRIC_SCOPE_REQUIRED",
+    )
+    visible_after_clarification, _ = _phase_visible_tools(
+        session,
+        outer.tools,
+    )
+    assert visible_after_clarification == []
 
 
 def test_discovery_read_control_never_uses_fixed_leaf_counts_to_freeze() -> None:
@@ -871,6 +936,42 @@ def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
     assert factory.graph.invocations == []
     assert response.clarification is not None
     assert response.clarification.type == ("CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE")
+
+
+def test_unresolved_topic_scope_returns_clarification_before_recall() -> None:
+    class NoTopicKernel(FakeKernel):
+        def route_topic(
+            self,
+            session: GroundedRuntimeSession,
+        ) -> TopicRoutingDecision:
+            self.route_calls += 1
+            session.routing = TopicRoutingDecision(
+                clarification_required=True,
+                routing_mode="semantic_topic_open_discovery",
+                reason="no bounded published Topic candidate",
+            )
+            session.workspace_topics = []
+            return session.routing
+
+        def recall_navigation(
+            self,
+            session: GroundedRuntimeSession,
+            *,
+            query: str = "",
+            **kwargs: Any,
+        ) -> RecallBundle:
+            raise AssertionError("recall must not run without a Topic scope")
+
+    factory = CapturingFactory(action="none")
+    kernel = NoTopicKernel()
+    outer = runtime(factory, kernel)
+
+    response = outer.run("今天天气怎么样？", "m-1")
+
+    assert kernel.route_calls == 1
+    assert factory.graph.invocations == []
+    assert response.clarification is not None
+    assert response.clarification.type == "TOPIC_SCOPE_REQUIRED"
 
 
 def test_provider_timeout_is_returned_as_controlled_operational_failure() -> None:

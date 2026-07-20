@@ -418,7 +418,7 @@ def test_proposal_is_blocked_when_assigned_goal_semantics_are_not_in_contract() 
     assert context.session.active_goal_ids == []
 
 
-def test_goal_contract_cannot_change_after_query_start() -> None:
+def test_goal_contract_is_once_only_and_idempotent() -> None:
     kernel = GoalGateKernel()
     runtime = _runtime(kernel)
     context = _context(kernel, question="return revenue")
@@ -439,16 +439,15 @@ def test_goal_contract_cannot_change_after_query_start() -> None:
         )
     )
     assert first["status"] == "ACCEPTED"
-    context.session.runtime.attempts.append(
-        GroundedRuntimeAttempt(
-            attempt_id="query-started",
-            contract=GroundedQueryContract(
-                question=context.session.runtime.question,
-                status="READY",
-                query_shape="SCALAR",
-            ),
+
+    replayed = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=initial,
+            runtime=SimpleNamespace(context=context),
         )
     )
+    assert replayed["status"] == "ALREADY_DECLARED"
+    assert replayed["contractFingerprint"] == first["contractFingerprint"]
 
     redeclared = json.loads(
         tools["declare_original_question_goals"].func(
@@ -467,7 +466,7 @@ def test_goal_contract_cannot_change_after_query_start() -> None:
     )
 
     assert redeclared["status"] == "REJECTED"
-    assert redeclared["code"] == "GOAL_CONTRACT_IMMUTABLE_AFTER_QUERY_START"
+    assert redeclared["code"] == "GOAL_CONTRACT_ALREADY_COMMITTED"
     assert len(redeclared["contractFingerprint"]) == 64
     assert list(context.session.question_goal_contract.goal_map()) == [
         "metric.revenue"

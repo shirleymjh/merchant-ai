@@ -369,6 +369,7 @@ def test_facade_reopens_published_artifact_before_binding_population(
         by_alias=True,
         mode="json",
     )
+    assert candidate_payload["label"] == "最近7天订单明细"
     assert "order-1" not in json.dumps(
         candidate_payload,
         ensure_ascii=False,
