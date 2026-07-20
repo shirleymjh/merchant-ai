@@ -43,7 +43,25 @@
     "businessLayer": "ADS",
     "queryableByAgent": true,
     "authorityLevel": 95,
-    "topicRole": "PROFILE"
+    "topicRole": "PROFILE",
+    "defaultForIntents": [
+      "METRIC",
+      "GROUP_AGG"
+    ],
+    "supportedIntents": [
+      "METRIC",
+      "GROUP_AGG"
+    ],
+    "recommendedFor": [
+      "商家级周期汇总",
+      "按日趋势",
+      "商家级多指标对比"
+    ],
+    "notRecommendedFor": [
+      "订单、商品、退款单或工单实体明细",
+      "商品或订单等细粒度排行",
+      "实体下钻"
+    ]
   },
   "sampleEvidenceGovernance": {
     "status": "STALE",

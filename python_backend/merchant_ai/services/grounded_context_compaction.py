@@ -412,6 +412,254 @@ def _query_artifact_receipts(session: Any) -> list[dict[str, Any]]:
     )
 
 
+def _dedupe_strings(values: Any) -> list[str]:
+    normalized_values = (
+        [values]
+        if isinstance(values, (str, bytes))
+        else list(values or [])
+    )
+    return list(
+        dict.fromkeys(
+            str(item or "").strip()
+            for item in normalized_values
+            if str(item or "").strip()
+        )
+    )
+
+
+def _read_next_items(
+    gaps: list[dict[str, Any]],
+    *,
+    semantic_receipts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    paths_by_ref = {
+        str(item.get("refId") or ""): str(item.get("path") or "")
+        for item in semantic_receipts
+        if str(item.get("refId") or "")
+    }
+    candidates: list[dict[str, Any]] = []
+
+    def items(value: Any) -> list[Any]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return [value]
+
+    def append_candidate(
+        value: Any,
+        *,
+        gap_code: str,
+    ) -> None:
+        if isinstance(value, dict):
+            ref_id = str(
+                value.get("refId")
+                or value.get("semanticRefId")
+                or value.get("ref_id")
+                or ""
+            ).strip()
+            path = str(
+                value.get("path")
+                or value.get("semanticPath")
+                or value.get("filePath")
+                or ""
+            ).strip()
+            if ref_id or path:
+                candidates.append(
+                    {
+                        "refId": ref_id,
+                        "path": path or paths_by_ref.get(ref_id, ""),
+                        "sourceGapCode": gap_code,
+                    }
+                )
+            return
+        normalized = str(value or "").strip()
+        if not normalized:
+            return
+        is_path = "/" in normalized and not normalized.startswith("semantic:")
+        candidates.append(
+            {
+                "refId": "" if is_path else normalized,
+                "path": normalized if is_path else paths_by_ref.get(normalized, ""),
+                "sourceGapCode": gap_code,
+            }
+        )
+
+    for gap in gaps:
+        code = str(gap.get("code") or "")
+        capability = dict(gap.get("requiredCapability") or {})
+        for key in (
+            "readNext",
+            "read_next",
+            "candidateReads",
+            "candidate_reads",
+        ):
+            raw = capability.get(key)
+            if isinstance(raw, (list, tuple)):
+                for item in raw:
+                    append_candidate(item, gap_code=code)
+            elif raw:
+                append_candidate(raw, gap_code=code)
+        for key in (
+            "candidateRefIds",
+            "candidateTimeFieldRefs",
+            "requiredRefIds",
+            "requiredFieldRefs",
+            "requiredMetricRefs",
+            "semanticRefIds",
+            "readRefIds",
+        ):
+            for item in items(capability.get(key)):
+                append_candidate(item, gap_code=code)
+        for key in (
+            "candidatePaths",
+            "requiredPaths",
+            "readPaths",
+        ):
+            for item in items(capability.get(key)):
+                append_candidate(item, gap_code=code)
+        for ref_id in list(gap.get("rejectedRefIds") or []):
+            append_candidate(ref_id, gap_code=code)
+
+    deduped: list[dict[str, Any]] = []
+    index_by_identity: dict[tuple[str, str], int] = {}
+    for item in candidates:
+        ref_id = str(item.get("refId") or "")
+        path = str(item.get("path") or "")
+        if not ref_id and not path:
+            continue
+        identity = ("ref", ref_id) if ref_id else ("path", path)
+        existing_index = index_by_identity.get(identity)
+        if existing_index is not None:
+            if (
+                path
+                and not str(
+                    deduped[existing_index].get("path") or ""
+                )
+            ):
+                deduped[existing_index] = item
+            continue
+        index_by_identity[identity] = len(deduped)
+        deduped.append(item)
+    return deduped
+
+
+def _latest_unresolved_contract_attempt(
+    session: Any,
+    *,
+    semantic_receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    runtime = getattr(session, "runtime", None)
+    attempts = list(getattr(runtime, "attempts", None) or [])
+    for attempt in reversed(attempts):
+        contract = getattr(attempt, "contract", None)
+        if contract is None:
+            continue
+        gaps = [
+            dict(item)
+            for item in (
+                _model_payload(gap)
+                for gap in list(
+                    getattr(contract, "unresolved_gaps", None) or []
+                )
+            )
+            if isinstance(item, dict)
+        ]
+        blocking_gaps = [
+            item for item in gaps if bool(item.get("blocking", True))
+        ]
+        status = str(
+            getattr(contract, "status", "")
+            or getattr(attempt, "status", "")
+            or ""
+        )
+        if not blocking_gaps and status == "READY":
+            continue
+        rejected_bindings = [
+            dict(item)
+            for item in (
+                _model_payload(binding)
+                for binding in list(
+                    getattr(contract, "rejected_bindings", None) or []
+                )
+            )
+            if isinstance(item, dict)
+        ]
+        rejected_ref_ids = _dedupe_strings(
+            [
+                ref_id
+                for gap in gaps
+                for ref_id in list(gap.get("rejectedRefIds") or [])
+            ]
+            + [
+                ref_id
+                for binding in rejected_bindings
+                for ref_id in list(binding.get("refIds") or [])
+            ]
+        )
+        read_next = _read_next_items(
+            gaps,
+            semantic_receipts=semantic_receipts,
+        )
+        repair_options = [
+            {
+                "gapCode": str(gap.get("code") or ""),
+                "resolution": str(gap.get("resolution") or ""),
+                "searchScope": str(gap.get("searchScope") or ""),
+                "requiredCapability": dict(
+                    gap.get("requiredCapability") or {}
+                ),
+                "rejectedRefIds": list(
+                    gap.get("rejectedRefIds") or []
+                ),
+            }
+            for gap in blocking_gaps
+        ]
+        contract_payload = _model_payload(contract)
+        return {
+            "attemptId": str(getattr(attempt, "attempt_id", "") or ""),
+            "status": status,
+            "nextAction": str(
+                getattr(attempt, "next_action", "") or ""
+            ),
+            "contractFingerprint": (
+                _fingerprint(contract_payload) if contract_payload else ""
+            ),
+            "acceptedBindingHints": _model_payload(
+                getattr(contract, "binding_hints", None)
+            )
+            or {},
+            "gaps": gaps,
+            "rejectedBindings": rejected_bindings,
+            "rejectedRefIds": rejected_ref_ids,
+            "readNext": read_next,
+            "repairOptions": repair_options,
+        }
+    return {}
+
+
+def _latest_graph_rejection(session: Any) -> dict[str, Any]:
+    direct = getattr(session, "latest_graph_rejection", None)
+    payload = _model_payload(direct)
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    for item in reversed(
+        list(getattr(session, "execution_graph_history", None) or [])
+    ):
+        if not isinstance(item, dict):
+            continue
+        nested = item.get("latestGraphRejection") or item.get(
+            "graphRejection"
+        )
+        if isinstance(nested, dict) and nested:
+            return dict(nested)
+        status = str(item.get("status") or "").upper()
+        code = str(item.get("code") or "").upper()
+        if "REJECT" in status or "REJECT" in code:
+            return dict(item)
+    return {}
+
+
 def build_grounded_recovery_payload(
     session: Any,
     *,
@@ -437,9 +685,43 @@ def build_grounded_recovery_payload(
             ).items()
         )
     ]
-    population_graph_receipt = _model_payload(getattr(session, "population_graph_receipt", None))
+    population_receipt = _model_payload(
+        getattr(session, "population_graph_receipt", None)
+    )
+    population_attestation = (
+        {
+            "authority": "ATTACHED_TO_EXECUTION_GRAPH",
+            "derivedFromExecutionGraph": True,
+            "executionGraphId": str(
+                population_receipt.get("graphId") or ""
+            ),
+            "executionGraphVersion": int(
+                population_receipt.get("graphVersion") or 0
+            ),
+            "executionGraphFingerprint": str(
+                population_receipt.get("graphFingerprint") or ""
+            ),
+            "attestationReceiptFingerprint": str(
+                population_receipt.get("receiptFingerprint") or ""
+            ),
+            "attestedNodeCount": len(
+                population_receipt.get("nodes") or []
+            ),
+            "attestedEdgeCount": len(
+                population_receipt.get("edges") or []
+            ),
+        }
+        if population_receipt
+        else {}
+    )
     active_contract = _model_payload(getattr(runtime, "active_contract", None))
     semantic_activation = _model_payload(getattr(runtime, "semantic_activation_seal", None))
+    semantic_receipts = _semantic_receipts(session)
+    latest_unresolved_attempt = _latest_unresolved_contract_attempt(
+        session,
+        semantic_receipts=semantic_receipts,
+    )
+    latest_graph_rejection = _latest_graph_rejection(session)
     branches: list[Any] = []
     for branch_id, context in sorted(dict(getattr(session, "query_branch_contexts", None) or {}).items()):
         spec = getattr(context, "spec", None)
@@ -490,7 +772,7 @@ def build_grounded_recovery_payload(
             "fingerprint": _fingerprint(goal_contract) if goal_contract else "",
             "contract": goal_contract,
         },
-        "semanticReceipts": _semantic_receipts(session),
+        "semanticReceipts": semantic_receipts,
         "semanticActivation": {
             "seal": semantic_activation,
             "executionStarted": bool(
@@ -545,12 +827,14 @@ def build_grounded_recovery_payload(
                 )
                 if isinstance(item, dict)
             ],
-            "populationReceipt": population_graph_receipt,
+            "populationAttestation": population_attestation,
         },
         "activeContract": {
             "fingerprint": _fingerprint(active_contract) if active_contract else "",
             "contract": active_contract,
         },
+        "latestUnresolvedContractAttempt": latest_unresolved_attempt,
+        "latestGraphRejection": latest_graph_rejection,
         "queryArtifactReceipts": _query_artifact_receipts(session),
     }
     payload["recoveryFingerprint"] = _fingerprint(payload)
@@ -630,6 +914,12 @@ def build_grounded_model_recovery_message(
             "semanticReceipts": semantic_receipts,
             "executionGraph": dict(payload.get("executionGraph") or {}),
             "activeContract": dict(payload.get("activeContract") or {}),
+            "latestUnresolvedContractAttempt": dict(
+                payload.get("latestUnresolvedContractAttempt") or {}
+            ),
+            "latestGraphRejection": dict(
+                payload.get("latestGraphRejection") or {}
+            ),
             "queryArtifactReceipts": query_receipts,
         },
         "instruction": (
@@ -669,8 +959,16 @@ def compact_summary_to_reference_only(
                 "revisionCount": execution_graph.get("revisionCount"),
                 "maximumRevisionCount": execution_graph.get("maximumRevisionCount"),
                 "replanEvidence": list(execution_graph.get("replanEvidence") or []),
-                "populationReceipt": execution_graph.get("populationReceipt"),
+                "populationAttestation": execution_graph.get(
+                    "populationAttestation"
+                ),
             },
+            "latestUnresolvedContractAttempt": dict(
+                payload.get("latestUnresolvedContractAttempt") or {}
+            ),
+            "latestGraphRejection": dict(
+                payload.get("latestGraphRejection") or {}
+            ),
             "queryArtifactIds": [
                 str(item.get("queryArtifactId") or "")
                 for item in list(payload.get("queryArtifactReceipts") or [])

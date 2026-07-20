@@ -1627,11 +1627,32 @@ class PopulationOnlineGateFacade:
                 "GOAL_CONTRACT_INVALID",
                 "The Goal Contract is invalid: %s" % str(exc)[:300],
             )
-        review = self.semantic_reviewer.review(
-            effective_question=exact_question,
-            contract=parsed,
-            declaration_author_fingerprint=(self.declaration_author_fingerprint),
+        declares_population_dependency = any(
+            str(goal.kind or "").upper() == "DEPENDENCY"
+            or bool(goal.population_goal_ids)
+            or str(
+                getattr(
+                    goal.population_scope,
+                    "value",
+                    goal.population_scope,
+                )
+                or ""
+            ).upper()
+            not in {"", "ALL_MATCHING_ROWS"}
+            for goal in parsed.goals
         )
+        if declares_population_dependency:
+            review = self.semantic_reviewer.review(
+                effective_question=exact_question,
+                contract=parsed,
+                declaration_author_fingerprint=(self.declaration_author_fingerprint),
+            )
+        else:
+            review = self.semantic_reviewer.attest_declared_independent(
+                effective_question=exact_question,
+                contract=parsed,
+                declaration_author_fingerprint=(self.declaration_author_fingerprint),
+            )
         if not review.passed or review.review is None:
             return PopulationOnlineGateCallResult(
                 stage=PopulationVerificationStage.GOAL_DECLARATION,

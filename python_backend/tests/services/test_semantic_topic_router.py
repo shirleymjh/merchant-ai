@@ -5,14 +5,21 @@ from types import SimpleNamespace
 from typing import Any
 
 from merchant_ai.config import get_settings
-from merchant_ai.models import ExtractedKeywords, QuestionCategory
+from merchant_ai.models import (
+    ExtractedKeywords,
+    QuestionCategory,
+)
 from merchant_ai.services.assets import TopicAssetService
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
     GroundedRuntimeBudgetLimits,
 )
 from merchant_ai.services.grounded_runtime_kernel import GroundedRuntimeKernel
-from merchant_ai.services.routing import SemanticTopicRouterService
+from merchant_ai.services.routing import (
+    KeywordExtractService,
+    RouteSlotExtractor,
+    SemanticTopicRouterService,
+)
 
 
 class FakeTopicAssets:
@@ -219,6 +226,47 @@ def test_profile_topic_card_exposes_representative_summary_metrics() -> None:
     )
 
 
+def test_profile_manifest_does_not_advertise_entity_detail_or_topn() -> None:
+    assets = TopicAssetService(get_settings())
+    manifest = assets.load_manifest("经营画像")[0]
+    asset = assets.load_table_asset("经营画像", "ads_merchant_profile")
+
+    assert manifest["supportsDetail"] is False
+    assert "DETAIL" not in manifest["preferredFor"]
+    assert "TOPN" not in manifest["preferredFor"]
+    usage = asset["tableUsageProfile"]
+    assert usage["defaultForIntents"] == ["METRIC", "GROUP_AGG"]
+    assert "实体明细" in " ".join(usage["notRecommendedFor"])
+
+
+def test_formal_natural_metric_aliases_are_loaded_into_keyword_lexicon() -> None:
+    assets = TopicAssetService(get_settings())
+    extracted = KeywordExtractService(assets).extract(
+        "最近7天退款单量是多少？"
+    )
+
+    assert any(
+        item.kind == "metric"
+        and item.canonical_key == "refund_bill_cnt"
+        and item.topic == QuestionCategory.REFUND
+        for item in extracted.mentions
+    )
+
+
+def test_governed_sales_ranking_phrase_resolves_to_sales_quantity_metric() -> None:
+    assets = TopicAssetService(get_settings())
+    extracted = KeywordExtractService(assets).extract(
+        "找到最近10天卖得最好的三个商品"
+    )
+
+    assert any(
+        item.kind in {"metric", "lineage"}
+        and item.canonical_key == "sku_cnt"
+        and item.topic == QuestionCategory.TRADE
+        for item in extracted.mentions
+    )
+
+
 def test_router_reads_complete_topic_cards_and_returns_only_scope() -> None:
     assets = FakeTopicAssets()
     llm = FakeLlm(
@@ -279,6 +327,53 @@ def test_single_topic_still_does_not_assign_primary_or_plan_query() -> None:
     assert decision.primary_topic == QuestionCategory.UNKNOWN
     assert decision.candidate_topics == [QuestionCategory("电商交易")]
     assert decision.dimension_topics == []
+
+
+def test_exact_published_metric_topic_is_protected_from_model_deletion() -> None:
+    assets = TopicAssetService(get_settings())
+    keyword_service = KeywordExtractService(assets)
+    slot_extractor = RouteSlotExtractor(assets)
+    question = "最近7天订单总数是多少？"
+    keywords = keyword_service.extract(question)
+    slots = slot_extractor.extract(question, keywords)
+    llm = FakeLlm(
+        [
+            {
+                "status": "RESOLVED",
+                "relevantTopics": ["电商交易"],
+                "confidence": 0.96,
+            }
+        ]
+    )
+    router = SemanticTopicRouterService(
+        settings(),
+        assets,
+        llm=llm,
+    )
+
+    decision = router.route_with_budget(
+        question,
+        keywords=keywords,
+        route_slots=slots,
+    )
+
+    assert QuestionCategory("经营画像") in decision.candidate_topics
+    assert decision.selection_evidence["protectedTopicNames"] == [
+        "经营画像"
+    ]
+    assert decision.selection_evidence["suppressedTopicNames"] == [
+        "电商交易"
+    ]
+    assert llm.calls[0]["user"]["publishedSignalBaseline"][
+        "protectedTopics"
+    ] == ["经营画像"]
+    assert llm.calls[0]["user"]["publishedSignalBaseline"][
+        "excludedTopics"
+    ] == ["电商交易"]
+    allowed_topics = llm.calls[0]["tool"]["function"]["parameters"][
+        "properties"
+    ]["relevantTopics"]["items"]["enum"]
+    assert "电商交易" not in allowed_topics
 
 
 def test_invalid_model_topic_is_rejected_and_repaired_once() -> None:
@@ -452,7 +547,7 @@ def test_degraded_router_requests_clarification_instead_of_empty_workspace() -> 
     assert decision.routing_mode == "semantic_topic_open_discovery"
 
 
-def test_kernel_does_not_feed_keyword_topic_scores_into_semantic_router() -> None:
+def test_kernel_feeds_published_asset_signal_baseline_into_semantic_router() -> None:
     assets = FakeTopicAssets()
     router = SemanticTopicRouterService(
         settings(),
@@ -481,7 +576,11 @@ def test_kernel_does_not_feed_keyword_topic_scores_into_semantic_router() -> Non
 
     assert session.keywords.topic_scores == {"商品管理": 99.0}
     assert session.workspace_topics == ["电商交易", "商品管理"]
-    assert session.routing.selection_evidence["keywordRoutingUsed"] is False
+    assert session.routing.selection_evidence["keywordRoutingUsed"] is True
+    assert session.routing.selection_evidence["assetSignalBaselineUsed"] is True
+    assert session.routing.selection_evidence["candidateTopicNames"] == [
+        "商品管理"
+    ]
 
 
 def test_topic_llm_call_uses_shared_runtime_budget_and_stage_telemetry() -> None:

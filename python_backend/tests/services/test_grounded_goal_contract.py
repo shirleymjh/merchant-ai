@@ -895,9 +895,27 @@ def test_scalar_artifact_cannot_claim_anomaly_analysis_is_covered() -> None:
 
     contract = anomaly_contract()
     goal_ids = [goal.goal_id for goal in contract.goals]
+    artifact = SimpleNamespace(
+        artifact_id="artifact-three-scalars",
+        verified_evidence=SimpleNamespace(passed=True),
+        contract=SimpleNamespace(
+            time_range=SimpleNamespace(
+                label="最近7天",
+                start_date="2026-07-14",
+                end_date="2026-07-20",
+                days=7,
+                timezone="Asia/Shanghai",
+                explicit=True,
+                anchor_policy="calendar",
+                window_role="primary",
+                kind="rolling",
+            ),
+            binding_hints=SimpleNamespace(time_expression="最近7天"),
+        ),
+    )
     result = GoalCoverageVerifier().verify(
         contract,
-        [declaration(contract, "artifact-three-scalars", goal_ids)],
+        [declare_verified_artifact_goal_coverage(contract, artifact, goal_ids)],
     )
 
     assert result.finalization_allowed is False
@@ -924,6 +942,22 @@ def test_anomaly_proof_requires_baseline_and_normalization() -> None:
                 covered_goal_ids=goal_ids,
                 verification_passed=True,
                 goal_resolutions=[
+                    {
+                        "goalId": "time.last_7_days",
+                        "goalKind": "time_window",
+                        "resolution": "proved",
+                        "proofType": "VERIFIED_QUERY_TIME_RANGE",
+                        "timeExpression": "最近7天",
+                        "start": "2026-07-14",
+                        "end": "2026-07-20",
+                        "timezone": "Asia/Shanghai",
+                        "days": 7,
+                        "label": "最近7天",
+                        "explicit": True,
+                        "anchorPolicy": "calendar",
+                        "windowRole": "primary",
+                        "timeRangeKind": "rolling",
+                    },
                     {
                         "goalId": "comparison.most_anomalous",
                         "goalKind": "comparison",
@@ -965,6 +999,22 @@ def test_explicit_insufficient_evidence_resolves_but_does_not_prove_goal() -> No
                 verification_passed=True,
                 goal_resolutions=[
                     {
+                        "goalId": "time.last_7_days",
+                        "goalKind": "time_window",
+                        "resolution": "proved",
+                        "proofType": "VERIFIED_QUERY_TIME_RANGE",
+                        "timeExpression": "最近7天",
+                        "start": "2026-07-14",
+                        "end": "2026-07-20",
+                        "timezone": "Asia/Shanghai",
+                        "days": 7,
+                        "label": "最近7天",
+                        "explicit": True,
+                        "anchorPolicy": "calendar",
+                        "windowRole": "primary",
+                        "timeRangeKind": "rolling",
+                    },
+                    {
                         "goalId": "comparison.most_anomalous",
                         "goalKind": "comparison",
                         "resolution": "insufficient_evidence",
@@ -997,6 +1047,7 @@ def dependency_contract() -> OriginalQuestionGoalContract:
                     "goalId": "metric.sales",
                     "kind": "metric",
                     "label": "销量",
+                    "metricRefId": "metric:sales",
                     "required": False,
                 },
                 {
@@ -1066,16 +1117,19 @@ def test_dependency_proof_with_verified_lineage_is_accepted() -> None:
                 goal_contract_fingerprint=fingerprint,
                 covered_goal_ids=["metric.sales", "ranking.top_products"],
                 verification_passed=True,
+                evidence_refs=["metric:sales"],
                 goal_resolutions=[
                     {
                         "goalId": "ranking.top_products",
                         "goalKind": "ranking",
                         "resolution": "proved",
                         "orderByGoalIds": ["metric.sales"],
+                        "rankingMetricRefId": "metric:sales",
                         "direction": "DESC",
                         "limit": 1,
                         "rowSetRef": "artifact-top-products",
                         "populationScope": "ALL_MATCHING_ROWS",
+                        "details": {"metricBindingMode": "SEMANTIC_REF_MATCH"},
                     }
                 ],
             ),

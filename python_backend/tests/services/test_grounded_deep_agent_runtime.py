@@ -22,6 +22,7 @@ from merchant_ai.models import (
     QuestionIntent,
     RecallBundle,
     RecallItem,
+    ResolvedTimeRange,
     SqlValidationResult,
     TopicRoutingDecision,
     VerifiedEvidence,
@@ -2764,7 +2765,6 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
     ].endswith("wrong_catalog.tickets")
     visible, _removed = _phase_visible_tools(deep_session, outer.tools)
     assert {item.name for item in visible} == {
-        "ask_human",
         "submit_grounded_sql_candidate",
     }
 
@@ -2946,6 +2946,20 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
                 question=session.question,
                 status="READY",
                 query_shape="SCALAR",
+                binding_hints=GroundedBindingHints(
+                    time_expression="最近30天"
+                ),
+                time_range=ResolvedTimeRange(
+                    kind="rolling",
+                    label="最近30天",
+                    days=30,
+                    start_date="2026-06-21",
+                    end_date="2026-07-20",
+                    timezone="Asia/Shanghai",
+                    anchor_policy="calendar",
+                    window_role="primary",
+                    explicit=True,
+                ),
             )
             session.verified_query_ledger.append(
                 GroundedVerifiedQueryArtifact(

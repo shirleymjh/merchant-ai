@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 
 from merchant_ai.config import Settings, get_settings
@@ -11,6 +13,7 @@ from merchant_ai.models import (
     ChatResponse,
     ClarificationRequest,
     ConversationMessage,
+    PendingAnswer,
     QuestionRoute,
 )
 from merchant_ai.services.answer import AnswerComposeService
@@ -57,13 +60,12 @@ from merchant_ai.services.retrieval import (
 from merchant_ai.services.routing import (
     KeywordExtractService,
     PreflightUnderstandingService,
-    QuestionRoutingService,
     RouteSlotExtractor,
     SemanticPreflightRouteClassifier,
     SemanticTopicRouterService,
 )
 from merchant_ai.services.runtime_bindings import SemanticRuntimeBindingRegistry
-from merchant_ai.services.security import identity_scope_payload
+from merchant_ai.services.security import identity_scope_hash, identity_scope_payload
 
 
 EventListener = Callable[[str, str, dict[str, Any]], None]
@@ -184,6 +186,7 @@ class GroundedApplicationRuntime:
                 return self._finalize_response(
                     response,
                     question=question,
+                    merchant_id=effective_merchant_id,
                     context=context,
                     listener=listener,
                     thread_id=actual_thread_id,
@@ -234,6 +237,7 @@ class GroundedApplicationRuntime:
                 return self._finalize_response(
                     response,
                     question=question,
+                    merchant_id=effective_merchant_id,
                     context=context,
                     listener=listener,
                     thread_id=actual_thread_id,
@@ -288,6 +292,7 @@ class GroundedApplicationRuntime:
         return self._finalize_response(
             response,
             question=question,
+            merchant_id=effective_merchant_id,
             context=context,
             listener=listener,
             thread_id=actual_thread_id,
@@ -351,6 +356,7 @@ class GroundedApplicationRuntime:
         response: ChatResponse,
         *,
         question: str,
+        merchant_id: str,
         context: Optional[ChatContext],
         listener: Optional[EventListener],
         thread_id: str,
@@ -397,6 +403,15 @@ class GroundedApplicationRuntime:
             }
         )
         response.debug_trace = {**dict(response.debug_trace or {}), "harness": harness}
+        self._persist_verified_answer(
+            response,
+            question=question,
+            merchant_id=merchant_id,
+            context=response_context,
+            thread_id=thread_id,
+            run_id=run_id,
+            core_invoked=core_invoked,
+        )
         _emit(
             listener,
             "answer.ready" if response.clarification is None else "clarification.required",
@@ -410,6 +425,142 @@ class GroundedApplicationRuntime:
             },
         )
         return response
+
+    def _persist_verified_answer(
+        self,
+        response: ChatResponse,
+        *,
+        question: str,
+        merchant_id: str,
+        context: ChatContext,
+        thread_id: str,
+        run_id: str,
+        core_invoked: bool,
+    ) -> None:
+        """Persist only an attested answer; never turn an error into a record.
+
+        PendingAnswer remains the feedback attribution authority even when the
+        MySQL repository is temporarily degraded.  Persistence is a post-answer
+        side effect and therefore cannot invalidate an already verified reply.
+        """
+
+        harness = dict((response.debug_trace or {}).get("harness") or {})
+        if (
+            not core_invoked
+            or response.clarification is not None
+            or not str(response.answer or "").strip()
+            or bool(harness.get("operationalFailure"))
+        ):
+            return
+        verified_query_ids = [
+            str(item).strip()
+            for item in harness.get("verifiedQueryArtifactIds") or []
+            if str(item).strip()
+        ]
+        verified_rule_ids = [
+            str(item).strip()
+            for item in harness.get("verifiedRuleArtifactIds") or []
+            if str(item).strip()
+        ]
+        if not verified_query_ids and not verified_rule_ids:
+            return
+        identity = context.user_identity
+        scope = identity_scope_payload(identity, merchant_id)
+        merchant_name = str(merchant_id or "")
+        try:
+            merchant = self.services.merchant_service.current_merchant(merchant_id)
+            merchant_name = str(getattr(merchant, "merchant_name", "") or merchant_name)
+        except Exception:
+            # Merchant lookup is enrichment only; the trusted merchant id is
+            # already bound by the runtime and must not block answer delivery.
+            pass
+        tables: list[str] = []
+        for section in response.data_sections or []:
+            tables.extend(str(item) for item in section.doris_tables or [] if str(item).strip())
+        tables.extend(str(item) for item in response.doris_tables or [] if str(item).strip())
+        pending = PendingAnswer(
+            id=response.id,
+            question=str(question or ""),
+            answer=str(response.answer or ""),
+            merchant_id=str(merchant_id or ""),
+            merchant_name=merchant_name,
+            category_name=str(response.category_name or ""),
+            doris_tables=",".join(dict.fromkeys(tables)),
+            suggested_questions=json.dumps(response.suggestions or [], ensure_ascii=False),
+            thread_id=str(thread_id or ""),
+            user_id=str(scope.get("userId") or ""),
+            identity_scope_hash=identity_scope_hash(identity, merchant_id),
+            store_ids=list(scope.get("storeIds") or []),
+            permissions=list(scope.get("permissions") or []),
+        )
+        pending_written = False
+        answer_written = False
+        try:
+            self.services.pending_store.put(pending)
+            pending_written = True
+        except Exception as exc:
+            harness["pendingAnswerPersistenceError"] = "%s:%s" % (
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+        try:
+            answer_written = bool(self.services.answer_repository.insert_answer(pending))
+        except Exception as exc:
+            harness["answerRepositoryPersistenceError"] = "%s:%s" % (
+                type(exc).__name__,
+                str(exc)[:300],
+            )
+        memory_written = False
+        if pending_written and self.services.memory_store is not None:
+            try:
+                topics = [str(item.value if hasattr(item, "value") else item) for item in context.topics]
+                metrics = [str(item) for item in context.metric_keys if str(item).strip()]
+                days = int(context.resolved_time_window_days or context.days or 0)
+                plan_intent = SimpleNamespace(
+                    category=str(context.topic or (topics[0] if topics else "")),
+                    metric_resolution={"metricKey": metrics[0] if metrics else ""},
+                    metric_name=metrics[0] if metrics else "",
+                    days=days,
+                )
+                memory_state = {
+                    "requested_merchant_id": merchant_id,
+                    "question": question,
+                    "answer": response.answer,
+                    "plan": SimpleNamespace(
+                        intents=[plan_intent],
+                        question_understanding={"analysisIntent": str(context.answer_mode or "")},
+                    ),
+                    "route_slots": {"timeWindow": {"days": days}},
+                    "user_identity": identity,
+                    "persisted": bool(answer_written or pending_written),
+                    "evidence_graph_verified": True,
+                    "evidence_accepted": True,
+                    "verification_status": "verified",
+                    "agent_run_result": SimpleNamespace(
+                        task_results=[object()],
+                        verified_evidence=SimpleNamespace(passed=True),
+                        evidence_gaps=[],
+                    ),
+                    "semantic_evidence": [],
+                }
+                self.services.memory_store.update_from_state(memory_state)
+                memory_written = True
+            except Exception as exc:
+                harness["memoryPersistenceError"] = "%s:%s" % (
+                    type(exc).__name__,
+                    str(exc)[:300],
+                )
+        response.persisted = bool(answer_written)
+        harness["persistence"] = {
+            "pendingAnswerWritten": pending_written,
+            "answerRepositoryWritten": answer_written,
+            "memoryWritten": memory_written,
+            "verifiedQueryArtifactIds": verified_query_ids,
+            "verifiedRuleArtifactIds": verified_rule_ids,
+            "feedbackPending": pending_written,
+            "runId": run_id,
+        }
+        response.debug_trace = {**dict(response.debug_trace or {}), "harness": harness}
 
     @staticmethod
     def _preflight_trace(preflight: Any) -> dict[str, Any]:
@@ -530,12 +681,12 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         knowledge_retriever = HybridKnowledgeRetrievalService(recall_service)
 
     keyword_service = KeywordExtractService(topic_assets)
+    route_slot_extractor = RouteSlotExtractor(topic_assets)
     preflight_understanding = PreflightUnderstandingService(
         settings,
         keyword_service,
-        QuestionRoutingService(topic_assets),
-        RouteSlotExtractor(topic_assets),
-        SemanticPreflightRouteClassifier(settings),
+        slot_extractor=route_slot_extractor,
+        semantic_classifier=SemanticPreflightRouteClassifier(settings),
     )
     topic_router = SemanticTopicRouterService(settings, topic_assets)
     answer_service = AnswerComposeService(LlmClient(settings))
@@ -694,6 +845,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
     kernel = GroundedRuntimeKernel(
         topic_assets,
         keyword_service=keyword_service,
+        route_slot_extractor=route_slot_extractor,
         topic_router=topic_router,
         recall_service=knowledge_retriever,
         executor=query_executor,

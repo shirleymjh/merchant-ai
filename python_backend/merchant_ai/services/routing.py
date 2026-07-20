@@ -656,7 +656,17 @@ class KeywordExtractService:
                     metric_key = str(metric.get("canonicalMetricKey") or metric.get("metricKey") or "")
                     business_name = str(metric.get("businessName") or metric_key)
                     aliases = semantic_metric_alias_phrases(
-                        [business_name, metric_key, str(metric.get("metricKey") or ""), *(metric.get("aliases") or [])]
+                        [
+                            business_name,
+                            metric_key,
+                            str(metric.get("metricKey") or ""),
+                            str(metric.get("displayName") or ""),
+                            str(metric.get("disambiguationName") or ""),
+                            str(metric.get("naturalName") or ""),
+                            str(metric.get("naturalAlias") or ""),
+                            str(metric.get("originalBusinessName") or ""),
+                            *(metric.get("aliases") or []),
+                        ]
                     )
                     for alias in aliases:
                         phrase = normalize_keyword_text(str(alias or ""))
@@ -1484,15 +1494,23 @@ class PreflightUnderstandingService:
         self,
         settings: Any,
         keyword_service: KeywordExtractService,
-        routing_service: QuestionRoutingService,
-        slot_extractor: "RouteSlotExtractor",
-        semantic_classifier: SemanticPreflightRouteClassifier,
+        routing_service: Optional[QuestionRoutingService] = None,
+        slot_extractor: Optional["RouteSlotExtractor"] = None,
+        semantic_classifier: Optional[SemanticPreflightRouteClassifier] = None,
     ):
         self.settings = settings
         self.keyword_service = keyword_service
-        self.routing_service = routing_service
-        self.slot_extractor = slot_extractor
-        self.semantic_classifier = semantic_classifier
+        # ``routing_service`` was part of the legacy full-understanding
+        # constructor but the online preflight has never called it.  Keep the
+        # positional parameter only for compatibility; do not retain a second
+        # routing authority in the surface gate.
+        del routing_service
+        self.slot_extractor = slot_extractor or RouteSlotExtractor(
+            keyword_service.topic_assets
+        )
+        self.semantic_classifier = semantic_classifier or (
+            SemanticPreflightRouteClassifier(settings)
+        )
 
     def understand(self, question: str, pending_context: bool = False) -> PreflightUnderstanding:
         surface_signals = self.surface_signals(question)
@@ -1559,8 +1577,7 @@ class PreflightUnderstandingService:
         )
 
     def surface_business_task_sufficient(self, signals: Dict[str, Any], pending_context: bool = False) -> bool:
-        if pending_context:
-            return True
+        del pending_context
         if signals.get("empty") or signals.get("greeting") or signals.get("assistantChat") or signals.get("writeOperation"):
             return False
         if signals.get("hasObjectRef") or signals.get("hasBusinessMetricLikePhrase"):
@@ -1895,13 +1912,12 @@ def topic_domain_order(scores: Optional[Dict[QuestionCategory, Any]] = None) -> 
 
 
 class SemanticTopicRouterService:
-    """LLM-only Topic scope selection over the complete published L0 directory.
+    """Asset-bounded Topic scope selection over the published L0 directory.
 
-    This service deliberately does not consume keyword extraction, metric hints,
-    dimensions, route slots, or table candidates.  Its only authority is to
-    select the published Topic workspaces whose semantic assets may be relevant
-    to the original question.  Query understanding and execution planning stay
-    with the Core and governed Contract path.
+    Published metric, dimension, entity and Topic signals establish the
+    deterministic candidate floor.  The LLM may resolve ambiguity or add/remove
+    unprotected candidates inside that published card set, but it cannot erase
+    an exact governed metric owner.  Query planning still belongs to the Core.
     """
 
     STATUSES = {"RESOLVED", "AMBIGUOUS", "UNSUPPORTED"}
@@ -1974,17 +1990,23 @@ class SemanticTopicRouterService:
         self,
         question: str,
         keywords: Optional[ExtractedKeywords] = None,
+        route_slots: Optional[RouteSlots] = None,
         **_: Any,
     ) -> TopicRoutingDecision:
         """Compatibility entry point for semantic routing with safe fallback."""
 
-        return self.route_with_budget(question, keywords=keywords)
+        return self.route_with_budget(
+            question,
+            keywords=keywords,
+            route_slots=route_slots,
+        )
 
     def route_with_budget(
         self,
         question: str,
         *,
         keywords: Optional[ExtractedKeywords] = None,
+        route_slots: Optional[RouteSlots] = None,
         runtime_budget: Any = None,
     ) -> TopicRoutingDecision:
         cards = self.topic_cards()
@@ -2005,10 +2027,37 @@ class SemanticTopicRouterService:
                 reason="没有已发布 Topic，无法建立语义检索范围",
             )
 
+        asset_baseline = self._published_asset_baseline(
+            question,
+            keywords,
+            route_slots,
+            cards,
+            topic_names,
+        )
+        # The model may compare published Topic cards, except a detail owner
+        # that the formal metric lineage explicitly marks as inappropriate for
+        # this exact summary request. This prevents a bare store total from
+        # drifting to a detail COUNT merely because both share an alias.
+        suppressed_topic_names = set(
+            asset_baseline.get("suppressedTopicNames") or []
+        )
+        model_topic_names = [
+            topic
+            for topic in topic_names
+            if topic not in suppressed_topic_names
+        ]
+        model_cards = [
+            card
+            for card in cards
+            if str(card.get("topic") or "") in set(model_topic_names)
+        ]
+
         if not self._llm_available():
             return self._deterministic_fallback_decision(
                 question,
                 keywords,
+                route_slots=route_slots,
+                asset_baseline=asset_baseline,
                 status="llm_unavailable",
                 reason="Topic LLM 不可用",
             )
@@ -2034,8 +2083,9 @@ class SemanticTopicRouterService:
             try:
                 payload = self._call_model(
                     question,
-                    cards,
-                    topic_names,
+                    model_cards,
+                    model_topic_names,
+                    asset_baseline=asset_baseline,
                     validation_error=validation_error,
                     runtime_budget=runtime_budget,
                     attempt=attempt,
@@ -2050,7 +2100,10 @@ class SemanticTopicRouterService:
             if not last_payload and provider_error:
                 last_error = provider_error
                 break
-            normalized, validation_error = self._validate_payload(last_payload, topic_names)
+            normalized, validation_error = self._validate_payload(
+                last_payload,
+                model_topic_names,
+            )
             if normalized is None:
                 last_error = validation_error
                 continue
@@ -2065,9 +2118,23 @@ class SemanticTopicRouterService:
                     % (normalized["confidence"], minimum_confidence)
                 )
                 continue
+            if (
+                normalized["status"] == "RESOLVED"
+                and normalized["confidence"] < minimum_confidence
+            ):
+                normalized = {
+                    **normalized,
+                    "status": "AMBIGUOUS",
+                    "ambiguityReason": (
+                        normalized.get("ambiguityReason")
+                        or "Topic 模型最终置信度低于 %.2f，按歧义候选处理"
+                        % minimum_confidence
+                    ),
+                }
             return self._decision_from_payload(
                 normalized,
                 topic_names,
+                asset_baseline=asset_baseline,
                 attempts=attempt,
             )
 
@@ -2075,6 +2142,8 @@ class SemanticTopicRouterService:
         return self._deterministic_fallback_decision(
             question,
             keywords,
+            route_slots=route_slots,
+            asset_baseline=asset_baseline,
             status="llm_failed",
             reason=(
                 "Topic LLM 返回无效结果"
@@ -2082,11 +2151,241 @@ class SemanticTopicRouterService:
             detail=(last_error or provider_error or str(last_payload)[:300]),
         )
 
+    def _published_asset_baseline(
+        self,
+        question: str,
+        keywords: Optional[ExtractedKeywords],
+        route_slots: Optional[RouteSlots],
+        cards: List[Dict[str, Any]],
+        topic_names: List[str],
+    ) -> Dict[str, Any]:
+        """Build one shared candidate floor for both model and fallback paths."""
+
+        extracted = keywords or ExtractedKeywords(
+            normalized_question=str(question or "")
+        )
+        slots = route_slots or RouteSlots()
+        asset_decision = TopicRouterService(self.topic_assets).route(
+            question,
+            extracted,
+            route_slots=slots,
+        )
+        asset_categories = list(asset_decision.recall_topics())
+        slot_categories = [
+            item.topic
+            for item in slots.topic_candidates
+            if item.topic != QuestionCategory.UNKNOWN
+        ]
+        topic_name_set = set(topic_names)
+
+        def names_for_categories(
+            categories: List[QuestionCategory],
+        ) -> List[str]:
+            loader = getattr(
+                self.topic_assets,
+                "topic_names_for_categories",
+                None,
+            )
+            if callable(loader):
+                try:
+                    return [
+                        str(item)
+                        for item in loader(categories)
+                        if str(item) in topic_name_set
+                    ]
+                except Exception:
+                    pass
+            values: List[str] = []
+            for category in categories:
+                raw = str(getattr(category, "value", category) or "")
+                if raw in topic_name_set and raw not in values:
+                    values.append(raw)
+            return values
+
+        asset_topic_names = names_for_categories(asset_categories)
+        slot_topic_names = names_for_categories(slot_categories)
+        selection_evidence = dict(asset_decision.selection_evidence or {})
+        serving_topics = [
+            str(item or "").strip()
+            for item in selection_evidence.get("servingTopics") or []
+            if str(item or "").strip() in topic_name_set
+        ]
+        business_topics = [
+            str(item or "").strip()
+            for item in selection_evidence.get("businessTopics") or []
+            if str(item or "").strip() in topic_name_set
+        ]
+        detail_requested = (
+            str(selection_evidence.get("queryShape") or "")
+            == "detail_or_breakdown"
+        )
+        declared_topics = dedupe_ordered(
+            [
+                *serving_topics,
+                *(business_topics if detail_requested else []),
+            ]
+        )
+        protected_topic_names = self._protected_metric_topic_names(
+            extracted,
+            topic_name_set,
+        )
+        suppressed_topic_names: List[str] = []
+        if not detail_requested:
+            for metric in selection_evidence.get("matchedMetrics") or []:
+                if not isinstance(metric, dict):
+                    continue
+                metric_intent = str(
+                    metric.get("metricIntent") or ""
+                ).strip()
+                metric_grain = str(
+                    metric.get("metricGrain") or ""
+                ).strip()
+                if (
+                    metric_intent != "store_summary"
+                    and metric_grain != "merchant_day_summary"
+                ):
+                    continue
+                serving_topic = str(
+                    metric.get("servingTopic") or ""
+                ).strip()
+                if serving_topic not in protected_topic_names:
+                    continue
+                for topic in metric.get("businessTopics") or []:
+                    topic_name = str(topic or "").strip()
+                    if (
+                        topic_name
+                        and topic_name != serving_topic
+                        and topic_name in topic_name_set
+                        and topic_name not in slot_topic_names
+                        and topic_name not in suppressed_topic_names
+                    ):
+                        suppressed_topic_names.append(topic_name)
+        card_scores = self._topic_card_fallback_scores(question, cards)
+        card_by_topic = {
+            str(card.get("topic") or ""): card
+            for card in cards
+            if str(card.get("topic") or "")
+        }
+        ranked_card_topics = [
+            topic
+            for topic, score in sorted(
+                card_scores.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+            if score > 0
+            and topic not in suppressed_topic_names
+            and (
+                not detail_requested
+                or bool(
+                    (card_by_topic.get(topic) or {}).get(
+                        "supportsDetail"
+                    )
+                )
+            )
+        ]
+        if ranked_card_topics:
+            top_score = card_scores[ranked_card_topics[0]]
+            threshold = max(0.9, top_score * 0.6)
+            ranked_card_topics = [
+                topic
+                for topic in ranked_card_topics
+                if card_scores[topic] >= threshold
+            ][:4]
+        candidate_topic_names = [
+            topic
+            for topic in dedupe_ordered(
+            [
+                *protected_topic_names,
+                *asset_topic_names,
+                *slot_topic_names,
+                *declared_topics,
+                *ranked_card_topics,
+            ]
+            )
+            if topic not in suppressed_topic_names
+            or topic in protected_topic_names
+        ]
+        return {
+            "candidateTopicNames": candidate_topic_names,
+            "protectedTopicNames": protected_topic_names,
+            "assetSignalTopicNames": dedupe_ordered(
+                [*asset_topic_names, *slot_topic_names, *declared_topics]
+            ),
+            "suppressedTopicNames": suppressed_topic_names,
+            "assetRoutingMode": str(asset_decision.routing_mode or ""),
+            "assetConfidence": float(asset_decision.confidence or 0.0),
+            "assetSelectionEvidence": selection_evidence,
+            "topicCardScores": {
+                topic: round(score, 4)
+                for topic, score in sorted(
+                    card_scores.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+                if score > 0
+            },
+        }
+
+    def _protected_metric_topic_names(
+        self,
+        keywords: ExtractedKeywords,
+        published_topics: Set[str],
+    ) -> List[str]:
+        mentions = list(keywords.mentions or [])
+        lineage_phrases = {
+            normalize_keyword_text(item.phrase)
+            for item in mentions
+            if item.kind == "lineage" and item.phrase
+        }
+        protected_categories: List[QuestionCategory] = []
+        for mention in mentions:
+            phrase = normalize_keyword_text(mention.phrase)
+            exact_metric = (
+                mention.kind == "lineage"
+                or (
+                    mention.kind == "metric"
+                    and phrase not in lineage_phrases
+                )
+            )
+            if (
+                not exact_metric
+                or mention.topic == QuestionCategory.UNKNOWN
+                or not str(mention.source or "").startswith("semantic_metric")
+            ):
+                continue
+            if mention.topic not in protected_categories:
+                protected_categories.append(mention.topic)
+        loader = getattr(
+            self.topic_assets,
+            "topic_names_for_categories",
+            None,
+        )
+        if callable(loader):
+            try:
+                return dedupe_ordered(
+                    [
+                        str(item)
+                        for item in loader(protected_categories)
+                        if str(item) in published_topics
+                    ]
+                )
+            except Exception:
+                pass
+        return dedupe_ordered(
+            [
+                str(getattr(item, "value", item) or "")
+                for item in protected_categories
+                if str(getattr(item, "value", item) or "")
+                in published_topics
+            ]
+        )
+
     def _deterministic_fallback_decision(
         self,
         question: str,
         keywords: Optional[ExtractedKeywords],
         *,
+        route_slots: Optional[RouteSlots] = None,
+        asset_baseline: Optional[Dict[str, Any]] = None,
         status: str,
         reason: str,
         detail: str = "",
@@ -2101,34 +2400,21 @@ class SemanticTopicRouterService:
         fallback = TopicRouterService(self.topic_assets).route(
             question,
             keywords or ExtractedKeywords(normalized_question=question),
+            route_slots=route_slots,
         )
         cards = self.topic_cards()
-        card_scores = self._topic_card_fallback_scores(question, cards)
-        ranked_card_topics = [
-            topic
-            for topic, score in sorted(
-                card_scores.items(),
-                key=lambda item: (-item[1], item[0]),
-            )
-            if score > 0
+        topic_names = [
+            str(item.get("topic") or "")
+            for item in cards
+            if item.get("topic")
         ]
-        if ranked_card_topics:
-            top_score = card_scores[ranked_card_topics[0]]
-            threshold = max(0.9, top_score * 0.6)
-            ranked_card_topics = [
-                topic
-                for topic in ranked_card_topics
-                if card_scores[topic] >= threshold
-            ][:3]
-        card_categories = [
-            resolve_asset_topic_category(self.topic_assets, topic)
-            for topic in ranked_card_topics
-        ]
-        card_categories = [
-            item
-            for item in card_categories
-            if item != QuestionCategory.UNKNOWN
-        ]
+        baseline = asset_baseline or self._published_asset_baseline(
+            question,
+            keywords,
+            route_slots,
+            cards,
+            topic_names,
+        )
         max_candidates = max(
             1,
             min(
@@ -2143,25 +2429,39 @@ class SemanticTopicRouterService:
                 ),
             ),
         )
-        candidates = dedupe_topics(
-            [*fallback.recall_topics(), *card_categories]
+        candidate_names = list(
+            baseline.get("candidateTopicNames") or []
         )[:max_candidates]
+        candidates = dedupe_topics(
+            [
+                resolve_asset_topic_category(self.topic_assets, topic)
+                for topic in candidate_names
+            ]
+        )
+        candidates = [
+            item
+            for item in candidates
+            if item != QuestionCategory.UNKNOWN
+        ]
         evidence = {
             **dict(fallback.selection_evidence or {}),
             "router": "semantic_topic_llm",
             "status": status,
             "keywordRoutingUsed": True,
-            "fallbackRouter": "published_semantic_keyword_scores",
-            "topicCardScores": {
-                topic: round(score, 4)
-                for topic, score in sorted(
-                    card_scores.items(),
-                    key=lambda item: (-item[1], item[0]),
-                )[:max_candidates]
-                if score > 0
-            },
+            "assetSignalBaselineUsed": True,
+            "fallbackRouter": "published_asset_signal_baseline",
+            "candidateTopicNames": candidate_names,
+            "protectedTopicNames": list(
+                baseline.get("protectedTopicNames") or []
+            ),
+            "suppressedTopicNames": list(
+                baseline.get("suppressedTopicNames") or []
+            ),
+            "topicCardScores": dict(
+                baseline.get("topicCardScores") or {}
+            ),
             "modelSelectedTopics": [],
-            "publishedTopicCount": len(self.topic_cards()),
+            "publishedTopicCount": len(cards),
             "detail": str(detail or "")[:300],
         }
         return TopicRoutingDecision(
@@ -2299,6 +2599,8 @@ class SemanticTopicRouterService:
             metric_aliases: List[str] = []
             column_aliases: List[str] = []
             rule_aliases: List[str] = []
+            preferred_for: List[str] = []
+            supports_detail = False
             for item in manifest:
                 if not isinstance(item, dict):
                     continue
@@ -2308,6 +2610,21 @@ class SemanticTopicRouterService:
                     summaries.append(summary)
                 if grain and grain not in grains:
                     grains.append(grain)
+                for intent in item.get("preferredFor") or []:
+                    normalized_intent = str(intent or "").strip().upper()
+                    if (
+                        normalized_intent
+                        and normalized_intent not in preferred_for
+                    ):
+                        preferred_for.append(normalized_intent)
+                supports_detail = bool(
+                    supports_detail
+                    or item.get("supportsDetail")
+                    or any(
+                        intent in {"DETAIL", "TOPN"}
+                        for intent in preferred_for
+                    )
+                )
                 navigation = (
                     item.get("navigationHints")
                     if isinstance(item.get("navigationHints"), dict)
@@ -2335,6 +2652,8 @@ class SemanticTopicRouterService:
                     "aliases": [str(item) for item in contract.get("aliases") or []][:8],
                     "capabilitySummaries": summaries[:6],
                     "dataGrains": grains[:6],
+                    "supportsDetail": supports_detail,
+                    "preferredFor": preferred_for[:12],
                     "metricAliases": metric_aliases[:80],
                     "columnAliases": column_aliases[:80],
                     "ruleAliases": rule_aliases[:40],
@@ -2348,6 +2667,7 @@ class SemanticTopicRouterService:
         cards: List[Dict[str, Any]],
         topic_names: List[str],
         *,
+        asset_baseline: Dict[str, Any],
         validation_error: str,
         runtime_budget: Any,
         attempt: int,
@@ -2359,6 +2679,22 @@ class SemanticTopicRouterService:
         user_payload = {
             "question": str(question or "")[:1200],
             "topicDirectory": cards,
+            "publishedSignalBaseline": {
+                "candidateTopics": list(
+                    asset_baseline.get("candidateTopicNames") or []
+                ),
+                "protectedTopics": list(
+                    asset_baseline.get("protectedTopicNames") or []
+                ),
+                "excludedTopics": list(
+                    asset_baseline.get("suppressedTopicNames") or []
+                ),
+                "instruction": (
+                    "protectedTopics 来自精确发布指标资产，不能删除；"
+                    "excludedTopics 是该指标声明的明细下钻 Topic，当前汇总问题不能恢复；"
+                    "其余候选可依据 Topic 卡片保留或删除。"
+                ),
+            },
             "instruction": (
                 "只选择后续应检索的 Topic 集合。不要输出指标、维度、时间、操作、表、主 Topic、"
                 "支持 Topic、JOIN 或 SQL 计划。"
@@ -2409,6 +2745,9 @@ class SemanticTopicRouterService:
             "你是企业 BI 系统的 Topic 语义路由器。你的唯一任务是判断原始问题需要在哪些已发布 "
             "Topic 中检索语义资产。Topic 只是检索范围，不代表主表、事实锚点或执行顺序。"
             "必须阅读完整 Topic Directory 的业务能力和边界，不得按关键词命中次数做分类。"
+            "publishedSignalBaseline.protectedTopics 来自精确命中的正式指标资产，必须全部保留；"
+            "publishedSignalBaseline.excludedTopics 是当前汇总指标正式声明不适用的明细下钻 Topic，不得为了相似词恢复；"
+            "你只能在给定 Topic Directory 候选中调整其他 Topic，不能扩展到目录之外。"
             "可以选择一个或多个 Topic；问题跨域时把所有相关 Topic 放进同一个 relevantTopics 数组。"
             "当问题询问商家级汇总指标、经营趋势或多个经营指标，且不要求商品、订单、工单等明细维度时，"
             "如果目录中存在明确承载商家-日期聚合指标的画像或汇总 Topic，必须将其加入 relevantTopics；"
@@ -2503,9 +2842,16 @@ class SemanticTopicRouterService:
         payload: Dict[str, Any],
         all_topic_names: List[str],
         *,
+        asset_baseline: Dict[str, Any],
         attempts: int,
     ) -> TopicRoutingDecision:
-        selected_names = list(payload.get("relevantTopics") or [])
+        model_selected_names = list(payload.get("relevantTopics") or [])
+        protected_names = list(
+            asset_baseline.get("protectedTopicNames") or []
+        )
+        selected_names = dedupe_ordered(
+            [*model_selected_names, *protected_names]
+        )
         categories = [
             resolve_asset_topic_category(self.topic_assets, item)
             for item in selected_names
@@ -2514,10 +2860,14 @@ class SemanticTopicRouterService:
             [item for item in categories if item != QuestionCategory.UNKNOWN]
         )
         status = str(payload.get("status") or "")
-        unsupported = status == "UNSUPPORTED"
+        unsupported = status == "UNSUPPORTED" and not protected_names
+        if status == "UNSUPPORTED" and protected_names:
+            status = "RESOLVED"
         reason = str(payload.get("ambiguityReason") or "").strip()
         if unsupported:
             reason = reason or "已发布 Topic 目录不支持该问题"
+        elif protected_names and not model_selected_names:
+            reason = "Topic 模型未保留精确指标资产，系统已恢复受保护的正式 Topic"
         elif status == "AMBIGUOUS":
             reason = reason or "Topic LLM 无法唯一收敛，保留所有合理 Topic 作为检索范围"
         else:
@@ -2540,10 +2890,24 @@ class SemanticTopicRouterService:
             selection_evidence={
                 "router": "semantic_topic_llm",
                 "status": status.lower(),
-                "modelSelectedTopics": selected_names,
+                "modelSelectedTopics": model_selected_names,
+                "candidateTopicNames": list(
+                    asset_baseline.get("candidateTopicNames") or []
+                ),
+                "protectedTopicNames": protected_names,
+                "suppressedTopicNames": list(
+                    asset_baseline.get("suppressedTopicNames") or []
+                ),
+                "assetSignalTopicNames": list(
+                    asset_baseline.get("assetSignalTopicNames") or []
+                ),
+                "assetSignalBaselineUsed": True,
                 "publishedTopicCount": len(all_topic_names),
                 "llmAttempts": attempts,
-                "keywordRoutingUsed": False,
+                "keywordRoutingUsed": bool(
+                    asset_baseline.get("assetSignalTopicNames")
+                    or protected_names
+                ),
             },
             reason=reason,
         )

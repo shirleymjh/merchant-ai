@@ -7,9 +7,14 @@ from merchant_ai.services.grounded_goal_contract import (
     ComparisonQuestionGoal,
     DependencyQuestionGoal,
     DetailQuestionGoal,
+    DimensionQuestionGoal,
+    GoalCoverageVerifier,
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
     RankingQuestionGoal,
+    TimeWindowQuestionGoal,
+    VerifiedArtifactGoalCoverage,
+    original_question_goal_contract_fingerprint,
 )
 from merchant_ai.services.grounded_goal_proofs import (
     derive_query_artifact_goal_resolutions,
@@ -169,6 +174,332 @@ def test_preview_coverage_is_truncated_even_when_counts_match() -> None:
 
     assert bundle.is_truncated is True
     assert bundle.has_complete_detail_coverage() is False
+
+
+def test_time_proof_uses_executed_range_and_rejects_goal_range_mismatch() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="最近7天订单数",
+        goals=[
+            TimeWindowQuestionGoal(
+                goal_id="time.7d",
+                label="最近7天",
+                time_expression="最近7天",
+                days=7,
+            )
+        ],
+    )
+    query_artifact = SimpleNamespace(
+        artifact_id="artifact-time",
+        verified_evidence=SimpleNamespace(passed=True),
+        contract=SimpleNamespace(
+            evidence_refs=[],
+            binding_hints=SimpleNamespace(time_expression="最近30天"),
+            time_range=SimpleNamespace(
+                kind="rolling",
+                label="最近30天",
+                days=30,
+                start_date="2026-06-21",
+                end_date="2026-07-20",
+                execution_start_date="2026-06-20",
+                execution_end_date="2026-07-19",
+                timezone="Asia/Shanghai",
+                anchor_policy="latest_partition",
+                window_role="primary",
+                explicit=True,
+            ),
+        ),
+        run_result=SimpleNamespace(merged_query_bundle=QueryBundle()),
+        output_columns=[],
+        output_lineage={},
+    )
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["time.7d"],
+        artifact_goal_ids={"artifact-time": ["time.7d"]},
+        all_artifacts=[query_artifact],
+    )
+
+    assert resolutions[0]["timeExpression"] == "最近30天"
+    assert resolutions[0]["days"] == 30
+    assert resolutions[0]["start"] == "2026-06-20"
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-time",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["time.7d"],
+                verification_passed=True,
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is False
+    assert {issue.code for issue in result.issues} >= {
+        "TIME_WINDOW_PROOF_EXPRESSION_MISMATCH",
+        "TIME_WINDOW_PROOF_DAYS_MISMATCH",
+    }
+
+
+def test_time_goal_granularity_waits_for_an_authoritative_contract_field() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="最近7天按天看订单趋势",
+        goals=[
+            TimeWindowQuestionGoal(
+                goal_id="time.7d.daily",
+                label="最近7天按天",
+                time_expression="最近7天",
+                days=7,
+                granularity="day",
+            )
+        ],
+    )
+    query_artifact = SimpleNamespace(
+        artifact_id="artifact-daily-trend",
+        verified_evidence=SimpleNamespace(passed=True),
+        contract=SimpleNamespace(
+            evidence_refs=[],
+            query_shape="TREND",
+            binding_hints=SimpleNamespace(time_expression="最近7天"),
+            time_range=SimpleNamespace(
+                kind="rolling",
+                label="最近7天",
+                days=7,
+                start_date="2026-07-14",
+                end_date="2026-07-20",
+                timezone="Asia/Shanghai",
+                anchor_policy="calendar",
+                window_role="primary",
+                explicit=True,
+            ),
+        ),
+        run_result=SimpleNamespace(merged_query_bundle=QueryBundle()),
+        output_columns=[],
+        output_lineage={},
+    )
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["time.7d.daily"],
+        artifact_goal_ids={"artifact-daily-trend": ["time.7d.daily"]},
+        all_artifacts=[query_artifact],
+    )
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-daily-trend",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["time.7d.daily"],
+                verification_passed=True,
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert resolutions[0]["granularity"] == ""
+    assert result.finalization_allowed is True
+
+
+def test_detail_proof_requires_every_actual_output_semantic_ref() -> None:
+    field_order = "semantic:trade:orders:column:order_id"
+    actual_field_order = "semantic:trade:orders:field:order_id"
+    field_amount = "semantic:trade:orders:field:pay_amount"
+    contract = OriginalQuestionGoalContract(
+        question="订单号和支付金额明细",
+        goals=[
+            DetailQuestionGoal(
+                goal_id="detail.orders",
+                label="订单明细",
+                required_field_ref_ids=[field_order, field_amount],
+            )
+        ],
+    )
+    query_artifact = artifact(
+        shape="DETAIL",
+        result_coverage=ResultCoverage.ALL_ROWS.value,
+    )
+    query_artifact.output_semantic_refs = {
+        "spu_id": actual_field_order
+    }
+    query_artifact.output_lineage = {
+        "metric": ["semantic:trade:orders:field:pay_amount"]
+    }
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["detail.orders"],
+        artifact_goal_ids={"artifact-1": ["detail.orders"]},
+        all_artifacts=[query_artifact],
+    )
+    complete = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-1",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["detail.orders"],
+                verification_passed=True,
+                evidence_refs=[actual_field_order, field_amount],
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert complete.finalization_allowed is True
+    query_artifact.output_lineage = {}
+    incomplete_resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["detail.orders"],
+        artifact_goal_ids={"artifact-1": ["detail.orders"]},
+        all_artifacts=[query_artifact],
+    )
+    incomplete = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-1",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["detail.orders"],
+                verification_passed=True,
+                evidence_refs=[actual_field_order, field_amount],
+                goal_resolutions=incomplete_resolutions,
+            )
+        ],
+    )
+    assert incomplete.finalization_allowed is False
+    assert "DETAIL_PROOF_REQUIRED_FIELDS_MISSING" in {
+        issue.code for issue in incomplete.issues
+    }
+
+
+def test_detail_generic_semantic_evidence_is_not_an_output_field_obligation() -> None:
+    table_ref = "semantic:trade:orders:detail"
+    required_field = "semantic:trade:orders:field:order_id"
+    contract = OriginalQuestionGoalContract(
+        question="给我订单号明细",
+        goals=[
+            DetailQuestionGoal(
+                goal_id="detail.orders",
+                label="订单明细",
+                semantic_ref_ids=[table_ref],
+                required_field_ref_ids=[required_field],
+            )
+        ],
+    )
+    query_artifact = artifact(
+        shape="DETAIL",
+        result_coverage=ResultCoverage.ALL_ROWS.value,
+    )
+    query_artifact.output_semantic_refs = {"spu_id": required_field}
+    query_artifact.output_lineage = {"spu_id": [required_field]}
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["detail.orders"],
+        artifact_goal_ids={"artifact-1": ["detail.orders"]},
+        all_artifacts=[query_artifact],
+    )
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-1",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["detail.orders"],
+                verification_passed=True,
+                evidence_refs=[table_ref, required_field],
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert table_ref not in resolutions[0]["outputSemanticRefs"]
+    assert result.finalization_allowed is True
+
+
+def test_ranking_proof_rejects_wrong_actual_direction_limit_and_bindings() -> None:
+    metric_sales = "semantic:trade:orders:metric:sales"
+    metric_refund = "semantic:trade:orders:metric:refund"
+    dimension_product = "semantic:trade:orders:field:spu_id"
+    dimension_store = "semantic:trade:orders:field:store_id"
+    contract = OriginalQuestionGoalContract(
+        question="销量最高的3个商品",
+        goals=[
+            MetricQuestionGoal(
+                goal_id="metric.sales",
+                label="销量",
+                metric_ref_id=metric_sales,
+            ),
+            DimensionQuestionGoal(
+                goal_id="dimension.product",
+                label="商品",
+                dimension_ref_id=dimension_product,
+            ),
+            RankingQuestionGoal(
+                goal_id="ranking.top3",
+                label="销量最高的3个商品",
+                metric_goal_ids=["metric.sales"],
+                dimension_goal_ids=["dimension.product"],
+                direction="DESC",
+                limit=3,
+                population_scope="ALL_MATCHING_ROWS",
+            ),
+        ],
+    )
+    fingerprint = original_question_goal_contract_fingerprint(contract)
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-ranking",
+                goal_contract_fingerprint=fingerprint,
+                covered_goal_ids=[
+                    "metric.sales",
+                    "dimension.product",
+                    "ranking.top3",
+                ],
+                verification_passed=True,
+                evidence_refs=[metric_sales, dimension_product],
+                goal_resolutions=[
+                    {
+                        "goalId": "ranking.top3",
+                        "goalKind": "RANKING",
+                        "resolution": "PROVED",
+                        "orderByGoalIds": ["metric.sales"],
+                        "dimensionGoalIds": ["dimension.product"],
+                        "rankingMetricRefId": metric_refund,
+                        "rankingDimensionRefId": dimension_store,
+                        "direction": "ASC",
+                        "limit": 5,
+                        "rowSetRef": "artifact-ranking",
+                        "populationScope": "ALL_MATCHING_ROWS",
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is False
+    assert {issue.code for issue in result.issues} >= {
+        "RANKING_PROOF_METRIC_REF_MISMATCH",
+        "RANKING_PROOF_DIMENSION_REF_MISMATCH",
+        "RANKING_PROOF_DIRECTION_MISMATCH",
+        "RANKING_PROOF_LIMIT_MISMATCH",
+    }
 
 
 def test_ranking_population_cannot_be_proved_from_goal_declaration_or_semantic_refs() -> None:

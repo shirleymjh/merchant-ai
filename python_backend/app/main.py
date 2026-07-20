@@ -336,12 +336,20 @@ async def chat(request: ChatRequest, authorization: Optional[str] = Header(defau
         requested_identity=request.user_identity,
     )
     request.message = message_with_attachments(request.message, request.attachments, merchant_id)
-    thread = run_manager.create_thread(
-        merchant_id,
-        request.context.topic if request.context else "",
-        request.context,
-        identity=request.user_identity,
-    )
+    if request.thread_id:
+        thread = require_thread_access(
+            request.thread_id,
+            merchant_id,
+            authorization,
+            request.user_identity,
+        )
+    else:
+        thread = run_manager.create_thread(
+            merchant_id,
+            request.context.topic if request.context else "",
+            request.context,
+            identity=request.user_identity,
+        )
     run = run_manager.create_run(thread.thread_id, merchant_id, request.message, identity=request.user_identity)
     message_history = run_manager.effective_message_history(
         thread.thread_id,

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from merchant_ai.models import RouteSpanType
 from merchant_ai.services.routing import (
     KeywordExtractService,
@@ -79,3 +81,44 @@ def test_two_metric_lookup_is_structurally_sent_to_planner() -> None:
     assert metric_phrases == ["订单量", "退款金额"]
     assert len(metric_phrases) >= 2
     assert keywords.analysis_intent == "unresolved"
+
+
+def test_pending_context_reply_reaches_semantic_clarification_classifier() -> None:
+    class Classifier:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def classify_surface(
+            self,
+            question: str,
+            surface_signals: dict,
+            pending_context: bool = False,
+        ) -> dict:
+            self.calls += 1
+            assert question == "第一个"
+            assert pending_context is True
+            assert surface_signals["pendingContext"] is True
+            return {
+                "enabled": True,
+                "status": "success",
+                "route": "CLARIFICATION_REPLY",
+                "confidence": 0.95,
+            }
+
+    keyword_service = KeywordExtractService()
+    classifier = Classifier()
+    service = PreflightUnderstandingService(
+        settings=SimpleNamespace(
+            preflight_semantic_route_min_confidence=0.62
+        ),
+        keyword_service=keyword_service,
+        routing_service=None,
+        slot_extractor=RouteSlotExtractor(keyword_service.topic_assets),
+        semantic_classifier=classifier,
+    )
+
+    result = service.understand("第一个", pending_context=True)
+
+    assert classifier.calls == 1
+    assert result.semantic_trace["route"] == "CLARIFICATION_REPLY"
+    assert result.routing_decision.route == "BUSINESS"

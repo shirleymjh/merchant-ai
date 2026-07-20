@@ -33,6 +33,7 @@ from merchant_ai.models import (
     RecallRoundTrace,
     RetrievalIssue,
     ResultCoverage,
+    RouteSlots,
     TaskRole,
     TopicRoutingDecision,
     VerifiedEvidence,
@@ -68,7 +69,11 @@ from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
-from merchant_ai.services.routing import KeywordExtractService, TopicRouterService
+from merchant_ai.services.routing import (
+    KeywordExtractService,
+    RouteSlotExtractor,
+    TopicRouterService,
+)
 from merchant_ai.services.grounded_rule_artifact import (
     GroundedVerifiedRuleArtifact,
     render_verified_rule_answer,
@@ -223,6 +228,7 @@ class GroundedRuntimeSession(APIModel):
     phase: str = "CREATED"
     revision: int = 0
     keywords: ExtractedKeywords = Field(default_factory=ExtractedKeywords)
+    route_slots: RouteSlots = Field(default_factory=RouteSlots)
     routing: TopicRoutingDecision = Field(default_factory=TopicRoutingDecision)
     workspace_topics: list[str] = Field(default_factory=list)
     semantic_activation_seal: Optional[
@@ -317,6 +323,7 @@ class GroundedRuntimeKernel:
         topic_assets: Any,
         *,
         keyword_service: Any | None = None,
+        route_slot_extractor: Any | None = None,
         topic_router: Any | None = None,
         recall_service: Any | None = None,
         contract_builder: Any | None = None,
@@ -330,6 +337,9 @@ class GroundedRuntimeKernel:
     ):
         self.topic_assets = topic_assets
         self.keyword_service = keyword_service or KeywordExtractService(topic_assets)
+        self.route_slot_extractor = (
+            route_slot_extractor or RouteSlotExtractor(topic_assets)
+        )
         self.topic_router = topic_router or TopicRouterService(topic_assets)
         self.recall_service = recall_service
         self.contract_builder = contract_builder or GroundedQueryContractBuilder()
@@ -920,19 +930,38 @@ class GroundedRuntimeKernel:
         runtime_budget: Any = None,
     ) -> TopicRoutingDecision:
         keywords = self.keyword_service.extract(session.question)
+        route_slots = self.route_slot_extractor.extract(
+            session.question,
+            keywords,
+        )
         semantic_route = getattr(self.topic_router, "route_with_budget", None)
         if callable(semantic_route):
             routing = semantic_route(
                 session.question,
                 keywords=keywords,
+                route_slots=route_slots,
                 runtime_budget=runtime_budget,
             )
         else:
-            routing = self.topic_router.route(session.question, keywords)
+            route = self.topic_router.route
+            try:
+                routing = route(
+                    session.question,
+                    keywords,
+                    route_slots=route_slots,
+                )
+            except TypeError as exc:
+                # Test and compatibility routers may expose the historical
+                # two-argument signature. Only retry that exact signature
+                # mismatch; do not hide a TypeError raised by router logic.
+                if "route_slots" not in str(exc):
+                    raise
+                routing = route(session.question, keywords)
         categories = routing.recall_topics()
         topic_names = list(self.topic_assets.topic_names_for_categories(categories))
         with self._lock:
             session.keywords = keywords
+            session.route_slots = route_slots
             session.routing = routing
             session.workspace_topics = _dedupe(topic_names)
             session.phase = "TOPIC_ROUTED"
@@ -964,6 +993,21 @@ class GroundedRuntimeKernel:
             if retrieval_query == session.question
             else self.keyword_service.extract(retrieval_query)
         )
+        retrieval_route_slots = (
+            session.route_slots
+            if retrieval_query == session.question
+            else self.route_slot_extractor.extract(
+                retrieval_query,
+                retrieval_keywords,
+            )
+        )
+        route_slots_payload = retrieval_route_slots.model_dump(
+            by_alias=True,
+            mode="json",
+        )
+        route_slots_payload["dimensions"] = list(
+            retrieval_keywords.dimension_keywords
+        )
         retrieve = getattr(self.recall_service, "retrieve", None)
         knowledge_bundle = None
         if callable(retrieve):
@@ -981,7 +1025,14 @@ class GroundedRuntimeKernel:
                         if str(item or "").strip()
                     ],
                     topic_categories=categories,
-                    route_slots={},
+                    route_slots=route_slots_payload,
+                    intent_kind=str(
+                        retrieval_keywords.analysis_intent or ""
+                    ),
+                    complexity=_retrieval_complexity(
+                        retrieval_keywords,
+                        retrieval_route_slots,
+                    ),
                     strict_topic_scope=True,
                 )
             )
@@ -4721,6 +4772,26 @@ def _combine_artifact_runs(
         list(artifact_ids)
     )
     return combined
+
+
+def _retrieval_complexity(
+    keywords: ExtractedKeywords,
+    route_slots: RouteSlots,
+) -> str:
+    metric_keys = {
+        str(item.canonical_key or item.phrase or "")
+        for item in keywords.mentions
+        if item.kind in {"metric", "lineage"}
+        and str(item.canonical_key or item.phrase or "")
+    }
+    if (
+        len(metric_keys) > 1
+        or len(route_slots.topic_candidates) > 1
+        or bool(keywords.ranking_keywords)
+        or bool(route_slots.analysis_signals)
+    ):
+        return "complex"
+    return "simple"
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:

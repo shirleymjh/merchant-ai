@@ -376,7 +376,7 @@ def test_facade_reopens_published_artifact_before_binding_population(
     )
 
 
-def test_every_standalone_turn_still_receives_structured_semantic_review(
+def test_standalone_turn_without_retained_artifact_skips_semantic_review(
     tmp_path: Path,
 ) -> None:
     values = _published_snapshot(tmp_path)
@@ -391,8 +391,7 @@ def test_every_standalone_turn_still_receives_structured_semantic_review(
 
     assert resolution.status == "STANDALONE"
     assert resolution.reference_detected is False
-    assert len(provider.requests) == 1
-    assert provider.requests[0].candidates == ()
+    assert len(provider.requests) == 0
 
 
 @pytest.mark.parametrize(

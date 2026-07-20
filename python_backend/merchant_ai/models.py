@@ -301,6 +301,7 @@ class AttachmentReference(APIModel):
 class ChatRequest(APIModel):
     message: str
     merchant_id: str = ""
+    thread_id: str = ""
     context: Optional[ChatContext] = None
     message_history: List[ConversationMessage] = Field(default_factory=list)
     attachments: List[AttachmentReference] = Field(default_factory=list)

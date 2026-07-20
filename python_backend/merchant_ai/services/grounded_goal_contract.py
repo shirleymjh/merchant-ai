@@ -71,6 +71,13 @@ class TimeWindowQuestionGoal(QuestionGoalBase):
     end: str = ""
     timezone: str = ""
     granularity: str = ""
+    # Optional execution semantics retained when Core has them.  Relative
+    # windows normally only carry ``time_expression``; the Kernel still has
+    # to prove the concrete values from the query artifact.
+    days: int = 0
+    anchor_policy: str = ""
+    window_role: str = ""
+    time_range_kind: str = ""
     applies_to_goal_ids: list[str] = Field(default_factory=list)
 
 
@@ -240,6 +247,12 @@ class TimeWindowGoalProofResolution(GoalProofResolutionBase):
     end: str = ""
     timezone: str = ""
     granularity: str = ""
+    days: int = 0
+    label: str = ""
+    explicit: bool = False
+    anchor_policy: str = ""
+    window_role: str = ""
+    time_range_kind: str = ""
 
 
 class ComparisonGoalProofResolution(GoalProofResolutionBase):
@@ -275,6 +288,7 @@ class RuleGoalProofResolution(GoalProofResolutionBase):
 class DetailGoalProofResolution(GoalProofResolutionBase):
     goal_kind: Literal["DETAIL"] = "DETAIL"
     output_fields: list[str] = Field(default_factory=list)
+    output_semantic_refs: list[str] = Field(default_factory=list)
     row_set_ref: str = ""
     row_count: int | None = None
 
@@ -282,6 +296,9 @@ class DetailGoalProofResolution(GoalProofResolutionBase):
 class RankingGoalProofResolution(GoalProofResolutionBase):
     goal_kind: Literal["RANKING"] = "RANKING"
     order_by_goal_ids: list[str] = Field(default_factory=list)
+    dimension_goal_ids: list[str] = Field(default_factory=list)
+    ranking_metric_ref_id: str = ""
+    ranking_dimension_ref_id: str = ""
     direction: str = ""
     limit: int = 0
     row_set_ref: str = ""
@@ -600,6 +617,7 @@ def declare_verified_artifact_goal_coverage(
             goal,
             artifact_id=artifact_id,
             evidence_refs=evidence_refs,
+            artifact=artifact,
         )
         if legacy_resolution is not None:
             normalized_resolutions.append(legacy_resolution)
@@ -803,6 +821,7 @@ class GoalCoverageVerifier:
                     resolution,
                     artifact_id=artifact_id,
                     accepted_artifact_ids=accepted_artifact_id_set,
+                    goal_map=goal_map,
                 )
                 issues.extend(resolution_issues)
                 if any(issue.blocking for issue in resolution_issues):
@@ -828,6 +847,15 @@ class GoalCoverageVerifier:
                     goal,
                     artifact_id=artifact_id,
                     evidence_refs=declaration.evidence_refs,
+                    artifact=next(
+                        (
+                            item
+                            for item in artifacts
+                            if str(_object_value(item, "artifact_id", "artifactId") or "").strip()
+                            == artifact_id
+                        ),
+                        None,
+                    ),
                 )
                 if legacy_resolution is None:
                     issues.append(
@@ -1708,7 +1736,9 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
     goal_id_list_fields = (
         "operand_goal_ids",
         "order_by_goal_ids",
+        "dimension_goal_ids",
         "input_goal_ids",
+        "population_goal_ids",
     )
     string_list_fields = (
         "evidence_refs",
@@ -1716,6 +1746,7 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
         "value_refs",
         "dimension_ref_ids",
         "output_fields",
+        "output_semantic_refs",
         "baseline_refs",
         "entity_ref_ids",
         "identity_fields",
@@ -1724,6 +1755,7 @@ def _normalize_goal_resolution_payload(payload: Any) -> dict[str, Any]:
         "lineage_refs",
         "rule_ref_ids",
         "citation_refs",
+        "population_lineage_refs",
     )
     for snake_name in goal_id_list_fields + string_list_fields:
         camel_name = _camel_name(snake_name)
@@ -1754,6 +1786,7 @@ def _legacy_primitive_goal_resolution(
     *,
     artifact_id: str,
     evidence_refs: Sequence[str],
+    artifact: Any | None = None,
 ) -> dict[str, Any] | None:
     """Create a narrow compatibility proof for already-verified primitives.
 
@@ -1785,15 +1818,14 @@ def _legacy_primitive_goal_resolution(
             }
         )
     elif isinstance(goal, TimeWindowQuestionGoal):
-        base.update(
-            {
-                "time_expression": goal.time_expression,
-                "start": goal.start,
-                "end": goal.end,
-                "timezone": goal.timezone,
-                "granularity": goal.granularity,
-            }
-        )
+        # A time window is not a primitive fact of the question declaration.
+        # It is proved only by the executed artifact's resolved time contract.
+        # In particular, never copy the Goal's expression/bounds into a proof:
+        # doing so would let a 30-day query masquerade as "最近7天".
+        actual = _artifact_time_window_payload(artifact)
+        if actual is None:
+            return None
+        base.update(actual)
     elif isinstance(goal, EntityQuestionGoal):
         base.update(
             {
@@ -1805,6 +1837,52 @@ def _legacy_primitive_goal_resolution(
     else:
         return None
     return base
+
+
+def _artifact_time_window_payload(artifact: Any | None) -> dict[str, Any] | None:
+    """Return only time facts sealed by a verified query contract.
+
+    Runtime execution dates are preferred because they are the snapshot bounds
+    actually used by SQL; declared dates are the fallback for older artifacts.
+    ``binding_hints.time_expression`` is the formal query-contract expression,
+    while the resolved range label is retained as a safe fallback.
+    """
+
+    contract = _object_value(artifact, "contract")
+    time_range = _object_value(contract, "time_range", "timeRange")
+    if time_range is None:
+        return None
+    execution_start = str(
+        _object_value(time_range, "execution_start_date", "executionStartDate")
+        or _object_value(time_range, "execution_start_value", "executionStartValue")
+        or _object_value(time_range, "start_date", "startDate")
+        or ""
+    ).strip()
+    execution_end = str(
+        _object_value(time_range, "execution_end_date", "executionEndDate")
+        or _object_value(time_range, "execution_end_value", "executionEndValue")
+        or _object_value(time_range, "end_date", "endDate")
+        or ""
+    ).strip()
+    hints = _object_value(contract, "binding_hints", "bindingHints")
+    expression = str(
+        _object_value(time_range, "label")
+        or _object_value(hints, "time_expression", "timeExpression")
+        or ""
+    ).strip()
+    return {
+        "time_expression": expression,
+        "start": execution_start,
+        "end": execution_end,
+        "timezone": str(_object_value(time_range, "timezone") or "").strip(),
+        "granularity": str(_object_value(time_range, "granularity") or "").strip(),
+        "days": int(_object_value(time_range, "days") or 0),
+        "label": str(_object_value(time_range, "label") or "").strip(),
+        "explicit": bool(_object_value(time_range, "explicit")),
+        "anchor_policy": str(_object_value(time_range, "anchor_policy", "anchorPolicy") or "").strip(),
+        "window_role": str(_object_value(time_range, "window_role", "windowRole") or "").strip(),
+        "time_range_kind": str(_object_value(time_range, "kind") or "").strip(),
+    }
 
 
 def _goal_semantic_refs(goal: QuestionGoal) -> set[str]:
@@ -1825,8 +1903,10 @@ def _semantic_evidence_issue(
     artifact_evidence_refs: Sequence[str],
     resolution_evidence_refs: Sequence[str],
 ) -> GoalCoverageIssue | None:
-    declared_semantic_refs = _goal_semantic_refs(goal)
-    evidence = set(_normalized_string_list([*artifact_evidence_refs, *resolution_evidence_refs]))
+    declared_semantic_refs = _canonical_semantic_refs(_goal_semantic_refs(goal))
+    evidence = _canonical_semantic_refs(
+        [*artifact_evidence_refs, *resolution_evidence_refs]
+    )
     if not declared_semantic_refs or declared_semantic_refs.intersection(evidence):
         return None
     return GoalCoverageIssue(
@@ -1849,6 +1929,7 @@ def _goal_resolution_issues(
     *,
     artifact_id: str,
     accepted_artifact_ids: set[str],
+    goal_map: Mapping[str, QuestionGoal],
 ) -> list[GoalCoverageIssue]:
     issues: list[GoalCoverageIssue] = []
 
@@ -1889,6 +1970,56 @@ def _goal_resolution_issues(
                 "TIME_WINDOW_PROOF_BOUNDARY_MISSING",
                 f"time goal {goal.goal_id!r} has no verified expression or boundaries",
             )
+        if not resolution.explicit:
+            add(
+                "TIME_WINDOW_PROOF_NOT_EXPLICIT",
+                f"time goal {goal.goal_id!r} was not proved by an explicit query time range",
+            )
+        if resolution.days <= 0:
+            add(
+                "TIME_WINDOW_PROOF_DAYS_INVALID",
+                f"time goal {goal.goal_id!r} has no positive executed window length",
+                actualDays=resolution.days,
+            )
+        if isinstance(goal, TimeWindowQuestionGoal):
+            actual_expression = resolution.time_expression or resolution.label
+            _add_time_value_mismatch(
+                add,
+                goal_id=goal.goal_id,
+                field_name="timeExpression",
+                expected=goal.time_expression,
+                actual=actual_expression,
+                code="TIME_WINDOW_PROOF_EXPRESSION_MISMATCH",
+            )
+            for field_name, expected, actual in (
+                ("start", goal.start, resolution.start),
+                ("end", goal.end, resolution.end),
+                ("timezone", goal.timezone, resolution.timezone),
+                ("anchorPolicy", goal.anchor_policy, resolution.anchor_policy),
+                ("windowRole", goal.window_role, resolution.window_role),
+                ("timeRangeKind", goal.time_range_kind, resolution.time_range_kind),
+            ):
+                _add_time_value_mismatch(
+                    add,
+                    goal_id=goal.goal_id,
+                    field_name=field_name,
+                    expected=expected,
+                    actual=actual,
+                    code="TIME_WINDOW_PROOF_%s_MISMATCH"
+                    % _canonical_ascii_symbol(field_name),
+                )
+            # ``ResolvedTimeRange`` does not carry an executed day/week/month
+            # grain.  TREND query shape proves only that a series was
+            # requested, not its concrete grain, so Goal granularity must be
+            # checked by a future authoritative query-contract field rather
+            # than compared with this necessarily empty proof attribute.
+            if goal.days > 0 and resolution.days != goal.days:
+                add(
+                    "TIME_WINDOW_PROOF_DAYS_MISMATCH",
+                    f"time goal {goal.goal_id!r} executed a different number of days",
+                    expectedDays=goal.days,
+                    actualDays=resolution.days,
+                )
     elif isinstance(resolution, ComparisonGoalProofResolution):
         expected_operands = set(getattr(goal, "left_goal_ids", []) + getattr(goal, "right_goal_ids", []))
         actual_operands = set(resolution.operand_goal_ids)
@@ -1972,24 +2103,110 @@ def _goal_resolution_issues(
                 "DETAIL_PROOF_ROW_COUNT_INVALID",
                 f"detail goal {goal.goal_id!r} has an invalid negative row count",
             )
+        if isinstance(goal, DetailQuestionGoal):
+            # Generic semantic refs prove that the Detail Goal is grounded;
+            # they may identify a table, metric, or rule and are checked by
+            # ``_semantic_evidence_issue``.  Only explicitly requested field
+            # refs are obligations on the artifact's output columns.
+            expected_refs = _canonical_semantic_refs(
+                goal.required_field_ref_ids
+            )
+            actual_refs = _canonical_semantic_refs(
+                resolution.output_semantic_refs
+            )
+            missing_refs = sorted(expected_refs - actual_refs)
+            if missing_refs:
+                add(
+                    "DETAIL_PROOF_REQUIRED_FIELDS_MISSING",
+                    f"detail goal {goal.goal_id!r} does not output every requested semantic field",
+                    missingSemanticRefIds=missing_refs,
+                    actualOutputSemanticRefIds=sorted(actual_refs),
+                    rejectedRefIds=missing_refs,
+                    readNext="read the published field definitions and regenerate the detail output binding",
+                )
     elif isinstance(resolution, RankingGoalProofResolution):
         expected_order_goals = set(getattr(goal, "metric_goal_ids", []))
-        if not expected_order_goals.issubset(set(resolution.order_by_goal_ids)):
+        actual_order_goals = set(resolution.order_by_goal_ids)
+        if expected_order_goals != actual_order_goals:
             add(
-                "RANKING_PROOF_ORDER_GOAL_MISSING",
-                f"ranking goal {goal.goal_id!r} does not prove its declared order metric",
+                "RANKING_PROOF_ORDER_GOAL_MISMATCH",
+                f"ranking goal {goal.goal_id!r} was not ordered by exactly its declared metric goals",
                 expectedOrderGoalIds=sorted(expected_order_goals),
-                actualOrderGoalIds=sorted(resolution.order_by_goal_ids),
+                actualOrderGoalIds=sorted(actual_order_goals),
             )
+        expected_dimension_goals = set(getattr(goal, "dimension_goal_ids", []))
+        actual_dimension_goals = set(resolution.dimension_goal_ids)
+        if expected_dimension_goals != actual_dimension_goals:
+            add(
+                "RANKING_PROOF_DIMENSION_GOAL_MISMATCH",
+                f"ranking goal {goal.goal_id!r} was not grouped by exactly its declared dimension goals",
+                expectedDimensionGoalIds=sorted(expected_dimension_goals),
+                actualDimensionGoalIds=sorted(actual_dimension_goals),
+            )
+        if not resolution.ranking_metric_ref_id:
+            add(
+                "RANKING_PROOF_METRIC_REF_MISSING",
+                f"ranking goal {goal.goal_id!r} has no actual ranking metric semantic ref",
+            )
+        elif not _ranking_ref_matches_goals(
+            resolution.ranking_metric_ref_id,
+            resolution.order_by_goal_ids,
+            goal_map,
+            allow_unique_binding=(
+                str(resolution.details.get("metricBindingMode") or "")
+                == "UNIQUE_CONTRACT_BINDING"
+            ),
+        ):
+            add(
+                "RANKING_PROOF_METRIC_REF_MISMATCH",
+                f"ranking goal {goal.goal_id!r} actual metric ref does not match its metric goal",
+                actualMetricRefId=resolution.ranking_metric_ref_id,
+                actualOrderGoalIds=list(resolution.order_by_goal_ids),
+            )
+        if expected_dimension_goals and not resolution.ranking_dimension_ref_id:
+            add(
+                "RANKING_PROOF_DIMENSION_REF_MISSING",
+                f"ranking goal {goal.goal_id!r} has no actual ranking dimension semantic ref",
+            )
+        elif resolution.ranking_dimension_ref_id and not _ranking_ref_matches_goals(
+            resolution.ranking_dimension_ref_id,
+            resolution.dimension_goal_ids,
+            goal_map,
+            allow_unique_binding=(
+                str(resolution.details.get("dimensionBindingMode") or "")
+                == "UNIQUE_CONTRACT_BINDING"
+            ),
+        ):
+            add(
+                "RANKING_PROOF_DIMENSION_REF_MISMATCH",
+                f"ranking goal {goal.goal_id!r} actual dimension ref does not match its dimension goal",
+                actualDimensionRefId=resolution.ranking_dimension_ref_id,
+                actualDimensionGoalIds=list(resolution.dimension_goal_ids),
+            )
+        expected_direction = str(getattr(goal, "direction", "") or "").upper()
         if resolution.direction not in {"ASC", "DESC"}:
             add(
                 "RANKING_PROOF_DIRECTION_INVALID",
                 f"ranking goal {goal.goal_id!r} requires ASC or DESC direction",
             )
+        elif resolution.direction != expected_direction:
+            add(
+                "RANKING_PROOF_DIRECTION_MISMATCH",
+                f"ranking goal {goal.goal_id!r} executed a different sort direction",
+                expectedDirection=expected_direction,
+                actualDirection=resolution.direction,
+            )
         if resolution.limit <= 0:
             add(
                 "RANKING_PROOF_LIMIT_INVALID",
                 f"ranking goal {goal.goal_id!r} requires a positive verified limit",
+            )
+        elif resolution.limit != int(getattr(goal, "limit", 0) or 0):
+            add(
+                "RANKING_PROOF_LIMIT_MISMATCH",
+                f"ranking goal {goal.goal_id!r} executed a different Top-N limit",
+                expectedLimit=int(getattr(goal, "limit", 0) or 0),
+                actualLimit=resolution.limit,
             )
         if not resolution.row_set_ref:
             add(
@@ -2064,6 +2281,73 @@ def _is_anomaly_goal(
         _canonical_analysis_capability(getattr(resolution, "analysis_type", "")),
     }
     return any(value == "ANOMALY" or value.startswith("ANOMALY_") for value in capability_types if value)
+
+
+def _canonical_semantic_ref(value: Any) -> str:
+    """Normalize equivalent published field coordinates for proof comparison."""
+
+    text = unicodedata.normalize("NFKC", str(value or "").strip()).casefold()
+    # Older assets called a field a ``column`` while newer assets use
+    # ``field``.  They identify the same governed coordinate.
+    return text.replace(":column:", ":field:")
+
+
+def _canonical_semantic_refs(values: Sequence[Any]) -> set[str]:
+    return {
+        normalized
+        for normalized in (_canonical_semantic_ref(value) for value in values)
+        if normalized
+    }
+
+
+def _ranking_ref_matches_goals(
+    actual_ref: str,
+    goal_ids: Sequence[str],
+    goal_map: Mapping[str, QuestionGoal],
+    *,
+    allow_unique_binding: bool = False,
+) -> bool:
+    actual = _canonical_semantic_ref(actual_ref)
+    if not actual or not goal_ids:
+        return False
+    if any(
+        actual in _canonical_semantic_refs(_goal_semantic_refs(goal_map[goal_id]))
+        for goal_id in goal_ids
+        if goal_id in goal_map
+    ):
+        return True
+    # The proof producer may use this only when the executed Contract had one
+    # metric/dimension binding and the Goal declared one corresponding slot.
+    return allow_unique_binding and len(goal_ids) == 1
+
+
+def _add_time_value_mismatch(
+    add: Any,
+    *,
+    goal_id: str,
+    field_name: str,
+    expected: Any,
+    actual: Any,
+    code: str,
+) -> None:
+    expected_text = str(expected or "").strip()
+    if not expected_text:
+        return
+    actual_text = str(actual or "").strip()
+    if _canonical_time_value(expected_text) == _canonical_time_value(actual_text):
+        return
+    add(
+        code,
+        f"time goal {goal_id!r} has a different executed {field_name}",
+        expected=expected_text,
+        actual=actual_text,
+        rejectedRefIds=["time:%s" % field_name],
+        readNext="read the executed query time contract before retrying",
+    )
+
+
+def _canonical_time_value(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
 
 
 def _canonical_analysis_capability(value: Any) -> str:

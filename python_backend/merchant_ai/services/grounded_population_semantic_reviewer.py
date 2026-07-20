@@ -521,6 +521,90 @@ class IndependentPopulationSemanticReviewer:
             issues=(),
         )
 
+    def attest_declared_independent(
+        self,
+        *,
+        effective_question: str,
+        contract: OriginalQuestionGoalContract | Mapping[str, Any] | str,
+        declaration_author_fingerprint: str,
+    ) -> PopulationSemanticReviewerOutcome:
+        """Attest a contract that declares no cross-population dependency.
+
+        This is the deterministic fast path used for ordinary scalar, grouped,
+        ranking and detail queries.  It preserves the independent reviewer
+        authority and the same cryptographic bindings without spending a model
+        call to rediscover that every Goal is non-gated.
+        """
+
+        try:
+            request = build_population_semantic_reviewer_request(
+                effective_question,
+                contract,
+            )
+            authority = _text(self.provider.authority_fingerprint)
+        except Exception as exc:
+            return _failed_outcome(
+                request=None,
+                provider_authority_fingerprint="",
+                provider_invoked=False,
+                issues=(
+                    _issue(
+                        PopulationSemanticReviewerIssueCode.PROVIDER_AUTHORITY_REQUIRED,
+                        "The deterministic population attestation could not be bound: %s"
+                        % _bounded_error(exc),
+                    ),
+                ),
+            )
+        if (
+            not authority
+            or authority
+            not in set(self.trusted_provider_authority_fingerprints)
+            or authority == _text(declaration_author_fingerprint)
+        ):
+            return _failed_outcome(
+                request=request,
+                provider_authority_fingerprint=authority,
+                provider_invoked=False,
+                issues=(
+                    _issue(
+                        PopulationSemanticReviewerIssueCode.PROVIDER_AUTHORITY_UNTRUSTED,
+                        "The deterministic population attestation authority is not trusted or independent.",
+                    ),
+                ),
+            )
+        output = PopulationSemanticProviderOutput(
+            request_fingerprint=request.request_fingerprint,
+            question_fingerprint=request.question_fingerprint,
+            goal_skeleton_fingerprint=request.goal_skeleton_fingerprint,
+            complete=True,
+            decisions=tuple(
+                PopulationSemanticProviderDecision(
+                    goal_id=item.goal_id,
+                    gate_required=False,
+                )
+                for item in request.goal_skeleton
+            ),
+        )
+        output_fingerprint = _stable_fingerprint(output)
+        review = _build_review(
+            request,
+            output,
+            authority,
+            output_fingerprint,
+        )
+        return PopulationSemanticReviewerOutcome(
+            passed=True,
+            review=review,
+            request=request,
+            request_fingerprint=request.request_fingerprint,
+            goal_skeleton_fingerprint=request.goal_skeleton_fingerprint,
+            provider_authority_fingerprint=authority,
+            provider_output_fingerprint=output_fingerprint,
+            review_fingerprint=population_semantic_review_fingerprint(review),
+            provider_invoked=False,
+            issues=(),
+        )
+
 
 def review_goal_contract_population_semantics(
     *,

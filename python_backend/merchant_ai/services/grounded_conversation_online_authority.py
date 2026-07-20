@@ -1087,7 +1087,10 @@ class GroundedConversationOnlineAuthorityFacade:
             candidates,
         )
         semantic_review = None
-        if self.semantic_provider is not None:
+        if (
+            (candidates or has_retained_artifacts)
+            and self.semantic_provider is not None
+        ):
             semantic_review = review_conversation_semantics(
                 self.semantic_provider,
                 request,

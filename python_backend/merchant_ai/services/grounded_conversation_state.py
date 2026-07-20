@@ -241,6 +241,14 @@ def resolve_grounded_conversation_turn(
     snapshot = dict(persisted_snapshot or {})
     revision = max(0, int(persisted_revision or 0))
     antecedent = _server_retained_antecedent(snapshot)
+    active_scope = snapshot.get("activeScope")
+    has_persisted_artifact_claim = bool(
+        isinstance(active_scope, Mapping)
+        and (
+            active_scope.get("artifactIds")
+            or active_scope.get("sourceArtifacts")
+        )
+    )
     pending = _pending_clarification(snapshot, request_context)
     if pending:
         pending_question = str(pending.get("pendingQuestion") or "").strip()
@@ -299,6 +307,16 @@ def resolve_grounded_conversation_turn(
             revision=revision,
             antecedent=antecedent,
             review=semantic_review,
+        )
+
+    if not candidates and not has_persisted_artifact_claim:
+        return GroundedConversationResolution(
+            original_question=original,
+            effective_question=original,
+            status="STANDALONE",
+            antecedent_question=antecedent,
+            source_revision=revision,
+            source="NO_RETAINED_VERIFIED_ARTIFACT",
         )
 
     semantic_fields = _semantic_trace_fields(semantic_review, request)

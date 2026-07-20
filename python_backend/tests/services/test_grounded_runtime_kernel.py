@@ -26,6 +26,8 @@ from merchant_ai.models import (
     RecallBundle,
     RecallItem,
     ResolvedTimeRange,
+    RouteSlots,
+    RouteTimeWindow,
     TopicRoutingDecision,
     VerifiedEvidence,
 )
@@ -420,6 +422,12 @@ def test_unified_retriever_is_preferred_with_strict_topic_scope_and_supplemental
 
     assert retriever.requests[0].strict_topic_scope is True
     assert retriever.requests[0].topic_categories == [QuestionCategory.SERVICE]
+    assert retriever.requests[0].route_slots["timeWindow"]["days"] == 30
+    assert retriever.requests[0].route_slots["topicCandidates"][0]["topic"] == (
+        QuestionCategory.SERVICE.value
+    )
+    assert retriever.requests[0].intent_kind == "lookup"
+    assert retriever.requests[0].complexity == "simple"
     assert retriever.requests[1].query == "商品字段"
     assert retriever.requests[1].strict_topic_scope is True
     assert [item.doc_id for item in initial.items] == ["semantic:客服工单:initial"]
@@ -427,6 +435,78 @@ def test_unified_retriever_is_preferred_with_strict_topic_scope_and_supplemental
         "semantic:客服工单:initial",
         "semantic:客服工单:supplemental",
     }
+
+
+def test_initial_route_extracts_keywords_and_slots_once_for_topic_and_recall() -> None:
+    class CountingKeywordService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def extract(self, question: str) -> ExtractedKeywords:
+            self.calls.append(question)
+            return ExtractedKeywords(
+                normalized_question=question,
+                keywords=["工单"],
+                topic_scores={QuestionCategory.SERVICE.value: 5.0},
+            )
+
+    class CountingSlotExtractor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ExtractedKeywords]] = []
+
+        def extract(
+            self,
+            question: str,
+            keywords: ExtractedKeywords,
+        ) -> RouteSlots:
+            self.calls.append((question, keywords))
+            return RouteSlots(
+                time_window=RouteTimeWindow(days=30, raw="最近30天")
+            )
+
+    class RecordingRouter:
+        def __init__(self) -> None:
+            self.keywords: ExtractedKeywords | None = None
+            self.route_slots: RouteSlots | None = None
+
+        def route_with_budget(
+            self,
+            question: str,
+            *,
+            keywords: ExtractedKeywords,
+            route_slots: RouteSlots,
+            runtime_budget: Any = None,
+        ) -> TopicRoutingDecision:
+            del question, runtime_budget
+            self.keywords = keywords
+            self.route_slots = route_slots
+            return TopicRoutingDecision(
+                primary_topic=QuestionCategory.SERVICE,
+                candidate_topics=[QuestionCategory.SERVICE],
+            )
+
+    keywords = CountingKeywordService()
+    slots = CountingSlotExtractor()
+    router = RecordingRouter()
+    retriever = FakeKnowledgeRetriever()
+    runtime = GroundedRuntimeKernel(
+        FakeTopicAssets(),
+        keyword_service=keywords,
+        route_slot_extractor=slots,
+        topic_router=router,
+        recall_service=retriever,
+        contract_builder=QueueBuilder([]),
+    )
+    session = runtime.new_session("最近30天工单量", "m-1")
+
+    runtime.route_topic(session)
+    runtime.recall_navigation(session)
+
+    assert keywords.calls == ["最近30天工单量"]
+    assert len(slots.calls) == 1
+    assert router.keywords is session.keywords
+    assert router.route_slots is session.route_slots
+    assert retriever.requests[0].route_slots["timeWindow"]["days"] == 30
 
 
 def test_unresolved_candidate_is_recorded_without_replacing_active_contract() -> None:

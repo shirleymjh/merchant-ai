@@ -358,6 +358,7 @@ def test_detail_goal_rejects_ordinary_text_renderer() -> None:
                         "resolution": "proved",
                         "evidenceRefs": [field_ref],
                         "outputFields": ["order_id"],
+                        "outputSemanticRefs": [field_ref],
                         "rowSetRef": artifact_id,
                         "rowCount": 1,
                     }
@@ -702,7 +703,7 @@ def test_verified_insufficiency_ref_is_rendered_without_masquerading_as_proof() 
     assert result.passed is True
 
 
-def test_derived_analysis_binding_requires_trusted_renderer_source() -> None:
+def test_derived_analysis_binding_accepts_internal_compose_verified_answer_source() -> None:
     contract = parse_original_question_goal_contract(
         {
             "question": "退款与订单是否相关",
@@ -755,7 +756,7 @@ def test_derived_analysis_binding_requires_trusted_renderer_source() -> None:
         "renderer": "VERIFIED_ANALYSIS_ARTIFACT_RENDERER",
     }
 
-    untrusted = AnswerCoverageVerifier().verify(
+    composed = AnswerCoverageVerifier().verify(
         contract,
         coverage,
         answer,
@@ -772,8 +773,18 @@ def test_derived_analysis_binding_requires_trusted_renderer_source() -> None:
         auto_bind_verified_primitives=True,
     )
 
+    untrusted = AnswerCoverageVerifier().verify(
+        contract,
+        coverage,
+        answer,
+        [binding],
+        source="ordinary_model_answer",
+        auto_bind_verified_primitives=True,
+    )
+
+    assert composed.passed is True
+    assert trusted.passed is True
     assert untrusted.passed is False
     assert "DERIVED_ANALYSIS_RENDERER_SOURCE_REQUIRED" in {
         issue.code for issue in untrusted.issues
     }
-    assert trusted.passed is True

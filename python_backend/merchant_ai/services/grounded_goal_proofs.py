@@ -7,9 +7,13 @@ from merchant_ai.services.grounded_goal_contract import (
     ComparisonQuestionGoal,
     DependencyQuestionGoal,
     DetailQuestionGoal,
+    DimensionQuestionGoal,
+    EntityQuestionGoal,
     GoalProofResolution,
+    MetricQuestionGoal,
     OriginalQuestionGoalContract,
     RankingQuestionGoal,
+    TimeWindowQuestionGoal,
 )
 
 
@@ -35,11 +39,20 @@ def derive_query_artifact_goal_resolutions(
     bundle = getattr(run_result, "merged_query_bundle", None)
     rows = list(getattr(bundle, "rows", None) or [])
     output_columns = list(getattr(artifact, "output_columns", None) or [])
+    output_semantic_refs = _artifact_output_semantic_refs(artifact)
     evidence_refs = list(getattr(contract, "evidence_refs", None) or [])
     resolutions: list[GoalProofResolution | dict[str, Any]] = []
     for goal_id in _dedupe_strings(assigned_goal_ids):
         goal = goal_map.get(goal_id)
-        if isinstance(goal, DetailQuestionGoal):
+        if isinstance(goal, TimeWindowQuestionGoal):
+            time_proof = _time_window_resolution(
+                goal_id=goal_id,
+                contract=contract,
+                evidence_refs=evidence_refs,
+            )
+            if time_proof is not None:
+                resolutions.append(time_proof)
+        elif isinstance(goal, DetailQuestionGoal):
             if not output_columns:
                 continue
             result_coverage = _bundle_result_coverage(bundle)
@@ -57,6 +70,7 @@ def derive_query_artifact_goal_resolutions(
                         "proofType": "QUERY_RESULT_COVERAGE_INCOMPLETE",
                         "evidenceRefs": evidence_refs,
                         "outputFields": output_columns,
+                        "outputSemanticRefs": output_semantic_refs,
                         "rowSetRef": artifact_id,
                         "rowCount": len(rows),
                         "reason": (
@@ -82,6 +96,7 @@ def derive_query_artifact_goal_resolutions(
                     "proofType": "VERIFIED_QUERY_ROW_SET",
                     "evidenceRefs": evidence_refs,
                     "outputFields": output_columns,
+                    "outputSemanticRefs": output_semantic_refs,
                     "rowSetRef": artifact_id,
                     "rowCount": int(
                         getattr(bundle, "original_row_count", 0) or len(rows)
@@ -112,6 +127,13 @@ def derive_query_artifact_goal_resolutions(
             population_scope, population_goal_ids, population_lineage_refs = (
                 population_proof
             )
+            metric_goal_ids, dimension_goal_ids, binding_details = (
+                _ranking_goal_bindings(
+                    goal,
+                    goal_map=goal_map,
+                    contract=contract,
+                )
+            )
             resolutions.append(
                 {
                     "goalId": goal_id,
@@ -121,13 +143,21 @@ def derive_query_artifact_goal_resolutions(
                     "evidenceRefs": _dedupe_strings(
                         [*evidence_refs, *ranking_receipt]
                     ),
-                    "orderByGoalIds": list(goal.metric_goal_ids),
+                    "orderByGoalIds": metric_goal_ids,
+                    "dimensionGoalIds": dimension_goal_ids,
+                    "rankingMetricRefId": str(
+                        getattr(ranking, "metric_ref_id", "") or ""
+                    ).strip(),
+                    "rankingDimensionRefId": str(
+                        getattr(ranking, "dimension_ref_id", "") or ""
+                    ).strip(),
                     "direction": str(getattr(ranking, "direction", "") or "").upper(),
                     "limit": int(getattr(ranking, "limit", 0) or 0),
                     "rowSetRef": artifact_id,
                     "populationScope": population_scope,
                     "populationGoalIds": population_goal_ids,
                     "populationLineageRefs": population_lineage_refs,
+                    "details": binding_details,
                 }
             )
         elif isinstance(goal, ComparisonQuestionGoal):
@@ -155,6 +185,181 @@ def derive_query_artifact_goal_resolutions(
             if resolution is not None:
                 resolutions.append(resolution)
     return resolutions
+
+
+def _time_window_resolution(
+    *,
+    goal_id: str,
+    contract: Any,
+    evidence_refs: Sequence[str],
+) -> dict[str, Any] | None:
+    """Build a TIME_WINDOW proof exclusively from the executed Contract."""
+
+    time_range = getattr(contract, "time_range", None)
+    if time_range is None:
+        return None
+    start = str(
+        getattr(time_range, "execution_start_date", "")
+        or getattr(time_range, "execution_start_value", "")
+        or getattr(time_range, "start_date", "")
+        or ""
+    ).strip()
+    end = str(
+        getattr(time_range, "execution_end_date", "")
+        or getattr(time_range, "execution_end_value", "")
+        or getattr(time_range, "end_date", "")
+        or ""
+    ).strip()
+    hints = getattr(contract, "binding_hints", None)
+    expression = str(
+        getattr(time_range, "label", "")
+        or getattr(hints, "time_expression", "")
+        or ""
+    ).strip()
+    actual = {
+        "timeExpression": expression,
+        "start": start,
+        "end": end,
+        "timezone": str(getattr(time_range, "timezone", "") or "").strip(),
+        "granularity": str(getattr(time_range, "granularity", "") or "").strip(),
+        "days": int(getattr(time_range, "days", 0) or 0),
+        "label": str(getattr(time_range, "label", "") or "").strip(),
+        "explicit": bool(getattr(time_range, "explicit", False)),
+        "anchorPolicy": str(
+            getattr(time_range, "anchor_policy", "") or ""
+        ).strip(),
+        "windowRole": str(
+            getattr(time_range, "window_role", "") or ""
+        ).strip(),
+        "timeRangeKind": str(getattr(time_range, "kind", "") or "").strip(),
+    }
+    if not actual["explicit"] or actual["days"] <= 0:
+        return {
+            "goalId": goal_id,
+            "goalKind": "TIME_WINDOW",
+            "resolution": "INSUFFICIENT_EVIDENCE",
+            "proofType": "QUERY_TIME_RANGE_NOT_EXPLICIT",
+            "evidenceRefs": list(evidence_refs),
+            **actual,
+            "reason": (
+                "the verified query artifact does not contain an explicit "
+                "positive executed time window"
+            ),
+            "details": {
+                "explicit": actual["explicit"],
+                "days": actual["days"],
+            },
+        }
+    return {
+        "goalId": goal_id,
+        "goalKind": "TIME_WINDOW",
+        "resolution": "PROVED",
+        "proofType": "VERIFIED_QUERY_TIME_RANGE",
+        "evidenceRefs": list(evidence_refs),
+        **actual,
+    }
+
+
+def _artifact_output_semantic_refs(artifact: Any) -> list[str]:
+    values: list[Any] = []
+    semantic_map = getattr(artifact, "output_semantic_refs", None) or {}
+    if isinstance(semantic_map, Mapping):
+        values.extend(semantic_map.values())
+    lineage = getattr(artifact, "output_lineage", None) or {}
+    if isinstance(lineage, Mapping):
+        for refs in lineage.values():
+            if isinstance(refs, (str, bytes)):
+                values.append(refs)
+            elif isinstance(refs, Sequence):
+                values.extend(refs)
+    return _dedupe_strings(values)
+
+
+def _ranking_goal_bindings(
+    goal: RankingQuestionGoal,
+    *,
+    goal_map: Mapping[str, Any],
+    contract: Any,
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    ranking = getattr(contract, "ranking", None)
+    metric_ref = str(getattr(ranking, "metric_ref_id", "") or "").strip()
+    dimension_ref = str(
+        getattr(ranking, "dimension_ref_id", "") or ""
+    ).strip()
+    metric_ids, metric_mode = _goal_ids_matching_ref(
+        metric_ref,
+        goal.metric_goal_ids,
+        goal_map=goal_map,
+        contract_bindings=list(getattr(contract, "metrics", None) or []),
+        allowed_goal_types=(MetricQuestionGoal,),
+    )
+    dimension_ids, dimension_mode = _goal_ids_matching_ref(
+        dimension_ref,
+        goal.dimension_goal_ids,
+        goal_map=goal_map,
+        contract_bindings=list(getattr(contract, "dimensions", None) or []),
+        allowed_goal_types=(DimensionQuestionGoal, EntityQuestionGoal),
+    )
+    return (
+        metric_ids,
+        dimension_ids,
+        {
+            "metricBindingMode": metric_mode,
+            "dimensionBindingMode": dimension_mode,
+        },
+    )
+
+
+def _goal_ids_matching_ref(
+    actual_ref: str,
+    declared_goal_ids: Sequence[str],
+    *,
+    goal_map: Mapping[str, Any],
+    contract_bindings: Sequence[Any],
+    allowed_goal_types: tuple[type, ...],
+) -> tuple[list[str], str]:
+    if not actual_ref:
+        return [], "ACTUAL_REF_MISSING"
+    actual = _canonical_semantic_ref(actual_ref)
+    matches = [
+        goal_id
+        for goal_id in declared_goal_ids
+        if isinstance(goal_map.get(goal_id), allowed_goal_types)
+        and actual in _goal_refs(goal_map[goal_id])
+    ]
+    if matches:
+        return _dedupe_strings(matches), "SEMANTIC_REF_MATCH"
+
+    binding_refs = [
+        _canonical_semantic_ref(getattr(item, "semantic_ref_id", ""))
+        for item in contract_bindings
+        if str(getattr(item, "semantic_ref_id", "") or "").strip()
+    ]
+    if (
+        len(declared_goal_ids) == 1
+        and len(binding_refs) == 1
+        and binding_refs[0] == actual
+        and isinstance(goal_map.get(declared_goal_ids[0]), allowed_goal_types)
+    ):
+        return [declared_goal_ids[0]], "UNIQUE_CONTRACT_BINDING"
+    return [], "NO_GOAL_REF_MATCH"
+
+
+def _goal_refs(goal: Any) -> set[str]:
+    values = list(getattr(goal, "semantic_ref_ids", None) or [])
+    for field_name in ("metric_ref_id", "dimension_ref_id", "entity_ref_id"):
+        value = str(getattr(goal, field_name, "") or "").strip()
+        if value:
+            values.append(value)
+    return {
+        value
+        for value in (_canonical_semantic_ref(item) for item in values)
+        if value
+    }
+
+
+def _canonical_semantic_ref(value: Any) -> str:
+    return str(value or "").strip().casefold().replace(":column:", ":field:")
 
 
 def _ranked_comparison_resolution(

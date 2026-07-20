@@ -13,6 +13,7 @@ from merchant_ai.models import (
     AgentTaskResult,
     AgentRunResult,
     DataSnapshotContract,
+    EvidenceGap,
     QueryBundle,
     QueryPlan,
     SqlValidationResult,
@@ -65,6 +66,7 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         self,
         *,
         failed_query_ids: set[str] | None = None,
+        evidence_gapped_query_ids: set[str] | None = None,
         internal_failed_query_ids: set[str] | None = None,
         require_overlap: bool = True,
         data_snapshot: DataSnapshotContract | None = None,
@@ -76,6 +78,9 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
             topic_router=object(),
         )
         self.failed_query_ids = set(failed_query_ids or set())
+        self.evidence_gapped_query_ids = set(
+            evidence_gapped_query_ids or set()
+        )
         self.internal_failed_query_ids = set(
             internal_failed_query_ids or set()
         )
@@ -182,6 +187,21 @@ class ConcurrentBranchKernel(GroundedRuntimeKernel):
         self.verify_query_ids.append(query_id)
         assert session.run_result is not None
         assert session.active_contract is not None
+        if query_id in self.evidence_gapped_query_ids:
+            verified = VerifiedEvidence(
+                passed=False,
+                blocking_gaps=[
+                    EvidenceGap(
+                        code="RESULT_TIME_WINDOW_NOT_PROVEN",
+                        reason="returned rows do not prove the requested window",
+                        severity="blocking",
+                    )
+                ],
+                partial_answer_reason="requested time window is not proven",
+            )
+            session.verified_evidence = verified
+            session.phase = "VERIFICATION_GAPPED"
+            return verified
         verified = VerifiedEvidence(passed=True, covered_evidence=[query_id])
         artifact = GroundedVerifiedQueryArtifact(
             artifact_id="artifact_%s" % query_id,
@@ -411,6 +431,32 @@ def test_internal_parallel_failure_is_terminal_without_partial_adoption() -> Non
     )
     assert failed["failureDisposition"] == "OPERATIONAL_TERMINAL"
     assert failed["replanEvidence"] == {}
+
+
+def test_parallel_verification_gap_reopens_only_gapped_node() -> None:
+    kernel = ConcurrentBranchKernel(
+        evidence_gapped_query_ids={"second"},
+        data_snapshot=_snapshot("OBSERVED_EPOCH"),
+    )
+    runtime = _runtime(kernel)
+    context, parent, _, _ = _prepared_context(kernel)
+    _freeze_test_graph(context, contract_scope=False)
+
+    result = _execute_batch(runtime, context)
+
+    assert result["status"] == "PARTIAL"
+    assert result["replanRequired"] is True
+    gapped = next(
+        item for item in result["queries"] if item["queryId"] == "second"
+    )
+    assert gapped["status"] == "REPLAN_REQUIRED"
+    assert gapped["failureDisposition"] == "EVIDENCE_GAPPED"
+    assert gapped["code"] == "RESULT_TIME_WINDOW_NOT_PROVEN"
+    assert gapped["replanEvidence"]["triggerKind"] == "DATA_GAP"
+    assert gapped["replanEvidence"]["sourceQueryNodeId"] == "second"
+    assert [item.artifact_id for item in parent.verified_query_ledger] == [
+        "artifact_first"
+    ]
 
 
 def test_contract_scope_batch_is_blocked_before_doris_without_atomic_snapshot() -> None:

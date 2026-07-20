@@ -18,7 +18,9 @@ from merchant_ai.models import (
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
 from merchant_ai.services.grounded_context_compaction import (
     ProviderAwareContextTokenCounter,
+    build_grounded_model_recovery_message,
     build_grounded_recovery_payload,
+    compact_summary_to_reference_only,
 )
 from merchant_ai.services.grounded_context_workspace import (
     GroundedContextWorkspace,
@@ -45,8 +47,14 @@ from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
 )
-from merchant_ai.services.grounded_query_contract import GroundedQueryContract
+from merchant_ai.services.grounded_query_contract import (
+    GroundedBindingHints,
+    GroundedContractGap,
+    GroundedQueryContract,
+    GroundedRejectedBinding,
+)
 from merchant_ai.services.grounded_runtime_kernel import (
+    GroundedRuntimeAttempt,
     GroundedRuntimeSession,
     GroundedVerifiedQueryArtifact,
     verified_query_artifact_integrity_fingerprint,
@@ -293,6 +301,61 @@ def test_context_at_watermark_persists_recovery_and_compacts_to_target(
     assert immutable_read["success"] is True
 
 
+def test_recovery_keeps_full_control_summary_until_safety_threshold(
+    tmp_path: Path,
+) -> None:
+    """The target ratio is an optimization, not a reason to drop control state."""
+
+    settings = _settings(tmp_path)
+    session = _session(settings)
+    request = _request(
+        session,
+        [
+            HumanMessage(content="raw-user-context" * 500),
+            AIMessage(content="raw-core-reasoning" * 500),
+        ],
+    )
+    captured: dict[str, Any] = {}
+
+    def count(current: list[Any], _system: Any, _tools: list[Any]) -> int:
+        if len(current) > 1:
+            return 900
+        try:
+            payload = json.loads(str(current[0].content))
+        except (TypeError, ValueError, IndexError):
+            return 300
+        summary = payload.get("contextRecoverySummary")
+        # A full recovery summary is deliberately kept in the target/threshold
+        # band.  A reference-only summary is made artificially small so the
+        # test fails if the middleware incorrectly chooses it for optimization.
+        return 700 if isinstance(summary, dict) and "goalContract" in summary else 300
+
+    middleware = GroundedContextManagementMiddleware(
+        settings,
+        provider_token_counter=count,
+    )
+    middleware.wrap_model_call(
+        request,
+        lambda updated: captured.setdefault("request", updated),
+    )
+
+    summary = json.loads(captured["request"].messages[0].content)
+    summary_payload = summary["contextRecoverySummary"]
+    report = session.core_context_reports[-1]
+
+    assert report["compactionTriggered"] is True
+    assert report["recoveryMode"] == "FULL"
+    assert report["afterTokens"] == 700
+    assert report["afterUsageRatio"] == 0.7
+    assert report["targetAchieved"] is False
+    assert summary_payload["goalContract"]["goals"][0]["goalId"] == (
+        "metric.context"
+    )
+    assert summary_payload["semanticReceipts"][0]["refId"] == (
+        "semantic:topic:table:metric:value"
+    )
+
+
 def test_recovery_artifact_keeps_graph_revision_and_population_authority(
     tmp_path: Path,
 ) -> None:
@@ -337,7 +400,140 @@ def test_recovery_artifact_keeps_graph_revision_and_population_authority(
     assert graph["replanEvidence"][0]["evidenceId"] == (trigger.evidence_id)
     assert graph["replanEvidence"][0]["evidenceFingerprint"] == (trigger.evidence_fingerprint)
     assert graph["usedReplanEvidenceFingerprints"] == ["used-trigger-fingerprint"]
-    assert graph["populationReceipt"]["receiptFingerprint"] == (session.population_graph_receipt.receipt_fingerprint)
+    assert graph["populationAttestation"]["attestationReceiptFingerprint"] == (
+        session.population_graph_receipt.receipt_fingerprint
+    )
+    assert graph["populationAttestation"]["derivedFromExecutionGraph"] is True
+
+
+def test_recovery_keeps_latest_unresolved_contract_and_graph_rejection(
+    tmp_path: Path,
+) -> None:
+    session = _session(_settings(tmp_path))
+    time_ref = "semantic:profile:daily:field:pt"
+    unresolved = GroundedQueryContract(
+        question=session.runtime.question,
+        status="UNRESOLVED",
+        query_shape="SCALAR",
+        binding_hints=GroundedBindingHints(
+            table_refs=["semantic:profile:daily:detail"],
+            metric_refs=["semantic:profile:daily:metric:orders"],
+            time_expression="最近7天",
+            time_field_ref=time_ref,
+        ),
+        unresolved_gaps=[
+            GroundedContractGap(
+                code="TIME_FIELD_REF_NOT_READ",
+                message="The selected time field has not been read.",
+                evidence_kind="COLUMN",
+                resolution="READ_EXACT_TIME_FIELD_OR_REMOVE_OPTIONAL_HINT",
+                search_scope="CURRENT_TABLE_COLUMNS",
+                required_capability={
+                    "readNext": [
+                        {
+                            "refId": time_ref,
+                            "path": (
+                                "topics/profile/tables/daily/columns/pt.json"
+                            ),
+                        }
+                    ],
+                    "candidateTimeFieldRefs": [time_ref],
+                },
+                rejected_ref_ids=[time_ref],
+            )
+        ],
+        rejected_bindings=[
+            GroundedRejectedBinding(
+                fingerprint="rejected-time-binding",
+                code="TIME_FIELD_REF_NOT_READ",
+                ref_ids=[time_ref],
+                reason="The selected time field has not been read.",
+            )
+        ],
+    )
+    session.runtime.phase = "CONTRACT_PROPOSED"
+    session.runtime.active_contract = None
+    session.runtime.attempts = [
+        GroundedRuntimeAttempt(
+            attempt_id="attempt-unresolved",
+            contract=unresolved,
+            status="UNRESOLVED",
+            next_action="RESOLVE_CONTRACT",
+        )
+    ]
+    session.latest_graph_rejection = {
+        "status": "REJECTED",
+        "code": "EXECUTION_GRAPH_INVALID",
+        "issues": [
+            {
+                "code": "GRAPH_NODE_GOAL_UNKNOWN",
+                "nodeKey": "node-orders",
+            }
+        ],
+        "nextAction": "REVISE_EXECUTION_GRAPH_FROM_CURRENT_DISCOVERY",
+    }
+
+    payload = build_grounded_recovery_payload(
+        session,
+        thread_id="thread-context",
+        run_id="run-context",
+    )
+
+    attempt = payload["latestUnresolvedContractAttempt"]
+    assert attempt["attemptId"] == "attempt-unresolved"
+    assert attempt["status"] == "UNRESOLVED"
+    assert attempt["nextAction"] == "RESOLVE_CONTRACT"
+    assert attempt["acceptedBindingHints"]["timeFieldRef"] == time_ref
+    assert attempt["gaps"][0]["code"] == "TIME_FIELD_REF_NOT_READ"
+    assert attempt["gaps"][0]["rejectedRefIds"] == [time_ref]
+    assert attempt["rejectedRefIds"] == [time_ref]
+    assert attempt["readNext"] == [
+        {
+            "refId": time_ref,
+            "path": "topics/profile/tables/daily/columns/pt.json",
+            "sourceGapCode": "TIME_FIELD_REF_NOT_READ",
+        }
+    ]
+    assert attempt["repairOptions"] == [
+        {
+            "gapCode": "TIME_FIELD_REF_NOT_READ",
+            "resolution": (
+                "READ_EXACT_TIME_FIELD_OR_REMOVE_OPTIONAL_HINT"
+            ),
+            "searchScope": "CURRENT_TABLE_COLUMNS",
+            "requiredCapability": {
+                "readNext": [
+                    {
+                        "refId": time_ref,
+                        "path": (
+                            "topics/profile/tables/daily/columns/pt.json"
+                        ),
+                    }
+                ],
+                "candidateTimeFieldRefs": [time_ref],
+            },
+            "rejectedRefIds": [time_ref],
+        }
+    ]
+    assert payload["latestGraphRejection"]["code"] == (
+        "EXECUTION_GRAPH_INVALID"
+    )
+
+    artifact_ref = "/workspace/context/recovery-test.json"
+    for message in (
+        build_grounded_model_recovery_message(payload, artifact_ref),
+        compact_summary_to_reference_only(payload, artifact_ref),
+    ):
+        summary = json.loads(message.content)["contextRecoverySummary"]
+        assert summary["latestUnresolvedContractAttempt"]["attemptId"] == (
+            "attempt-unresolved"
+        )
+        assert summary["latestUnresolvedContractAttempt"]["readNext"][0][
+            "refId"
+        ] == time_ref
+        assert summary["latestGraphRejection"]["nextAction"] == (
+            "REVISE_EXECUTION_GRAPH_FROM_CURRENT_DISCOVERY"
+        )
 
 
 def test_token_counter_prefers_current_model_counter_and_labels_fallback() -> None:
@@ -422,7 +618,7 @@ def test_recovery_omits_a_query_artifact_after_ledger_tampering(
     assert recovery["queryArtifactReceipts"] == []
 
 
-def test_frozen_graph_reopens_only_artifact_filesystem_after_verified_query(
+def test_complete_goal_coverage_exposes_only_final_answer_tool(
     tmp_path: Path,
 ) -> None:
     session = _session(_settings(tmp_path))
@@ -437,14 +633,14 @@ def test_frozen_graph_reopens_only_artifact_filesystem_after_verified_query(
             "grep",
             "retrieve_knowledge",
             "finalize_evidence_collection",
+            "compose_verified_answer",
         )
     ]
 
     visible, _ = _phase_visible_tools(session, tools)
     names = {item.name for item in visible}
 
-    assert {"ls", "read_file", "grep"}.issubset(names)
-    assert "retrieve_knowledge" not in names
+    assert names == {"compose_verified_answer"}
 
 
 @pytest.mark.parametrize("coverage", ["PREVIEW", "ALL_ROWS"])

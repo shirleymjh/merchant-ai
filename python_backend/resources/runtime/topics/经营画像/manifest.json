@@ -7,12 +7,10 @@
     "timeColumn": "pt",
     "merchantFilterColumn": "merchant_id",
     "freshnessType": "UNKNOWN",
-    "supportsDetail": true,
+    "supportsDetail": false,
     "supportsMetrics": true,
     "preferredFor": [
-      "DETAIL",
       "METRIC",
-      "TOPN",
       "GROUP_AGG",
       "RULE_REFERENCE"
     ],

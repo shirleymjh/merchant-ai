@@ -593,6 +593,7 @@ def _binding_issues(
     }
     derived_analysis_proof = "DETERMINISTIC_DERIVED_ANALYSIS" in proof_types
     trusted_analysis_source = source in {
+        "compose_verified_answer",
         "trusted_analysis_renderer",
         "run_skill",
     }
@@ -699,7 +700,12 @@ def _expected_goal_renderer(
     }
     if (
         "DETERMINISTIC_DERIVED_ANALYSIS" in proof_types
-        and source in {"trusted_analysis_renderer", "run_skill"}
+        and source
+        in {
+            "compose_verified_answer",
+            "trusted_analysis_renderer",
+            "run_skill",
+        }
     ):
         return "VERIFIED_ANALYSIS_ARTIFACT_RENDERER"
     if expected_resolution == "INSUFFICIENT_EVIDENCE":
