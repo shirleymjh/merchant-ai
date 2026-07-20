@@ -901,3 +901,19 @@ def test_reference_scope_is_part_of_sql_contract_fingerprint() -> None:
     assert grounded_query_contract_fingerprint(contract) != grounded_query_contract_fingerprint(
         different_source
     )
+
+
+def test_ungrounded_database_prefix_is_rejected_before_doris_execution() -> None:
+    contract = _metric_contract()
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        SELECT SUM(f.amount) AS total_amount
+        FROM hallucinated_db.fact_metric f
+        WHERE f.event_date >= '2026-06-01'
+          AND f.event_date <= '2026-06-30'
+        """,
+        contract,
+    )
+
+    assert result.valid is False
+    assert "SQL_TABLE_QUALIFIER_NOT_GROUNDED" in _codes(result)

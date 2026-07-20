@@ -1002,6 +1002,198 @@ _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES = frozenset(
 )
 _GROUNDED_RECOVERABLE_EXECUTION_CODES = frozenset({"DORIS_ERROR"})
 
+_CORE_SQL_OPERATIONAL_ERROR_MARKERS = (
+    "backend unavailable",
+    "service unavailable",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "network error",
+    "timed out",
+    "timeout",
+    "too many connections",
+    "memory limit",
+    "mem alloc",
+    "cancelled",
+    "canceled",
+)
+_CORE_SQL_TABLE_ERROR_MARKERS = (
+    "unknown table",
+    "table not found",
+    "table does not exist",
+    "table doesn't exist",
+    "unknown database",
+    "database not found",
+    "no database selected",
+    "表不存在",
+    "库不存在",
+)
+_CORE_SQL_COLUMN_ERROR_MARKERS = (
+    "unknown column",
+    "column not found",
+    "column does not exist",
+    "cannot resolve column",
+    "ambiguous column",
+    "字段不存在",
+    "列不存在",
+)
+_CORE_SQL_FUNCTION_ERROR_MARKERS = (
+    "syntax error",
+    "parse error",
+    "unknown function",
+    "function not found",
+    "no matching function",
+    "function signature",
+    "语法错误",
+    "函数不存在",
+)
+_CORE_SQL_TYPE_ERROR_MARKERS = (
+    "cannot cast",
+    "cast error",
+    "type mismatch",
+    "invalid type",
+    "data type mismatch",
+    "类型不匹配",
+    "类型转换",
+)
+
+
+def _core_sql_execution_failure_review(
+    session: GroundedRuntimeSession,
+    failure: GroundedExecutionFailureClassification,
+) -> dict[str, Any]:
+    """Turn one Doris failure into bounded, model-actionable repair evidence."""
+
+    message = str(failure.message or failure.code or "")[:500]
+    normalized = message.casefold()
+    operational = any(
+        marker in normalized for marker in _CORE_SQL_OPERATIONAL_ERROR_MARKERS
+    )
+    table_resolution_error = any(
+        marker in normalized for marker in _CORE_SQL_TABLE_ERROR_MARKERS
+    ) or (
+        "table" in normalized
+        and any(
+            marker in normalized
+            for marker in ("does not exist", "doesn't exist", "not found")
+        )
+    )
+    column_resolution_error = any(
+        marker in normalized for marker in _CORE_SQL_COLUMN_ERROR_MARKERS
+    ) or (
+        "column" in normalized
+        and any(
+            marker in normalized
+            for marker in ("does not exist", "doesn't exist", "not found")
+        )
+    )
+    if table_resolution_error:
+        category = "TABLE_RESOLUTION"
+        instruction = (
+            "Compare the failed table identity with allowedTables. Remove or replace "
+            "an ungrounded catalog/database prefix, and use only an exact table already "
+            "bound by the active Contract. Do not invent another table."
+        )
+    elif column_resolution_error:
+        category = "COLUMN_RESOLUTION"
+        instruction = (
+            "Use only columns bound by the active Contract and qualify ambiguous columns "
+            "with an existing SQL alias. Do not invent or rename a physical column."
+        )
+    elif any(marker in normalized for marker in _CORE_SQL_FUNCTION_ERROR_MARKERS):
+        category = "DORIS_DIALECT_OR_FUNCTION"
+        instruction = (
+            "Rewrite the failing expression with Doris-compatible syntax while preserving "
+            "the exact metric formula and semantic bindings in the active Contract."
+        )
+    elif any(marker in normalized for marker in _CORE_SQL_TYPE_ERROR_MARKERS):
+        category = "TYPE_OR_CAST"
+        instruction = (
+            "Repair the failing expression or cast without changing the requested metric, "
+            "filters, grain, time window, or governed source columns."
+        )
+    elif operational:
+        category = "DATASOURCE_OPERATIONAL"
+        instruction = (
+            "This looks like datasource availability or resource failure, not a SQL AST "
+            "mistake. Do not fabricate a changed SQL merely to consume a retry."
+        )
+    else:
+        category = "DORIS_EXECUTION_UNKNOWN"
+        instruction = (
+            "Review the exact Doris error against the active Contract and submit one "
+            "materially changed SQL AST only if the error can be corrected without new "
+            "semantic bindings."
+        )
+    if operational:
+        category = "DATASOURCE_OPERATIONAL"
+        instruction = (
+            "This looks like datasource availability or resource failure, not a SQL AST "
+            "mistake. Do not fabricate a changed SQL merely to consume a retry."
+        )
+
+    generation_attempts = [
+        item
+        for item in session.sql_candidate_attempts
+        if item.active_generation == session.active_generation
+        and item.status != "REPAIR_EXHAUSTED"
+    ]
+    remaining_repairs = max(0, 3 - len(generation_attempts))
+    contract = session.active_contract
+    allowed_tables = list(
+        dict.fromkeys(
+            str(item.table or "").strip()
+            for item in (contract.tables if contract is not None else [])
+            if str(item.table or "").strip()
+        )
+    )
+    candidate = session.active_sql_candidate
+    latest_attempt = next(
+        (
+            item
+            for item in reversed(generation_attempts)
+            if item.status == "ACCEPTED"
+        ),
+        None,
+    )
+    if operational:
+        decision = "STOP_OPERATIONAL"
+    elif remaining_repairs <= 0:
+        decision = "REVISE_BINDINGS"
+        instruction = (
+            "The initial SQL and both permitted repair attempts have executed and failed. "
+            "Stop SQL repair and revise the grounded Contract with changed evidence."
+        )
+    else:
+        decision = "REPAIR_SQL"
+    review = {
+        "decision": decision,
+        "repairable": decision == "REPAIR_SQL",
+        "category": category,
+        "errorCode": str(failure.code or "DORIS_ERROR"),
+        "errorMessage": message,
+        "failedCandidateId": str(
+            getattr(latest_attempt, "candidate_id", "") or ""
+        ),
+        "failedAstFingerprint": str(
+            getattr(latest_attempt, "ast_fingerprint", "") or ""
+        ),
+        "failedSql": str(getattr(candidate, "sql", "") or "")[:4000],
+        "activeGeneration": int(session.active_generation or 0),
+        "contractFingerprint": (
+            grounded_query_contract_fingerprint(contract)
+            if contract is not None
+            else ""
+        ),
+        "allowedTables": allowed_tables[:24],
+        "submittedCandidateCount": len(generation_attempts),
+        "remainingRepairAttempts": remaining_repairs,
+        "instruction": instruction,
+        "forbiddenAction": "DO_NOT_RETRY_SAME_SQL_AST",
+    }
+    review["reviewFingerprint"] = _stable_json_fingerprint(review)
+    return review
+
 
 def _grounded_failed_execution_codes(
     run_result: AgentRunResult,
@@ -3133,6 +3325,7 @@ def _grounded_semantic_read_control(
             "ACTIVE_COMPILED",
             "ACTIVE_CORE_SQL_REQUIRED",
             "ACTIVE_CORE_SQL_VALIDATED",
+            "CORE_SQL_EXECUTION_REPAIR_REQUIRED",
         }
         and state.active_contract is not None
     ):
@@ -3147,6 +3340,9 @@ def _grounded_semantic_read_control(
                 "activeGeneration": state.active_generation,
                 "activeAttemptId": state.active_attempt_id,
                 "executionMode": state.active_execution_mode,
+                "sqlExecutionRepair": dict(
+                    state.sql_execution_repair_context or {}
+                ),
                 "retrievalClosed": True,
             }
         )
@@ -4159,6 +4355,9 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
                 "activeAttemptId": str(state.active_attempt_id or ""),
                 "activeGeneration": int(state.active_generation or 0),
                 "executionMode": _enum_value(state.active_execution_mode),
+                "sqlExecutionRepair": dict(
+                    state.sql_execution_repair_context or {}
+                ),
             },
             "goal": {
                 "contractFingerprint": GroundedTrustedSessionContextMiddleware._goal_fingerprint(
@@ -4577,6 +4776,7 @@ When thinRecallCandidates already contains an exact readable path, read that pat
 Do not read optional name/label columns unless the user explicitly asks for a name/title. For ranking by an entity ID, the ID dimension is sufficient. labelRefs maps semantic ref IDs to the user's display phrase; it never carries a user's entity value. Put literal entity values only in typed entityFilters.
 Before creating a TopN -> entity lookup chain, check whether the ranked fact table itself has every requested display attribute. If it does, include those exact same-table fields in selectedFields of the single RANKED Contract and execute once. Publish an entity set and create a serial downstream lookup only when a required attribute is genuinely absent from the ranked table or the Contract returns a structured cross-table gap.
 GroundedQueryContract is the only semantic planning authority. After it is READY, inspect executionMode. DETERMINISTIC_METRIC, DETERMINISTIC_MULTI_METRIC, DETERMINISTIC_GROUPED, DETERMINISTIC_TREND, DETERMINISTIC_RANKED and DETERMINISTIC_ENTITY_LOOKUP are runtime-owned deterministic compilation modes and may be executed directly; they compile only the already-grounded Contract and never plan goals or impose an execution order. CORE_SQL_REQUIRED means you must author the complete Doris SELECT/WITH SQL yourself and call submit_grounded_sql_candidate with the exact activeGeneration and contractFingerprint returned by propose_grounded_contract; never reuse these values after another Contract is proposed. An ACCEPTED Core SQL candidate is executed and evidence-verified atomically inside that same tool call, so do not call execute_grounded_query afterward. Implement sqlObligations exactly. The runtime will not invent semantic bindings, joins, CTEs, windows, complex dependency logic, or fallback SQL for you. Never put merchant/tenant predicates or runtimeInjected upstream entity predicates in your SQL: trusted execution injects them after validation.
+When execution returns SQL_EXECUTION_REPAIR_REQUIRED, repairReview is server-observed evidence from the failed Doris execution. Review its category, exact error, failedSql and allowedTables, then submit one materially changed SQL AST with the same active Contract generation. For TABLE_RESOLUTION, remove or replace only an ungrounded catalog/database prefix and use an exact allowed table; never invent a fallback table. For COLUMN_RESOLUTION, DIALECT_OR_FUNCTION or TYPE_OR_CAST, preserve the Contract's metric formula, filters, grain and time window. Never resubmit failedAstFingerprint. If repairReview says REVISE_BINDINGS or STOP_OPERATIONAL, stop SQL repair and follow that decision instead of consuming another candidate.
 propose_grounded_contract.binding_hints has a strict schema. Use only tableRefs, metricRefs, fieldAggregations, dimensionRefs, selectedFields, entityFilters, upstreamEntityBindings, groupByRef, labelRefs, relationshipRefs, ranking, analysisMode, timeExpression and timeFieldRef. selectedFields contains exact fieldRef/outputAlias projections. entityFilters contains fieldRef/operator/literalValue/requestedPhrase and may only target a read field whose filterOperators allow that operator. upstreamEntityBindings contains only entitySetArtifactId/targetFieldRef/operator/requestedPhrase; never copy or invent its values. If the user names a business clock such as payment time, order-created time or refund time, read that exact governed TIME column and bind it through timeFieldRef; never silently substitute the table partition column. A separate partition pruning column is only a physical optimization and is usable only when the read TIME field declares a safe pruning guarantee. Use analysisMode=RANKED plus groupByRef for TopN/ranking, ENTITY_LOOKUP for a concrete entity lookup, and DETAIL for an unbounded detail list. Never invent alternative keys such as tableRef, metricBindings, metrics, timeWindow or timeRange.
 Available governed tools are declare_original_question_goals, propose_grounded_execution_graph, reopen_grounded_execution_graph_discovery, revise_grounded_execution_graph, retrieve_knowledge, publish_verified_rule_evidence, compose_verified_rule_answer, propose_grounded_contract, prepare_grounded_query_batch, submit_grounded_sql_candidate, execute_grounded_query, execute_grounded_query_batch, publish_verified_entity_set, delegate_grounded_tasks, delegate_grounded_exploration, finalize_evidence_collection, compose_verified_answer, run_skill and ask_human. There is no action catalog, legacy branch-planning tool, legacy planner, NodeAgent SQL writer, or complex-query template compiler.
 One verified query may be only partial evidence for the user's question. When a later query depends on a verified entity output, call publish_verified_entity_set, progressively read the downstream target field, and propose a new Contract using upstreamEntityBindings. Do not treat a first successful TopN/entity query as the end of data collection. Each query remains an independent grounded QueryGraph chosen dynamically by you, not a fixed workflow.
@@ -9190,6 +9390,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     )
                     == "CORE_SQL_REQUIRED"
                 )
+                repair_review: dict[str, Any] = {}
                 if execution_failure.terminal:
                     with deep_session.lock:
                         deep_session.operational_failure = {
@@ -9205,6 +9406,68 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                             == "SECURITY_TERMINAL"
                             else "OPERATIONAL_FAILURE"
                         )
+                        deep_session.runtime.sql_execution_repair_context = {}
+                elif core_sql_mode:
+                    repair_review = _core_sql_execution_failure_review(
+                        session,
+                        execution_failure,
+                    )
+                    decision = str(repair_review.get("decision") or "")
+                    with deep_session.lock:
+                        session.sql_execution_repair_context = dict(
+                            repair_review
+                        )
+                        if decision == "REPAIR_SQL":
+                            session.phase = (
+                                "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
+                            )
+                        elif decision == "REVISE_BINDINGS":
+                            session.phase = "CORE_SQL_REPAIR_EXHAUSTED"
+                            contract_fingerprint = str(
+                                repair_review.get("contractFingerprint")
+                                or ""
+                            )
+                            if (
+                                contract_fingerprint
+                                and contract_fingerprint
+                                not in session.repair_exhausted_contract_fingerprints
+                            ):
+                                session.repair_exhausted_contract_fingerprints.append(
+                                    contract_fingerprint
+                                )
+                        else:
+                            session.phase = "OPERATIONAL_FAILURE"
+                            deep_session.operational_failure = {
+                                "code": execution_failure.code,
+                                "failureDisposition": (
+                                    execution_failure.disposition
+                                ),
+                                "retryable": True,
+                                "message": execution_failure.message,
+                                "sqlExecutionReview": dict(
+                                    repair_review
+                                ),
+                            }
+                        session.revision += 1
+                        session.events.append(
+                            GroundedRuntimeEvent(
+                                sequence=len(session.events) + 1,
+                                stage="core_sql_execution_review",
+                                status=decision or "UNKNOWN",
+                                detail=(
+                                    "%s:%s"
+                                    % (
+                                        repair_review.get("category")
+                                        or "UNKNOWN",
+                                        execution_failure.message,
+                                    )
+                                )[:500],
+                                attempt_id=session.active_attempt_id,
+                            )
+                        )
+                repair_decision = str(
+                    repair_review.get("decision") or ""
+                )
                 return json.dumps(
                     {
                         "status": (
@@ -9214,21 +9477,32 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                             else "OPERATIONAL_FAILURE"
                             if execution_failure.terminal
                             else "SQL_EXECUTION_REPAIR_REQUIRED"
+                            if repair_decision == "REPAIR_SQL"
+                            else "SQL_EXECUTION_REPAIR_EXHAUSTED"
+                            if repair_decision == "REVISE_BINDINGS"
+                            else "OPERATIONAL_FAILURE"
                             if core_sql_mode
                             else "EXECUTION_FAILED"
                         ),
                         "code": execution_failure.code,
                         "failureDisposition": (
-                            execution_failure.disposition
+                            "OPERATIONAL_TRANSIENT"
+                            if repair_decision == "STOP_OPERATIONAL"
+                            else execution_failure.disposition
                         ),
                         "nextAction": (
                             "STOP"
                             if execution_failure.terminal
                             else "SUBMIT_GROUNDED_SQL_CANDIDATE"
+                            if repair_decision == "REPAIR_SQL"
+                            else "PROPOSE_GROUNDED_CONTRACT"
+                            if repair_decision == "REVISE_BINDINGS"
+                            else "RETRY_LATER"
                             if core_sql_mode
                             else "REVISE_BINDINGS"
                         ),
                         "message": execution_failure.message,
+                        "repairReview": repair_review,
                         "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                         "instruction": (
                             "Access denial is terminal for this request; do not alter SQL to bypass policy."
@@ -9236,15 +9510,17 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                             == "SECURITY_TERMINAL"
                             else "Stop: this failure is not a SQL/data recovery trigger."
                             if execution_failure.terminal
-                            else (
-                                "Use the execution error and active Contract to author one changed SQL AST. "
-                                "Do not rerun the same accepted candidate."
+                            else str(
+                                repair_review.get("instruction")
+                                or "Revise the grounded bindings before retrying."
                             )
                         ),
                     },
                     ensure_ascii=False,
                     default=str,
                 )
+            with deep_session.lock:
+                session.sql_execution_repair_context = {}
             verification_failure = (
                 _classify_grounded_execution_result(
                     run_result,

@@ -250,6 +250,7 @@ class GroundedRuntimeSession(APIModel):
     sql_candidate_attempts: list[GroundedRuntimeSqlCandidateAttempt] = Field(
         default_factory=list
     )
+    sql_execution_repair_context: dict[str, Any] = Field(default_factory=dict)
     rejected_sql_candidate_fingerprints: list[str] = Field(default_factory=list)
     executed_sql_candidate_fingerprints: list[str] = Field(default_factory=list)
     repair_exhausted_contract_fingerprints: list[str] = Field(default_factory=list)
@@ -466,6 +467,9 @@ class GroundedRuntimeKernel:
         branch.recall_retrieval_issues = [
             item.model_copy(deep=True) for item in session.recall_retrieval_issues
         ]
+        branch.sql_execution_repair_context = deepcopy(
+            session.sql_execution_repair_context
+        )
         branch.active_goal_contract_fingerprint = str(
             session.active_goal_contract_fingerprint or ""
         )
@@ -1506,6 +1510,7 @@ class GroundedRuntimeKernel:
             session.active_preparation = candidate_preparation
             session.active_sql_candidate = None
             session.active_sql_validation = None
+            session.sql_execution_repair_context = {}
             session.active_attempt_id = attempt_id
             session.active_generation = next_generation
             session.run_result = None
@@ -4107,6 +4112,7 @@ class GroundedRuntimeKernel:
         session.active_preparation = None
         session.active_sql_candidate = None
         session.active_sql_validation = None
+        session.sql_execution_repair_context = {}
         session.active_attempt_id = attempt.attempt_id
         session.active_generation = generation
         session.run_result = None

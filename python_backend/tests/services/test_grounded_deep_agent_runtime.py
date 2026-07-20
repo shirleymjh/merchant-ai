@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from merchant_ai.config import Settings
 from merchant_ai.models import (
     AgentRunResult,
+    AgentTaskResult,
     ClarificationRequest,
     DataSnapshotContract,
     ExtractedKeywords,
@@ -21,6 +22,7 @@ from merchant_ai.models import (
     QuestionIntent,
     RecallBundle,
     RecallItem,
+    SqlValidationResult,
     TopicRoutingDecision,
     VerifiedEvidence,
 )
@@ -55,6 +57,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedEntityFilterBinding,
     GroundedEntityFilterHint,
     GroundedQueryContract,
+    GroundedTableBinding,
     GroundedUpstreamEntityBinding,
     GroundedUpstreamEntityHint,
 )
@@ -80,6 +83,7 @@ from merchant_ai.services.grounded_goal_contract import (
     TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_sql_candidate import (
+    GroundedSqlCandidate,
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
@@ -2473,6 +2477,218 @@ def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
     assert result["rowCount"] == 1
     assert kernel.execute_calls == 1
     assert kernel.verify_calls == 1
+
+
+def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies() -> None:
+    class RepairingCoreSqlKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submitted_sql: list[str] = []
+            self.execute_calls = 0
+
+        def submit_sql_candidate(
+            self,
+            session: GroundedRuntimeSession,
+            sql: str,
+            **kwargs: Any,
+        ) -> GroundedRuntimeSqlCandidateAttempt:
+            self.submitted_sql.append(sql)
+            fingerprint = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            attempt = GroundedRuntimeSqlCandidateAttempt(
+                candidate_id="sql-%d" % len(self.submitted_sql),
+                active_generation=session.active_generation,
+                status="ACCEPTED",
+                next_action="EXECUTE_GROUNDED_QUERY",
+                ast_fingerprint=fingerprint,
+                contract_fingerprint=kwargs["expected_contract_fingerprint"],
+                output_columns=["ticket_count"],
+            )
+            session.sql_candidate_attempts.append(attempt)
+            session.active_sql_candidate = GroundedSqlCandidate(
+                sql=sql,
+                contract_fingerprint=kwargs[
+                    "expected_contract_fingerprint"
+                ],
+                rationale=kwargs["rationale"],
+            )
+            session.phase = "ACTIVE_CORE_SQL_VALIDATED"
+            return attempt
+
+        def execute_active(
+            self,
+            session: GroundedRuntimeSession,
+            **kwargs: Any,
+        ) -> AgentRunResult:
+            del kwargs
+            self.execute_calls += 1
+            if self.execute_calls == 1:
+                message = (
+                    "errCode = 2, detailMessage = Table "
+                    "[wrong_catalog.tickets] does not exist"
+                )
+                failed_bundle = QueryBundle(
+                    failed=True,
+                    error=message,
+                    tables=["tickets"],
+                )
+                result = AgentRunResult(
+                    task_results=[
+                        AgentTaskResult(
+                            task_id="tickets",
+                            success=False,
+                            query_bundle=failed_bundle,
+                            validation_results=[
+                                SqlValidationResult(
+                                    valid=False,
+                                    error_code="DORIS_ERROR",
+                                    message=message,
+                                )
+                            ],
+                        )
+                    ],
+                    merged_query_bundle=failed_bundle,
+                )
+                session.run_result = result
+                return result
+            result = AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    rows=[{"ticket_count": 3}],
+                    tables=["tickets"],
+                )
+            )
+            session.run_result = result
+            return result
+
+        @staticmethod
+        def verify_active(
+            session: GroundedRuntimeSession,
+        ) -> VerifiedEvidence:
+            verified = VerifiedEvidence(passed=True)
+            session.verified_evidence = verified
+            assert session.active_contract is not None
+            assert session.run_result is not None
+            session.verified_query_ledger.append(
+                GroundedVerifiedQueryArtifact(
+                    artifact_id="query_artifact_repaired_sql",
+                    generation=session.active_generation,
+                    contract_fingerprint=(
+                        grounded_query_contract_fingerprint(
+                            session.active_contract
+                        )
+                    ),
+                    sql_fingerprint=hashlib.sha256(
+                        str(session.active_sql_candidate.sql).encode("utf-8")
+                    ).hexdigest(),
+                    contract=session.active_contract.model_copy(deep=True),
+                    plan=QueryPlan(),
+                    run_result=session.run_result,
+                    verified_evidence=verified,
+                    output_columns=["ticket_count"],
+                )
+            )
+            return verified
+
+        @staticmethod
+        def latest_verified_query_artifact(
+            session: GroundedRuntimeSession,
+        ) -> GroundedVerifiedQueryArtifact | None:
+            return (
+                session.verified_query_ledger[-1]
+                if session.verified_query_ledger
+                else None
+            )
+
+    table_ref = "semantic:客服工单:tickets:detail"
+    contract = GroundedQueryContract(
+        question="统计工单量",
+        status="READY",
+        query_shape="GROUPED",
+        topics=["客服工单"],
+        primary_table="tickets",
+        tables=[
+            GroundedTableBinding(
+                topic="客服工单",
+                table="tickets",
+                detail_ref_id=table_ref,
+            )
+        ],
+        evidence_refs=[table_ref],
+    )
+    contract_fingerprint = grounded_query_contract_fingerprint(contract)
+    factory = CapturingFactory(action="none")
+    kernel = RepairingCoreSqlKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = GroundedRuntimeSession(
+        session_id="repair-table-prefix",
+        question=contract.question,
+        merchant_id="m-1",
+        workspace_topics=["客服工单"],
+        phase="ACTIVE_CORE_SQL_REQUIRED",
+        active_generation=1,
+        active_attempt_id="attempt-repair",
+        active_execution_mode=GroundedExecutionMode.CORE_SQL_REQUIRED,
+        active_contract=contract,
+    )
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-repair-table-prefix",
+        run_id="r-repair-table-prefix",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    failed = json.loads(
+        tools["submit_grounded_sql_candidate"].func(
+            sql=(
+                "SELECT COUNT(*) AS ticket_count "
+                "FROM wrong_catalog.tickets"
+            ),
+            expected_generation=1,
+            contract_fingerprint=contract_fingerprint,
+            rationale="Count tickets from the grounded table",
+            evidence_ref_ids=[table_ref],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert failed["status"] == "SQL_EXECUTION_REPAIR_REQUIRED"
+    assert failed["nextAction"] == "SUBMIT_GROUNDED_SQL_CANDIDATE"
+    assert failed["repairReview"]["decision"] == "REPAIR_SQL"
+    assert failed["repairReview"]["category"] == "TABLE_RESOLUTION"
+    assert failed["repairReview"]["allowedTables"] == ["tickets"]
+    assert failed["repairReview"]["remainingRepairAttempts"] == 2
+    assert kernel_session.phase == "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
+    assert kernel_session.sql_execution_repair_context[
+        "failedSql"
+    ].endswith("wrong_catalog.tickets")
+    visible, _removed = _phase_visible_tools(deep_session, outer.tools)
+    assert {item.name for item in visible} == {
+        "ask_human",
+        "submit_grounded_sql_candidate",
+    }
+
+    repaired = json.loads(
+        tools["submit_grounded_sql_candidate"].func(
+            sql="SELECT COUNT(*) AS ticket_count FROM tickets",
+            expected_generation=1,
+            contract_fingerprint=contract_fingerprint,
+            rationale=(
+                "Doris rejected the ungrounded catalog prefix; use the exact "
+                "Contract table identity"
+            ),
+            evidence_ref_ids=[table_ref],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert repaired["status"] == "VERIFIED"
+    assert repaired["submittedAndExecuted"] is True
+    assert kernel.execute_calls == 2
+    assert kernel.submitted_sql == [
+        "SELECT COUNT(*) AS ticket_count FROM wrong_catalog.tickets",
+        "SELECT COUNT(*) AS ticket_count FROM tickets",
+    ]
+    assert kernel_session.sql_execution_repair_context == {}
 
 
 def test_internal_runtime_failure_cannot_be_disguised_as_user_clarification() -> None:

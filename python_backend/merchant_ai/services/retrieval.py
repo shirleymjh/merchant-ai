@@ -156,7 +156,7 @@ class EsKnowledgeRetrievalService:
         self._recall_cache = build_ttl_cache("es_recall", settings, settings.cache_recall_ttl_seconds)
         self._embedding_cache = build_ttl_cache("es_embedding", settings, settings.cache_recall_ttl_seconds)
         self._active_retrieval_profile: dict[str, Any] | None = None
-        self._active_directory_scope: dict[str, str] | None = None
+        self._active_directory_scope: dict[str, Any] | None = None
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
@@ -290,10 +290,20 @@ class EsKnowledgeRetrievalService:
                         )
                     )
                 query_ranked_groups: list[tuple[str, list[RecallItem]]] = [("query:base", items)]
+                coverage_items = list(items)
                 for subquery in retrieval_query_plan[1:]:
                     subquery_id = str(subquery.get("id") or "supplemental")
                     subquery_text = str(subquery.get("query") or "").strip()
                     if not subquery_text:
+                        continue
+                    if not uncovered_retrieval_queries([subquery], coverage_items):
+                        record_retrieval_query_result(
+                            retrieval_query_plan,
+                            query_id=subquery_id,
+                            status="SKIPPED",
+                            items=[],
+                            stop_reason="BASE_OR_PRIOR_QUERY_COVERAGE",
+                        )
                         continue
                     try:
                         subquery_items = self._search(
@@ -354,6 +364,7 @@ class EsKnowledgeRetrievalService:
                             items=subquery_items,
                         )
                     query_ranked_groups.append(("query:%s" % subquery_id, subquery_items))
+                    coverage_items = merge_recall_items(coverage_items, subquery_items)
                 if len(query_ranked_groups) > 1:
                     items = rrf_fuse_recall_items(
                         query_ranked_groups,
@@ -688,131 +699,136 @@ class EsKnowledgeRetrievalService:
         if not directories:
             return [], trace, "NO_TABLE_DIRECTORY_CANDIDATE", issues
 
-        expanded: list[RecallItem] = []
-        seen_refs = set(unique_source_refs(governed_initial))
-        max_leaf_items = max(1, int(self.settings.es_hierarchical_max_leaf_items or 16))
-        for directory in directories:
-            topic = str(directory.get("topic") or "")
-            table = str(directory.get("table") or "")
-            if not topic or not table:
-                continue
-            directory_query = build_directory_retrieval_query(
-                query_text=query_text,
-                topic=topic,
-                table=table,
-                uncovered_queries=uncovered,
-            )
-            previous_directory_scope = self._active_directory_scope
-            self._active_directory_scope = {
-                "topic": topic,
-                "table": table,
-                "directoryId": "semantic:%s:%s:directory" % (topic, table),
+        selected_topics = sorted(
+            {
+                str(directory.get("topic") or "")
+                for directory in directories
+                if str(directory.get("topic") or "")
             }
-            try:
-                hits = self._search(
-                    directory_query,
-                    [topic],
-                    include_rules=include_rules,
-                )
-            except RetrievalLaneFailure as exc:
-                hits = list(exc.partial_items)
-                issues.append(
-                    RetrievalIssue(
-                        code=exc.code,
-                        message=str(exc)[:500],
-                        backend=self.backend_name,
-                        lane=exc.lane,
-                        stage="directory_expansion",
-                        severity="warning",
-                        request_key=request_key,
-                        details={
-                            "topic": topic,
-                            "table": table,
-                            "partialItemCount": len(hits),
-                        },
-                    )
-                )
-            except Exception as exc:
-                issues.append(
-                    RetrievalIssue(
-                        code="ES_DIRECTORY_RETRIEVAL_FAILED",
-                        message=str(exc)[:500],
-                        backend=self.backend_name,
-                        lane="directory:%s/%s" % (topic, table),
-                        stage="directory_expansion",
-                        severity="warning",
-                        request_key=request_key,
-                        details={"topic": topic, "table": table},
-                    )
-                )
-                trace.append(
-                    {
-                        "stepId": "directory:%s/%s" % (topic, table),
-                        "parentStepId": "directory:selection",
-                        "stage": "DIRECTORY_EXPANSION",
-                        "depth": 2,
-                        "topic": topic,
-                        "table": table,
-                        "query": directory_query,
-                        "status": "FAILED",
-                        "newRefs": [],
-                    }
-                )
-                continue
-            finally:
-                self._active_directory_scope = previous_directory_scope
-
-            governed_hits = self._attach_current_asset_governance(hits)
-            governed_hits, leaf_governance_filtered = filter_recall_items_by_governance(
-                governed_hits,
-                request,
+        )
+        selected_tables = [
+            str(directory.get("table") or "")
+            for directory in directories
+            if str(directory.get("table") or "")
+        ]
+        selected_directory_ids = [
+            "semantic:%s:%s:directory"
+            % (str(directory.get("topic") or ""), str(directory.get("table") or ""))
+            for directory in directories
+        ]
+        directory_query = build_directory_retrieval_query(
+            query_text=query_text,
+            directories=directories,
+            uncovered_queries=uncovered,
+        )
+        previous_directory_scope = self._active_directory_scope
+        self._active_directory_scope = {
+            "topics": selected_topics,
+            "tables": selected_tables,
+            "directoryIds": selected_directory_ids,
+        }
+        try:
+            hits = self._search(
+                directory_query,
+                selected_topics,
+                include_rules=include_rules,
             )
-            scoped_hits = [
-                item
-                for item in governed_hits
-                if recall_item_in_directory(item, topic=topic, table=table)
-                and recall_item_is_exact_leaf(item)
-                and recall_item_matches_uncovered_queries(item, uncovered)
-            ]
-            new_hits: list[RecallItem] = []
-            duplicate_refs: list[str] = []
-            for item in scoped_hits:
-                ref = item.doc_id or str((item.metadata or {}).get("semanticRefId") or "")
-                if not ref or ref in seen_refs:
-                    if ref:
-                        duplicate_refs.append(ref)
-                    continue
-                seen_refs.add(ref)
-                metadata = dict(item.metadata or {})
-                metadata["directoryTraversal"] = {
-                    "topic": topic,
-                    "table": table,
-                    "depth": 2,
-                    "queryIds": [str(value.get("id") or "") for value in uncovered],
-                }
-                new_hits.append(item.model_copy(update={"metadata": metadata}))
-                if len(expanded) + len(new_hits) >= max_leaf_items:
-                    break
-            expanded.extend(new_hits)
+        except RetrievalLaneFailure as exc:
+            hits = list(exc.partial_items)
+            issues.append(
+                RetrievalIssue(
+                    code=exc.code,
+                    message=str(exc)[:500],
+                    backend=self.backend_name,
+                    lane=exc.lane,
+                    stage="directory_expansion",
+                    severity="warning",
+                    request_key=request_key,
+                    details={
+                        "directories": selected_directory_ids,
+                        "partialItemCount": len(hits),
+                    },
+                )
+            )
+        except Exception as exc:
+            issues.append(
+                RetrievalIssue(
+                    code="ES_DIRECTORY_RETRIEVAL_FAILED",
+                    message=str(exc)[:500],
+                    backend=self.backend_name,
+                    lane="directory_batch",
+                    stage="directory_expansion",
+                    severity="warning",
+                    request_key=request_key,
+                    details={"directories": selected_directory_ids},
+                )
+            )
             trace.append(
                 {
-                    "stepId": "directory:%s/%s" % (topic, table),
+                    "stepId": "directory:batch",
                     "parentStepId": "directory:selection",
                     "stage": "DIRECTORY_EXPANSION",
                     "depth": 2,
-                    "topic": topic,
-                    "table": table,
+                    "directories": selected_directory_ids,
                     "query": directory_query,
-                    "status": "EXPANDED",
-                    "candidateRefs": unique_source_refs(scoped_hits)[:12],
-                    "newRefs": unique_source_refs(new_hits)[:12],
-                    "discardedOutsideDirectory": max(0, len(governed_hits) - len(scoped_hits)),
-                    "discardedDuplicateRefs": duplicate_refs[:12],
-                    "governanceFiltered": leaf_governance_filtered,
+                    "status": "FAILED",
+                    "newRefs": [],
                 }
             )
+            return [], trace, "DIRECTORY_EXPANSION_DEGRADED", issues
+        finally:
+            self._active_directory_scope = previous_directory_scope
+
+        governed_hits = self._attach_current_asset_governance(hits)
+        governed_hits, leaf_governance_filtered = filter_recall_items_by_governance(
+            governed_hits,
+            request,
+        )
+        scoped_hits = [
+            item
+            for item in governed_hits
+            if recall_item_in_directories(item, directories)
+            and recall_item_is_exact_leaf(item)
+            and recall_item_matches_uncovered_queries(item, uncovered)
+        ]
+        seen_refs = set(unique_source_refs(governed_initial))
+        max_leaf_items = max(1, int(self.settings.es_hierarchical_max_leaf_items or 16))
+        expanded: list[RecallItem] = []
+        duplicate_refs: list[str] = []
+        for item in scoped_hits:
+            ref = item.doc_id or str((item.metadata or {}).get("semanticRefId") or "")
+            if not ref or ref in seen_refs:
+                if ref:
+                    duplicate_refs.append(ref)
+                continue
+            seen_refs.add(ref)
+            matched_directory = recall_item_matched_directory(item, directories)
+            metadata = dict(item.metadata or {})
+            metadata["directoryTraversal"] = {
+                "topic": str(matched_directory.get("topic") or ""),
+                "table": str(matched_directory.get("table") or ""),
+                "depth": 2,
+                "queryIds": [str(value.get("id") or "") for value in uncovered],
+            }
+            expanded.append(item.model_copy(update={"metadata": metadata}))
             if len(expanded) >= max_leaf_items:
                 break
+        trace.append(
+            {
+                "stepId": "directory:batch",
+                "parentStepId": "directory:selection",
+                "stage": "DIRECTORY_EXPANSION",
+                "depth": 2,
+                "directories": selected_directory_ids,
+                "query": directory_query,
+                "status": "EXPANDED",
+                "candidateRefs": unique_source_refs(scoped_hits)[:12],
+                "newRefs": unique_source_refs(expanded)[:12],
+                "discardedOutsideDirectory": max(0, len(governed_hits) - len(scoped_hits)),
+                "discardedDuplicateRefs": duplicate_refs[:12],
+                "governanceFiltered": leaf_governance_filtered,
+            }
+        )
 
         if expanded:
             reason = (
@@ -821,8 +837,6 @@ class EsKnowledgeRetrievalService:
                 else "NEW_EXACT_LEAF_EVIDENCE_FOUND"
             )
             return expanded[:max_leaf_items], trace, reason, issues
-        if issues:
-            return [], trace, "DIRECTORY_EXPANSION_DEGRADED", issues
         return [], trace, "NO_NEW_EXACT_LEAF_EVIDENCE", issues
 
     def _attach_current_asset_governance(self, items: list[RecallItem]) -> list[RecallItem]:
@@ -982,24 +996,32 @@ class EsKnowledgeRetrievalService:
         elif include_rules:
             filters.append({"term": {"source_type": "GOVERNED_RULE"}})
         directory_scope = self._active_directory_scope or {}
-        directory_id = str(directory_scope.get("directoryId") or "")
-        table = str(directory_scope.get("table") or "")
-        if directory_id or table:
+        directory_ids = [
+            str(item)
+            for item in directory_scope.get("directoryIds") or []
+            if str(item or "").strip()
+        ]
+        tables = [
+            str(item)
+            for item in directory_scope.get("tables") or []
+            if str(item or "").strip()
+        ]
+        if directory_ids or tables:
             directory_should: list[dict[str, object]] = []
-            if directory_id:
+            if directory_ids:
                 directory_should.extend(
                     [
-                        {"term": {"parent_directory_id": directory_id}},
-                        {"term": {"directory_id": directory_id}},
+                        {"terms": {"parent_directory_id": directory_ids}},
+                        {"terms": {"directory_id": directory_ids}},
                     ]
                 )
-            if table:
+            if tables:
                 directory_should.extend(
                     [
-                        {"term": {"table": table}},
-                        {"term": {"metadata.tableName": table}},
-                        {"term": {"metadata.leftTable": table}},
-                        {"term": {"metadata.rightTable": table}},
+                        {"terms": {"table": tables}},
+                        {"terms": {"metadata.tableName": tables}},
+                        {"terms": {"metadata.leftTable": tables}},
+                        {"terms": {"metadata.rightTable": tables}},
                     ]
                 )
             filters.append(
@@ -1801,6 +1823,7 @@ def record_retrieval_query_result(
     status: str,
     items: list[RecallItem],
     error_code: str = "",
+    stop_reason: str = "",
 ) -> None:
     for query in query_plan:
         if str(query.get("id") or "") != query_id:
@@ -1813,6 +1836,8 @@ def record_retrieval_query_result(
         )
         if error_code:
             query["errorCode"] = error_code
+        if stop_reason:
+            query["stopReason"] = stop_reason
         return
 
 
@@ -1886,13 +1911,21 @@ def select_retrieval_directories(
 def build_directory_retrieval_query(
     *,
     query_text: str,
-    topic: str,
-    table: str,
+    directories: list[dict[str, Any]],
     uncovered_queries: list[dict[str, Any]],
 ) -> str:
     purposes = [str(item.get("purpose") or "") for item in uncovered_queries if str(item.get("purpose") or "")]
     focus = "、".join(purposes[:4]) or "精确语义定义"
-    return "%s；限定目录：%s/%s；继续查找：%s" % (query_text, topic, table, focus)
+    paths = [
+        "%s/%s" % (str(item.get("topic") or ""), str(item.get("table") or ""))
+        for item in directories
+        if str(item.get("topic") or "") and str(item.get("table") or "")
+    ]
+    return "%s；限定目录：%s；继续查找：%s" % (
+        query_text,
+        "、".join(paths[:4]),
+        focus,
+    )
 
 
 def recall_item_in_directory(item: RecallItem, *, topic: str, table: str) -> bool:
@@ -1909,6 +1942,25 @@ def recall_item_in_directory(item: RecallItem, *, topic: str, table: str) -> boo
             str(metadata.get("rightTable") or ""),
         }
     return False
+
+
+def recall_item_in_directories(
+    item: RecallItem,
+    directories: list[dict[str, Any]],
+) -> bool:
+    return bool(recall_item_matched_directory(item, directories))
+
+
+def recall_item_matched_directory(
+    item: RecallItem,
+    directories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    for directory in directories:
+        topic = str(directory.get("topic") or "")
+        table = str(directory.get("table") or "")
+        if topic and table and recall_item_in_directory(item, topic=topic, table=table):
+            return directory
+    return {}
 
 
 def recall_item_is_exact_leaf(item: RecallItem) -> bool:
