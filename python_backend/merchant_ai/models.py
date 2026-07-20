@@ -852,6 +852,11 @@ class RecallRoundTrace(APIModel):
     intent_kind: str = ""
     complexity: str = ""
     retrieval_lanes: List[Dict[str, Any]] = Field(default_factory=list)
+    retrieval_query_plan: List[Dict[str, Any]] = Field(default_factory=list)
+    directory_retrieval_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    hierarchical_retrieval_applied: bool = False
+    retrieval_stop_reason: str = ""
+    retrieval_stop_details: Dict[str, Any] = Field(default_factory=dict)
     rewritten_query: str = ""
     governance_filtered: Dict[str, int] = Field(default_factory=dict)
     rerank_applied: bool = False

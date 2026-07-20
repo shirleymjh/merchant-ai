@@ -2752,6 +2752,130 @@ class HybridRecallService:
     def cache_trace(self) -> Dict[str, Any]:
         return {"recall": self._recall_cache.trace()}
 
+    def _table_leaf_recall_documents(
+        self,
+        topic: str,
+        table: str,
+        asset: Dict[str, Any],
+    ) -> List[RecallItem]:
+        """Index every governed L2 table leaf as its own recall document.
+
+        Exact coordinates come from ``SemanticCatalogService`` so local and ES
+        recall point at the same virtual files used by progressive reads.  In-
+        table business rules remain ordinary Topic-scoped recall documents and
+        receive no implicit prompt-injection or permanent-application authority.
+        """
+
+        documents: List[RecallItem] = []
+        directory_id = "semantic:%s:%s:directory" % (topic, table)
+        section_specs = (
+            ("columns", "semanticColumns", "SEMANTIC_COLUMN"),
+            ("terms", "terms", "SEMANTIC_TERM"),
+            ("rules", "knowledgeRules", "SEMANTIC_BUSINESS_RULE"),
+        )
+        for section, asset_field, source_type in section_specs:
+            values = [item for item in asset.get(asset_field) or [] if isinstance(item, dict)]
+            entry_keys = semantic_table_entry_keys(section, values)
+            for index, value in enumerate(values):
+                entry_key = entry_keys[index]
+                if not entry_key:
+                    continue
+                ref = self.semantic_catalog.table_entry_ref(topic, table, section, entry_key)
+                if ref is None:
+                    continue
+                title = str(ref.get("title") or semantic_table_entry_title(section, value, entry_key))
+                metadata: Dict[str, Any] = {
+                    "semanticSource": asset_field,
+                    "semanticKind": str(ref.get("kind") or ""),
+                    "semanticRefId": str(ref.get("refId") or ""),
+                    "semanticPath": str(ref.get("path") or ""),
+                    "merchantUri": str(ref.get("merchantUri") or ""),
+                    "contextLayer": "L2",
+                    "contextDepth": ref.get("contextDepth"),
+                    "retrievalLevel": "LEAF",
+                    "parentDirectoryId": directory_id,
+                    "directoryId": directory_id,
+                    "semanticSection": section,
+                    "semanticEntryKey": entry_key,
+                    "tableName": table,
+                    "topic": topic,
+                    "businessName": str(
+                        value.get("businessName")
+                        or value.get("title")
+                        or value.get("term")
+                        or value.get("comment")
+                        or title
+                    ),
+                    "aliases": value.get("aliases") or [],
+                    "confidence": value.get("confidence"),
+                    "status": value.get("status") or asset.get("status") or "",
+                    "assetStatus": asset.get("status") or "",
+                    "version": value.get("version") or asset.get("version") or "",
+                    "assetVersion": asset.get("version") or "",
+                    "merchantId": value.get("merchantId") or asset.get("merchantId") or "",
+                    "assetMerchantId": asset.get("merchantId") or "",
+                    "allowedRoles": value.get("allowedRoles") or asset.get("allowedRoles") or [],
+                    "assetAllowedRoles": asset.get("allowedRoles") or [],
+                    "requiredPermissions": value.get("requiredPermissions") or asset.get("requiredPermissions") or [],
+                    "assetRequiredPermissions": asset.get("requiredPermissions") or [],
+                    "visibilityPolicy": value.get("visibilityPolicy") or asset.get("visibilityPolicy") or {},
+                    "assetVisibilityPolicy": asset.get("visibilityPolicy") or {},
+                    "expiresAt": value.get("expiresAt") or asset.get("expiresAt") or "",
+                    "assetExpiresAt": asset.get("expiresAt") or "",
+                }
+                if section == "columns":
+                    metadata.update(
+                        {
+                            "columnName": str(
+                                value.get("columnName")
+                                or value.get("field")
+                                or value.get("name")
+                                or entry_key
+                            ),
+                            "semanticRole": str(
+                                value.get("semanticRole")
+                                or value.get("role")
+                                or value.get("entityRole")
+                                or ""
+                            ).upper(),
+                            "timeRole": str(value.get("timeRole") or "").upper(),
+                        }
+                    )
+                elif section == "terms":
+                    metadata.update(
+                        {
+                            "term": str(value.get("term") or value.get("termKey") or entry_key),
+                            "canonicalMetricKey": str(value.get("canonicalMetricKey") or ""),
+                        }
+                    )
+                else:
+                    metadata.update(
+                        {
+                            "ruleId": str(
+                                value.get("ruleId")
+                                or value.get("ruleKey")
+                                or value.get("id")
+                                or entry_key
+                            ),
+                            "ruleKey": str(value.get("ruleKey") or entry_key),
+                            "ruleTitle": str(value.get("title") or title),
+                            "scope": str(value.get("scope") or "topic"),
+                            "priority": int(value.get("priority") or 0),
+                        }
+                    )
+                documents.append(
+                    RecallItem(
+                        doc_id=str(ref.get("refId") or ""),
+                        title="%s/%s/%s %s" % (topic, table, title, section.rstrip("s")),
+                        content=str(ref.get("content") or ""),
+                        source_type=source_type,
+                        topic=topic,
+                        table=table,
+                        metadata=metadata,
+                    )
+                )
+        return documents
+
     def _load_documents(self) -> List[RecallItem]:
         self.refresh_if_recall_manifest_changed()
         if self._documents is not None:
@@ -2782,7 +2906,10 @@ class HybridRecallService:
                                 "sectionChunkIndex": chunk["sectionChunkIndex"],
                                 "chunkChars": len(chunk["content"]),
                                 "overlapChars": chunk["overlapChars"],
-                                "chunkStrategy": "langchain_markdown_header_recursive",
+                            "chunkStrategy": "langchain_markdown_header_recursive",
+                            "retrievalLevel": "LEAF",
+                            "parentDirectoryId": "semantic:rules:%s:directory" % path.stem,
+                            "directoryId": "semantic:rules:%s:directory" % path.stem,
                                 "status": "PUBLISHED",
                                 "visibilityPolicy": {"level": "public", "allowedRoles": []},
                             },
@@ -2809,6 +2936,9 @@ class HybridRecallService:
                             "semanticKind": ref["kind"],
                             "semanticRefId": ref["refId"],
                             "semanticPath": ref["path"],
+                            "retrievalLevel": "DIRECTORY",
+                            "directoryId": "semantic:%s:%s:directory" % (topic, table),
+                            "parentDirectoryId": "semantic:%s:manifest" % topic,
                             "merchantUri": ref.get("merchantUri", ""),
                             "contextLayer": ref.get("contextLayer", ""),
                             "tableName": table,
@@ -2848,6 +2978,9 @@ class HybridRecallService:
                                 "semanticKind": "METRIC",
                                 "semanticRefId": semantic_ref_id,
                                 "semanticPath": semantic_path,
+                                "retrievalLevel": "LEAF",
+                                "directoryId": "semantic:%s:%s:directory" % (topic, table),
+                                "parentDirectoryId": "semantic:%s:%s:directory" % (topic, table),
                                 "metricKey": metric_key,
                                 "tableName": table,
                                 "topic": topic,
@@ -2871,7 +3004,7 @@ class HybridRecallService:
                                 "sourceColumns": metric.get("sourceColumns") or [],
                                 "aliases": metric.get("aliases") or [],
                                 "merchantUri": merchant_uri_for_semantic_ref(semantic_ref_id, topic=topic, table=table, kind="METRIC", key=metric_key),
-                                "contextLayer": "L1",
+                                "contextLayer": "L2",
                                 "status": metric.get("status") or asset.get("status") or "",
                                 "assetStatus": asset.get("status") or "",
                                 "version": metric.get("version") or asset.get("version") or "",
@@ -2883,6 +3016,7 @@ class HybridRecallService:
                             },
                         )
                     )
+                docs.extend(self._table_leaf_recall_documents(topic, table, asset))
             relationships = self.topic_assets.load_relationships(topic)
             if relationships:
                 ref = self.semantic_catalog.relationship_index_ref(topic, relationships)
@@ -2898,6 +3032,9 @@ class HybridRecallService:
                             "semanticKind": ref["kind"],
                             "semanticRefId": ref["refId"],
                             "semanticPath": ref["path"],
+                            "retrievalLevel": "DIRECTORY",
+                            "directoryId": ref["refId"],
+                            "parentDirectoryId": "semantic:%s:manifest" % topic,
                             "merchantUri": ref.get("merchantUri", ""),
                             "contextLayer": ref.get("contextLayer", ""),
                             "topic": topic,
@@ -2941,6 +3078,9 @@ class HybridRecallService:
                                 "semanticKind": self.semantic_catalog.RELATIONSHIP_ENTRY_KIND,
                                 "semanticRefId": rel_ref["refId"],
                                 "semanticPath": rel_ref["path"],
+                                "retrievalLevel": "LEAF",
+                                "directoryId": ref["refId"],
+                                "parentDirectoryId": ref["refId"],
                                 "merchantUri": merchant_uri_for_semantic_ref(
                                     rel_ref["refId"],
                                     topic=topic,

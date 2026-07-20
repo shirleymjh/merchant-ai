@@ -6921,6 +6921,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     "reason": str(reason or "")[:500],
                     "recallCandidates": _thin_recall(bundle, limit=8),
                     "scope": runtime.context.session.effective_topics(),
+                    "retrievalTrace": _retrieval_trace_summary(
+                        runtime.context.session.runtime
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -11249,6 +11252,9 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
                     "reason": str(reason or "")[:300],
                     "scope": isolated_session.effective_topics(),
                     "recallCandidates": _thin_recall(bundle, limit=8),
+                    "retrievalTrace": _retrieval_trace_summary(
+                        isolated_session.runtime
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -14576,6 +14582,7 @@ Never invent a formula, binding, SQL result, rule, evidence status or answer. A 
             "topicRouting": session.runtime.routing.model_dump(by_alias=True),
             "topicL0Manifests": manifests,
             "thinRecallCandidates": _thin_recall(session.runtime.recall, limit=4),
+            "retrievalNavigation": _retrieval_trace_summary(session.runtime),
             "restoredExecutionState": restored_execution_state,
             "originalQuestionGoalPolicy": {
                 "requiredBeforeQuery": True,
@@ -15032,6 +15039,43 @@ def _core_visible_entity_filter_obligations(contract: Any) -> list[dict[str, Any
             }
         )
     return result
+
+
+def _retrieval_trace_summary(session: GroundedRuntimeSession) -> dict[str, Any]:
+    latest = session.recall_rounds[-1] if session.recall_rounds else None
+    steps = list(latest.directory_retrieval_trace or []) if latest is not None else []
+    return {
+        "status": str(session.recall_retrieval_status or "not_started"),
+        "indexVersion": str(session.recall_index_version or ""),
+        "semanticSourceHash": str(session.recall_semantic_source_hash or ""),
+        "roundCount": len(session.recall_rounds),
+        "stopReason": str(latest.retrieval_stop_reason or "") if latest is not None else "",
+        "queryCount": len(latest.retrieval_query_plan or []) if latest is not None else 0,
+        "stepCount": len(steps),
+        "depthReached": max(
+            [
+                int(item.get("depth") or 0)
+                for item in steps
+                if isinstance(item, dict)
+                and str(item.get("stage") or "")
+                in {
+                    "INITIAL_LEAF_COVERAGE",
+                    "DIRECTORY_SELECTION",
+                    "DIRECTORY_EXPANSION",
+                }
+            ]
+            or [0]
+        ),
+        "hierarchicalRetrievalApplied": bool(
+            latest.hierarchical_retrieval_applied if latest is not None else False
+        ),
+        "sourceRefs": list(latest.source_refs or [])[:12] if latest is not None else [],
+        "issueCodes": [
+            str(item.code or "")
+            for item in session.recall_retrieval_issues
+            if str(item.code or "")
+        ][:12],
+    }
 
 
 def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:

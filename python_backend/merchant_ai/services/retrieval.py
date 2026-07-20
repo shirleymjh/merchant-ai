@@ -156,6 +156,7 @@ class EsKnowledgeRetrievalService:
         self._recall_cache = build_ttl_cache("es_recall", settings, settings.cache_recall_ttl_seconds)
         self._embedding_cache = build_ttl_cache("es_embedding", settings, settings.cache_recall_ttl_seconds)
         self._active_retrieval_profile: dict[str, Any] | None = None
+        self._active_directory_scope: dict[str, str] | None = None
 
     def retrieve(self, request: KnowledgeRetrievalRequest) -> KnowledgeBundle:
         request_key = request.knowledge_request.request_key if request.knowledge_request else ""
@@ -177,6 +178,15 @@ class EsKnowledgeRetrievalService:
             intent_kind=request.intent_kind,
             complexity=request.complexity,
             settings=self.settings,
+        )
+        retrieval_query_plan = build_retrieval_query_plan(
+            query_text=query_text,
+            request=request,
+            retrieval_profile=retrieval_profile,
+            metric_candidates=metric_candidates,
+            include_rules=include_rules,
+            max_queries=int(self.settings.es_multi_query_max_queries or 5),
+            enabled=bool(self.settings.es_multi_query_enabled),
         )
         source_type_top_k = source_type_top_k_policy(
             include_rules=include_rules,
@@ -208,7 +218,13 @@ class EsKnowledgeRetrievalService:
                 dimensions=list(route_slots.get("dimensions") or []),
                 filters=[
                     *object_filters,
-                    {"includeRules": include_rules, "intentKind": request.intent_kind, "complexity": request.complexity},
+                    {
+                        "includeRules": include_rules,
+                        "intentKind": request.intent_kind,
+                        "complexity": request.complexity,
+                        "strictTopicScope": request.strict_topic_scope,
+                        "retrievalQueryPlan": retrieval_query_plan,
+                    },
                     *([knowledge_filter] if knowledge_filter else []),
                 ],
                 time_range=resolve_time_range(query_text, self.settings.business_timezone),
@@ -216,7 +232,14 @@ class EsKnowledgeRetrievalService:
                     "indexVersion": self._index_version(),
                     "vectorEnabled": self._vector_enabled(),
                     "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
-                    "retrievalPolicy": {"rrfK": self.settings.es_rrf_k, "sourceTypeTopK": source_type_top_k},
+                    "retrievalPolicy": {
+                        "version": "hierarchical_v1",
+                        "rrfK": self.settings.es_rrf_k,
+                        "sourceTypeTopK": source_type_top_k,
+                        "multiQueryEnabled": bool(self.settings.es_multi_query_enabled),
+                        "hierarchicalEnabled": bool(self.settings.es_hierarchical_retrieval_enabled),
+                        "hierarchicalMaxDirectories": int(self.settings.es_hierarchical_max_directories or 2),
+                    },
                 },
                 scope={
                     "merchantId": request.merchant_id,
@@ -232,12 +255,28 @@ class EsKnowledgeRetrievalService:
             return normalize_knowledge_bundle_status(KnowledgeBundle.model_validate(cached))
         self._active_retrieval_profile = retrieval_profile
         retrieval_issues: list[RetrievalIssue] = []
+        directory_retrieval_trace: list[dict[str, Any]] = []
+        retrieval_stop_reason = ""
+        hierarchical_retrieval_applied = False
         try:
             try:
                 try:
                     items = self._search(query_text, topics, include_rules=include_rules)
+                    record_retrieval_query_result(
+                        retrieval_query_plan,
+                        query_id="base",
+                        status="SUCCESS" if items else "EMPTY",
+                        items=items,
+                    )
                 except RetrievalLaneFailure as exc:
                     items = list(exc.partial_items)
+                    record_retrieval_query_result(
+                        retrieval_query_plan,
+                        query_id="base",
+                        status="DEGRADED",
+                        items=items,
+                        error_code=exc.code,
+                    )
                     retrieval_issues.append(
                         RetrievalIssue(
                             code=exc.code,
@@ -250,7 +289,91 @@ class EsKnowledgeRetrievalService:
                             details={"partialItemCount": len(items)},
                         )
                     )
-                if topics and not request.knowledge_request and bool(retrieval_profile.get("broadSearchEnabled", True)):
+                query_ranked_groups: list[tuple[str, list[RecallItem]]] = [("query:base", items)]
+                for subquery in retrieval_query_plan[1:]:
+                    subquery_id = str(subquery.get("id") or "supplemental")
+                    subquery_text = str(subquery.get("query") or "").strip()
+                    if not subquery_text:
+                        continue
+                    try:
+                        subquery_items = self._search(
+                            subquery_text,
+                            topics,
+                            include_rules=include_rules,
+                        )
+                    except RetrievalLaneFailure as exc:
+                        subquery_items = list(exc.partial_items)
+                        record_retrieval_query_result(
+                            retrieval_query_plan,
+                            query_id=subquery_id,
+                            status="DEGRADED",
+                            items=subquery_items,
+                            error_code=exc.code,
+                        )
+                        retrieval_issues.append(
+                            RetrievalIssue(
+                                code=exc.code,
+                                message=str(exc)[:500],
+                                backend=self.backend_name,
+                                lane=exc.lane,
+                                stage="multi_query",
+                                severity="warning",
+                                request_key=str(request_key or ""),
+                                details={
+                                    "queryId": subquery_id,
+                                    "partialItemCount": len(subquery_items),
+                                },
+                            )
+                        )
+                    except Exception as exc:
+                        record_retrieval_query_result(
+                            retrieval_query_plan,
+                            query_id=subquery_id,
+                            status="FAILED",
+                            items=[],
+                            error_code="ES_MULTI_QUERY_FAILED",
+                        )
+                        retrieval_issues.append(
+                            RetrievalIssue(
+                                code="ES_MULTI_QUERY_FAILED",
+                                message=str(exc)[:500],
+                                backend=self.backend_name,
+                                lane=subquery_id,
+                                stage="multi_query",
+                                severity="warning",
+                                request_key=str(request_key or ""),
+                                details={"queryId": subquery_id},
+                            )
+                        )
+                        continue
+                    else:
+                        record_retrieval_query_result(
+                            retrieval_query_plan,
+                            query_id=subquery_id,
+                            status="SUCCESS" if subquery_items else "EMPTY",
+                            items=subquery_items,
+                        )
+                    query_ranked_groups.append(("query:%s" % subquery_id, subquery_items))
+                if len(query_ranked_groups) > 1:
+                    items = rrf_fuse_recall_items(
+                        query_ranked_groups,
+                        rrf_k=self.settings.es_rrf_k,
+                        score_scale=self.settings.es_rrf_score_scale,
+                        limit=max(
+                            1,
+                            int(
+                                retrieval_profile.get("hybridTopK")
+                                or self.settings.es_hybrid_top_k
+                                or 24
+                            ),
+                        ),
+                    )
+                if (
+                    topics
+                    and not request.knowledge_request
+                    and not request.strict_topic_scope
+                    and bool(retrieval_profile.get("broadSearchEnabled", True))
+                ):
                     try:
                         broad_items = self._search(query_text, [], include_rules=False)
                         items = rrf_fuse_recall_items(
@@ -292,19 +415,86 @@ class EsKnowledgeRetrievalService:
                                 details={"topicScopedItemCount": len(items)},
                             )
                         )
+                (
+                    hierarchical_items,
+                    directory_retrieval_trace,
+                    retrieval_stop_reason,
+                    hierarchical_issues,
+                ) = self._expand_hierarchical_retrieval(
+                    request=request,
+                    query_text=query_text,
+                    topics=topics,
+                    include_rules=include_rules,
+                    initial_items=items,
+                    retrieval_query_plan=retrieval_query_plan,
+                    retrieval_profile=retrieval_profile,
+                    request_key=str(request_key or ""),
+                )
+                retrieval_issues.extend(hierarchical_issues)
+                hierarchical_retrieval_applied = any(
+                    str(item.get("stage") or "") == "DIRECTORY_EXPANSION"
+                    for item in directory_retrieval_trace
+                )
+                items = merge_recall_items(items, hierarchical_items)
                 items = merge_recall_items(items, self._metric_candidate_items(query_text, metric_candidates))
                 items = merge_recall_items(items, self._exact_metric_evidence(query_text, topics))
                 items = self._attach_current_asset_governance(items)
+                governance_decisions = recall_governance_decisions(items, request)
                 items, governance_filtered = filter_recall_items_by_governance(items, request)
+                directory_retrieval_trace.append(
+                    {
+                        "stepId": "final:governance",
+                        "parentStepId": (
+                            str(directory_retrieval_trace[-1].get("stepId") or "")
+                            if directory_retrieval_trace
+                            else ""
+                        ),
+                        "stage": "FINAL_GOVERNANCE",
+                        "depth": 3,
+                        "candidateCount": len(items) + len(governance_decisions),
+                        "selectedRefs": unique_source_refs(items)[:16],
+                        "eliminatedCandidates": governance_decisions[:16],
+                        "governanceFiltered": governance_filtered,
+                    }
+                )
                 items = business_rerank_recall_items(items, query_text, request)
+                pre_cap_items = list(items)
                 items = limit_recall_items_by_source_type(
                     items,
                     source_type_top_k,
                     limit=max(1, int(retrieval_profile.get("hybridTopK") or self.settings.es_hybrid_top_k or len(items) or 1)),
                 )
+                selected_refs = set(unique_source_refs(items))
+                cap_eliminated = [
+                    {
+                        "refId": item.doc_id
+                        or str((item.metadata or {}).get("semanticRefId") or ""),
+                        "sourceType": str(item.source_type or "UNKNOWN").upper(),
+                        "reasonCode": "SOURCE_TYPE_OR_FINAL_TOP_K_CAP",
+                    }
+                    for item in pre_cap_items
+                    if (
+                        item.doc_id
+                        or str((item.metadata or {}).get("semanticRefId") or "")
+                    )
+                    not in selected_refs
+                ]
+                directory_retrieval_trace.append(
+                    {
+                        "stepId": "final:selection",
+                        "parentStepId": "final:governance",
+                        "stage": "FINAL_SOURCE_TYPE_CAP",
+                        "depth": 3,
+                        "candidateCount": len(pre_cap_items),
+                        "selectedRefs": unique_source_refs(items)[:16],
+                        "eliminatedCandidates": cap_eliminated[:16],
+                        "omittedCandidateCount": max(0, len(cap_eliminated) - 16),
+                    }
+                )
             except Exception as exc:
                 items = []
                 governance_filtered = {}
+                retrieval_stop_reason = retrieval_stop_reason or "RETRIEVAL_FAILED"
                 retrieval_issues.append(
                     RetrievalIssue(
                         code="ES_RETRIEVAL_FAILED",
@@ -319,6 +509,22 @@ class EsKnowledgeRetrievalService:
         finally:
             self._active_retrieval_profile = None
         retrieval_status = retrieval_status_for(items, retrieval_issues)
+        hierarchical_stop_reason = retrieval_stop_reason
+        if retrieval_status == "failed":
+            retrieval_stop_reason = "BACKEND_FAILED"
+        elif not items:
+            retrieval_stop_reason = "NO_CANDIDATES"
+        elif retrieval_status == "degraded":
+            retrieval_stop_reason = "FINAL_EVIDENCE_SELECTED_DEGRADED"
+        else:
+            retrieval_stop_reason = "FINAL_EVIDENCE_SELECTED"
+        retrieval_stop_details = {
+            "hierarchicalStopReason": hierarchical_stop_reason,
+            "finalItemCount": len(items),
+            "issueCount": len(retrieval_issues),
+            "queryCount": len(retrieval_query_plan),
+            "stepCount": len(directory_retrieval_trace),
+        }
         blocked_reason = next(
             (
                 "%s:%s" % (issue.code, issue.message[:240])
@@ -333,7 +539,11 @@ class EsKnowledgeRetrievalService:
             query=request.query,
             topics=[str(item.value if hasattr(item, "value") else item) for item in request.topic_categories],
             backend=self.backend_name,
-            recall_queries=[query_text] if query_text else [],
+            recall_queries=[
+                str(item.get("query") or "")
+                for item in retrieval_query_plan
+                if str(item.get("query") or "").strip()
+            ],
             source_refs=source_refs,
             item_count=len(items),
             blocked_reason=blocked_reason,
@@ -351,8 +561,15 @@ class EsKnowledgeRetrievalService:
                 vector_enabled=self._vector_enabled(),
                 include_rules=include_rules,
                 has_metric_candidates=bool(metric_candidates),
-                broad_enabled=bool(topics),
+                broad_enabled=bool(topics and not request.strict_topic_scope),
+                query_plan_size=len(retrieval_query_plan),
+                hierarchical_enabled=bool(self.settings.es_hierarchical_retrieval_enabled),
             ),
+            retrieval_query_plan=retrieval_query_plan,
+            directory_retrieval_trace=directory_retrieval_trace,
+            hierarchical_retrieval_applied=hierarchical_retrieval_applied,
+            retrieval_stop_reason=retrieval_stop_reason,
+            retrieval_stop_details=retrieval_stop_details,
             rewritten_query=rewritten_query,
             governance_filtered=governance_filtered,
             rerank_applied=bool(items),
@@ -388,6 +605,225 @@ class EsKnowledgeRetrievalService:
             if display and display not in names:
                 names.append(display)
         return names
+
+    def _expand_hierarchical_retrieval(
+        self,
+        *,
+        request: KnowledgeRetrievalRequest,
+        query_text: str,
+        topics: list[str],
+        include_rules: bool,
+        initial_items: list[RecallItem],
+        retrieval_query_plan: list[dict[str, Any]],
+        retrieval_profile: dict[str, Any],
+        request_key: str,
+    ) -> tuple[list[RecallItem], list[dict[str, Any]], str, list[RetrievalIssue]]:
+        """Resolve a bounded Topic -> table -> exact-leaf retrieval path.
+
+        The Core keeps orchestration authority.  This helper only turns the
+        existing L0/L1/L2 semantic directory into a generic, observable search
+        primitive and never treats a recall hit as execution authority.
+        """
+
+        trace: list[dict[str, Any]] = []
+        issues: list[RetrievalIssue] = []
+        if not bool(self.settings.es_hierarchical_retrieval_enabled):
+            return [], trace, "HIERARCHICAL_RETRIEVAL_DISABLED", issues
+        if not topics:
+            return [], trace, "NO_TOPIC_DIRECTORY_SCOPE", issues
+
+        governed_initial = self._attach_current_asset_governance(initial_items)
+        governed_initial, initial_governance_filtered = filter_recall_items_by_governance(
+            governed_initial,
+            request,
+        )
+        target_queries = [
+            item
+            for item in retrieval_query_plan
+            if item.get("targetSourceTypes")
+        ]
+        if not target_queries:
+            return [], trace, "SIMPLE_QUERY_SINGLE_PASS", issues
+
+        uncovered = uncovered_retrieval_queries(target_queries, governed_initial)
+        trace.append(
+            {
+                "stepId": "coverage:initial",
+                "parentStepId": "",
+                "stage": "INITIAL_LEAF_COVERAGE",
+                "depth": 0,
+                "queryIds": [str(item.get("id") or "") for item in target_queries],
+                "coveredQueryIds": [
+                    str(item.get("id") or "")
+                    for item in target_queries
+                    if item not in uncovered
+                ],
+                "uncoveredQueryIds": [str(item.get("id") or "") for item in uncovered],
+                "candidateRefs": unique_source_refs(governed_initial)[:12],
+                "governanceFiltered": initial_governance_filtered,
+            }
+        )
+        if not uncovered:
+            return [], trace, "TARGET_TYPES_ALREADY_COVERED", issues
+
+        all_directories = select_retrieval_directories(
+            governed_initial,
+            allowed_topics=topics,
+            limit=max(1, len(governed_initial)),
+        )
+        directory_limit = max(1, int(self.settings.es_hierarchical_max_directories or 2))
+        directories = all_directories[:directory_limit]
+        trace.append(
+            {
+                "stepId": "directory:selection",
+                "parentStepId": "coverage:initial",
+                "stage": "DIRECTORY_SELECTION",
+                "depth": 1,
+                "candidateCount": len(all_directories),
+                "selectedDirectories": directories,
+                "eliminatedByDirectoryCap": all_directories[directory_limit:][:8],
+                "directoryLimit": directory_limit,
+            }
+        )
+        if not directories:
+            return [], trace, "NO_TABLE_DIRECTORY_CANDIDATE", issues
+
+        expanded: list[RecallItem] = []
+        seen_refs = set(unique_source_refs(governed_initial))
+        max_leaf_items = max(1, int(self.settings.es_hierarchical_max_leaf_items or 16))
+        for directory in directories:
+            topic = str(directory.get("topic") or "")
+            table = str(directory.get("table") or "")
+            if not topic or not table:
+                continue
+            directory_query = build_directory_retrieval_query(
+                query_text=query_text,
+                topic=topic,
+                table=table,
+                uncovered_queries=uncovered,
+            )
+            previous_directory_scope = self._active_directory_scope
+            self._active_directory_scope = {
+                "topic": topic,
+                "table": table,
+                "directoryId": "semantic:%s:%s:directory" % (topic, table),
+            }
+            try:
+                hits = self._search(
+                    directory_query,
+                    [topic],
+                    include_rules=include_rules,
+                )
+            except RetrievalLaneFailure as exc:
+                hits = list(exc.partial_items)
+                issues.append(
+                    RetrievalIssue(
+                        code=exc.code,
+                        message=str(exc)[:500],
+                        backend=self.backend_name,
+                        lane=exc.lane,
+                        stage="directory_expansion",
+                        severity="warning",
+                        request_key=request_key,
+                        details={
+                            "topic": topic,
+                            "table": table,
+                            "partialItemCount": len(hits),
+                        },
+                    )
+                )
+            except Exception as exc:
+                issues.append(
+                    RetrievalIssue(
+                        code="ES_DIRECTORY_RETRIEVAL_FAILED",
+                        message=str(exc)[:500],
+                        backend=self.backend_name,
+                        lane="directory:%s/%s" % (topic, table),
+                        stage="directory_expansion",
+                        severity="warning",
+                        request_key=request_key,
+                        details={"topic": topic, "table": table},
+                    )
+                )
+                trace.append(
+                    {
+                        "stepId": "directory:%s/%s" % (topic, table),
+                        "parentStepId": "directory:selection",
+                        "stage": "DIRECTORY_EXPANSION",
+                        "depth": 2,
+                        "topic": topic,
+                        "table": table,
+                        "query": directory_query,
+                        "status": "FAILED",
+                        "newRefs": [],
+                    }
+                )
+                continue
+            finally:
+                self._active_directory_scope = previous_directory_scope
+
+            governed_hits = self._attach_current_asset_governance(hits)
+            governed_hits, leaf_governance_filtered = filter_recall_items_by_governance(
+                governed_hits,
+                request,
+            )
+            scoped_hits = [
+                item
+                for item in governed_hits
+                if recall_item_in_directory(item, topic=topic, table=table)
+                and recall_item_is_exact_leaf(item)
+                and recall_item_matches_uncovered_queries(item, uncovered)
+            ]
+            new_hits: list[RecallItem] = []
+            duplicate_refs: list[str] = []
+            for item in scoped_hits:
+                ref = item.doc_id or str((item.metadata or {}).get("semanticRefId") or "")
+                if not ref or ref in seen_refs:
+                    if ref:
+                        duplicate_refs.append(ref)
+                    continue
+                seen_refs.add(ref)
+                metadata = dict(item.metadata or {})
+                metadata["directoryTraversal"] = {
+                    "topic": topic,
+                    "table": table,
+                    "depth": 2,
+                    "queryIds": [str(value.get("id") or "") for value in uncovered],
+                }
+                new_hits.append(item.model_copy(update={"metadata": metadata}))
+                if len(expanded) + len(new_hits) >= max_leaf_items:
+                    break
+            expanded.extend(new_hits)
+            trace.append(
+                {
+                    "stepId": "directory:%s/%s" % (topic, table),
+                    "parentStepId": "directory:selection",
+                    "stage": "DIRECTORY_EXPANSION",
+                    "depth": 2,
+                    "topic": topic,
+                    "table": table,
+                    "query": directory_query,
+                    "status": "EXPANDED",
+                    "candidateRefs": unique_source_refs(scoped_hits)[:12],
+                    "newRefs": unique_source_refs(new_hits)[:12],
+                    "discardedOutsideDirectory": max(0, len(governed_hits) - len(scoped_hits)),
+                    "discardedDuplicateRefs": duplicate_refs[:12],
+                    "governanceFiltered": leaf_governance_filtered,
+                }
+            )
+            if len(expanded) >= max_leaf_items:
+                break
+
+        if expanded:
+            reason = (
+                "MAX_LEAF_BUDGET_REACHED"
+                if len(expanded) >= max_leaf_items
+                else "NEW_EXACT_LEAF_EVIDENCE_FOUND"
+            )
+            return expanded[:max_leaf_items], trace, reason, issues
+        if issues:
+            return [], trace, "DIRECTORY_EXPANSION_DEGRADED", issues
+        return [], trace, "NO_NEW_EXACT_LEAF_EVIDENCE", issues
 
     def _attach_current_asset_governance(self, items: list[RecallItem]) -> list[RecallItem]:
         """Recheck ES hits against the live published semantic asset.
@@ -516,8 +952,12 @@ class EsKnowledgeRetrievalService:
                             "metadata.businessName^3",
                             "metadata.aliases^2",
                             "metadata.metricKey^3",
+                            "metadata.columnName^3",
+                            "metadata.term^3",
+                            "metadata.ruleTitle^3",
                             "metadata.relationshipId^2",
                             "metadata.tableName^2",
+                            "metadata.semanticKind^2",
                         ],
                     }
                 }
@@ -541,6 +981,35 @@ class EsKnowledgeRetrievalService:
             filters.append({"bool": {"should": topic_should, "minimum_should_match": 1}})
         elif include_rules:
             filters.append({"term": {"source_type": "GOVERNED_RULE"}})
+        directory_scope = self._active_directory_scope or {}
+        directory_id = str(directory_scope.get("directoryId") or "")
+        table = str(directory_scope.get("table") or "")
+        if directory_id or table:
+            directory_should: list[dict[str, object]] = []
+            if directory_id:
+                directory_should.extend(
+                    [
+                        {"term": {"parent_directory_id": directory_id}},
+                        {"term": {"directory_id": directory_id}},
+                    ]
+                )
+            if table:
+                directory_should.extend(
+                    [
+                        {"term": {"table": table}},
+                        {"term": {"metadata.tableName": table}},
+                        {"term": {"metadata.leftTable": table}},
+                        {"term": {"metadata.rightTable": table}},
+                    ]
+                )
+            filters.append(
+                {
+                    "bool": {
+                        "should": directory_should,
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
         return filters
 
     def _text_size(self, topics: list[str]) -> int:
@@ -614,6 +1083,11 @@ class EsKnowledgeRetrievalService:
             "rrfK": self.settings.es_rrf_k,
             "hybridTopK": self.settings.es_hybrid_top_k,
             "dynamicTopKEnabled": True,
+            "multiQueryEnabled": bool(self.settings.es_multi_query_enabled),
+            "multiQueryMaxQueries": int(self.settings.es_multi_query_max_queries or 5),
+            "hierarchicalRetrievalEnabled": bool(self.settings.es_hierarchical_retrieval_enabled),
+            "hierarchicalMaxDirectories": int(self.settings.es_hierarchical_max_directories or 2),
+            "hierarchicalMaxLeafItems": int(self.settings.es_hierarchical_max_leaf_items or 16),
         }
         return trace
 
@@ -1182,6 +1656,283 @@ def metric_trace_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any
     return payload
 
 
+RETRIEVAL_LEAF_SOURCE_TYPES = {
+    "SEMANTIC_METRIC",
+    "SEMANTIC_COLUMN",
+    "SEMANTIC_TERM",
+    "SEMANTIC_BUSINESS_RULE",
+    "SEMANTIC_RELATIONSHIP",
+    "GOVERNED_RULE",
+}
+
+
+def build_retrieval_query_plan(
+    *,
+    query_text: str,
+    request: KnowledgeRetrievalRequest,
+    retrieval_profile: dict[str, Any],
+    metric_candidates: list[dict[str, Any]],
+    include_rules: bool,
+    max_queries: int = 5,
+    enabled: bool = True,
+) -> list[dict[str, Any]]:
+    """Build a bounded, deterministic search plan without inventing semantics."""
+
+    base_query = collapse_whitespace(query_text)
+    if not base_query:
+        return []
+    plan: list[dict[str, Any]] = [
+        {
+            "id": "base",
+            "query": base_query,
+            "purpose": "original_question",
+            "priority": 100,
+            "targetSourceTypes": [],
+        }
+    ]
+    if not enabled or max_queries <= 1:
+        return plan
+
+    query_type = str(retrieval_profile.get("queryType") or "")
+    complex_query = query_type in {
+        "multi_metric",
+        "multi_hop_analysis",
+        "mixed_rule_data",
+        "rule_qa",
+    }
+    if not complex_query and not include_rules:
+        return plan
+
+    candidates: list[dict[str, Any]] = []
+    metric_labels: list[str] = []
+    for candidate in metric_candidates[:3]:
+        label = str(
+            candidate.get("matchedMetricLabel")
+            or candidate.get("businessName")
+            or candidate.get("metricKey")
+            or ""
+        ).strip()
+        if label and label not in metric_labels:
+            metric_labels.append(label)
+    if metric_labels or query_type in {"multi_metric", "multi_hop_analysis", "mixed_rule_data"}:
+        focus = "、".join(metric_labels[:3]) or "问题涉及的指标"
+        candidates.append(
+            {
+                "id": "metrics",
+                "query": "%s；检索重点：%s的指标定义、计算公式、来源字段和时间口径" % (base_query, focus),
+                "purpose": "metric_definition",
+                "priority": 90,
+                "targetSourceTypes": ["SEMANTIC_METRIC"],
+            }
+        )
+
+    if query_type in {"multi_hop_analysis", "mixed_rule_data"}:
+        candidates.append(
+            {
+                "id": "relationships",
+                "query": "%s；检索重点：相关数据表之间的关联关系、关联字段、数据粒度和重复计算风险" % base_query,
+                "purpose": "relationship_path",
+                "priority": 85,
+                "targetSourceTypes": ["SEMANTIC_RELATIONSHIP"],
+            }
+        )
+
+    route_slots = request.route_slots if isinstance(request.route_slots, dict) else {}
+    dimensions = retrieval_slot_labels(route_slots.get("dimensions") or [])
+    if complex_query or dimensions:
+        focus = "、".join(dimensions[:4]) or "问题涉及的维度、时间和筛选字段"
+        candidates.append(
+            {
+                "id": "fields",
+                "query": "%s；检索重点：%s对应的字段定义、业务术语和使用方式" % (base_query, focus),
+                "purpose": "field_and_term_binding",
+                "priority": 80,
+                "targetSourceTypes": ["SEMANTIC_COLUMN", "SEMANTIC_TERM"],
+            }
+        )
+
+    if include_rules or query_type in {"rule_qa", "mixed_rule_data"}:
+        candidates.append(
+            {
+                "id": "rules",
+                "query": "%s；检索重点：业务规则、指标限制、必选条件和风险提示" % base_query,
+                "purpose": "business_rule",
+                "priority": 95 if query_type == "rule_qa" else 75,
+                "targetSourceTypes": ["SEMANTIC_BUSINESS_RULE", "GOVERNED_RULE"],
+            }
+        )
+
+    seen_queries = {base_query}
+    for candidate in sorted(candidates, key=lambda item: int(item.get("priority") or 0), reverse=True):
+        query = collapse_whitespace(candidate.get("query"))
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        plan.append({**candidate, "query": query})
+        if len(plan) >= max(1, int(max_queries or 5)):
+            break
+    return plan
+
+
+def retrieval_slot_labels(values: object) -> list[str]:
+    candidates = values if isinstance(values, list) else [values]
+    labels: list[str] = []
+    for value in candidates:
+        if isinstance(value, dict):
+            label = str(
+                value.get("businessName")
+                or value.get("label")
+                or value.get("name")
+                or value.get("column")
+                or value.get("key")
+                or ""
+            ).strip()
+        else:
+            label = str(value or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def record_retrieval_query_result(
+    query_plan: list[dict[str, Any]],
+    *,
+    query_id: str,
+    status: str,
+    items: list[RecallItem],
+    error_code: str = "",
+) -> None:
+    for query in query_plan:
+        if str(query.get("id") or "") != query_id:
+            continue
+        query["status"] = status
+        query["itemCount"] = len(items or [])
+        query["candidateRefs"] = unique_source_refs(items)[:12]
+        query["candidateSourceTypes"] = sorted(
+            {str(item.source_type or "UNKNOWN").upper() for item in items or []}
+        )
+        if error_code:
+            query["errorCode"] = error_code
+        return
+
+
+def uncovered_retrieval_queries(
+    query_plan: list[dict[str, Any]],
+    items: list[RecallItem],
+) -> list[dict[str, Any]]:
+    available = {str(item.source_type or "").upper() for item in items or []}
+    uncovered: list[dict[str, Any]] = []
+    for query in query_plan:
+        targets = {str(value or "").upper() for value in query.get("targetSourceTypes") or [] if value}
+        if targets and not targets.intersection(available):
+            uncovered.append(query)
+    return uncovered
+
+
+def select_retrieval_directories(
+    items: list[RecallItem],
+    *,
+    allowed_topics: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    allowed = {str(item) for item in allowed_topics if str(item or "").strip()}
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items or []:
+        metadata = dict(item.metadata or {})
+        topic = str(item.topic or metadata.get("topic") or "").strip()
+        table = str(item.table or metadata.get("tableName") or "").strip()
+        if not topic or not table or (allowed and topic not in allowed):
+            continue
+        key = (topic, table)
+        entry = grouped.setdefault(
+            key,
+            {
+                "topic": topic,
+                "table": table,
+                "score": 0.0,
+                "hitCount": 0,
+                "sourceTypes": [],
+                "sourceRefs": [],
+            },
+        )
+        entry["score"] = max(float(entry.get("score") or 0.0), float(item.fusion_score or 0.0))
+        entry["hitCount"] = int(entry.get("hitCount") or 0) + 1
+        source_type = str(item.source_type or "UNKNOWN").upper()
+        if source_type not in entry["sourceTypes"]:
+            entry["sourceTypes"].append(source_type)
+        ref = item.doc_id or str(metadata.get("semanticRefId") or "")
+        if ref and ref not in entry["sourceRefs"]:
+            entry["sourceRefs"].append(ref)
+    ranked = sorted(
+        grouped.values(),
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            int(item.get("hitCount") or 0),
+            str(item.get("topic") or ""),
+            str(item.get("table") or ""),
+        ),
+        reverse=True,
+    )
+    return [
+        {
+            **item,
+            "score": round(float(item.get("score") or 0.0), 6),
+            "sourceRefs": list(item.get("sourceRefs") or [])[:8],
+        }
+        for item in ranked[: max(1, int(limit or 1))]
+    ]
+
+
+def build_directory_retrieval_query(
+    *,
+    query_text: str,
+    topic: str,
+    table: str,
+    uncovered_queries: list[dict[str, Any]],
+) -> str:
+    purposes = [str(item.get("purpose") or "") for item in uncovered_queries if str(item.get("purpose") or "")]
+    focus = "、".join(purposes[:4]) or "精确语义定义"
+    return "%s；限定目录：%s/%s；继续查找：%s" % (query_text, topic, table, focus)
+
+
+def recall_item_in_directory(item: RecallItem, *, topic: str, table: str) -> bool:
+    metadata = dict(item.metadata or {})
+    item_topic = str(item.topic or metadata.get("topic") or "")
+    item_table = str(item.table or metadata.get("tableName") or "")
+    if item_topic != topic:
+        return False
+    if item_table == table:
+        return True
+    if str(item.source_type or "").upper() == "SEMANTIC_RELATIONSHIP":
+        return table in {
+            str(metadata.get("leftTable") or ""),
+            str(metadata.get("rightTable") or ""),
+        }
+    return False
+
+
+def recall_item_is_exact_leaf(item: RecallItem) -> bool:
+    source_type = str(item.source_type or "").upper()
+    metadata = dict(item.metadata or {})
+    if source_type not in RETRIEVAL_LEAF_SOURCE_TYPES:
+        return False
+    if source_type == "SEMANTIC_RELATIONSHIP":
+        kind = str(metadata.get("semanticKind") or "").upper()
+        return kind == "RELATIONSHIP" or str(metadata.get("contextLayer") or "").upper() == "L2"
+    return source_type != "GOVERNED_RULE" or bool(metadata.get("semanticPath"))
+
+
+def recall_item_matches_uncovered_queries(
+    item: RecallItem,
+    uncovered_queries: list[dict[str, Any]],
+) -> bool:
+    source_type = str(item.source_type or "").upper()
+    return any(
+        source_type in {str(value or "").upper() for value in query.get("targetSourceTypes") or []}
+        for query in uncovered_queries
+    )
+
+
 def build_retrieval_profile(
     query_text: str,
     topics: list[str],
@@ -1571,6 +2322,11 @@ def source_type_top_k_policy(
             "SEMANTIC_METRIC": int(configured_caps.get("SEMANTIC_METRIC") or 12),
             "SEMANTIC_RELATIONSHIP": int(configured_caps.get("SEMANTIC_RELATIONSHIP") or 8),
             "SEMANTIC_TABLE_ASSET": int(configured_caps.get("SEMANTIC_TABLE_ASSET") or 6),
+            "SEMANTIC_COLUMN": int(configured_caps.get("SEMANTIC_COLUMN") or 10),
+            "SEMANTIC_TERM": int(configured_caps.get("SEMANTIC_TERM") or 6),
+            "SEMANTIC_BUSINESS_RULE": int(
+                configured_caps.get("SEMANTIC_BUSINESS_RULE") or (6 if include_rules else 3)
+            ),
             "GOVERNED_RULE": int(configured_caps.get("GOVERNED_RULE") or (6 if include_rules else 3)),
         }
     else:
@@ -1580,6 +2336,9 @@ def source_type_top_k_policy(
                 "SEMANTIC_METRIC": 10,
                 "SEMANTIC_RELATIONSHIP": 5,
                 "SEMANTIC_TABLE_ASSET": 4,
+                "SEMANTIC_COLUMN": 8,
+                "SEMANTIC_TERM": 4,
+                "SEMANTIC_BUSINESS_RULE": 4 if include_rules else 2,
                 "GOVERNED_RULE": 4 if include_rules else 2,
             }
         elif profile_kind == "broad":
@@ -1587,6 +2346,9 @@ def source_type_top_k_policy(
                 "SEMANTIC_METRIC": 14,
                 "SEMANTIC_RELATIONSHIP": 10,
                 "SEMANTIC_TABLE_ASSET": 8,
+                "SEMANTIC_COLUMN": 12,
+                "SEMANTIC_TERM": 8,
+                "SEMANTIC_BUSINESS_RULE": 8 if include_rules else 4,
                 "GOVERNED_RULE": 8 if include_rules else 4,
             }
         else:
@@ -1594,6 +2356,9 @@ def source_type_top_k_policy(
                 "SEMANTIC_METRIC": 12,
                 "SEMANTIC_RELATIONSHIP": 8,
                 "SEMANTIC_TABLE_ASSET": 6,
+                "SEMANTIC_COLUMN": 10,
+                "SEMANTIC_TERM": 6,
+                "SEMANTIC_BUSINESS_RULE": 6 if include_rules else 3,
                 "GOVERNED_RULE": 6 if include_rules else 3,
             }
     relationship_heavy = str(profile.get("queryType") or "") in {
@@ -1642,6 +2407,8 @@ def retrieval_lane_trace(
     include_rules: bool,
     has_metric_candidates: bool,
     broad_enabled: bool,
+    query_plan_size: int = 1,
+    hierarchical_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     lanes: list[dict[str, Any]] = []
     lanes.append({"lane": "metric_candidate_lane", "enabled": has_metric_candidates, "topK": 6 if has_metric_candidates else 0})
@@ -1651,6 +2418,20 @@ def retrieval_lane_trace(
     lanes.append({"lane": "broad_bm25_lane", "enabled": broad_flag, "topK": int(retrieval_profile.get("broadTextTopK") or 0) if broad_flag else 0})
     lanes.append({"lane": "broad_vector_lane", "enabled": broad_flag and vector_enabled, "topK": int(retrieval_profile.get("broadVectorTopK") or 0) if broad_flag and vector_enabled else 0})
     lanes.append({"lane": "exact_metric_fallback_lane", "enabled": has_metric_candidates, "topK": 3 if has_metric_candidates else 0})
+    lanes.append(
+        {
+            "lane": "multi_query_lane",
+            "enabled": query_plan_size > 1,
+            "queryCount": max(1, int(query_plan_size or 1)),
+        }
+    )
+    lanes.append(
+        {
+            "lane": "directory_recursive_lane",
+            "enabled": bool(hierarchical_enabled and query_plan_size > 1),
+            "maxDepth": 2,
+        }
+    )
     if include_rules:
         lanes.append({"lane": "governed_rule_lane", "enabled": True, "topK": int((retrieval_profile.get("sourceTypeCaps") or {}).get("GOVERNED_RULE") or 0)})
     return lanes
@@ -1786,6 +2567,28 @@ def filter_recall_items_by_governance(
             continue
         kept.append(item)
     return kept, filtered
+
+
+def recall_governance_decisions(
+    items: list[RecallItem],
+    request: KnowledgeRetrievalRequest,
+) -> list[dict[str, Any]]:
+    decisions: list[dict[str, Any]] = []
+    for item in items or []:
+        reason = recall_governance_block_reason(item, request)
+        if not reason:
+            continue
+        metadata = dict(item.metadata or {})
+        decisions.append(
+            {
+                "refId": item.doc_id or str(metadata.get("semanticRefId") or ""),
+                "sourceType": str(item.source_type or "UNKNOWN").upper(),
+                "topic": str(item.topic or metadata.get("topic") or ""),
+                "table": str(item.table or metadata.get("tableName") or ""),
+                "reasonCode": "GOVERNANCE_%s" % reason.upper(),
+            }
+        )
+    return decisions
 
 
 def recall_governance_metadata(payload: object) -> dict[str, Any]:
@@ -2147,6 +2950,11 @@ def es_hit_to_recall_item(hit: dict[str, object], query_text: str, channel: str 
     semantic_path = str(source.get("semantic_path") or metadata.get("semanticPath") or "")
     merchant_uri = str(source.get("merchant_uri") or metadata.get("merchantUri") or "")
     context_layer = str(source.get("context_layer") or metadata.get("contextLayer") or "")
+    retrieval_level = str(source.get("retrieval_level") or metadata.get("retrievalLevel") or "")
+    directory_id = str(source.get("directory_id") or metadata.get("directoryId") or "")
+    parent_directory_id = str(
+        source.get("parent_directory_id") or metadata.get("parentDirectoryId") or ""
+    )
     metadata["semanticRefId"] = semantic_ref_id
     if semantic_path:
         metadata["semanticPath"] = semantic_path
@@ -2154,6 +2962,12 @@ def es_hit_to_recall_item(hit: dict[str, object], query_text: str, channel: str 
         metadata["merchantUri"] = merchant_uri
     if context_layer:
         metadata["contextLayer"] = context_layer
+    if retrieval_level:
+        metadata["retrievalLevel"] = retrieval_level
+    if directory_id:
+        metadata["directoryId"] = directory_id
+    if parent_directory_id:
+        metadata["parentDirectoryId"] = parent_directory_id
     metadata["recallQuery"] = query_text
     metadata["recallQueries"] = [query_text] if query_text else []
     metadata["esScore"] = float(hit.get("_score") or 0.0)

@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 from merchant_ai.config import Settings, get_settings
-from merchant_ai.models import ChatContext, ChatResponse, ConversationMessage
+from merchant_ai.models import (
+    ChatContext,
+    ChatResponse,
+    ClarificationRequest,
+    ConversationMessage,
+    QuestionRoute,
+)
 from merchant_ai.services.answer import AnswerComposeService
 from merchant_ai.services.access_control import AccessControlService
 from merchant_ai.services.authorization_policy import load_authorization_policy
@@ -48,7 +54,14 @@ from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     HybridKnowledgeRetrievalService,
 )
-from merchant_ai.services.routing import KeywordExtractService, SemanticTopicRouterService
+from merchant_ai.services.routing import (
+    KeywordExtractService,
+    PreflightUnderstandingService,
+    QuestionRoutingService,
+    RouteSlotExtractor,
+    SemanticPreflightRouteClassifier,
+    SemanticTopicRouterService,
+)
 from merchant_ai.services.runtime_bindings import SemanticRuntimeBindingRegistry
 from merchant_ai.services.security import identity_scope_payload
 
@@ -77,6 +90,7 @@ class RuntimeServices:
     answer_repository: AnswerRepository
     pending_store: PendingAnswerStore
     keyword_service: KeywordExtractService
+    preflight_understanding: PreflightUnderstandingService
     answer_service: AnswerComposeService
     memory_store: Any
     merchant_profile_store: MerchantProfileStore
@@ -121,6 +135,112 @@ class GroundedApplicationRuntime:
         effective_merchant_id = str(merchant_id or self.settings.merchant_id).strip()
         actual_thread_id = thread_id or "thread_%s" % uuid.uuid4().hex
         actual_run_id = run_id or "run_%s" % uuid.uuid4().hex
+        _emit(
+            listener,
+            "runtime.started",
+            "GROUNDED_CORE",
+            {
+                "runtime": self.runtime_kind,
+                "threadId": actual_thread_id,
+                "runId": actual_run_id,
+                "messageHistoryCount": len(message_history or []),
+                "preflightEnabled": True,
+            },
+        )
+        preflight = self._preflight_understanding(
+            question,
+            context=context,
+            message_history=message_history,
+            listener=listener,
+        )
+        if preflight is not None:
+            route = preflight.routing_decision.route
+            if route == QuestionRoute.GREETING:
+                semantic_route = str(
+                    (preflight.semantic_trace or {}).get("route") or ""
+                ).strip().upper()
+                response = ChatResponse(
+                    answer=(
+                        "您好，我是 yshopping 商家 AI 助手，可以查询已接入的经营指标、"
+                        "明细和规则信息。"
+                    ),
+                    category_name=(
+                        "BUSINESS_CHAT"
+                        if semantic_route == "BUSINESS_CHAT"
+                        else "GREETING"
+                    ),
+                    suggestions=[
+                        "查询最近7天经营指标",
+                        "查看订单或退款明细",
+                        "了解已发布业务规则",
+                    ],
+                    debug_trace={
+                        "harness": {
+                            "runtimePath": "preflight_fast_path",
+                            "coreInvoked": False,
+                        }
+                    },
+                )
+                return self._finalize_response(
+                    response,
+                    question=question,
+                    context=context,
+                    listener=listener,
+                    thread_id=actual_thread_id,
+                    run_id=actual_run_id,
+                    preflight=preflight,
+                    core_invoked=False,
+                )
+            if route == QuestionRoute.INVALID:
+                write_operation = bool(
+                    (preflight.surface_signals or {}).get("writeOperation")
+                )
+                clarification_question = (
+                    "当前 BI Agent 只支持只读查询和分析，不能执行写操作。请改成只读查询问题。"
+                    if write_operation
+                    else (
+                        str(preflight.clarification_question or "").strip()
+                        or "请补充要看的业务对象、指标、时间范围或分析目标。"
+                    )
+                )
+                clarification = ClarificationRequest(
+                    question=clarification_question,
+                    stage=("UNSUPPORTED_OPERATION" if write_operation else "BUSINESS_SCOPE"),
+                    type=("write_operation" if write_operation else "business_scope"),
+                    options=(
+                        ["改成只读查询", "取消本次操作"]
+                        if write_operation
+                        else [
+                            "查询经营指标",
+                            "查看业务明细",
+                            "分析经营变化",
+                        ]
+                    ),
+                    pending_question=str(question or ""),
+                )
+                response = ChatResponse(
+                    answer=clarification_question,
+                    category_name=(
+                        "UNSUPPORTED_WRITE" if write_operation else "INVALID"
+                    ),
+                    clarification=clarification,
+                    debug_trace={
+                        "harness": {
+                            "runtimePath": "preflight_fast_path",
+                            "coreInvoked": False,
+                        }
+                    },
+                )
+                return self._finalize_response(
+                    response,
+                    question=question,
+                    context=context,
+                    listener=listener,
+                    thread_id=actual_thread_id,
+                    run_id=actual_run_id,
+                    preflight=preflight,
+                    core_invoked=False,
+                )
         if self.core is None:
             reason = self._unavailable_reason or "required model authority is unavailable"
             _emit(
@@ -139,17 +259,6 @@ class GroundedApplicationRuntime:
         access_role = load_authorization_policy().access_role_for_identity(str(user_scope.get("role") or ""))
         merchant = self.services.merchant_service.current_merchant(effective_merchant_id)
 
-        _emit(
-            listener,
-            "runtime.started",
-            "GROUNDED_CORE",
-            {
-                "runtime": self.runtime_kind,
-                "threadId": actual_thread_id,
-                "runId": actual_run_id,
-                "messageHistoryCount": len(message_history or []),
-            },
-        )
         try:
             response = self.core.run(
                 question,
@@ -176,6 +285,79 @@ class GroundedApplicationRuntime:
             )
             raise
 
+        return self._finalize_response(
+            response,
+            question=question,
+            context=context,
+            listener=listener,
+            thread_id=actual_thread_id,
+            run_id=actual_run_id,
+            preflight=preflight,
+            core_invoked=True,
+        )
+
+    def _preflight_understanding(
+        self,
+        question: str,
+        *,
+        context: Optional[ChatContext],
+        message_history: Optional[Sequence[ConversationMessage]],
+        listener: Optional[EventListener],
+    ) -> Any:
+        service = getattr(self.services, "preflight_understanding", None)
+        if service is None or not hasattr(service, "understand"):
+            return None
+        pending_context = bool(
+            message_history
+            or (
+                context
+                and (
+                    str(context.pending_clarification_stage or "").strip()
+                    or str(context.pending_clarification_type or "").strip()
+                    or str(context.pending_question or "").strip()
+                    or str(context.question or "").strip()
+                    or str(context.topic or "").strip()
+                    or bool(context.topics)
+                    or bool(context.metric_keys)
+                    or bool(context.dimension_keys)
+                    or str(context.context_summary or "").strip()
+                )
+            )
+        )
+        try:
+            return service.understand(
+                question,
+                pending_context=pending_context,
+            )
+        except Exception as exc:
+            # The preflight gate is an optimization and routing guard. An
+            # internal classifier failure must not incorrectly reject a valid
+            # business task; the grounded Core remains the fail-safe path.
+            _emit(
+                listener,
+                "runtime.preflight_failed",
+                "PREFLIGHT_ROUTE",
+                {
+                    "runtime": self.runtime_kind,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc)[:300],
+                    "fallback": "GROUNDED_CORE",
+                },
+            )
+            return None
+
+    def _finalize_response(
+        self,
+        response: ChatResponse,
+        *,
+        question: str,
+        context: Optional[ChatContext],
+        listener: Optional[EventListener],
+        thread_id: str,
+        run_id: str,
+        preflight: Any,
+        core_invoked: bool,
+    ) -> ChatResponse:
         if not response.id:
             response.id = "qa_%s" % uuid.uuid4().hex
         response_context = (context or ChatContext()).model_copy(deep=True)
@@ -203,12 +385,14 @@ class GroundedApplicationRuntime:
         harness.update(
             {
                 "runtime": self.runtime_kind,
-                "threadId": actual_thread_id,
-                "runId": actual_run_id,
+                "threadId": thread_id,
+                "runId": run_id,
                 "legacyFallbackUsed": False,
+                "coreInvoked": bool(core_invoked),
+                "preflight": self._preflight_trace(preflight),
                 "checkpoint": self._checkpoint_manager.deep_agent_ref(
-                    actual_thread_id,
-                    actual_run_id,
+                    thread_id,
+                    run_id,
                 ),
             }
         )
@@ -216,7 +400,7 @@ class GroundedApplicationRuntime:
         _emit(
             listener,
             "answer.ready" if response.clarification is None else "clarification.required",
-            "GROUNDED_CORE",
+            "GROUNDED_CORE" if core_invoked else "PREFLIGHT_ROUTE",
             {
                 "runtime": self.runtime_kind,
                 "answer": response.answer if response.clarification is None else "",
@@ -226,6 +410,25 @@ class GroundedApplicationRuntime:
             },
         )
         return response
+
+    @staticmethod
+    def _preflight_trace(preflight: Any) -> dict[str, Any]:
+        if preflight is None:
+            return {
+                "status": "FAILED_OPEN_TO_CORE",
+                "route": "BUSINESS",
+            }
+        decision = getattr(preflight, "routing_decision", None)
+        route = getattr(decision, "route", QuestionRoute.INVALID)
+        return {
+            "status": "COMPLETED",
+            "route": str(getattr(route, "value", route) or ""),
+            "reason": str(getattr(decision, "reason", "") or "")[:300],
+            "semantic": dict(getattr(preflight, "semantic_trace", {}) or {}),
+            "surfaceSignals": dict(
+                getattr(preflight, "surface_signals", {}) or {}
+            ),
+        }
 
     async def run_async(
         self,
@@ -281,6 +484,9 @@ class GroundedApplicationRuntime:
         return {
             "runtime": self.runtime_kind,
             "onlineReady": self.core is not None,
+            "preflightReady": bool(
+                getattr(self.services, "preflight_understanding", None)
+            ),
             "unavailableReason": self._unavailable_reason,
             "planner": None,
             "nodeAgent": None,
@@ -324,6 +530,13 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         knowledge_retriever = HybridKnowledgeRetrievalService(recall_service)
 
     keyword_service = KeywordExtractService(topic_assets)
+    preflight_understanding = PreflightUnderstandingService(
+        settings,
+        keyword_service,
+        QuestionRoutingService(topic_assets),
+        RouteSlotExtractor(topic_assets),
+        SemanticPreflightRouteClassifier(settings),
+    )
     topic_router = SemanticTopicRouterService(settings, topic_assets)
     answer_service = AnswerComposeService(LlmClient(settings))
     merchant_service = MerchantService(
@@ -346,6 +559,7 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
             answer_repository=answer_repository,
             pending_store=pending_store,
             keyword_service=keyword_service,
+            preflight_understanding=preflight_understanding,
             answer_service=answer_service,
             memory_store=memory_store,
             merchant_profile_store=merchant_profile_store,
@@ -377,8 +591,9 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
         # Management/control-plane APIs must remain available for health,
         # identity, uploads and governance when inference credentials are not
         # installed.  The data plane stays fail-closed: no population gate,
-        # query executor or Core is constructed, and every chat/run call is
-        # rejected explicitly by the facade.
+        # query executor or Core is constructed. Lightweight preflight routes
+        # remain available, while BUSINESS tasks are rejected explicitly by
+        # the facade.
         return GroundedApplicationRuntime(
             settings=settings,
             core=None,

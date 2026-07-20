@@ -185,6 +185,20 @@ class Settings(BaseSettings):
     es_rrf_score_scale: float = Field(1000.0, validation_alias="YSHOPPING_ES_RRF_SCORE_SCALE")
     es_hybrid_top_k: int = Field(24, validation_alias="YSHOPPING_ES_HYBRID_TOP_K")
     es_retrieval_profiles_json: str = Field("", validation_alias="YSHOPPING_ES_RETRIEVAL_PROFILES_JSON")
+    es_multi_query_enabled: bool = Field(True, validation_alias="YSHOPPING_ES_MULTI_QUERY_ENABLED")
+    es_multi_query_max_queries: int = Field(5, validation_alias="YSHOPPING_ES_MULTI_QUERY_MAX_QUERIES")
+    es_hierarchical_retrieval_enabled: bool = Field(
+        True,
+        validation_alias="YSHOPPING_ES_HIERARCHICAL_RETRIEVAL_ENABLED",
+    )
+    es_hierarchical_max_directories: int = Field(
+        2,
+        validation_alias="YSHOPPING_ES_HIERARCHICAL_MAX_DIRECTORIES",
+    )
+    es_hierarchical_max_leaf_items: int = Field(
+        16,
+        validation_alias="YSHOPPING_ES_HIERARCHICAL_MAX_LEAF_ITEMS",
+    )
     rule_chunk_target_chars: int = Field(1600, validation_alias="YSHOPPING_RULE_CHUNK_TARGET_CHARS")
     rule_chunk_max_chars: int = Field(2400, validation_alias="YSHOPPING_RULE_CHUNK_MAX_CHARS")
     rule_chunk_overlap_chars: int = Field(160, validation_alias="YSHOPPING_RULE_CHUNK_OVERLAP_CHARS")

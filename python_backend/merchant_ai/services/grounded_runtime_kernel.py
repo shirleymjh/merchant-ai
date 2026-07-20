@@ -30,6 +30,8 @@ from merchant_ai.models import (
     QueryPlan,
     QuestionIntent,
     RecallBundle,
+    RecallRoundTrace,
+    RetrievalIssue,
     ResultCoverage,
     TaskRole,
     TopicRoutingDecision,
@@ -228,6 +230,11 @@ class GroundedRuntimeSession(APIModel):
     ] = None
     semantic_activation_execution_started: bool = False
     recall: RecallBundle = Field(default_factory=RecallBundle)
+    recall_rounds: list[RecallRoundTrace] = Field(default_factory=list)
+    recall_index_version: str = ""
+    recall_semantic_source_hash: str = ""
+    recall_retrieval_status: str = "not_started"
+    recall_retrieval_issues: list[RetrievalIssue] = Field(default_factory=list)
     attempts: list[GroundedRuntimeAttempt] = Field(default_factory=list)
     active_generation: int = 0
     active_attempt_id: str = ""
@@ -452,6 +459,13 @@ class GroundedRuntimeKernel:
                 parent_execution_started
             )
         branch.recall = session.recall.model_copy(deep=True)
+        branch.recall_rounds = [item.model_copy(deep=True) for item in session.recall_rounds]
+        branch.recall_index_version = str(session.recall_index_version or "")
+        branch.recall_semantic_source_hash = str(session.recall_semantic_source_hash or "")
+        branch.recall_retrieval_status = str(session.recall_retrieval_status or "not_started")
+        branch.recall_retrieval_issues = [
+            item.model_copy(deep=True) for item in session.recall_retrieval_issues
+        ]
         branch.active_goal_contract_fingerprint = str(
             session.active_goal_contract_fingerprint or ""
         )
@@ -946,6 +960,7 @@ class GroundedRuntimeKernel:
             else self.keyword_service.extract(retrieval_query)
         )
         retrieve = getattr(self.recall_service, "retrieve", None)
+        knowledge_bundle = None
         if callable(retrieve):
             knowledge_bundle = retrieve(
                 KnowledgeRetrievalRequest(
@@ -981,12 +996,37 @@ class GroundedRuntimeKernel:
             bundle = _merge_recall_bundles(session.recall, bundle)
         with self._lock:
             session.recall = bundle
+            if knowledge_bundle is not None:
+                session.recall_rounds = [
+                    *session.recall_rounds,
+                    *[
+                        item.model_copy(deep=True)
+                        for item in knowledge_bundle.recall_rounds
+                    ],
+                ][-32:]
+                session.recall_index_version = str(knowledge_bundle.index_version or "")
+                session.recall_semantic_source_hash = str(
+                    knowledge_bundle.semantic_source_hash or ""
+                )
+                session.recall_retrieval_status = str(
+                    knowledge_bundle.retrieval_status or "not_started"
+                )
+                session.recall_retrieval_issues = [
+                    item.model_copy(deep=True)
+                    for item in knowledge_bundle.retrieval_issues
+                ][-24:]
             session.phase = "NAVIGATION_RECALLED"
+            stop_reason = (
+                str(knowledge_bundle.recall_rounds[-1].retrieval_stop_reason or "")
+                if knowledge_bundle is not None and knowledge_bundle.recall_rounds
+                else ""
+            )
             self._event(
                 session,
                 "recall_navigation",
                 "OK",
-                "query=%s;items=%d" % (retrieval_query[:120], len(bundle.items)),
+                "query=%s;items=%d;stop=%s"
+                % (retrieval_query[:120], len(bundle.items), stop_reason or "unknown"),
             )
         return bundle
 
