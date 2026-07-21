@@ -125,6 +125,27 @@ def entity_lookup_contract() -> GroundedQueryContract:
     return contract
 
 
+def detail_contract() -> GroundedQueryContract:
+    contract = eligible_contract()
+    field_ref = "semantic:topic_alpha:table_alpha:field:order_id"
+    contract.query_shape = "DETAIL"
+    contract.execution_shape = "detail"
+    contract.metrics = []
+    contract.selected_fields = [
+        GroundedSelectedFieldBinding(
+            semantic_ref_id=field_ref,
+            topic="topic_alpha",
+            table="table_alpha",
+            column="order_id",
+            output_alias="order_id",
+        )
+    ]
+    contract.binding_hints.selected_fields = [
+        GroundedSelectedFieldHint(field_ref=field_ref)
+    ]
+    return contract
+
+
 def same_table_multi_metric_contract() -> GroundedQueryContract:
     contract = eligible_contract()
     contract.execution_shape = "same_table_multi_metric"
@@ -500,6 +521,35 @@ def test_allows_single_table_entity_lookup_with_typed_filter() -> None:
     assert decision.eligible is True
     assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_ENTITY_LOOKUP
     assert decision.reason_codes == []
+
+
+def test_allows_bounded_single_table_detail_projection() -> None:
+    decision = evaluate_deterministic_execution(detail_contract())
+
+    assert decision.eligible is True
+    assert decision.execution_mode == GroundedExecutionMode.DETERMINISTIC_DETAIL
+    assert decision.reason_codes == []
+
+
+def test_detail_with_join_or_upstream_population_remains_core_owned() -> None:
+    contract = detail_contract()
+    contract.tables.append(
+        GroundedTableBinding(topic="topic_beta", table="table_beta")
+    )
+    contract.binding_hints.upstream_entity_bindings = [
+        GroundedUpstreamEntityHint(
+            entity_set_artifact_id="verified-entity-set",
+            target_field_ref=contract.selected_fields[0].semantic_ref_id,
+        )
+    ]
+
+    decision = evaluate_deterministic_execution(contract)
+
+    assert decision.execution_mode == GroundedExecutionMode.CORE_SQL_REQUIRED
+    assert set(decision.reason_codes) >= {
+        GroundedFastPathReason.TABLE_COUNT_NOT_ONE.value,
+        GroundedFastPathReason.UPSTREAM_ENTITY_BINDINGS_PRESENT.value,
+    }
 
 
 def test_entity_lookup_does_not_require_unique_key_when_identity_is_typed() -> None:

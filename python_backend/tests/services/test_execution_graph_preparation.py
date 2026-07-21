@@ -373,7 +373,8 @@ def realtime_fallback_graph() -> tuple[str, QueryPlan, PlanningAssetPack]:
                 time_range=ResolvedTimeRange(
                     kind="rolling",
                     days=1,
-                    anchor_policy="latest_partition",
+                    calendar_anchor_policy="runtime_current_date",
+                    data_as_of_policy="latest_available_partition",
                 ),
                 sql_strategy="structured_first",
                 metric_resolution=seal_semantic_metric_resolution(

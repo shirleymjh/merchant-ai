@@ -415,7 +415,8 @@ def test_latest_value_only_prefers_the_resolved_execution_anchor(
 ) -> None:
     time_range = ResolvedTimeRange(
         kind="rolling",
-        anchor_policy="latest_partition",
+        calendar_anchor_policy="runtime_current_date",
+        data_as_of_policy="latest_available_partition",
         **{resolved_field: resolved_anchor},
     )
 
@@ -439,7 +440,7 @@ def test_latest_value_only_prefers_the_resolved_execution_anchor(
 def test_latest_value_calendar_as_of_uses_the_same_max_not_after_operator_as_query_graph() -> None:
     time_range = ResolvedTimeRange(
         kind="exact_date",
-        anchor_policy="calendar",
+        calendar_anchor_policy="runtime_current_date",
         end_date="2026-07-12",
         execution_end_value="20260712",
     )

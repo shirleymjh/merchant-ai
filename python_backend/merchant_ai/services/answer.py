@@ -571,6 +571,20 @@ class AnswerComposeService:
         effective_rule_context = rule_context if plan_requires_rule_evidence(plan) else ""
         bundle = run_result.merged_query_bundle if run_result else QueryBundle()
         mandatory_skeleton = self._mandatory_answer_skeleton(question, plan, run_result)
+        if (
+            not analysis_summary
+            and self._verified_detail_renderer_owned(plan, run_result)
+        ):
+            # The grounded runtime renders the immutable verified row set
+            # after this composer returns.  Do not ask an LLM to restate the
+            # rows or run metric-oriented claim completeness over an answer
+            # whose authoritative table has not been attached yet.
+            return self._finalize_answer(
+                "",
+                question,
+                plan,
+                run_result,
+            )
         if analysis_summary:
             if answer_metric_comparison_facts(question, plan, run_result):
                 grounded = deterministic_structured_answer(question, plan, run_result)
@@ -1633,6 +1647,32 @@ class AnswerComposeService:
             )
             self._record_lightweight_answer_verification(run_result, verification)
             return guarded
+        if self._verified_detail_renderer_owned(plan, run_result):
+            row_count = (
+                run_result.merged_query_bundle.effective_row_count()
+                if run_result is not None
+                else 0
+            )
+            rendered_intro = (
+                "已查询到符合条件的明细，结果如下。"
+                if row_count > 0
+                else "当前查询范围内没有符合条件的明细。"
+            )
+            guarded = self._apply_answer_guard(
+                rendered_intro,
+                run_result,
+            )
+            verification = AnswerClaimVerification(
+                passed=True,
+                fact_count=0,
+                fallback_used=True,
+                fallback_reason="verified_detail_renderer_owned",
+            )
+            self._record_lightweight_answer_verification(
+                run_result,
+                verification,
+            )
+            return guarded
         if run_result is not None:
             run_result.verified_facts = build_verified_facts(plan, run_result)
         guarded = self._apply_answer_guard(answer or fallback_answer, run_result)
@@ -1709,6 +1749,28 @@ class AnswerComposeService:
         )
         self._record_lightweight_answer_verification(run_result, final_verification)
         return safe_answer
+
+    @staticmethod
+    def _verified_detail_renderer_owned(
+        plan: QueryPlan,
+        run_result: AgentRunResult | None,
+    ) -> bool:
+        if run_result is None or not plan.intents:
+            return False
+        source = str(
+            (plan.question_understanding or {}).get("source") or ""
+        ).strip()
+        verified = run_result.verified_evidence
+        return bool(
+            source == "verified_evidence_portfolio"
+            and verified is not None
+            and verified.passed
+            and run_result.merged_query_bundle.source_artifact_refs
+            and all(
+                intent.answer_mode == AnswerMode.DETAIL
+                for intent in plan.intents
+            )
+        )
 
     def _record_lightweight_answer_verification(
         self,

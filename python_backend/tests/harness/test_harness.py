@@ -4220,7 +4220,10 @@ def test_quick_metric_executes_governed_summary_formula_for_broad_metric_phrase(
     assert "%s AS value" % metric["compiled_formula"] in calls[1][0]
     assert "GROUP BY" not in calls[1][0]
     assert calls[1][1] == [merchant_id, merchant_id, merchant_id]
-    assert response.debug_trace["timeWindowContract"]["anchorPolicy"] == "latest_available_partition"
+    assert (
+        response.debug_trace["timeWindowContract"]["dataAsOfPolicy"]
+        == "latest_available_partition"
+    )
     assert response.data_sections[1].data_rows[0]["value"] == 15.0
 
 
@@ -16197,7 +16200,7 @@ def test_detail_node_uses_structured_fast_path_before_llm():
                     end_date="2026-06-30",
                     days=7,
                     label="2026-06-24 至 2026-06-30",
-                    anchor_policy="calendar",
+                    calendar_anchor_policy="runtime_current_date",
                     explicit=True,
                     source="test_fixture",
                 ),

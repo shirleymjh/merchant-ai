@@ -720,7 +720,12 @@ class ResolvedTimeRange(APIModel):
     days: int = 0
     label: str = ""
     timezone: str = "Asia/Shanghai"
-    anchor_policy: str = "calendar"
+    # The user's calendar-window anchor and the source freshness policy are
+    # independent.  A request such as "最近7天" may be anchored to the runtime
+    # current date while the selected source is read as of its latest
+    # available partition.
+    calendar_anchor_policy: str = "runtime_current_date"
+    data_as_of_policy: str = ""
     explicit: bool = False
     source: str = ""
     window_role: str = "primary"
@@ -733,7 +738,7 @@ class ResolvedTimeRange(APIModel):
     execution_end_date: str = ""
     execution_start_value: str = ""
     execution_end_value: str = ""
-    execution_anchor_policy: str = ""
+    execution_boundary_policy: str = ""
 
 
 class FastUnderstandingResult(APIModel):

@@ -21,7 +21,8 @@ def test_resolve_yesterday_to_absolute_business_date():
     assert resolved.kind == "exact_date"
     assert resolved.start_date == "2026-07-12"
     assert resolved.end_date == "2026-07-12"
-    assert resolved.anchor_policy == "calendar"
+    assert resolved.calendar_anchor_policy == "runtime_current_date"
+    assert resolved.data_as_of_policy == ""
 
 
 def test_resolve_rolling_window_to_absolute_bounds():
@@ -34,7 +35,8 @@ def test_resolve_rolling_window_to_absolute_bounds():
     assert resolved.start_date == "2026-07-07"
     assert resolved.end_date == "2026-07-13"
     assert resolved.days == 7
-    assert resolved.anchor_policy == "latest_available_partition"
+    assert resolved.calendar_anchor_policy == "runtime_current_date"
+    assert resolved.data_as_of_policy == ""
 
 
 def test_resolve_arbitrary_week_quantity_from_shared_temporal_span():
@@ -96,7 +98,10 @@ def test_apply_time_range_seals_every_query_intent():
 
     assert all(intent.time_range.end_date == "2026-07-12" for intent in updated.intents)
     assert all(intent.days == 1 for intent in updated.intents)
-    assert updated.question_understanding["timeRange"]["anchorPolicy"] == "calendar"
+    assert (
+        updated.question_understanding["timeRange"]["calendarAnchorPolicy"]
+        == "runtime_current_date"
+    )
 
 
 def test_partition_date_normalization_accepts_common_pt_formats():

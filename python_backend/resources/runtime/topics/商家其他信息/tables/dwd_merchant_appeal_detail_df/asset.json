@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "商家申诉明细表，承载申诉状态、申诉类型以及处罚类申诉判断",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["appeal_id", "spu_id", "spu_name", "appeal_status_name", "apply_type_name", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 64,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "appeal_id",
@@ -819,6 +827,25 @@
       "unit": "%",
       "description": "申诉通过次数占申诉次数的比例",
       "sourceColumns": [],
+      "calculationExpression": "appeal_pass_cnt / NULLIF(appeal_cnt, 0)",
+      "componentMetricRefs": [
+        {
+          "semanticRefId": "semantic:商家其他信息:dwd_merchant_appeal_detail_df:metric:appeal_pass_cnt",
+          "metricKey": "appeal_pass_cnt"
+        },
+        {
+          "semanticRefId": "semantic:商家其他信息:dwd_merchant_appeal_detail_df:metric:appeal_cnt",
+          "metricKey": "appeal_cnt"
+        }
+      ],
+      "alignment": {
+        "entityGrain": ["merchant"],
+        "entityKeys": ["merchant_id"],
+        "timeGrain": "PERIOD",
+        "timePolicy": "SAME_WINDOW",
+        "componentJoinPolicy": "SAME_TABLE_COMPONENTS",
+        "nullPolicy": "NULL_IF_DENOMINATOR_ZERO"
+      },
       "requiresMetrics": [
         "appeal_pass_cnt",
         "appeal_cnt"

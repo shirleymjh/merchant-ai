@@ -61,7 +61,7 @@ class GroundedFastPathReason(str, Enum):
     METRIC_TIME_COLUMN_MISSING = "METRIC_TIME_COLUMN_MISSING"
     METRIC_TIME_COLUMN_INCOMPATIBLE = "METRIC_TIME_COLUMN_INCOMPATIBLE"
     METRIC_TIME_POLICY_INCOMPATIBLE = "METRIC_TIME_POLICY_INCOMPATIBLE"
-    METRIC_ANCHOR_POLICY_INCOMPATIBLE = "METRIC_ANCHOR_POLICY_INCOMPATIBLE"
+    METRIC_DATA_AS_OF_POLICY_INCOMPATIBLE = "METRIC_DATA_AS_OF_POLICY_INCOMPATIBLE"
     DIMENSION_BINDING_INVALID = "DIMENSION_BINDING_INVALID"
     TREND_DIMENSION_NOT_TEMPORAL = "TREND_DIMENSION_NOT_TEMPORAL"
     RANKING_LIMIT_EXCEEDS_MAXIMUM = "RANKING_LIMIT_EXCEEDS_MAXIMUM"
@@ -78,6 +78,7 @@ class GroundedExecutionMode(str, Enum):
     DETERMINISTIC_GROUPED = "DETERMINISTIC_GROUPED"
     DETERMINISTIC_TREND = "DETERMINISTIC_TREND"
     DETERMINISTIC_RANKED = "DETERMINISTIC_RANKED"
+    DETERMINISTIC_DETAIL = "DETERMINISTIC_DETAIL"
     DETERMINISTIC_ENTITY_LOOKUP = "DETERMINISTIC_ENTITY_LOOKUP"
     CORE_SQL_REQUIRED = "CORE_SQL_REQUIRED"
 
@@ -91,6 +92,7 @@ class GroundedExecutionReason(str, Enum):
     GROUPED_DETERMINISTIC_ELIGIBLE = "GROUPED_DETERMINISTIC_ELIGIBLE"
     TREND_DETERMINISTIC_ELIGIBLE = "TREND_DETERMINISTIC_ELIGIBLE"
     RANKED_DETERMINISTIC_ELIGIBLE = "RANKED_DETERMINISTIC_ELIGIBLE"
+    DETAIL_DETERMINISTIC_ELIGIBLE = "DETAIL_DETERMINISTIC_ELIGIBLE"
     ENTITY_LOOKUP_DETERMINISTIC_ELIGIBLE = "ENTITY_LOOKUP_DETERMINISTIC_ELIGIBLE"
     COMPLEX_QUERY_REQUIRES_CORE_SQL = "COMPLEX_QUERY_REQUIRES_CORE_SQL"
 
@@ -102,6 +104,7 @@ DETERMINISTIC_EXECUTION_MODES = frozenset(
         GroundedExecutionMode.DETERMINISTIC_GROUPED,
         GroundedExecutionMode.DETERMINISTIC_TREND,
         GroundedExecutionMode.DETERMINISTIC_RANKED,
+        GroundedExecutionMode.DETERMINISTIC_DETAIL,
         GroundedExecutionMode.DETERMINISTIC_ENTITY_LOOKUP,
     }
 )
@@ -312,6 +315,13 @@ def evaluate_deterministic_execution(
             _evaluate_ranked_fast_path(contract),
             GroundedExecutionMode.DETERMINISTIC_RANKED,
             GroundedExecutionReason.RANKED_DETERMINISTIC_ELIGIBLE,
+        )
+    if shape == "DETAIL":
+        return _execution_decision(
+            contract,
+            _evaluate_detail_fast_path(contract),
+            GroundedExecutionMode.DETERMINISTIC_DETAIL,
+            GroundedExecutionReason.DETAIL_DETERMINISTIC_ELIGIBLE,
         )
     if shape == "ENTITY_LOOKUP":
         return _execution_decision(
@@ -687,6 +697,75 @@ def _evaluate_entity_lookup_fast_path(
     )
 
 
+def _evaluate_detail_fast_path(
+    contract: GroundedQueryContract,
+) -> GroundedFastPathDecision:
+    """Admit bounded, single-table detail projections without an LLM SQL turn."""
+
+    reasons: list[str] = []
+
+    def reject(reason: GroundedFastPathReason) -> None:
+        if reason.value not in reasons:
+            reasons.append(reason.value)
+
+    if not contract.ready:
+        reject(GroundedFastPathReason.CONTRACT_NOT_READY)
+    if str(contract.execution_shape or "").strip().lower() not in {"", "detail"}:
+        reject(GroundedFastPathReason.EXECUTION_SHAPE_NOT_DETERMINISTIC)
+    if len(contract.tables) != 1:
+        reject(GroundedFastPathReason.TABLE_COUNT_NOT_ONE)
+    if contract.metrics or contract.binding_hints.metric_refs:
+        reject(GroundedFastPathReason.METRICS_PRESENT)
+    if contract.dimensions or contract.binding_hints.dimension_refs or contract.binding_hints.group_by_ref:
+        reject(GroundedFastPathReason.DIMENSIONS_PRESENT)
+    if contract.relationships or contract.binding_hints.relationship_refs:
+        reject(GroundedFastPathReason.RELATIONSHIPS_PRESENT)
+    if contract.entity_filters or contract.binding_hints.entity_filters:
+        reject(GroundedFastPathReason.ENTITY_FILTERS_PRESENT)
+    if contract.upstream_entity_bindings or contract.binding_hints.upstream_entity_bindings:
+        reject(GroundedFastPathReason.UPSTREAM_ENTITY_BINDINGS_PRESENT)
+    if _ranking_present(contract):
+        reject(GroundedFastPathReason.RANKING_PRESENT)
+    if _has_multiple_windows(contract):
+        reject(GroundedFastPathReason.MULTI_WINDOW_PRESENT)
+    if not contract.selected_fields:
+        reject(GroundedFastPathReason.SELECTED_FIELDS_MISSING)
+    if len(contract.selected_fields) > 32:
+        reject(GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID)
+
+    table = contract.tables[0].table if len(contract.tables) == 1 else ""
+    if table and contract.primary_table != table:
+        reject(GroundedFastPathReason.PRIMARY_TABLE_MISMATCH)
+    aliases: list[str] = []
+    selected_refs: set[str] = set()
+    for field in contract.selected_fields:
+        alias = str(field.output_alias or field.column or "").strip()
+        ref_id = str(field.semantic_ref_id or "").strip()
+        aliases.append(alias.casefold())
+        selected_refs.add(ref_id)
+        if (
+            not ref_id.startswith("semantic:")
+            or not str(field.column or "").strip()
+            or field.table != table
+            or not alias
+        ):
+            reject(GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID)
+    if len(set(aliases)) != len(aliases):
+        reject(GroundedFastPathReason.SELECTED_FIELD_ALIAS_DUPLICATE)
+    hinted = {
+        str(item.field_ref or "").strip()
+        for item in contract.binding_hints.selected_fields
+        if str(item.field_ref or "").strip()
+    }
+    if hinted and hinted != selected_refs:
+        reject(GroundedFastPathReason.SELECTED_FIELD_BINDING_INVALID)
+
+    return GroundedFastPathDecision(
+        eligible=not reasons,
+        reason_codes=reasons,
+    )
+
+
 def _validate_metric_binding(
     contract: GroundedQueryContract,
     metric: Any,
@@ -966,11 +1045,11 @@ def _validate_metric_set_time_compatibility(
     if len(selection_policies) > 1:
         reject(GroundedFastPathReason.METRIC_TIME_POLICY_INCOMPATIBLE)
 
-    anchor_policies = {
+    data_as_of_policies = {
         str(
             dict(metric.time_semantics or {}).get("asOfPolicy")
             or dict(metric.time_semantics or {}).get("as_of_policy")
-            or metric.anchor_policy
+            or metric.data_as_of_policy
             or ""
         )
         .strip()
@@ -979,17 +1058,19 @@ def _validate_metric_set_time_compatibility(
         if str(
             dict(metric.time_semantics or {}).get("asOfPolicy")
             or dict(metric.time_semantics or {}).get("as_of_policy")
-            or metric.anchor_policy
+            or metric.data_as_of_policy
             or ""
         ).strip()
     }
-    contract_anchor = str(contract.time_range.anchor_policy or "").strip().lower()
-    if len(anchor_policies) > 1 or (
-        len(anchor_policies) == 1
-        and contract_anchor
-        and contract_anchor not in anchor_policies
+    contract_data_as_of = str(
+        contract.time_range.data_as_of_policy or ""
+    ).strip().lower()
+    if len(data_as_of_policies) > 1 or (
+        len(data_as_of_policies) == 1
+        and contract_data_as_of
+        and contract_data_as_of not in data_as_of_policies
     ):
-        reject(GroundedFastPathReason.METRIC_ANCHOR_POLICY_INCOMPATIBLE)
+        reject(GroundedFastPathReason.METRIC_DATA_AS_OF_POLICY_INCOMPATIBLE)
 
 
 def _supports_native_grain_trend(metric: Any) -> bool:

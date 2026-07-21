@@ -1,6 +1,14 @@
 import pytest
 
-from merchant_ai.models import AgentRunResult, EvidenceGap, QueryBundle, QueryPlan
+from merchant_ai.models import (
+    AgentRunResult,
+    AgentTaskResult,
+    EntitySet,
+    EvidenceGap,
+    PlanDependency,
+    QueryBundle,
+    QueryPlan,
+)
 from merchant_ai.services.evidence import EvidenceVerifier
 
 
@@ -90,3 +98,76 @@ def test_natural_evidence_label_may_embed_an_exact_governed_identifier():
     verified = EvidenceVerifier().verify("退款订单是什么", plan, run_result)
 
     assert verified.passed is True
+
+
+def test_standalone_detail_entity_preview_does_not_claim_downstream_truncation() -> None:
+    task = AgentTaskResult(
+        task_id="orders",
+        success=True,
+        query_bundle=QueryBundle(
+            tables=["orders"],
+            rows=[{"order_id": "order-1"}],
+        ),
+        entity_set=EntitySet(
+            task_id="orders",
+            join_key="order_id",
+            values=["order-1"],
+            truncated=True,
+            source_row_count=58,
+        ),
+    )
+    run_result = AgentRunResult(
+        task_results=[task],
+        merged_query_bundle=task.query_bundle.model_copy(deep=True),
+    )
+
+    verified = EvidenceVerifier().verify(
+        "最近10天订单明细",
+        QueryPlan(),
+        run_result,
+    )
+
+    assert "ENTITY_SET_TRUNCATED" not in {
+        gap.code for gap in verified.warning_gaps
+    }
+
+
+def test_consumed_truncated_entity_set_keeps_downstream_coverage_warning() -> None:
+    task = AgentTaskResult(
+        task_id="orders",
+        success=True,
+        query_bundle=QueryBundle(
+            tables=["orders"],
+            rows=[{"order_id": "order-1"}],
+        ),
+        entity_set=EntitySet(
+            task_id="orders",
+            join_key="order_id",
+            values=["order-1"],
+            truncated=True,
+            source_row_count=58,
+        ),
+    )
+    run_result = AgentRunResult(
+        task_results=[task],
+        merged_query_bundle=task.query_bundle.model_copy(deep=True),
+    )
+    plan = QueryPlan(
+        dependencies=[
+            PlanDependency(
+                anchor_task_id="orders",
+                dependent_task_id="refunds",
+                join_key="order_id",
+            )
+        ]
+    )
+
+    verified = EvidenceVerifier().verify(
+        "从这些订单中查询退款",
+        plan,
+        run_result,
+    )
+
+    assert "ENTITY_SET_TRUNCATED" in {
+        gap.code for gap in verified.warning_gaps
+    }

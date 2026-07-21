@@ -376,6 +376,72 @@ def test_read_table_detail_allows_unambiguous_short_table_ref() -> None:
     assert contract.tables[0].detail_ref_id == detail["refId"]
 
 
+def test_generic_detail_uses_published_default_projection_from_table_detail() -> None:
+    topic = "电商交易"
+    table = "dwm_trade_order_detail_di"
+    order_id_ref = "semantic:%s:%s:field:order_id" % (topic, table)
+    pay_amount_ref = "semantic:%s:%s:field:pay_amt" % (topic, table)
+    detail = core_read(
+        "semantic:%s:%s:detail" % (topic, table),
+        "TABLE_DETAIL",
+        topic,
+        table,
+        {
+            "topic": topic,
+            "tableName": table,
+            "title": "订单明细表",
+            "dataGrain": "订单/子订单明细粒度",
+            "timeColumn": "pt",
+            "merchantFilterColumn": "seller_id",
+            "supportsDetail": True,
+            "detailProjectionPolicy": {
+                "version": "detail_projection.v1",
+                "defaultFieldRefs": [order_id_ref, pay_amount_ref],
+                "defaultFields": [
+                    {
+                        "fieldRef": order_id_ref,
+                        "columnName": "order_id",
+                        "businessName": "主订单号",
+                        "role": "KEY",
+                        "aliases": ["订单号"],
+                    },
+                    {
+                        "fieldRef": pay_amount_ref,
+                        "columnName": "pay_amt",
+                        "businessName": "支付金额",
+                        "role": "METRIC",
+                        "aliases": ["订单金额"],
+                    },
+                ],
+                "allowExplicitFieldSelection": True,
+                "allowAllVisibleFields": True,
+            },
+        },
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "给我最近10天的订单明细",
+        [topic],
+        [detail],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "analysisMode": "DETAIL",
+            "detailProjectionMode": "DEFAULT",
+            "timeExpression": "最近10天",
+        },
+        now=datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc),
+    )
+
+    assert contract.query_shape == "DETAIL"
+    assert [item.column for item in contract.selected_fields] == [
+        "order_id",
+        "pay_amt",
+    ]
+    assert "OUTPUT_BINDING_EVIDENCE_REQUIRED" not in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+
+
 def entity_lookup_evidence() -> tuple[list[dict[str, object]], dict[str, object]]:
     order_topic = "电商交易"
     goods_topic = "商品管理"
@@ -529,7 +595,8 @@ def test_builds_ready_same_table_multi_metric_contract_from_core_reads_only() ->
     assert {metric.metric_key for metric in contract.metrics} == {"order_cnt_1d", "refund_amt_1d"}
     assert {metric.table for metric in contract.metrics} == {table}
     assert contract.time_range.days == 30
-    assert contract.time_range.anchor_policy == "latest_available_partition"
+    assert contract.time_range.calendar_anchor_policy == "runtime_current_date"
+    assert contract.time_range.data_as_of_policy == "latest_available_partition"
     assert contract.relationships == []
     assert set(contract.evidence_refs) == {str(item["refId"]) for item in evidence}
     assert contract.unresolved_gaps == []
@@ -1960,6 +2027,76 @@ def test_cross_table_binding_fails_closed_until_relationship_is_read() -> None:
     assert resolved.execution_shape == "multi_table"
     assert [item.name for item in resolved.relationships] == ["goods_order_by_spu_id"]
     assert str(relationship["refId"]) in resolved.evidence_refs
+
+
+def test_independent_cross_table_metrics_require_parallel_split_not_join() -> None:
+    profile_topic = "经营画像"
+    refund_topic = "电商退货"
+    profile_table = "ads_merchant_profile"
+    refund_table = "dwm_trade_refund_detail_di"
+    profile_detail = table_detail(
+        profile_topic,
+        profile_table,
+        merchant_column="merchant_id",
+    )
+    refund_detail = table_detail(
+        refund_topic,
+        refund_table,
+        merchant_column="seller_id",
+    )
+    order_metric = metric_read(
+        profile_topic,
+        profile_table,
+        "order_cnt_1d",
+        "订单总数",
+        ["订单总数"],
+        "SUM(order_cnt_1d)",
+        ["order_cnt_1d"],
+    )
+    refund_metric = metric_read(
+        refund_topic,
+        refund_table,
+        "refund_bill_cnt",
+        "退款单量",
+        ["退款单量"],
+        "COUNT(DISTINCT refund_id)",
+        ["refund_id"],
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近7天订单总数和退款单量分别是多少",
+        [profile_topic, refund_topic],
+        [profile_detail, refund_detail, order_metric, refund_metric],
+        binding_hints={
+            "tableRefs": [
+                profile_detail["refId"],
+                refund_detail["refId"],
+            ],
+            "metricRefs": [
+                order_metric["refId"],
+                refund_metric["refId"],
+            ],
+            "timeExpression": "最近7天",
+        },
+    )
+
+    assert contract.status == "REVISE_BINDINGS"
+    gap_codes = {gap.code for gap in contract.unresolved_gaps}
+    assert "INDEPENDENT_QUERY_SPLIT_REQUIRED" in gap_codes
+    assert "RELATIONSHIP_EVIDENCE_REQUIRED" not in gap_codes
+    gap = next(
+        gap
+        for gap in contract.unresolved_gaps
+        if gap.code == "INDEPENDENT_QUERY_SPLIT_REQUIRED"
+    )
+    assert gap.resolution == (
+        "REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"
+    )
+    assert gap.required_capability["relationshipEvidenceRequired"] is False
+    assert {
+        item["table"]
+        for item in gap.required_capability["tableGroups"]
+    } == {profile_table, refund_table}
 
 
 def test_build_from_refs_resolves_only_core_selected_semantic_files() -> None:

@@ -97,8 +97,7 @@ from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
 from merchant_ai.services.tool_runtime import ExecutionIdentity
 from merchant_ai.services.time_semantics import (
-    CALENDAR_ANCHOR_POLICY,
-    LATEST_PARTITION_ANCHOR_POLICY,
+    LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY,
     latest_as_of_partition_predicate_sql,
     latest_partition_window_predicate,
 )
@@ -1243,7 +1242,8 @@ class GroundedQueryExecutionKernel:
                 "days": contract.time_range.days,
                 "startDate": contract.time_range.start_date,
                 "endDate": contract.time_range.end_date,
-                "anchorPolicy": contract.time_range.anchor_policy,
+                "calendarAnchorPolicy": contract.time_range.calendar_anchor_policy,
+                "dataAsOfPolicy": contract.time_range.data_as_of_policy,
                 "partitionColumn": time_column,
                 "tenantColumn": merchant_column,
             }
@@ -1478,7 +1478,8 @@ class GroundedQueryExecutionKernel:
                         "days": contract.time_range.days,
                         "startDate": contract.time_range.start_date,
                         "endDate": contract.time_range.end_date,
-                        "anchorPolicy": contract.time_range.anchor_policy,
+                        "calendarAnchorPolicy": contract.time_range.calendar_anchor_policy,
+                        "dataAsOfPolicy": contract.time_range.data_as_of_policy,
                         "partitionColumn": binding.time_column,
                         "tenantColumn": merchant_column,
                     }
@@ -2779,9 +2780,12 @@ class GroundedQueryExecutionKernel:
         population_query_node_id: str,
     ) -> None:
         gate = self.population_execution_gate
-        if gate is None and reference is None:
+        # Population authorization is query-scoped.  A standalone query has
+        # no upstream verified entity/result-set reference and must not be
+        # rejected merely because a gate is configured globally.
+        if reference is None:
             return
-        if gate is None or reference is None:
+        if gate is None:
             raise GroundedPopulationRuntimeGateError(
                 "POPULATION_PRE_EXECUTION_REJECTED"
             )
@@ -4493,7 +4497,8 @@ class GroundedQueryExecutionKernel:
                 "published metric requires per-time-grain execution for a multi-day window"
             )
         if (
-            time_range.anchor_policy == LATEST_PARTITION_ANCHOR_POLICY
+            time_range.data_as_of_policy
+            == LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY
             and time_range.days > 0
         ):
             return latest_partition_window_predicate(
@@ -4510,9 +4515,7 @@ class GroundedQueryExecutionKernel:
                 sql_literal(time_range.start_date),
                 sql_literal(time_range.end_date),
             )
-        if time_range.anchor_policy == CALENDAR_ANCHOR_POLICY:
-            raise RuntimeError("calendar time range is missing explicit start/end bounds")
-        raise RuntimeError("grounded time semantics cannot be compiled")
+        raise RuntimeError("grounded calendar window is missing explicit start/end bounds")
 
     @staticmethod
     def _bounded_time_predicate(

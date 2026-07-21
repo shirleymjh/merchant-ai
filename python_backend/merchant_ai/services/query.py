@@ -145,8 +145,9 @@ from merchant_ai.services.query_security import (
     table_field_semantics,
 )
 from merchant_ai.services.time_semantics import (
-    CALENDAR_ANCHOR_POLICY,
-    LATEST_PARTITION_ANCHOR_POLICY,
+    EXPLICIT_DATE_RANGE_CALENDAR_POLICY,
+    LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY,
+    RUNTIME_CURRENT_DATE_CALENDAR_POLICY,
     latest_as_of_partition_predicate_sql,
     latest_partition_window_predicate,
     time_window_contract_payload,
@@ -219,15 +220,15 @@ def bind_runtime_snapshot_alignment(
                 if time_selection_policy == "latest_as_of"
                 else effective_end - timedelta(days=days - 1)
             )
-            execution_anchor_policy = "common_latest_partition"
+            execution_boundary_policy = "common_latest_partition"
         elif requested_start and requested_end:
             effective_start = requested_start
             effective_end = requested_end
-            execution_anchor_policy = "resolved_calendar_window"
+            execution_boundary_policy = "resolved_calendar_window"
         else:
             effective_start = None
             effective_end = None
-            execution_anchor_policy = ""
+            execution_boundary_policy = ""
 
         sample_value = str(getattr(report, "max_pt", "") or "")
         execution_start = partition_execution_value(effective_start, sample_value) if effective_start else ""
@@ -265,7 +266,7 @@ def bind_runtime_snapshot_alignment(
                     "execution_end_date": effective_end.isoformat(),
                     "execution_start_value": execution_start,
                     "execution_end_value": execution_end,
-                    "execution_anchor_policy": execution_anchor_policy,
+                    "execution_boundary_policy": execution_boundary_policy,
                 }
             )
             if str(getattr(intent.time_range, "window_role", "") or "primary") == "primary":
@@ -275,13 +276,13 @@ def bind_runtime_snapshot_alignment(
             report.effective_end_time_value = effective_end.isoformat() if effective_end else ""
             report.execution_start_value = execution_start
             report.execution_end_value = execution_end
-            report.alignment_status = execution_anchor_policy.upper() if execution_anchor_policy else "UNBOUND"
+            report.alignment_status = execution_boundary_policy.upper() if execution_boundary_policy else "UNBOUND"
             report.coverage_complete = coverage_complete
             if effective_start and effective_end:
                 report.reason = append_note(
                     report.reason,
                     "effective_window=%s..%s alignment=%s"
-                    % (effective_start.isoformat(), effective_end.isoformat(), execution_anchor_policy),
+                    % (effective_start.isoformat(), effective_end.isoformat(), execution_boundary_policy),
                 )
 
         sources.append(
@@ -344,11 +345,8 @@ def bind_runtime_snapshot_alignment(
 
 
 def runtime_window_uses_latest_partition(intent: QuestionIntent) -> bool:
-    policy = str(getattr(intent.time_range, "anchor_policy", "") or "")
-    kind = str(getattr(intent.time_range, "kind", "") or "")
-    if policy == LATEST_PARTITION_ANCHOR_POLICY:
-        return True
-    return bool(kind == "rolling" and policy != CALENDAR_ANCHOR_POLICY)
+    policy = str(getattr(intent.time_range, "data_as_of_policy", "") or "")
+    return policy == LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY
 
 
 def intent_metric_aggregation_policy(intent: QuestionIntent) -> str:
@@ -4326,10 +4324,10 @@ class NodeWorkerExecutor:
                     "selectMustInclude 是强制 SELECT 输出列，必须逐个原样出现在 SELECT 中；"
                     "QueryGraph outputKeys 是传给 dependent 的实体键，必须原样出现在 SELECT 结果中，不能只放在 WHERE/GROUP BY；"
                     "GROUP_AGG/TOPN 必须按 contract 声明的 outputKeys 和 groupByColumn 分组并原样输出；"
-                    "timeWindowContract 非空时，必须使用其中的 partitionColumn、tenantColumn、anchorPolicy 和 days 生成过滤。"
+                    "timeWindowContract 非空时，必须使用其中的 partitionColumn、tenantColumn、calendarAnchorPolicy、dataAsOfPolicy 和 days 生成过滤。"
                     "timeWindowContract 声明 executionStartValue/executionEndValue 时，必须直接使用这两个已绑定边界，禁止再按本表 MAX(partitionColumn) 改写；"
                     "仅当没有 runtime execution 边界时，相对时间窗才锚定 preferredTable 在授权主体过滤后的 MAX(partitionColumn)，不要用 CURDATE()/CURRENT_DATE；"
-                    "显式日期且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
+                    "显式日期且 calendarAnchorPolicy=explicit_date_range 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
                     "没有倒排索引时不要假设索引存在；只选择 requiredColumns 中需要字段和过滤字段；明细 LIMIT <= 20。"
                     "不能修改 contract 里的指标、粒度、依赖或证据要求。"
                 ),
@@ -4577,7 +4575,12 @@ class NodeWorkerExecutor:
     def _apply_partition_date_anchor(self, sql: str, intent: QuestionIntent, freshness: FreshnessCheckResult) -> tuple[str, str]:
         if not bool(getattr(self.settings, "agent_partition_date_anchor_enabled", False)):
             return sql, ""
-        if intent.time_range.start_date and intent.time_range.end_date and intent.time_range.anchor_policy == "calendar":
+        if (
+            intent.time_range.start_date
+            and intent.time_range.end_date
+            and intent.time_range.calendar_anchor_policy
+            == EXPLICIT_DATE_RANGE_CALENDAR_POLICY
+        ):
             return sql, ""
         anchor_value = freshness.effective_end_time_value or freshness.max_pt
         if not freshness.checked or not anchor_value:
@@ -5183,7 +5186,8 @@ class NodeWorkerExecutor:
             partition_column in columns
             and intent.time_range.start_date
             and intent.time_range.end_date
-            and intent.time_range.anchor_policy == CALENDAR_ANCHOR_POLICY
+            and intent.time_range.calendar_anchor_policy
+            == EXPLICIT_DATE_RANGE_CALENDAR_POLICY
         ):
             if not any(sql_filters_column(predicate, partition_column) for predicate in where):
                 where.append(
@@ -5637,8 +5641,10 @@ class NodeWorkerExecutor:
             contract.update(metric_time_contract)
             if has_execution_window:
                 contract["executionRule"] = metric_time_execution_rule(contract)
-            elif contract.get("anchorPolicy") != CALENDAR_ANCHOR_POLICY:
-                contract["anchorPolicy"] = LATEST_PARTITION_ANCHOR_POLICY
+            elif (
+                contract.get("dataAsOfPolicy")
+                == LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY
+            ):
                 contract["executionRule"] = "relative windows must anchor to MAX(partitionColumn) after tenant filter"
             if intent.days and not contract.get("days"):
                 contract["days"] = int(intent.days or 0)
@@ -5648,7 +5654,8 @@ class NodeWorkerExecutor:
             "kind": "rolling",
             "label": "最近%d天" % days,
             "days": days,
-            "anchorPolicy": LATEST_PARTITION_ANCHOR_POLICY,
+            "calendarAnchorPolicy": RUNTIME_CURRENT_DATE_CALENDAR_POLICY,
+            "dataAsOfPolicy": LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY,
             "partitionColumn": time_column,
             "table": table,
             "tenantColumn": merchant_filter_column,

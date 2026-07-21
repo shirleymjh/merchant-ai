@@ -490,6 +490,51 @@ def test_operational_budget_failure_takes_precedence_over_stale_answer_state() -
     assert response.debug_trace["harness"]["operationalFailure"]["code"] == ("GROUNDED_RUNTIME_BUDGET_EXHAUSTED")
 
 
+def test_non_budget_operational_failure_preserves_real_error_code() -> None:
+    kernel = _BudgetKernel()
+    state = kernel.new_session("query orders", "merchant-1")
+    session = GroundedDeepAgentSession(
+        runtime=state,
+        operational_failure={
+            "code": "POPULATION_PRE_EXECUTION_REJECTED",
+            "failureDisposition": "OPERATIONAL_TERMINAL",
+            "retryable": False,
+        },
+        runtime_budget_report={
+            "status": "finished",
+            "exhausted": False,
+        },
+    )
+
+    response = GroundedDeepAgentRuntime._governed_response(
+        session,
+        "population-thread",
+        "population-run",
+    )
+
+    assert "POPULATION_PRE_EXECUTION_REJECTED" in response.answer
+    assert "运行预算内完成" not in response.answer
+    assert response.debug_trace["harness"]["operationalFailure"]["code"] == (
+        "POPULATION_PRE_EXECUTION_REJECTED"
+    )
+
+
+def test_incomplete_terminal_state_returns_controlled_failure_instead_of_500() -> None:
+    kernel = _BudgetKernel()
+    state = kernel.new_session("query orders", "merchant-1")
+    session = GroundedDeepAgentSession(runtime=state)
+
+    response = GroundedDeepAgentRuntime._governed_response(
+        session,
+        "incomplete-thread",
+        "incomplete-run",
+    )
+
+    failure = response.debug_trace["harness"]["operationalFailure"]
+    assert failure["code"] == "GROUNDED_CORE_INCOMPLETE_TERMINAL_STATE"
+    assert "GROUNDED_CORE_INCOMPLETE_TERMINAL_STATE" in response.answer
+
+
 class _AnswerLlm:
     configured = True
     settings = SimpleNamespace(llm_answer_timeout_seconds=3)

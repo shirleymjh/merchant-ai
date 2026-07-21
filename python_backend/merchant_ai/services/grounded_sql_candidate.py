@@ -128,6 +128,19 @@ class _MetricFormulaObligation:
 
 
 @dataclass(frozen=True)
+class _CompositeMetricObligation:
+    semantic_ref_id: str
+    metric_key: str
+    expression: str
+    reference_ref_by_key: tuple[tuple[str, str], ...]
+    component_refs: frozenset[str]
+    component_tables: tuple[tuple[str, str], ...]
+    alignment: dict[str, Any]
+    signature: str
+    parse_error: str = ""
+
+
+@dataclass(frozen=True)
 class _TimeObligation:
     obligation_index: int
     table: str
@@ -156,6 +169,9 @@ class _ValidationContext:
     )
     runtime_injected_entity_refs: set[str] = field(default_factory=set)
     metric_formula_obligations: list[_MetricFormulaObligation] = field(default_factory=list)
+    composite_metric_obligations: list[_CompositeMetricObligation] = field(
+        default_factory=list
+    )
     metric_formula_coverage: set[int] = field(default_factory=set)
     metric_formula_scopes: dict[int, set[int]] = field(default_factory=dict)
     time_obligations: list[_TimeObligation] = field(default_factory=list)
@@ -222,6 +238,19 @@ class GroundedSqlCandidateValidator:
                     resolution="Use one grounded SELECT, or bind and validate every set-operation branch separately.",
                 )
             )
+        for window in parsed.find_all(exp.Window):
+            if sum(1 for node in window.walk() if isinstance(node, exp.Window)) <= 1:
+                continue
+            preliminary.append(
+                _gap(
+                    "SQL_WINDOW_NESTING_INVALID",
+                    "Doris does not allow one window expression to directly contain another window expression",
+                    resolution=(
+                        "Materialize the inner window result in a CTE or subquery, then apply the outer window in the next scope."
+                    ),
+                )
+            )
+            break
 
         canonical = _canonical_sql(parsed, self.dialect)
         ast_fingerprint = _ast_fingerprint(canonical, self.dialect)
@@ -230,6 +259,7 @@ class GroundedSqlCandidateValidator:
         self._validate_scopes(parsed, context)
         self._validate_metric_formula_obligations(context)
         self._validate_metric_fanout(context)
+        self._validate_composite_alignment(context)
         self._validate_entity_obligations(context)
         self._validate_time_obligations(context)
         self._validate_reference_scope(context)
@@ -667,38 +697,12 @@ class GroundedSqlCandidateValidator:
                 for obligation in context.metric_formula_obligations:
                     if obligation.metric_index in context.metric_formula_coverage:
                         continue
-                    if (
-                        obligation.parse_error
-                        or type(node).__name__ != obligation.signature.split(":", 1)[0]
-                    ):
-                        # The type check is only a cheap rejection.  The exact
-                        # structural signature below remains authoritative.
-                        continue
-                    signature = _resolved_expression_signature(
+                    if not _metric_formula_matches(
                         node,
                         state,
                         context.allowed_columns,
-                    )
-                    if signature != obligation.signature:
-                        continue
-                    columns = _direct_columns(node)
-                    resolved_origins: set[_Origin] = set()
-                    unresolved = False
-                    for column in columns:
-                        resolved = _resolve_column(column, state, context.allowed_columns)
-                        if resolved.status != "ok":
-                            unresolved = True
-                            break
-                        resolved_origins.update(resolved.origins)
-                    if unresolved:
-                        continue
-                    if resolved_origins and any(
-                        origin.table != obligation.table
-                        or origin.column not in obligation.source_columns
-                        for origin in resolved_origins
+                        obligation,
                     ):
-                        continue
-                    if not resolved_origins and obligation.table not in state.base_tables:
                         continue
                     context.metric_formula_coverage.add(obligation.metric_index)
                     context.metric_formula_scopes.setdefault(
@@ -863,17 +867,36 @@ class GroundedSqlCandidateValidator:
                 context.allowed_columns,
             )
             for node in _direct_expression_nodes(expression):
-                signature = _resolved_expression_signature(
-                    node,
-                    state,
-                    context.allowed_columns,
-                )
                 for obligation in context.metric_formula_obligations:
-                    if not obligation.parse_error and signature == obligation.signature:
+                    if _metric_formula_matches(
+                        node,
+                        state,
+                        context.allowed_columns,
+                        obligation,
+                    ):
                         semantic_refs.add(obligation.semantic_ref_id)
             for obligation in context.metric_formula_obligations:
-                if not obligation.parse_error and top_signature == obligation.signature:
+                if _metric_formula_matches(
+                    expression,
+                    state,
+                    context.allowed_columns,
+                    obligation,
+                    resolved_signature=top_signature,
+                ):
                     exact_metric_refs.add(obligation.semantic_ref_id)
+            for obligation in context.composite_metric_obligations:
+                if obligation.parse_error:
+                    continue
+                signature = _resolved_composite_expression_signature(
+                    expression,
+                    state,
+                    context,
+                )
+                if signature != obligation.signature:
+                    continue
+                semantic_refs.update(obligation.component_refs)
+                semantic_refs.add(obligation.semantic_ref_id)
+                exact_metric_refs.add(obligation.semantic_ref_id)
             outputs[output_name] = _Output(
                 origins=origins,
                 passthrough=False,
@@ -908,6 +931,21 @@ class GroundedSqlCandidateValidator:
             )
 
     def _validate_metric_formula_obligations(self, context: _ValidationContext) -> None:
+        for obligation in context.composite_metric_obligations:
+            if not obligation.parse_error:
+                continue
+            context.gaps.append(
+                _gap(
+                    "SQL_GOVERNED_COMPOSITE_FORMULA_INVALID",
+                    "Governed composite metric expression could not be compiled for semantic AST validation",
+                    details={
+                        "metricKey": obligation.metric_key,
+                        "semanticRefId": obligation.semantic_ref_id,
+                        "parserError": obligation.parse_error,
+                    },
+                    resolution="Repair and republish the composite metric calculation graph.",
+                )
+            )
         for obligation in context.metric_formula_obligations:
             if obligation.parse_error:
                 context.gaps.append(
@@ -987,6 +1025,145 @@ class GroundedSqlCandidateValidator:
                             "relationshipName": proof.relationship_name,
                         },
                         resolution="Aggregate before the join or select a relationship direction/policy that preserves the metric grain.",
+                    )
+                )
+
+    def _validate_composite_alignment(
+        self,
+        context: _ValidationContext,
+    ) -> None:
+        states_by_scope = {
+            id(state.scope): state
+            for state in context.scope_states.values()
+        }
+        formula_by_ref = {
+            obligation.semantic_ref_id: obligation
+            for obligation in context.metric_formula_obligations
+        }
+        for obligation in context.composite_metric_obligations:
+            component_table_by_ref = dict(obligation.component_tables)
+            component_tables = set(component_table_by_ref.values())
+            if len(component_tables) <= 1:
+                continue
+            adjacency: dict[str, set[str]] = {
+                table: set() for table in component_tables
+            }
+            joined_columns: dict[str, set[str]] = {
+                table: set() for table in component_tables
+            }
+            for proof, _join_state in context.join_proofs:
+                relationship = proof.relationship
+                left_table = _identifier(relationship.left_table)
+                right_table = _identifier(relationship.right_table)
+                if (
+                    left_table not in component_tables
+                    or right_table not in component_tables
+                ):
+                    continue
+                adjacency[left_table].add(right_table)
+                adjacency[right_table].add(left_table)
+                for pair in relationship.keys:
+                    if len(pair) != 2:
+                        continue
+                    joined_columns[left_table].add(_identifier(pair[0]))
+                    joined_columns[right_table].add(_identifier(pair[1]))
+            reachable: set[str] = set()
+            pending = [next(iter(component_tables))]
+            while pending:
+                table = pending.pop()
+                if table in reachable:
+                    continue
+                reachable.add(table)
+                pending.extend(adjacency.get(table, set()) - reachable)
+            if reachable != component_tables:
+                context.gaps.append(
+                    _gap(
+                        "SQL_COMPOSITE_JOIN_GRAPH_INCOMPLETE",
+                        "Composite metric components are not connected by governed relationship edges",
+                        details={
+                            "metricKey": obligation.metric_key,
+                            "componentTables": sorted(component_tables),
+                            "unconnectedTables": sorted(
+                                component_tables - reachable
+                            ),
+                        },
+                        resolution=(
+                            "Join every component through the complete published relationship graph."
+                        ),
+                    )
+                )
+                continue
+            alignment_keys = {
+                _identifier(item)
+                for item in obligation.alignment.get("entityKeys") or []
+                if _identifier(item)
+            }
+            missing_join_keys = {
+                table: sorted(alignment_keys - joined_columns[table])
+                for table in component_tables
+                if alignment_keys - joined_columns[table]
+            }
+            if missing_join_keys:
+                context.gaps.append(
+                    _gap(
+                        "SQL_COMPOSITE_ALIGNMENT_KEYS_MISSING",
+                        "Composite JOIN graph does not preserve every governed alignment key",
+                        details={
+                            "metricKey": obligation.metric_key,
+                            "missingKeysByTable": missing_join_keys,
+                        },
+                        resolution=(
+                            "Use every declared entity alignment key on each component edge."
+                        ),
+                    )
+                )
+            join_policy = _normalize_ascii_token(
+                obligation.alignment.get("componentJoinPolicy")
+            )
+            if "PRE_AGGREGATE" not in join_policy:
+                continue
+            missing_preaggregation: list[dict[str, Any]] = []
+            for component_ref, table in obligation.component_tables:
+                formula = formula_by_ref.get(component_ref)
+                if formula is None:
+                    continue
+                formula_states = [
+                    states_by_scope[scope_id]
+                    for scope_id in context.metric_formula_scopes.get(
+                        formula.metric_index,
+                        set(),
+                    )
+                    if scope_id in states_by_scope
+                ]
+                if any(
+                    _scope_groups_table_by_keys(
+                        state,
+                        table,
+                        alignment_keys,
+                        context.allowed_columns,
+                    )
+                    for state in formula_states
+                ):
+                    continue
+                missing_preaggregation.append(
+                    {
+                        "semanticRefId": component_ref,
+                        "table": table,
+                        "alignmentKeys": sorted(alignment_keys),
+                    }
+                )
+            if missing_preaggregation:
+                context.gaps.append(
+                    _gap(
+                        "SQL_COMPOSITE_PREAGGREGATION_REQUIRED",
+                        "Composite components must be aggregated to the governed grain before JOIN",
+                        details={
+                            "metricKey": obligation.metric_key,
+                            "components": missing_preaggregation,
+                        },
+                        resolution=(
+                            "Aggregate each component in its own CTE at the declared alignment keys, then JOIN."
+                        ),
                     )
                 )
 
@@ -1394,12 +1571,28 @@ def grounded_query_contract_fingerprint(contract: GroundedQueryContract) -> str:
             for item in contract.tables
         ],
         "metrics": [item.model_dump(by_alias=True, mode="json") for item in contract.metrics],
+        "internalMetrics": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.internal_metrics
+        ],
+        "calculationGraph": contract.calculation_graph.model_dump(
+            by_alias=True,
+            mode="json",
+        ),
+        "requestedOutputs": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.requested_outputs
+        ],
         "dimensions": [item.model_dump(by_alias=True, mode="json") for item in contract.dimensions],
         "selectedFields": [item.model_dump(by_alias=True, mode="json") for item in contract.selected_fields],
         "entityFilters": [item.model_dump(by_alias=True, mode="json") for item in contract.entity_filters],
         "upstreamEntityBindings": [
             item.model_dump(by_alias=True, mode="json")
             for item in contract.upstream_entity_bindings
+        ],
+        "upstreamArtifactBindings": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.upstream_artifact_bindings
         ],
         "relationships": [item.model_dump(by_alias=True, mode="json") for item in contract.relationships],
         "timeRange": contract.time_range.model_dump(by_alias=True, mode="json"),
@@ -1467,8 +1660,64 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
             )
 
     metric_formula_obligations: list[_MetricFormulaObligation] = []
-    for metric_index, metric in enumerate(contract.metrics):
+    composite_metric_obligations: list[_CompositeMetricObligation] = []
+    all_metrics = [*contract.metrics, *contract.internal_metrics]
+    metric_by_ref = {
+        metric.semantic_ref_id: metric
+        for metric in all_metrics
+        if metric.semantic_ref_id
+    }
+    for metric_index, metric in enumerate(all_metrics):
         if metric.semantic_ref_id not in trusted_refs:
+            continue
+        if metric.calculation_graph.composite:
+            reference_ref_by_key = tuple(
+                sorted(
+                    (
+                        node.binding_key or node.metric_key,
+                        node.semantic_ref_id,
+                    )
+                    for node in metric.calculation_graph.nodes
+                    if node.node_type
+                    in {"METRIC_REF", "DIMENSION_REF", "TIME_REF"}
+                    and (node.binding_key or node.metric_key)
+                    and node.semantic_ref_id
+                )
+            )
+            signature, parse_error = _composite_formula_signature(
+                metric.calculation_graph.expression or metric.formula,
+                dict(reference_ref_by_key),
+            )
+            component_refs = frozenset(
+                node.semantic_ref_id
+                for node in metric.calculation_graph.nodes
+                if node.node_type == "METRIC_REF"
+                and node.semantic_ref_id
+            )
+            composite_metric_obligations.append(
+                _CompositeMetricObligation(
+                    semantic_ref_id=metric.semantic_ref_id,
+                    metric_key=metric.metric_key,
+                    expression=(
+                        metric.calculation_graph.expression or metric.formula
+                    ),
+                    reference_ref_by_key=reference_ref_by_key,
+                    component_refs=component_refs,
+                    component_tables=tuple(
+                        sorted(
+                            (
+                                ref_id,
+                                _identifier(metric_by_ref[ref_id].table),
+                            )
+                            for ref_id in component_refs
+                            if ref_id in metric_by_ref
+                        )
+                    ),
+                    alignment=dict(metric.alignment),
+                    signature=signature,
+                    parse_error=parse_error,
+                )
+            )
             continue
         table = _identifier(metric.table)
         allowed_columns.setdefault(table, set()).update(
@@ -1561,7 +1810,7 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                 (_identifier(time_field.table), _identifier(time_field.column))
             )
         else:
-            for metric in contract.metrics:
+            for metric in all_metrics:
                 table = _identifier(metric.table)
                 table_binding = table_bindings.get(table)
                 column = _identifier(
@@ -1659,6 +1908,7 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
         },
         relationships=relationships,
         metric_formula_obligations=metric_formula_obligations,
+        composite_metric_obligations=composite_metric_obligations,
         time_obligations=time_obligations,
         column_binding_refs=column_binding_refs,
         required_reference_tables=(
@@ -2140,6 +2390,152 @@ def _governed_formula_signature(formula: str) -> tuple[str, str]:
     return _unqualified_expression_signature(expression), ""
 
 
+def _metric_formula_matches(
+    expression: exp.Expression,
+    state: _ScopeState,
+    allowed_columns: Mapping[str, set[str]],
+    obligation: _MetricFormulaObligation,
+    *,
+    resolved_signature: str = "",
+) -> bool:
+    """Match one governed formula together with its physical lineage.
+
+    Structural equality alone is insufficient: two component metrics may both
+    be ``SUM(amount)`` while belonging to different fact tables.  Requiring the
+    resolved origins here prevents one CTE output from inheriting every metric
+    that happens to share the same SQL text.
+    """
+
+    if obligation.parse_error:
+        return False
+    if type(expression).__name__ != obligation.signature.split(":", 1)[0]:
+        return False
+    signature = resolved_signature or _resolved_expression_signature(
+        expression,
+        state,
+        allowed_columns,
+    )
+    if signature != obligation.signature:
+        return False
+    resolved_origins: set[_Origin] = set()
+    for column in _direct_columns(expression):
+        resolved = _resolve_column(column, state, allowed_columns)
+        if resolved.status != "ok":
+            return False
+        resolved_origins.update(resolved.origins)
+    if resolved_origins:
+        return all(
+            origin.table == obligation.table
+            and origin.column in obligation.source_columns
+            for origin in resolved_origins
+        )
+    return obligation.table in state.base_tables
+
+
+def _composite_formula_signature(
+    formula: str,
+    reference_ref_by_key: Mapping[str, str],
+) -> tuple[str, str]:
+    text = str(formula or "").strip()
+    if not text:
+        return "", "composite calculation expression is empty"
+    try:
+        parsed = sqlglot.parse_one(
+            "SELECT %s AS __metric_value" % text,
+            read="doris",
+        )
+    except Exception as exc:
+        return "", str(exc)[:500]
+    if not isinstance(parsed, exp.Select) or len(parsed.expressions) != 1:
+        return "", "composite expression did not parse as one SQL expression"
+    projection = parsed.expressions[0]
+    expression = projection.this if isinstance(projection, exp.Alias) else projection
+    normalized = _semantic_metric_expression(
+        expression,
+        expected_reference_refs={
+            _identifier(key): ref_id
+            for key, ref_id in reference_ref_by_key.items()
+        },
+    )
+    if normalized is None:
+        return "", "composite expression references an undeclared component metric"
+    return _expression_ast_signature(normalized), ""
+
+
+def _resolved_composite_expression_signature(
+    expression: exp.Expression,
+    state: _ScopeState,
+    context: _ValidationContext,
+) -> str:
+    normalized = _semantic_metric_expression(
+        expression,
+        state=state,
+        context=context,
+    )
+    return _expression_ast_signature(normalized) if normalized is not None else ""
+
+
+def _semantic_metric_expression(
+    expression: exp.Expression,
+    *,
+    state: _ScopeState | None = None,
+    context: _ValidationContext | None = None,
+    expected_reference_refs: Mapping[str, str] | None = None,
+) -> exp.Expression | None:
+    invalid = False
+    expected = dict(expected_reference_refs or {})
+
+    def normalize(node: exp.Expression) -> exp.Expression:
+        nonlocal invalid
+        if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+            ref_id = ""
+            if state is not None:
+                refs = _exact_metric_refs_for_column(node, state)
+                if not refs and context is not None:
+                    refs = _semantic_refs_for_column(
+                        node,
+                        state,
+                        context,
+                    )
+                if len(refs) == 1:
+                    ref_id = next(iter(refs))
+            else:
+                ref_id = expected.get(_identifier(node.name), "")
+            if not ref_id:
+                invalid = True
+                return node
+            return exp.Column(
+                this=exp.Identifier(
+                    this=_metric_ref_placeholder(ref_id),
+                    quoted=False,
+                )
+            )
+        if isinstance(node, exp.Identifier):
+            return exp.Identifier(this=_identifier(node.this), quoted=False)
+        return node
+
+    normalized = _unwrap(expression).copy().transform(normalize)
+    return None if invalid else normalized
+
+
+def _metric_ref_placeholder(ref_id: str) -> str:
+    return "metric_%s" % hashlib.sha256(
+        str(ref_id or "").encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _expression_ast_signature(expression: exp.Expression) -> str:
+    return "%s:%s" % (
+        type(expression).__name__,
+        expression.sql(
+            dialect="doris",
+            pretty=False,
+            normalize=True,
+            comments=False,
+        ),
+    )
+
+
 def _resolved_expression_signature(
     expression: exp.Expression,
     state: _ScopeState,
@@ -2484,6 +2880,29 @@ def _scope_feeds(source_scope: Any, target_scope: Any) -> bool:
         seen.add(id(current))
         current = getattr(current, "parent", None)
     return False
+
+
+def _scope_groups_table_by_keys(
+    state: _ScopeState,
+    table: str,
+    expected_keys: set[str],
+    allowed_columns: Mapping[str, set[str]],
+) -> bool:
+    select = state.scope.expression
+    if not isinstance(select, exp.Select):
+        return False
+    group = select.args.get("group")
+    expressions = list(group.expressions) if isinstance(group, exp.Group) else []
+    observed: set[str] = set()
+    for expression in expressions:
+        current = _unwrap(expression)
+        if not isinstance(current, exp.Column):
+            continue
+        resolved = _resolve_column(current, state, allowed_columns)
+        for origin in resolved.origins:
+            if origin.table == table:
+                observed.add(origin.column)
+    return bool(expected_keys) and expected_keys.issubset(observed)
 
 
 def _normalize_operator(value: Any) -> str:

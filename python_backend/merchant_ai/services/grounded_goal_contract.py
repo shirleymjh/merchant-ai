@@ -26,8 +26,60 @@ class QuestionGoalKind(str, Enum):
     ANALYSIS = "ANALYSIS"
 
 
+_GOAL_DECLARATION_HIDDEN_SCHEMA_FIELDS = {
+    "semantic_ref_ids",
+    "semanticRefIds",
+    "metric_ref_id",
+    "metricRefId",
+    "dimension_ref_id",
+    "dimensionRefId",
+    "entity_ref_id",
+    "entityRefId",
+    "rule_ref_ids",
+    "ruleRefIds",
+    "required_field_ref_ids",
+    "requiredFieldRefIds",
+    "population_scope",
+    "populationScope",
+    "population_goal_ids",
+    "populationGoalIds",
+    "artifact_kind",
+    "artifactKind",
+}
+
+
+def _scrub_goal_declaration_schema(value: Any) -> None:
+    if isinstance(value, dict):
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            for field_name in _GOAL_DECLARATION_HIDDEN_SCHEMA_FIELDS:
+                properties.pop(field_name, None)
+        required = value.get("required")
+        if isinstance(required, list):
+            value["required"] = [
+                item
+                for item in required
+                if item not in _GOAL_DECLARATION_HIDDEN_SCHEMA_FIELDS
+            ]
+        for child in value.values():
+            _scrub_goal_declaration_schema(child)
+    elif isinstance(value, list):
+        for child in value:
+            _scrub_goal_declaration_schema(child)
+
+
 class _StrictGoalModel(APIModel):
     model_config = ConfigDict(extra="forbid")
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        core_schema: Any,
+        handler: Any,
+    ) -> dict[str, Any]:
+        schema = handler(core_schema)
+        _scrub_goal_declaration_schema(schema)
+        return schema
 
 
 PopulationScope: TypeAlias = Literal[
@@ -48,8 +100,6 @@ class QuestionGoalBase(_StrictGoalModel):
     source_spans: list[str] = Field(default_factory=list)
     semantic_ref_ids: list[str] = Field(default_factory=list)
     rationale: str = ""
-    population_scope: PopulationScope = "ALL_MATCHING_ROWS"
-    population_goal_ids: list[str] = Field(default_factory=list)
 
 
 class MetricQuestionGoal(QuestionGoalBase):
@@ -66,7 +116,10 @@ class DimensionQuestionGoal(QuestionGoalBase):
 
 class TimeWindowQuestionGoal(QuestionGoalBase):
     kind: Literal["TIME_WINDOW"] = "TIME_WINDOW"
-    time_expression: str = ""
+    # Every time Goal must retain the exact user-facing expression.  Making
+    # this required in the tool schema prevents a later validator from
+    # rejecting an input that the model was previously told was optional.
+    time_expression: str
     start: str = ""
     end: str = ""
     timezone: str = ""
@@ -75,7 +128,8 @@ class TimeWindowQuestionGoal(QuestionGoalBase):
     # windows normally only carry ``time_expression``; the Kernel still has
     # to prove the concrete values from the query artifact.
     days: int = 0
-    anchor_policy: str = ""
+    calendar_anchor_policy: str = ""
+    data_as_of_policy: str = ""
     window_role: str = ""
     time_range_kind: str = ""
     applies_to_goal_ids: list[str] = Field(default_factory=list)
@@ -114,6 +168,8 @@ class DetailQuestionGoal(QuestionGoalBase):
     kind: Literal["DETAIL"] = "DETAIL"
     required_field_ref_ids: list[str] = Field(default_factory=list)
     input_goal_ids: list[str] = Field(default_factory=list)
+    requested_field_phrases: list[str] = Field(default_factory=list)
+    request_all_fields: bool = False
 
 
 class RankingQuestionGoal(QuestionGoalBase):
@@ -122,6 +178,7 @@ class RankingQuestionGoal(QuestionGoalBase):
     # ordinary case.  External/history-backed populations must be opted into
     # explicitly with one of the VERIFIED_* scopes below.
     population_scope: PopulationScope = "ALL_MATCHING_ROWS"
+    population_goal_ids: list[str] = Field(default_factory=list)
     metric_goal_ids: list[str] = Field(default_factory=list)
     dimension_goal_ids: list[str] = Field(default_factory=list)
     direction: str = "DESC"
@@ -167,6 +224,21 @@ class OriginalQuestionGoalContract(_StrictGoalModel):
 
     def goal_map(self) -> dict[str, QuestionGoal]:
         return {goal.goal_id: goal for goal in self.goals}
+
+
+class OriginalQuestionGoalDeclaration(_StrictGoalModel):
+    """Core-authored Goal payload before trusted question binding.
+
+    The original question already belongs to the server-owned run state, so
+    the model must not duplicate it inside the tool call.  The Harness turns
+    this declaration into an immutable ``OriginalQuestionGoalContract`` by
+    binding the exact retained question at the tool boundary.
+    """
+
+    contract_version: str = "original_question_goal_contract.v1"
+    contract_id: str = ""
+    goals: list[QuestionGoal] = Field(default_factory=list)
+    source: str = "core"
 
 
 class GoalContractIssue(APIModel):
@@ -253,7 +325,8 @@ class TimeWindowGoalProofResolution(GoalProofResolutionBase):
     days: int = 0
     label: str = ""
     explicit: bool = False
-    anchor_policy: str = ""
+    calendar_anchor_policy: str = ""
+    data_as_of_policy: str = ""
     window_role: str = ""
     time_range_kind: str = ""
 
@@ -1203,6 +1276,7 @@ def _normalize_goal_payload(payload: Any) -> dict[str, Any]:
         "semantic_ref_ids",
         "rule_ref_ids",
         "required_field_ref_ids",
+        "requested_field_phrases",
     )
     for snake_name in id_list_fields + string_list_fields:
         camel_name = _camel_name(snake_name)
@@ -1233,6 +1307,16 @@ def _normalize_goal_payload(payload: Any) -> dict[str, Any]:
         ).strip().upper()
         if population_scope:
             normalized["population_scope"] = population_scope
+    else:
+        # Population is an execution-graph concern, not a property of an
+        # original-question coverage Goal.  Older checkpoints may still carry
+        # these fields on DETAIL/ENTITY/etc.; discard them during recovery so
+        # a plain answer obligation cannot accidentally activate the legacy
+        # population gate before semantic discovery.
+        normalized.pop("population_scope", None)
+        normalized.pop("populationScope", None)
+        normalized.pop("population_goal_ids", None)
+        normalized.pop("populationGoalIds", None)
     return normalized
 
 
@@ -1882,7 +1966,14 @@ def _artifact_time_window_payload(artifact: Any | None) -> dict[str, Any] | None
         "days": int(_object_value(time_range, "days") or 0),
         "label": str(_object_value(time_range, "label") or "").strip(),
         "explicit": bool(_object_value(time_range, "explicit")),
-        "anchor_policy": str(_object_value(time_range, "anchor_policy", "anchorPolicy") or "").strip(),
+        "calendar_anchor_policy": str(
+            _object_value(time_range, "calendar_anchor_policy", "calendarAnchorPolicy")
+            or ""
+        ).strip(),
+        "data_as_of_policy": str(
+            _object_value(time_range, "data_as_of_policy", "dataAsOfPolicy")
+            or ""
+        ).strip(),
         "window_role": str(_object_value(time_range, "window_role", "windowRole") or "").strip(),
         "time_range_kind": str(_object_value(time_range, "kind") or "").strip(),
     }
@@ -1998,8 +2089,16 @@ def _goal_resolution_issues(
                 ("start", goal.start, resolution.start),
                 ("end", goal.end, resolution.end),
                 ("timezone", goal.timezone, resolution.timezone),
-                ("anchorPolicy", goal.anchor_policy, resolution.anchor_policy),
-                ("timeRangeKind", goal.time_range_kind, resolution.time_range_kind),
+                (
+                    "calendarAnchorPolicy",
+                    goal.calendar_anchor_policy,
+                    resolution.calendar_anchor_policy,
+                ),
+                (
+                    "dataAsOfPolicy",
+                    goal.data_as_of_policy,
+                    resolution.data_as_of_policy,
+                ),
             ):
                 _add_time_value_mismatch(
                     add,
@@ -2009,6 +2108,18 @@ def _goal_resolution_issues(
                     actual=actual,
                     code="TIME_WINDOW_PROOF_%s_MISMATCH"
                     % _canonical_ascii_symbol(field_name),
+                )
+            if not _time_range_kinds_equivalent(
+                goal.time_range_kind,
+                resolution.time_range_kind,
+            ):
+                _add_time_value_mismatch(
+                    add,
+                    goal_id=goal.goal_id,
+                    field_name="timeRangeKind",
+                    expected=goal.time_range_kind,
+                    actual=resolution.time_range_kind,
+                    code="TIME_WINDOW_PROOF_TIMERANGEKIND_MISMATCH",
                 )
             if not _time_window_roles_equivalent(
                 goal.window_role,
@@ -2388,6 +2499,23 @@ def _time_window_roles_equivalent(
         expected_role,
         actual_role,
     } == {"filter", "primary"}
+
+
+def _time_range_kinds_equivalent(expected: Any, actual: Any) -> bool:
+    expected_kind = _canonical_ascii_symbol(expected)
+    actual_kind = _canonical_ascii_symbol(actual)
+    if not expected_kind:
+        return True
+    aliases = {
+        "RELATIVE": "ROLLING",
+        "ROLLING": "ROLLING",
+        "RELATIVE_WINDOW": "ROLLING",
+        "ROLLING_WINDOW": "ROLLING",
+    }
+    return aliases.get(expected_kind, expected_kind) == aliases.get(
+        actual_kind,
+        actual_kind,
+    )
 
 
 def _canonical_time_value(value: Any) -> str:

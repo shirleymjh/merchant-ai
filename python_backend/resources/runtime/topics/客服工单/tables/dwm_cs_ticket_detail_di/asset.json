@@ -52,6 +52,14 @@
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
   "businessSummary": "客服工单明细宽表，覆盖工单、订单/子订单、商品及客服服务过程信息，可按表内商品属性分析工单情况。",
   "manualNotes": "客服工单明细表，承载咨询、催单、关闭、评分、状态等服务过程",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["ticket_id", "session_id", "priority_name", "user_type_name", "ticket_status_name", "spu_id", "reminder_cnt", "ticket_score", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 96,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "ticket_id",
@@ -2716,6 +2724,25 @@
       "unit": "%",
       "description": "同一商品、订单集合或日期粒度下，客服工单明细量占订单明细去重下单数的比例；分子来自客服工单明细量，分母来自订单明细去重下单数。",
       "sourceColumns": [],
+      "calculationExpression": "ticket_cnt / NULLIF(order_detail_cnt, 0)",
+      "componentMetricRefs": [
+        {
+          "semanticRefId": "semantic:客服工单:dwm_cs_ticket_detail_di:metric:ticket_cnt",
+          "metricKey": "ticket_cnt"
+        },
+        {
+          "semanticRefId": "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt",
+          "metricKey": "order_detail_cnt"
+        }
+      ],
+      "alignment": {
+        "entityGrain": ["merchant", "spu"],
+        "entityKeys": ["seller_id", "spu_id"],
+        "timeGrain": "PERIOD",
+        "timePolicy": "SAME_WINDOW",
+        "componentJoinPolicy": "PRE_AGGREGATE_THEN_ALIGN",
+        "nullPolicy": "NULL_IF_DENOMINATOR_ZERO"
+      },
       "aliases": [
         "商品维度工单率",
         "ticket_rate",

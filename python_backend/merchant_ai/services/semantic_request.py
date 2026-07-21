@@ -113,8 +113,10 @@ def _canonical_time_range(value: Any) -> Dict[str, Any]:
         "end_date": "endDate",
         "days": "days",
         "timezone": "timezone",
-        "anchorPolicy": "anchorPolicy",
-        "anchor_policy": "anchorPolicy",
+        "calendarAnchorPolicy": "calendarAnchorPolicy",
+        "calendar_anchor_policy": "calendarAnchorPolicy",
+        "dataAsOfPolicy": "dataAsOfPolicy",
+        "data_as_of_policy": "dataAsOfPolicy",
         "explicit": "explicit",
     }
     result: Dict[str, Any] = {}

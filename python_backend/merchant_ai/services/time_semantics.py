@@ -24,8 +24,9 @@ from merchant_ai.services.text_parsing import (
 )
 
 
-CALENDAR_ANCHOR_POLICY = "calendar"
-LATEST_PARTITION_ANCHOR_POLICY = "latest_available_partition"
+RUNTIME_CURRENT_DATE_CALENDAR_POLICY = "runtime_current_date"
+EXPLICIT_DATE_RANGE_CALENDAR_POLICY = "explicit_date_range"
+LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY = "latest_available_partition"
 _TEMPORAL_LANGUAGE = load_language_policy().temporal
 COMPARISON_MARKERS = _TEMPORAL_LANGUAGE.comparison_markers
 DAILY_GRAIN_MARKERS = _TEMPORAL_LANGUAGE.daily_grain_markers
@@ -650,7 +651,7 @@ def resolved_comparison_range(
     payload.comparison_type = comparison_type
     payload.offset_days = max(0, int(offset_days or 0))
     if kind == "previous_period" and payload.offset_days > 0:
-        payload.anchor_policy = LATEST_PARTITION_ANCHOR_POLICY
+        payload.calendar_anchor_policy = RUNTIME_CURRENT_DATE_CALENDAR_POLICY
     return payload
 
 
@@ -1322,8 +1323,13 @@ def local_today(timezone_name: str, now: Optional[datetime]) -> date:
     return now.astimezone(zone).date()
 
 
-def time_window_anchor_policy(kind: str) -> str:
-    return LATEST_PARTITION_ANCHOR_POLICY if kind == "rolling" else CALENDAR_ANCHOR_POLICY
+def time_window_calendar_anchor_policy(kind: str, source: str = "") -> str:
+    del kind
+    return (
+        EXPLICIT_DATE_RANGE_CALENDAR_POLICY
+        if str(source or "").strip() in {"question_date", "question_dates"}
+        else RUNTIME_CURRENT_DATE_CALENDAR_POLICY
+    )
 
 
 def resolved_range(kind: str, start: date, end: date, timezone_name: str, label: str, source: str) -> ResolvedTimeRange:
@@ -1334,7 +1340,7 @@ def resolved_range(kind: str, start: date, end: date, timezone_name: str, label:
         days=(end - start).days + 1,
         label=label,
         timezone=timezone_name,
-        anchor_policy=time_window_anchor_policy(kind),
+        calendar_anchor_policy=time_window_calendar_anchor_policy(kind, source),
         explicit=True,
         source=source,
     )
@@ -1426,7 +1432,11 @@ def time_window_contract_payload(
     partition_column: str = "",
     tenant_column: str = "",
 ) -> Dict[str, Any]:
-    anchor_policy = time_range.anchor_policy or time_window_anchor_policy(time_range.kind)
+    calendar_anchor_policy = (
+        time_range.calendar_anchor_policy
+        or time_window_calendar_anchor_policy(time_range.kind, time_range.source)
+    )
+    data_as_of_policy = str(time_range.data_as_of_policy or "").strip()
     contract = {
         "kind": time_range.kind,
         "label": time_range.label,
@@ -1434,7 +1444,8 @@ def time_window_contract_payload(
         "startDate": time_range.start_date,
         "endDate": time_range.end_date,
         "timezone": time_range.timezone,
-        "anchorPolicy": anchor_policy,
+        "calendarAnchorPolicy": calendar_anchor_policy,
+        "dataAsOfPolicy": data_as_of_policy,
         "source": time_range.source,
         "windowRole": time_range.window_role,
         "offsetDays": int(time_range.offset_days or 0),
@@ -1447,7 +1458,7 @@ def time_window_contract_payload(
                 "executionEndDate": time_range.execution_end_date,
                 "executionStartValue": time_range.execution_start_value or time_range.execution_start_date,
                 "executionEndValue": time_range.execution_end_value or time_range.execution_end_date,
-                "executionAnchorPolicy": time_range.execution_anchor_policy or "source_snapshot",
+                "executionBoundaryPolicy": time_range.execution_boundary_policy or "source_snapshot",
             }
         )
     if partition_column:
@@ -1458,9 +1469,12 @@ def time_window_contract_payload(
         contract["tenantColumn"] = tenant_column
     if contract.get("executionStartValue") and contract.get("executionEndValue"):
         contract["executionRule"] = "use the runtime-bound executionStartValue/executionEndValue directly"
-    elif anchor_policy == LATEST_PARTITION_ANCHOR_POLICY and partition_column:
+    elif (
+        data_as_of_policy == LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY
+        and partition_column
+    ):
         contract["executionRule"] = "relative windows must anchor to MAX(%s) after tenant filter" % quote_sql_identifier(partition_column)
-    elif anchor_policy == LATEST_PARTITION_ANCHOR_POLICY:
+    elif data_as_of_policy == LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY:
         contract["executionRule"] = "relative window execution requires a semantic partitionColumn binding"
     else:
         contract["executionRule"] = "calendar/exact windows use startDate/endDate directly"

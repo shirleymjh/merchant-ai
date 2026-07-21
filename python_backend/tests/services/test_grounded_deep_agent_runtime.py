@@ -46,6 +46,8 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     _core_visible_binding_hints,
     _grounded_contract_sql_obligations,
     _grounded_semantic_read_control,
+    _latest_grounded_repair_tool_exchange,
+    _metric_recall_slots,
     _parallel_goal_dependency_issues,
     _phase_visible_tools,
     _skill_output_contract_issues,
@@ -79,8 +81,11 @@ from merchant_ai.services.grounded_runtime_kernel import (
 from merchant_ai.services.grounded_goal_contract import (
     AnalysisQuestionGoal,
     DependencyQuestionGoal,
+    DetailQuestionGoal,
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
+    OriginalQuestionGoalDeclaration,
+    RankingQuestionGoal,
     TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_sql_candidate import (
@@ -572,6 +577,210 @@ def declare_single_metric_goal(
     assert result["status"] == "ACCEPTED"
 
 
+def test_goal_declaration_binds_trusted_question_without_model_copy() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    kernel_session = outer.kernel.new_session("最近7天订单总数", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-goal-trusted-question",
+        run_id="run-goal-trusted-question",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalDeclaration(
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.orders",
+                        label="订单总数",
+                    ),
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_7_days",
+                        label="最近7天",
+                        time_expression="最近7天",
+                        days=7,
+                        applies_to_goal_ids=["metric.orders"],
+                    ),
+                ]
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert deep_session.question_goal_contract is not None
+    assert deep_session.question_goal_contract.question == "最近7天订单总数"
+
+
+def test_goal_declaration_does_not_invoke_population_gate() -> None:
+    class ExplodingPopulationGate:
+        def commit_goal(self, **_: Any) -> Any:
+            raise AssertionError("Goal declaration must not call population authority")
+
+    factory = CapturingFactory(action="none")
+    outer = GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        agent_factory=factory,
+        population_execution_gate=ExplodingPopulationGate(),
+        population_gate_enforced=True,
+    )
+    kernel_session = outer.kernel.new_session("最近10天订单明细", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-goal-no-population",
+        run_id="run-goal-no-population",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    DetailQuestionGoal(
+                        goal_id="detail.orders",
+                        label="最近10天订单明细",
+                    )
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert deep_session.population_goal_gate_result == {}
+    assert deep_session.population_goal_attestation is None
+
+
+def test_generic_detail_goal_forces_detail_analysis_mode_before_contract_build() -> None:
+    class CapturingHintsKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.last_hints: GroundedBindingHints | None = None
+
+        def propose_contract(
+            self,
+            session: GroundedRuntimeSession,
+            evidence: list[dict[str, Any]],
+            hints: dict[str, Any] | GroundedBindingHints,
+            **kwargs: Any,
+        ) -> GroundedRuntimeAttempt:
+            self.last_hints = GroundedBindingHints.model_validate(hints)
+            return super().propose_contract(session, evidence, hints, **kwargs)
+
+    factory = CapturingFactory(action="none")
+    kernel = CapturingHintsKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("给我最近10天的订单明细", "m-1")
+    detail_ref = "semantic:客服工单:tickets:detail"
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        core_semantic_evidence=[
+            {
+                "refId": detail_ref,
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": "{}",
+                "contentHash": "hash",
+            }
+        ],
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-generic-detail",
+        run_id="run-generic-detail",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    DetailQuestionGoal(
+                        goal_id="detail.orders",
+                        label="订单明细",
+                    ),
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_10_days",
+                        label="最近10天",
+                        time_expression="最近10天",
+                        days=10,
+                        applies_to_goal_ids=["detail.orders"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert declared["status"] == "ACCEPTED"
+
+    tools["propose_grounded_contract"].func(
+        read_ref_ids=[detail_ref],
+        binding_hints={
+            "tableRefs": [detail_ref],
+            "timeExpression": "最近10天",
+        },
+        goal_ids=["detail.orders", "time.recent_10_days"],
+        runtime=SimpleNamespace(context=context),
+    )
+
+    assert kernel.last_hints is not None
+    assert kernel.last_hints.analysis_mode == "DETAIL"
+    assert kernel.last_hints.detail_projection_mode == "DEFAULT"
+    assert kernel.last_hints.selected_fields == []
+
+
+def test_goal_declaration_rejects_premature_population_binding() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    kernel_session = outer.kernel.new_session("在这些订单中找退款最高的三单", "m-1")
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-goal-population-rejected",
+        run_id="run-goal-population-rejected",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=kernel_session.question,
+                goals=[
+                    DetailQuestionGoal(
+                        goal_id="detail.orders",
+                        label="这些订单",
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refund_amount",
+                        label="退款金额",
+                    ),
+                    RankingQuestionGoal(
+                        goal_id="ranking.refunds",
+                        label="退款最高三单",
+                        metric_goal_ids=["metric.refund_amount"],
+                        limit=3,
+                        population_scope="SAME_AS_GOAL",
+                        population_goal_ids=["detail.orders"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["code"] == "GOAL_EXECUTION_SCOPE_FORBIDDEN"
+    assert deep_session.question_goal_contract is None
+
+
 def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
     source_path = (
         Path(__file__).resolve().parents[2]
@@ -589,6 +798,21 @@ def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
         "graph.policy",
     ):
         assert forbidden not in source
+
+    services_root = source_path.parent
+    for online_module in (
+        services_root / "runtime_factory.py",
+        services_root / "grounded_runtime_kernel.py",
+        services_root / "grounded_query_contract.py",
+        services_root / "grounded_query_executor.py",
+    ):
+        online_source = online_module.read_text(encoding="utf-8")
+        for forbidden_import in (
+            "from merchant_ai.graph.workflow import",
+            "from merchant_ai.services.planning import",
+            "from merchant_ai.services.query import NodeWorkerExecutor",
+        ):
+            assert forbidden_import not in online_source
 
 
 def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
@@ -650,6 +874,25 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "tableRefs" in contract_schema
     assert "metricRefs" in contract_schema
     assert "timeExpression" in contract_schema
+    goal_tool = next(
+        item
+        for item in factory.kwargs["tools"]
+        if item.name == "declare_original_question_goals"
+    )
+    goal_schema = json.dumps(
+        goal_tool.tool_call_schema.model_json_schema(),
+        ensure_ascii=False,
+    )
+    for execution_field in (
+        "populationScope",
+        "populationGoalIds",
+        "metricRefId",
+        "dimensionRefId",
+        "entityRefId",
+        "requiredFieldRefIds",
+        "artifactKind",
+    ):
+        assert execution_field not in goal_schema
     compose_tool = next(item for item in factory.kwargs["tools"] if item.name == "compose_verified_answer")
     assert compose_tool.return_direct is True
     ask_human_tool = next(item for item in factory.kwargs["tools"] if item.name == "ask_human")
@@ -682,16 +925,130 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert factory.kwargs["subagents"][0]["skills"] is None
     assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
-    for deterministic_mode in (
-        "DETERMINISTIC_METRIC",
-        "DETERMINISTIC_MULTI_METRIC",
-        "DETERMINISTIC_GROUPED",
-        "DETERMINISTIC_TREND",
-        "DETERMINISTIC_RANKED",
-        "DETERMINISTIC_ENTITY_LOOKUP",
-    ):
-        assert deterministic_mode in factory.kwargs["system_prompt"]
-    assert "never plan goals or impose an execution order" in factory.kwargs["system_prompt"]
+    assert "Execute deterministic modes directly" in factory.kwargs[
+        "system_prompt"
+    ]
+    assert "phase-specific procedure" in factory.kwargs["system_prompt"]
+    assert "not alternate planning authorities" in factory.kwargs[
+        "system_prompt"
+    ]
+
+
+def test_topology_repair_keeps_rebinding_and_execution_graph_tools_visible() -> None:
+    outer = runtime(CapturingFactory(action="none"))
+    kernel_session = GroundedRuntimeSession(
+        session_id="topology-repair",
+        question="最近7天订单总数和退款单量",
+        merchant_id="merchant-1",
+        phase="QUERY_REPAIR_REQUIRED",
+    )
+    contract = GroundedQueryContract(
+        question=kernel_session.question,
+        status="REVISE_BINDINGS",
+        query_shape="MULTI_TABLE",
+        unresolved_gaps=[
+            GroundedContractGap(
+                code="INDEPENDENT_QUERY_SPLIT_REQUIRED",
+                message="independent metrics must be split",
+                evidence_kind="QUERY_TOPOLOGY",
+                resolution=(
+                    "REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"
+                ),
+                required_capability={
+                    "relationshipEvidenceRequired": False,
+                    "tableGroups": [
+                        {"table": "ads_merchant_profile"},
+                        {"table": "dwm_trade_refund_detail_di"},
+                    ],
+                },
+            )
+        ],
+    )
+    kernel_session.attempts = [
+        GroundedRuntimeAttempt(
+            attempt_id="attempt-topology",
+            contract=contract,
+            status=contract.status,
+            next_action=(
+                "REBIND_COMPATIBLE_CONTRACT_OR_PROPOSE_EXECUTION_GRAPH"
+            ),
+        )
+    ]
+    session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=kernel_session.question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.orders",
+                    label="订单总数",
+                ),
+                MetricQuestionGoal(
+                    goal_id="metric.refunds",
+                    label="退款单量",
+                ),
+            ],
+        ),
+    )
+
+    control = _grounded_semantic_read_control(session)
+    visible, _ = _phase_visible_tools(
+        session,
+        [*outer.tools, SimpleNamespace(name="read_file")],
+    )
+    visible_names = {item.name for item in visible}
+
+    assert control["status"] == "REPAIR_REQUIRED"
+    assert control["repairType"] == "TOPOLOGY"
+    assert control["relationshipEvidenceRequired"] is False
+    assert "propose_grounded_contract" in visible_names
+    assert "propose_grounded_execution_graph" in visible_names
+    assert "retrieve_knowledge" in visible_names
+    assert "read_file" in visible_names
+    assert "ask_human" in visible_names
+
+
+def test_context_recovery_preserves_latest_repair_tool_call_pair() -> None:
+    tool_call_id = "call_contract_repair"
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": tool_call_id,
+                "name": "propose_grounded_contract",
+                "args": {
+                    "read_ref_ids": ["semantic:topic:table:metric:orders"],
+                    "binding_hints": {},
+                    "goal_ids": ["metric.orders"],
+                },
+                "type": "tool_call",
+            }
+        ],
+    )
+    tool_message = ToolMessage(
+        name="propose_grounded_contract",
+        tool_call_id=tool_call_id,
+        content=json.dumps(
+            {
+                "status": "REVISE_BINDINGS",
+                "repairDirective": {
+                    "status": "REPAIR_REQUIRED",
+                    "repairType": "BINDING",
+                },
+            }
+        ),
+    )
+
+    exchange = _latest_grounded_repair_tool_exchange(
+        [HumanMessage(content="最近7天订单数"), ai_message, tool_message]
+    )
+
+    assert len(exchange) == 2
+    assert exchange[0].tool_calls[0]["id"] == tool_call_id
+    assert exchange[1].tool_call_id == tool_call_id
+    assert json.loads(exchange[1].content)["repairDirective"][
+        "repairType"
+    ] == "BINDING"
 
 
 def test_verified_query_can_compose_without_analysis_skill_snapshot() -> None:
@@ -1030,9 +1387,13 @@ def test_plain_core_answer_cannot_bypass_return_direct_compose_attestation() -> 
             context.session.runtime.answer = "我直接声称这是最终答案。"
 
     outer.deep_agent_graph = PlainAnswerGraph()
-    with pytest.raises(RuntimeError) as exc_info:
-        outer.run("工单量", "m-1")
-    assert "without a matching answer-coverage" in str(exc_info.value)
+    response = outer.run("工单量", "m-1")
+
+    assert response.answer != "我直接声称这是最终答案。"
+    assert (
+        response.debug_trace["harness"]["operationalFailure"]["code"]
+        == "GROUNDED_ANSWER_ATTESTATION_MISSING"
+    )
 
 
 def test_semantic_backend_records_only_complete_exact_reads() -> None:
@@ -1297,6 +1658,183 @@ def test_duplicate_complete_semantic_read_returns_receipt_without_backend_call()
     assert called["handler"] is False
     assert payload["status"] == "ALREADY_READ"
     assert payload["receipt"]["refId"] == "semantic:客服工单:tickets:detail"
+
+
+def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(
+        GroundedSemanticBackend(FakeSemanticCatalog())
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="tool-loop-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="工单量",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.tickets",
+                    label="工单量",
+                )
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="tool-loop-thread",
+        run_id="tool-loop-run",
+        session=session,
+    )
+    calls = {"count": 0}
+
+    def invoke(call_id: str) -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={
+                "id": call_id,
+                "name": "ls",
+                "args": {"path": "/knowledge/topics/客服工单"},
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+
+        def handler(_: Any) -> ToolMessage:
+            calls["count"] += 1
+            return ToolMessage(
+                content="manifest.json",
+                name="ls",
+                tool_call_id=call_id,
+            )
+
+        return middleware.wrap_tool_call(request, handler)
+
+    first = invoke("call-ls-1")
+    second = invoke("call-ls-2")
+    second_payload = json.loads(str(second.content))
+
+    assert first.status == "success"
+    assert calls["count"] == 1
+    assert second.status == "error"
+    assert second.tool_call_id == "call-ls-2"
+    assert second_payload["code"] == "TOOL_CALL_NO_PROGRESS"
+    assert second_payload["previousToolCallId"] == "call-ls-1"
+
+    visible, _ = _phase_visible_tools(
+        session,
+        [
+            SimpleNamespace(name="ls"),
+            SimpleNamespace(name="propose_grounded_contract"),
+        ],
+    )
+    assert {item.name for item in visible} == {
+        "propose_grounded_contract"
+    }
+
+    session.core_semantic_evidence.append(
+        {
+            "refId": "semantic:客服工单:tickets:detail",
+            "contentHash": "new-evidence",
+            "contentComplete": True,
+        }
+    )
+    visible_after_progress, _ = _phase_visible_tools(
+        session,
+        [
+            SimpleNamespace(name="ls"),
+            SimpleNamespace(name="propose_grounded_contract"),
+        ],
+    )
+    assert "ls" in {item.name for item in visible_after_progress}
+
+
+def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(
+        GroundedSemanticBackend(FakeSemanticCatalog())
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="generic-tool-loop-session",
+            question="工单量",
+            merchant_id="m-1",
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="generic-tool-loop-thread",
+        run_id="generic-tool-loop-run",
+        session=session,
+    )
+    calls = {"count": 0}
+
+    def invoke(call_id: str, reason: str) -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={
+                "id": call_id,
+                "name": "propose_grounded_contract",
+                "args": {
+                    "read_ref_ids": ["semantic:metric:tickets"],
+                    "binding_hints": {"metricRefs": ["semantic:metric:tickets"]},
+                    "goal_ids": ["metric.tickets"],
+                    "reason": reason,
+                },
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+
+        def handler(_: Any) -> ToolMessage:
+            calls["count"] += 1
+            return ToolMessage(
+                content='{"status":"REJECTED"}',
+                name="propose_grounded_contract",
+                tool_call_id=call_id,
+            )
+
+        return middleware.wrap_tool_call(request, handler)
+
+    invoke("call-contract-1", "first wording")
+    repeated = invoke("call-contract-2", "paraphrased wording")
+
+    assert calls["count"] == 1
+    assert json.loads(str(repeated.content))["code"] == (
+        "TOOL_CALL_NO_PROGRESS"
+    )
+
+
+def test_tool_call_exception_is_recovered_with_original_call_id() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(
+        GroundedSemanticBackend(FakeSemanticCatalog())
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="tool-recovery-session",
+            question="工单量",
+            merchant_id="m-1",
+        )
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-tool-error",
+            "name": "retrieve_knowledge",
+            "args": {"query": "工单量", "reason": "find metric"},
+        },
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="tool-recovery-thread",
+                run_id="tool-recovery-run",
+                session=session,
+            )
+        ),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _: (_ for _ in ()).throw(RuntimeError("backend down")),
+    )
+    payload = json.loads(str(result.content))
+
+    assert result.status == "error"
+    assert result.tool_call_id == "call-tool-error"
+    assert payload["code"] == "TOOL_CALL_FAILED"
+    assert payload["toolCallId"] == "call-tool-error"
 
 
 def test_ready_contract_closes_semantic_read_boundary() -> None:
@@ -2063,6 +2601,129 @@ def test_thin_recall_never_leaks_host_paths_and_keeps_rules_inline_only() -> Non
             "bindingEligible": False,
         }
     ]
+
+
+def test_multi_metric_thin_recall_retains_candidates_for_each_metric_phrase() -> None:
+    keywords = SimpleNamespace(
+        mentions=[
+            SimpleNamespace(
+                kind="metric",
+                phrase="订单总数",
+                canonical_key="order_cnt_1d",
+                owner_table="ads_merchant_profile",
+            ),
+            SimpleNamespace(
+                kind="metric",
+                phrase="退款单量",
+                canonical_key="direct_refund_cnt_1d",
+                owner_table="ads_merchant_profile",
+            ),
+            SimpleNamespace(
+                kind="metric",
+                phrase="退款单量",
+                canonical_key="refund_bill_cnt",
+                owner_table="dwm_trade_refund_detail_di",
+            ),
+        ],
+        metric_keywords=["订单总数", "退款单量"],
+    )
+    slots = _metric_recall_slots(keywords)
+    assert [item["phrase"] for item in slots] == [
+        "订单总数",
+        "退款单量",
+    ]
+    recall = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="semantic:经营画像:ads_merchant_profile:metric:refund_rate_by_pay_order",
+                title="退款率",
+                content="周期汇总退款率",
+                source_type="SEMANTIC_METRIC",
+                topic="经营画像",
+                table="ads_merchant_profile",
+                fusion_score=0.99,
+                metadata={
+                    "semanticRefId": "semantic:经营画像:ads_merchant_profile:metric:refund_rate_by_pay_order",
+                    "semanticPath": "topics/经营画像/tables/ads_merchant_profile/metrics/refund_rate_by_pay_order.json",
+                    "semanticKind": "METRIC",
+                    "metricKey": "refund_rate_by_pay_order",
+                    "aliases": ["退款率"],
+                },
+            ),
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:product_refund_order_share",
+                title="商品退款订单占比",
+                content="商品退款订单占比",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=0.98,
+                metadata={
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:product_refund_order_share",
+                    "semanticPath": "topics/电商退货/tables/dwm_trade_refund_detail_di/metrics/product_refund_order_share.json",
+                    "semanticKind": "METRIC",
+                    "metricKey": "product_refund_order_share",
+                    "aliases": ["商品退款订单占比"],
+                },
+            ),
+            RecallItem(
+                doc_id="semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d",
+                title="订单总数",
+                content="订单总数",
+                source_type="SEMANTIC_METRIC",
+                topic="经营画像",
+                table="ads_merchant_profile",
+                fusion_score=0.40,
+                metadata={
+                    "semanticRefId": "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d",
+                    "semanticPath": "topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json",
+                    "semanticKind": "METRIC",
+                    "metricKey": "order_cnt_1d",
+                    "aliases": ["订单总数"],
+                },
+            ),
+            RecallItem(
+                doc_id="semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_bill_cnt",
+                title="退款单量",
+                content="退款单量",
+                source_type="SEMANTIC_METRIC",
+                topic="电商退货",
+                table="dwm_trade_refund_detail_di",
+                fusion_score=0.30,
+                metadata={
+                    "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_bill_cnt",
+                    "semanticPath": "topics/电商退货/tables/dwm_trade_refund_detail_di/metrics/refund_bill_cnt.json",
+                    "semanticKind": "METRIC",
+                    "metricKey": "refund_bill_cnt",
+                    "aliases": ["退款单量"],
+                },
+            ),
+            RecallItem(
+                doc_id="semantic:经营画像:ads_merchant_profile:metric:direct_refund_cnt_1d",
+                title="直接退款量",
+                content="退款单量",
+                source_type="SEMANTIC_METRIC",
+                topic="经营画像",
+                table="ads_merchant_profile",
+                fusion_score=0.20,
+                metadata={
+                    "semanticRefId": "semantic:经营画像:ads_merchant_profile:metric:direct_refund_cnt_1d",
+                    "semanticPath": "topics/经营画像/tables/ads_merchant_profile/metrics/direct_refund_cnt_1d.json",
+                    "semanticKind": "METRIC",
+                    "metricKey": "direct_refund_cnt_1d",
+                    "aliases": ["退款单量"],
+                },
+            ),
+        ]
+    )
+
+    thin = _thin_recall(recall, 4, metric_slots=slots)
+    refs = [item["refId"] for item in thin]
+
+    assert "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d" in refs
+    assert "semantic:经营画像:ads_merchant_profile:metric:direct_refund_cnt_1d" in refs
+    assert "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_bill_cnt" in refs
+    assert thin[0]["metricSlotPhrases"] == ["订单总数"]
 
 
 def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() -> None:
@@ -2956,7 +3617,7 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
                     start_date="2026-06-21",
                     end_date="2026-07-20",
                     timezone="Asia/Shanghai",
-                    anchor_policy="calendar",
+                    calendar_anchor_policy="runtime_current_date",
                     window_role="primary",
                     explicit=True,
                 ),

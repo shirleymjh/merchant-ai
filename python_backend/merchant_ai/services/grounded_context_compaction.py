@@ -9,6 +9,10 @@ from typing import Any, Callable, Optional
 from langchain_core.messages import HumanMessage
 
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.grounded_contract_repair import (
+    build_contract_repair_directive,
+    collect_contract_repair_reads,
+)
 from merchant_ai.services.grounded_runtime_kernel import (
     verified_query_artifact_integrity_valid,
 )
@@ -432,116 +436,14 @@ def _read_next_items(
     *,
     semantic_receipts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    paths_by_ref = {
-        str(item.get("refId") or ""): str(item.get("path") or "")
-        for item in semantic_receipts
-        if str(item.get("refId") or "")
-    }
-    candidates: list[dict[str, Any]] = []
-
-    def items(value: Any) -> list[Any]:
-        if value in (None, ""):
-            return []
-        if isinstance(value, (list, tuple, set)):
-            return list(value)
-        return [value]
-
-    def append_candidate(
-        value: Any,
-        *,
-        gap_code: str,
-    ) -> None:
-        if isinstance(value, dict):
-            ref_id = str(
-                value.get("refId")
-                or value.get("semanticRefId")
-                or value.get("ref_id")
-                or ""
-            ).strip()
-            path = str(
-                value.get("path")
-                or value.get("semanticPath")
-                or value.get("filePath")
-                or ""
-            ).strip()
-            if ref_id or path:
-                candidates.append(
-                    {
-                        "refId": ref_id,
-                        "path": path or paths_by_ref.get(ref_id, ""),
-                        "sourceGapCode": gap_code,
-                    }
-                )
-            return
-        normalized = str(value or "").strip()
-        if not normalized:
-            return
-        is_path = "/" in normalized and not normalized.startswith("semantic:")
-        candidates.append(
-            {
-                "refId": "" if is_path else normalized,
-                "path": normalized if is_path else paths_by_ref.get(normalized, ""),
-                "sourceGapCode": gap_code,
-            }
-        )
-
-    for gap in gaps:
-        code = str(gap.get("code") or "")
-        capability = dict(gap.get("requiredCapability") or {})
-        for key in (
-            "readNext",
-            "read_next",
-            "candidateReads",
-            "candidate_reads",
-        ):
-            raw = capability.get(key)
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    append_candidate(item, gap_code=code)
-            elif raw:
-                append_candidate(raw, gap_code=code)
-        for key in (
-            "candidateRefIds",
-            "candidateTimeFieldRefs",
-            "requiredRefIds",
-            "requiredFieldRefs",
-            "requiredMetricRefs",
-            "semanticRefIds",
-            "readRefIds",
-        ):
-            for item in items(capability.get(key)):
-                append_candidate(item, gap_code=code)
-        for key in (
-            "candidatePaths",
-            "requiredPaths",
-            "readPaths",
-        ):
-            for item in items(capability.get(key)):
-                append_candidate(item, gap_code=code)
-        for ref_id in list(gap.get("rejectedRefIds") or []):
-            append_candidate(ref_id, gap_code=code)
-
-    deduped: list[dict[str, Any]] = []
-    index_by_identity: dict[tuple[str, str], int] = {}
-    for item in candidates:
-        ref_id = str(item.get("refId") or "")
-        path = str(item.get("path") or "")
-        if not ref_id and not path:
-            continue
-        identity = ("ref", ref_id) if ref_id else ("path", path)
-        existing_index = index_by_identity.get(identity)
-        if existing_index is not None:
-            if (
-                path
-                and not str(
-                    deduped[existing_index].get("path") or ""
-                )
-            ):
-                deduped[existing_index] = item
-            continue
-        index_by_identity[identity] = len(deduped)
-        deduped.append(item)
-    return deduped
+    return collect_contract_repair_reads(
+        gaps,
+        paths_by_ref={
+            str(item.get("refId") or ""): str(item.get("path") or "")
+            for item in semantic_receipts
+            if str(item.get("refId") or "")
+        },
+    )
 
 
 def _latest_unresolved_contract_attempt(
@@ -597,34 +499,46 @@ def _latest_unresolved_contract_attempt(
                 for ref_id in list(binding.get("refIds") or [])
             ]
         )
-        read_next = _read_next_items(
-            gaps,
-            semantic_receipts=semantic_receipts,
-        )
-        repair_options = [
-            {
-                "gapCode": str(gap.get("code") or ""),
-                "resolution": str(gap.get("resolution") or ""),
-                "searchScope": str(gap.get("searchScope") or ""),
-                "requiredCapability": dict(
-                    gap.get("requiredCapability") or {}
-                ),
-                "rejectedRefIds": list(
-                    gap.get("rejectedRefIds") or []
-                ),
-            }
-            for gap in blocking_gaps
-        ]
         contract_payload = _model_payload(contract)
+        contract_fingerprint = (
+            _fingerprint(contract_payload) if contract_payload else ""
+        )
+        repair_directive = build_contract_repair_directive(
+            blocking_gaps,
+            contract_status=status,
+            paths_by_ref={
+                str(item.get("refId") or ""): str(item.get("path") or "")
+                for item in semantic_receipts
+                if str(item.get("refId") or "")
+            },
+            base_attempt_id=str(
+                getattr(attempt, "attempt_id", "") or ""
+            ),
+            base_contract_fingerprint=contract_fingerprint,
+            contract_version=int(
+                getattr(attempt, "contract_version", 0) or 0
+            ),
+            parent_attempt_id=str(
+                getattr(attempt, "parent_attempt_id", "") or ""
+            ),
+            parent_contract_fingerprint=str(
+                getattr(attempt, "parent_contract_fingerprint", "") or ""
+            ),
+        )
         return {
             "attemptId": str(getattr(attempt, "attempt_id", "") or ""),
+            "contractVersion": int(
+                getattr(attempt, "contract_version", 0) or 0
+            ),
+            "parentAttemptId": str(
+                getattr(attempt, "parent_attempt_id", "") or ""
+            ),
             "status": status,
-            "nextAction": str(
-                getattr(attempt, "next_action", "") or ""
+            "nextAction": (
+                repair_directive.next_action
+                or str(getattr(attempt, "next_action", "") or "")
             ),
-            "contractFingerprint": (
-                _fingerprint(contract_payload) if contract_payload else ""
-            ),
+            "contractFingerprint": contract_fingerprint,
             "acceptedBindingHints": _model_payload(
                 getattr(contract, "binding_hints", None)
             )
@@ -632,8 +546,12 @@ def _latest_unresolved_contract_attempt(
             "gaps": gaps,
             "rejectedBindings": rejected_bindings,
             "rejectedRefIds": rejected_ref_ids,
-            "readNext": read_next,
-            "repairOptions": repair_options,
+            "readNext": repair_directive.read_next,
+            "repairOptions": repair_directive.repair_options,
+            "repairDirective": repair_directive.model_dump(
+                by_alias=True,
+                mode="json",
+            ),
         }
     return {}
 

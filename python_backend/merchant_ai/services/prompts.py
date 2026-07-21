@@ -363,7 +363,7 @@ def default_prompt_registry() -> PromptRegistry:
                 "dependent node 用 upstreamEntitySets 做 IN 过滤。主体过滤必须使用 nodePlanContract.merchantFilterColumn 和授权值。\n"
                 "TimeWindowContract 必须落地：相对时间窗必须锚定 preferredTable 在当前授权主体过滤后的 MAX(timeColumn)，不要用 CURDATE()/CURRENT_DATE。"
                 "通用写法：`timeColumn` BETWEEN DATE_SUB((SELECT MAX(`timeColumn`) FROM `preferredTable` WHERE `merchantFilterColumn` = <authorized value>), INTERVAL N-1 DAY) AND (SELECT MAX(`timeColumn`) FROM `preferredTable` WHERE `merchantFilterColumn` = <authorized value>)。"
-                "显式日期/明确 startDate-endDate 且 anchorPolicy=calendar 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
+                "显式日期/明确 startDate-endDate 且 calendarAnchorPolicy=explicit_date_range 时才用固定日期 BETWEEN；不要使用 DATE_FORMAT('%Y%m%d')。"
             ),
         )
     )

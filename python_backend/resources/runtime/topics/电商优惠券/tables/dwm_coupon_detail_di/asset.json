@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "优惠券/津贴明细表，承载优惠券发放、领取、退回、优惠金额与津贴金额",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["coupon_id", "user_id", "suit_owner_name", "coupon_amt", "discount_way_name", "coupon_send_status_name", "activity_name", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 64,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "coupon_id",

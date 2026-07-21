@@ -56,6 +56,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "退款/售后明细表，承载退款单、退款原因、退款金额、商品与订单关联",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["refund_id", "pt", "order_id", "sub_order_id", "biz_type_name", "buyer_name", "refund_type_name", "refund_status_name", "sku_id", "pay_amt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 128,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "refund_id",
@@ -3538,6 +3546,25 @@
       "unit": "%",
       "description": "商品粒度的退款明细单量占订单明细去重下单数的比例；这是商品退款订单占比，不是商家退货率或直接退款率。",
       "sourceColumns": [],
+      "calculationExpression": "refund_bill_cnt / NULLIF(order_detail_cnt, 0)",
+      "componentMetricRefs": [
+        {
+          "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_bill_cnt",
+          "metricKey": "refund_bill_cnt"
+        },
+        {
+          "semanticRefId": "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt",
+          "metricKey": "order_detail_cnt"
+        }
+      ],
+      "alignment": {
+        "entityGrain": ["merchant", "spu"],
+        "entityKeys": ["seller_id", "spu_id"],
+        "timeGrain": "PERIOD",
+        "timePolicy": "SAME_WINDOW",
+        "componentJoinPolicy": "PRE_AGGREGATE_THEN_ALIGN",
+        "nullPolicy": "NULL_IF_DENOMINATOR_ZERO"
+      },
       "aliases": [
         "商品退款订单占比",
         "按商品退款订单占比",

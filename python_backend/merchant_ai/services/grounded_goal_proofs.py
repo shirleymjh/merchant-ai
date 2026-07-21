@@ -59,7 +59,6 @@ def derive_query_artifact_goal_resolutions(
             detail_complete = (
                 result_coverage == ResultCoverage.ALL_ROWS.value
                 and not bool(getattr(bundle, "failed", False))
-                and not bool(getattr(bundle, "is_truncated", False))
             )
             if not detail_complete:
                 resolutions.append(
@@ -74,8 +73,8 @@ def derive_query_artifact_goal_resolutions(
                         "rowSetRef": artifact_id,
                         "rowCount": len(rows),
                         "reason": (
-                            "detail result coverage is %s; a capped, truncated, "
-                            "or unclassified row set cannot prove all requested rows"
+                            "detail result coverage is %s; a capped or unclassified "
+                            "row set cannot prove all requested rows"
                             % result_coverage
                         ),
                         "details": {
@@ -225,8 +224,11 @@ def _time_window_resolution(
         "days": int(getattr(time_range, "days", 0) or 0),
         "label": str(getattr(time_range, "label", "") or "").strip(),
         "explicit": bool(getattr(time_range, "explicit", False)),
-        "anchorPolicy": str(
-            getattr(time_range, "anchor_policy", "") or ""
+        "calendarAnchorPolicy": str(
+            getattr(time_range, "calendar_anchor_policy", "") or ""
+        ).strip(),
+        "dataAsOfPolicy": str(
+            getattr(time_range, "data_as_of_policy", "") or ""
         ).strip(),
         "windowRole": str(
             getattr(time_range, "window_role", "") or ""

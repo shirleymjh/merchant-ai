@@ -76,6 +76,18 @@ class EvidenceVerifier:
             gaps.append(EvidenceGap(code="DEPENDENCY_GAP", evidence=gap, reason=gap))
         succeeded_tasks = [item for item in run_result.task_results if not item.query_bundle.failed]
         failed_tasks = [item for item in run_result.task_results if item.query_bundle.failed]
+        consumed_entity_set_task_ids = {
+            str(dependency.anchor_task_id or "")
+            for dependency in plan.dependencies
+            if str(dependency.anchor_task_id or "")
+            and str(dependency.dependent_task_id or "")
+        }
+        consumed_entity_set_task_ids.update(
+            str(task_id or "")
+            for intent in plan.intents
+            for task_id in intent.depends_on_task_ids
+            if str(task_id or "")
+        )
         if succeeded_tasks and failed_tasks:
             gaps.append(
                 EvidenceGap(
@@ -108,7 +120,11 @@ class EvidenceVerifier:
                             answer_instruction="说明该节点因 Doris 资源限制使用了降级 SQL，结论应按部分覆盖理解。",
                         )
                     )
-            if task_result.entity_set and task_result.entity_set.truncated:
+            if (
+                task_result.entity_set
+                and task_result.entity_set.truncated
+                and task_result.task_id in consumed_entity_set_task_ids
+            ):
                 gaps.append(
                     EvidenceGap(
                         code="ENTITY_SET_TRUNCATED",

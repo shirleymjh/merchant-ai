@@ -151,9 +151,11 @@ from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudgetExceeded,
 )
 from merchant_ai.services.grounded_goal_contract import (
+    DetailQuestionGoal,
     GoalCoverageBlocked,
     GoalCoverageVerifier,
     OriginalQuestionGoalContract,
+    OriginalQuestionGoalDeclaration,
     RankingQuestionGoal,
     VerifiedArtifactGoalCoverage,
     canonical_goal_id,
@@ -192,6 +194,11 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
     GroundedQueryContract,
     GroundedReferenceScopeBinding,
+    GroundedUpstreamArtifactBinding,
+    GroundedUpstreamEntityHint,
+)
+from merchant_ai.services.grounded_contract_repair import (
+    build_contract_repair_directive,
 )
 from merchant_ai.services.grounded_query_branches import (
     GroundedBranchBudget,
@@ -244,12 +251,12 @@ from merchant_ai.services.grounded_population_verifier import (
     PopulationVerificationStage,
     population_attestation_fingerprint,
 )
-from merchant_ai.services.grounded_population_semantic_reviewer import (
-    population_semantic_model_required,
-)
 from merchant_ai.services.grounded_semantic_activation import (
     GroundedSemanticActivationSeal,
     semantic_activation_seal_valid,
+)
+from merchant_ai.services.grounded_semantic_ir import (
+    trusted_query_artifact_descriptor,
 )
 from merchant_ai.services.data_snapshot_contract import (
     derive_multi_query_snapshot_requirement,
@@ -995,6 +1002,13 @@ class GroundedDeepAgentSession:
         default_factory=list
     )
     workspace_read_signatures: set[str] = field(default_factory=set)
+    tool_action_receipts: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    tool_no_progress_blocked: dict[str, str] = field(default_factory=dict)
+    tool_no_progress_events: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     latest_graph_rejection: dict[str, Any] = field(default_factory=dict)
     conversation_context: dict[str, Any] = field(default_factory=dict)
     lock: Any = field(default_factory=RLock, repr=False)
@@ -1451,6 +1465,18 @@ def _grounded_state_semantics(
             "retryable": bool(failure.get("retryable")),
             "nextAction": "STOP",
         }
+    if phase == "QUERY_REPAIR_REQUIRED":
+        latest_attempt = state.attempts[-1] if state.attempts else None
+        repair_type = str(
+            getattr(latest_attempt, "repair_type", "") or "UNKNOWN"
+        ).upper()
+        return {
+            "stateClass": "QUERY_REPAIR",
+            "failureCategory": "QUERY_%s" % repair_type,
+            "terminal": False,
+            "retryable": True,
+            "nextAction": "CHOOSE_SAFE_REPAIR_AND_SUBMIT_NEW_VERSION",
+        }
     if phase in {
         "CORE_SQL_REPAIR_REQUIRED",
         "CORE_SQL_EXECUTION_REPAIR_REQUIRED",
@@ -1529,6 +1555,71 @@ def _grounded_state_semantics(
     }
 
 
+def _grounded_operational_failure_answer(
+    failure: Mapping[str, Any],
+) -> str:
+    """Preserve the real terminal failure instead of reporting every failure as budget exhaustion."""
+
+    payload = dict(failure or {})
+    code = str(payload.get("code") or "GROUNDED_OPERATIONAL_FAILURE").strip()
+    if code == "GROUNDED_PROVIDER_TIMEOUT":
+        return (
+            "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；"
+            "请稍后重试。"
+        )
+    if code == "GROUNDED_RUNTIME_BUDGET_EXHAUSTED":
+        return (
+            "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
+            "请缩小查询范围，或稍后重试。"
+        )
+
+    failures = [
+        dict(item)
+        for item in payload.get("failures") or []
+        if isinstance(item, Mapping)
+    ]
+    specific_code = next(
+        (
+            str(item.get("code") or "").strip()
+            for item in failures
+            if str(item.get("code") or "").strip()
+        ),
+        code,
+    )
+    disposition = str(
+        payload.get("failureDisposition")
+        or payload.get("disposition")
+        or next(
+            (
+                item.get("disposition")
+                for item in failures
+                if item.get("disposition")
+            ),
+            "",
+        )
+        or ""
+    ).upper()
+    if disposition == "SECURITY_TERMINAL" or "SECURITY" in code:
+        return (
+            "本次查询未通过权限或安全校验（%s），系统未执行或展示未经授权的数据。"
+            % specific_code
+        )
+    if specific_code == "POPULATION_PRE_EXECUTION_REJECTED":
+        return (
+            "本次查询在执行前的上游实体集合依赖校验中被拒绝"
+            "（POPULATION_PRE_EXECUTION_REJECTED），系统未展示未验证结果。"
+        )
+    if specific_code == "POPULATION_POST_RESULT_REJECTED":
+        return (
+            "本次查询结果未通过上游实体集合依赖校验"
+            "（POPULATION_POST_RESULT_REJECTED），系统未展示未验证结果。"
+        )
+    return (
+        "本次查询执行失败（%s）。系统没有把未完成或未验证的结果作为最终答案；请稍后重试。"
+        % specific_code
+    )
+
+
 def _artifact_population_authorized(
     session: GroundedDeepAgentSession,
     artifact_id: str,
@@ -1536,6 +1627,26 @@ def _artifact_population_authorized(
     if not session.population_gate_enforced:
         return True
     normalized_artifact_id = str(artifact_id or "").strip()
+    artifact = next(
+        (
+            item
+            for item in session.runtime.verified_query_ledger
+            if item.artifact_id == normalized_artifact_id
+        ),
+        None,
+    )
+    if artifact is None:
+        return False
+    contract = artifact.contract
+    population_required = bool(
+        contract.upstream_entity_bindings
+        or (
+            contract.reference_scope.enabled
+            and contract.reference_scope.population_required
+        )
+    )
+    if not population_required:
+        return True
     query_node_id = session.population_artifact_query_node_ids.get(
         normalized_artifact_id,
         "",
@@ -3468,29 +3579,43 @@ def _grounded_branch_read_control(
             ),
             "retrievalClosed": True,
         }
-    if state is not None and state.attempts:
-        latest = state.attempts[-1]
-        blocking = [gap for gap in latest.contract.unresolved_gaps if gap.blocking]
-        if blocking:
+    if branch.status == "CONTRACT_GAPPED" and branch.last_gaps:
+        latest = state.attempts[-1] if state is not None and state.attempts else None
+        contract_status = str(
+            getattr(getattr(latest, "contract", None), "status", "") or ""
+        )
+        directive = build_contract_repair_directive(
+            branch.last_gaps,
+            contract_status=contract_status or "REVISE_BINDINGS",
+            base_attempt_id=str(
+                getattr(latest, "attempt_id", "") or ""
+            ),
+            base_contract_fingerprint=(
+                grounded_query_contract_fingerprint(latest.contract)
+                if latest is not None
+                else ""
+            ),
+            contract_version=int(
+                getattr(latest, "contract_version", 0) or 0
+            ),
+            parent_attempt_id=str(
+                getattr(latest, "parent_attempt_id", "") or ""
+            ),
+            parent_contract_fingerprint=str(
+                getattr(latest, "parent_contract_fingerprint", "") or ""
+            ),
+        )
+        if directive.repair_type != "NONE":
             return {
-                "status": "NEED_MORE_EVIDENCE",
-                "nextAction": "READ_ONLY_FOR_BRANCH_STRUCTURED_GAPS",
+                "status": "REPAIR_REQUIRED",
+                "repairType": directive.repair_type,
+                "nextAction": directive.next_action,
                 "retrievalClosed": False,
-                "gaps": [
-                    {
-                        "code": gap.code,
-                        "message": gap.message,
-                        "evidenceKind": gap.evidence_kind,
-                        "topic": gap.topic,
-                        "table": gap.table,
-                        "phrase": gap.phrase,
-                        "resolution": gap.resolution,
-                        "searchScope": gap.search_scope,
-                        "requiredCapability": gap.required_capability,
-                        "rejectedRefIds": list(gap.rejected_ref_ids),
-                    }
-                    for gap in blocking[:8]
-                ],
+                "gaps": [dict(item) for item in branch.last_gaps[:8]],
+                "repairDirective": directive.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
             }
     exact_kinds = [
         str(item.get("kind") or "").upper()
@@ -3588,6 +3713,56 @@ def _grounded_semantic_read_control(
         }
 
     state = session.runtime
+    latest_sql_attempt = next(
+        (
+            item
+            for item in reversed(state.sql_candidate_attempts)
+            if not state.active_generation
+            or item.active_generation == state.active_generation
+        ),
+        None,
+    )
+    sql_repair_action = str(
+        getattr(latest_sql_attempt, "next_action", "") or ""
+    ).upper()
+    if (
+        state.active_contract is not None
+        and sql_repair_action in {
+            "REVISE_BINDINGS",
+            "REPAIR_SQL_OR_BINDINGS",
+        }
+    ):
+        return with_snapshot(
+            {
+                "status": "REPAIR_REQUIRED",
+                "repairType": (
+                    "BINDING"
+                    if sql_repair_action == "REVISE_BINDINGS"
+                    else "BINDING_OR_SQL"
+                ),
+                "nextAction": sql_repair_action,
+                "activeGeneration": state.active_generation,
+                "activeAttemptId": state.active_attempt_id,
+                "contractFingerprint": grounded_query_contract_fingerprint(
+                    state.active_contract
+                ),
+                "sqlCandidateRepair": (
+                    latest_sql_attempt.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                    if latest_sql_attempt is not None
+                    else {}
+                ),
+                "repairOptions": [
+                    {"action": "SUBMIT_SQL_VERSION"},
+                    {"action": "SUBMIT_CONTRACT_VERSION"},
+                    {"action": "READ_SEMANTIC_EVIDENCE"},
+                    {"action": "PROPOSE_OR_REVISE_EXECUTION_GRAPH"},
+                ],
+                "retrievalClosed": False,
+            }
+        )
     if (
         state.phase
         in {
@@ -3595,6 +3770,7 @@ def _grounded_semantic_read_control(
             "ACTIVE_CORE_SQL_REQUIRED",
             "ACTIVE_CORE_SQL_VALIDATED",
             "CORE_SQL_REPAIR_REQUIRED",
+            "CORE_SQL_NO_PROGRESS",
             "CORE_SQL_EXECUTION_REPAIR_REQUIRED",
         }
         and state.active_contract is not None
@@ -3644,6 +3820,84 @@ def _grounded_semantic_read_control(
                     "retrievalClosed": False,
                 }
             )
+        gapped_branches: list[dict[str, Any]] = []
+        repair_priority = {"EVIDENCE": 1, "BINDING": 2, "TOPOLOGY": 3}
+        dominant_repair_type = "NONE"
+        for query_id, context in session.query_branch_contexts.items():
+            if context.status != "CONTRACT_GAPPED" or not context.last_gaps:
+                continue
+            branch_state = context.runtime
+            latest_attempt = (
+                branch_state.attempts[-1]
+                if branch_state is not None and branch_state.attempts
+                else None
+            )
+            directive = build_contract_repair_directive(
+                context.last_gaps,
+                contract_status=str(
+                    getattr(
+                        getattr(latest_attempt, "contract", None),
+                        "status",
+                        "",
+                    )
+                    or ""
+                ),
+                base_attempt_id=str(
+                    getattr(latest_attempt, "attempt_id", "") or ""
+                ),
+                base_contract_fingerprint=(
+                    grounded_query_contract_fingerprint(
+                        latest_attempt.contract
+                    )
+                    if latest_attempt is not None
+                    else ""
+                ),
+                contract_version=int(
+                    getattr(latest_attempt, "contract_version", 0) or 0
+                ),
+                parent_attempt_id=str(
+                    getattr(latest_attempt, "parent_attempt_id", "") or ""
+                ),
+                parent_contract_fingerprint=str(
+                    getattr(
+                        latest_attempt,
+                        "parent_contract_fingerprint",
+                        "",
+                    )
+                    or ""
+                ),
+            )
+            if repair_priority.get(directive.repair_type, 0) > repair_priority.get(
+                dominant_repair_type,
+                0,
+            ):
+                dominant_repair_type = directive.repair_type
+            gapped_branches.append(
+                {
+                    "queryId": query_id,
+                    "goalIds": list(context.spec.goal_ids),
+                    "repairDirective": directive.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    ),
+                }
+            )
+        if gapped_branches:
+            return with_snapshot(
+                {
+                    "status": "BRANCH_REPAIR_REQUIRED",
+                    "repairType": dominant_repair_type,
+                    "nextAction": (
+                        "REPAIR_AFFECTED_BRANCH_CONTRACT_VERSION"
+                        if dominant_repair_type == "BINDING"
+                        else "OPEN_VERSIONED_GRAPH_REVISION_FOR_REQUIRED_EVIDENCE"
+                        if dominant_repair_type == "EVIDENCE"
+                        else "REVISE_ACTIVE_EXECUTION_GRAPH"
+                    ),
+                    "branches": gapped_branches,
+                    "retrievalClosed": True,
+                }
+            )
         return with_snapshot(
             {
                 "status": "EXECUTION_GRAPH_DISCOVERY_FROZEN",
@@ -3655,27 +3909,69 @@ def _grounded_semantic_read_control(
         latest = state.attempts[-1]
         blocking = [gap for gap in latest.contract.unresolved_gaps if gap.blocking]
         if blocking:
+            directive_payload = dict(latest.repair_directive or {})
+            if directive_payload:
+                repair_type = str(
+                    directive_payload.get("repairType") or ""
+                ).upper()
+            else:
+                repair_type = ""
+            if repair_type not in {"EVIDENCE", "BINDING", "TOPOLOGY"}:
+                directive = build_contract_repair_directive(
+                    blocking,
+                    contract_status=latest.contract.status,
+                    base_attempt_id=latest.attempt_id,
+                    base_contract_fingerprint=(
+                        grounded_query_contract_fingerprint(latest.contract)
+                    ),
+                    contract_version=int(
+                        getattr(latest, "contract_version", 0) or 0
+                    ),
+                    parent_attempt_id=str(
+                        getattr(latest, "parent_attempt_id", "") or ""
+                    ),
+                    parent_contract_fingerprint=str(
+                        getattr(
+                            latest,
+                            "parent_contract_fingerprint",
+                            "",
+                        )
+                        or ""
+                    ),
+                )
+                directive_payload = directive.model_dump(
+                    by_alias=True,
+                    mode="json",
+                )
+                repair_type = directive.repair_type
             return with_snapshot(
                 {
-                    "status": "NEED_MORE_EVIDENCE",
-                    "nextAction": "READ_ONLY_FOR_RETURNED_STRUCTURED_GAPS_THEN_RESUBMIT",
+                    "status": "REPAIR_REQUIRED",
+                    "repairType": repair_type,
+                    "nextAction": str(
+                        directive_payload.get("nextAction") or ""
+                    ),
                     "attemptId": latest.attempt_id,
+                    "contractVersion": int(
+                        getattr(latest, "contract_version", 0) or 0
+                    ),
+                    "parentAttemptId": str(
+                        getattr(latest, "parent_attempt_id", "") or ""
+                    ),
                     "blockingGapCount": len(blocking),
-                    "gaps": [
-                        {
-                            "code": gap.code,
-                            "message": gap.message,
-                            "evidenceKind": gap.evidence_kind,
-                            "topic": gap.topic,
-                            "table": gap.table,
-                            "phrase": gap.phrase,
-                            "resolution": gap.resolution,
-                            "searchScope": gap.search_scope,
-                            "requiredCapability": gap.required_capability,
-                            "rejectedRefIds": list(gap.rejected_ref_ids),
-                        }
-                        for gap in blocking[:8]
-                    ],
+                    "gaps": [gap.model_dump(by_alias=True) for gap in blocking[:8]],
+                    "repairDirective": directive_payload,
+                    "relationshipEvidenceRequired": not (
+                        repair_type == "TOPOLOGY"
+                        and all(
+                            gap.required_capability.get(
+                                "relationshipEvidenceRequired"
+                            )
+                            is False
+                            for gap in blocking
+                            if gap.required_capability
+                        )
+                    ),
                     "retrievalClosed": False,
                 }
             )
@@ -3796,6 +4092,220 @@ def _stable_json_fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _grounded_tool_progress_fingerprint(
+    session: GroundedDeepAgentSession,
+) -> str:
+    """Fingerprint only state that represents real Agent progress."""
+
+    runtime = session.runtime
+    latest_attempt = runtime.attempts[-1] if runtime.attempts else None
+    branches: dict[str, Any] = {}
+    for query_id, context in sorted(session.query_branch_contexts.items()):
+        branch_runtime = getattr(context, "runtime", None)
+        branch_attempt = (
+            branch_runtime.attempts[-1]
+            if branch_runtime is not None and branch_runtime.attempts
+            else None
+        )
+        semantic_ledger = getattr(context, "semantic_ledger", None)
+        branches[query_id] = {
+            "status": str(getattr(context, "status", "") or ""),
+            "semanticRefs": sorted(
+                semantic_ledger.refs()
+                if semantic_ledger is not None
+                else ()
+            ),
+            "contractFingerprint": (
+                grounded_query_contract_fingerprint(
+                    branch_attempt.contract
+                )
+                if branch_attempt is not None
+                else ""
+            ),
+            "activeContractFingerprint": (
+                grounded_query_contract_fingerprint(
+                    branch_runtime.active_contract
+                )
+                if branch_runtime is not None
+                and branch_runtime.active_contract is not None
+                else ""
+            ),
+            "verifiedArtifactIds": sorted(
+                getattr(context, "verified_artifact_ids", ()) or ()
+            ),
+        }
+    return _stable_json_fingerprint(
+        {
+            "phase": runtime.phase,
+            "topics": sorted(session.effective_topics()),
+            "topicIndexRead": bool(session.topic_index_read),
+            "semanticEvidence": sorted(
+                (
+                    str(item.get("refId") or ""),
+                    str(item.get("contentHash") or ""),
+                    bool(item.get("contentComplete")),
+                )
+                for item in session.core_semantic_evidence
+                if str(item.get("refId") or "")
+            ),
+            "latestContractFingerprint": (
+                grounded_query_contract_fingerprint(
+                    latest_attempt.contract
+                )
+                if latest_attempt is not None
+                else ""
+            ),
+            "latestAttemptStatus": str(
+                getattr(latest_attempt, "status", "") or ""
+            ),
+            "activeContractFingerprint": (
+                grounded_query_contract_fingerprint(runtime.active_contract)
+                if runtime.active_contract is not None
+                else ""
+            ),
+            "graphFingerprint": session.execution_graph_fingerprint,
+            "graphRevisionDiscoveryIds": sorted(
+                session.execution_graph_revision_discovery_evidence_ids
+                or (
+                    [session.execution_graph_revision_discovery_evidence_id]
+                    if session.execution_graph_revision_discovery_evidence_id
+                    else []
+                )
+            ),
+            "branches": branches,
+            "verifiedQueryArtifactIds": sorted(
+                artifact.artifact_id
+                for artifact in runtime.verified_query_ledger
+            ),
+            "verifiedRuleArtifactIds": sorted(
+                artifact.artifact_id
+                for artifact in runtime.verified_rule_ledger
+            ),
+            "verifiedEntitySetIds": sorted(
+                artifact.artifact_id
+                for artifact in runtime.verified_entity_sets
+            ),
+            "latestSqlCandidate": (
+                {
+                    "status": runtime.sql_candidate_attempts[-1].status,
+                    "nextAction": runtime.sql_candidate_attempts[-1].next_action,
+                    "progressFingerprint": (
+                        runtime.sql_candidate_attempts[-1].progress_fingerprint
+                    ),
+                }
+                if runtime.sql_candidate_attempts
+                else {}
+            ),
+            "dataCollectionSealed": bool(session.data_collection_sealed),
+            "skillRunCount": len(session.skill_runs),
+            "verifiedSkillCount": len(session.verified_skill_ledger),
+            "subagentDispatchCount": len(session.subagent_dispatches),
+            "answerPresent": bool(runtime.answer),
+            "operationalFailure": session.operational_failure,
+            "clarification": (
+                runtime.clarification.model_dump(by_alias=True, mode="json")
+                if runtime.clarification is not None
+                else {}
+            ),
+            "latestGraphRejection": session.latest_graph_rejection,
+        }
+    )
+
+
+def _grounded_tool_key_args(
+    tool_name: str,
+    args: Mapping[str, Any],
+) -> dict[str, Any]:
+    if tool_name == "ls":
+        selected = {
+            "path": args.get("path") or args.get("file_path") or "/",
+        }
+    elif tool_name == "read_file":
+        selected = {
+            "file_path": args.get("file_path") or args.get("path") or "",
+            "offset": int(args.get("offset") or 0),
+            "limit": int(args.get("limit") or 2000),
+        }
+    elif tool_name == "grep":
+        selected = {
+            "pattern": str(args.get("pattern") or "").strip(),
+            "path": args.get("path") or args.get("file_path") or "/knowledge",
+            "glob": str(args.get("glob") or "").strip(),
+        }
+    elif tool_name == "retrieve_knowledge":
+        selected = {
+            "query": " ".join(
+                str(args.get("query") or "").lower().split()
+            ),
+        }
+    else:
+        # Free-form explanations must not let a model bypass duplicate-call
+        # detection by paraphrasing the same operation.
+        selected = {
+            str(key): value
+            for key, value in args.items()
+            if str(key) not in {
+                "reason",
+                "rationale",
+                "instruction",
+                "message",
+            }
+        }
+    for key in ("path", "file_path"):
+        if key in selected:
+            selected[key] = "/%s" % str(
+                selected[key] or ""
+            ).strip().strip("/")
+    return selected
+
+
+def _grounded_tool_action_signature(
+    tool_name: str,
+    args: Mapping[str, Any],
+    state_fingerprint: str,
+) -> str:
+    return _stable_json_fingerprint(
+        {
+            "tool": tool_name,
+            "args": _grounded_tool_key_args(tool_name, args),
+            "progressState": state_fingerprint,
+        }
+    )
+
+
+def _record_grounded_tool_post_state(
+    session: GroundedDeepAgentSession,
+    *,
+    tool_name: str,
+    args: Mapping[str, Any],
+    tool_call_id: str,
+) -> None:
+    state_fingerprint = _grounded_tool_progress_fingerprint(session)
+    signature = _grounded_tool_action_signature(
+        tool_name,
+        args,
+        state_fingerprint,
+    )
+    with session.lock:
+        session.tool_action_receipts.setdefault(
+            signature,
+            {
+                "toolName": tool_name,
+                "toolCallId": tool_call_id,
+                "stateFingerprint": state_fingerprint,
+                "keyArgs": _grounded_tool_key_args(
+                    tool_name,
+                    args,
+                ),
+            },
+        )
+        session.tool_no_progress_blocked = {
+            name: fingerprint
+            for name, fingerprint in session.tool_no_progress_blocked.items()
+            if fingerprint == state_fingerprint
+        }
+
+
 def _is_provider_timeout_error(exc: BaseException) -> bool:
     current: Optional[BaseException] = exc
     seen: set[int] = set()
@@ -3816,10 +4326,164 @@ def _tool_name(item: Any) -> str:
     return str(getattr(item, "name", "") or "")
 
 
+_GROUNDED_CAPABILITY_TOOLS: dict[str, set[str]] = {
+    "GOAL_DECLARATION": {"declare_original_question_goals"},
+    "CLARIFICATION": {"ask_human"},
+    "FILESYSTEM_READ": {"ls", "read_file", "grep"},
+    "SEMANTIC_RECALL": {"retrieve_knowledge"},
+    "CONTRACT_VERSION": {"propose_grounded_contract"},
+    "GRAPH_CREATE": {"propose_grounded_execution_graph"},
+    "GRAPH_PREPARE": {"prepare_grounded_query_batch"},
+    "GRAPH_REVISION": {
+        "reopen_grounded_execution_graph_discovery",
+        "revise_grounded_execution_graph",
+    },
+    "SQL_VERSION": {"submit_grounded_sql_candidate"},
+    "QUERY_EXECUTION": {"execute_grounded_query"},
+    "QUERY_BATCH_EXECUTION": {"execute_grounded_query_batch"},
+    "RULE_PUBLICATION": {"publish_verified_rule_evidence"},
+    "RULE_ANSWER": {"compose_verified_rule_answer"},
+    "ENTITY_SET_PUBLICATION": {"publish_verified_entity_set"},
+    "EVIDENCE_FINALIZATION": {"finalize_evidence_collection"},
+    "ANSWER_COMPOSITION": {"compose_verified_answer"},
+    "DELEGATION": {"delegate_grounded_tasks"},
+    "ANALYSIS_DELEGATION": {"delegate_grounded_exploration"},
+    "ANALYSIS_SKILL": {"run_skill"},
+}
+
+
+def _grounded_runtime_tool_capabilities(
+    session: GroundedDeepAgentSession,
+    *,
+    read_control: dict[str, Any],
+    finalization_ready: bool,
+) -> set[str]:
+    """Derive safe affordances from live obligations, not one fixed workflow.
+
+    Phases remain useful diagnostic state, but they no longer directly name a
+    hard-coded tool list.  Every tool call is selected from capabilities whose
+    preconditions are currently satisfied, and the tool boundary revalidates
+    those preconditions at invocation time.
+    """
+
+    if (
+        session.runtime.clarification is not None
+        or session.operational_failure
+        or session.skill_execution_in_progress
+    ):
+        return set()
+    if finalization_ready:
+        return {"ANSWER_COMPOSITION"}
+    if session.runtime.verified_rule_ledger and _required_goals_are_rule_only(session):
+        return {"RULE_ANSWER"}
+
+    status = str(read_control.get("status") or "").upper()
+    if status == "READY_TO_EXECUTE":
+        return {
+            "SQL_VERSION"
+            if _enum_value(session.runtime.active_execution_mode)
+            == "CORE_SQL_REQUIRED"
+            else "QUERY_EXECUTION"
+        }
+    if session.question_goal_contract is None:
+        return {"GOAL_DECLARATION", "CLARIFICATION"}
+    if status == "REPAIR_REQUIRED":
+        capabilities = {
+            "FILESYSTEM_READ",
+            "SEMANTIC_RECALL",
+            "CONTRACT_VERSION",
+            "GRAPH_CREATE",
+            "SQL_VERSION",
+            "QUERY_EXECUTION",
+            "CLARIFICATION",
+        }
+        if session.execution_graph_receipt is not None:
+            capabilities.add("GRAPH_REVISION")
+        return capabilities
+    if status == "BRANCH_REPAIR_REQUIRED":
+        return {
+            "FILESYSTEM_READ",
+            "SEMANTIC_RECALL",
+            "GRAPH_PREPARE",
+            "GRAPH_REVISION",
+            "CLARIFICATION",
+        }
+
+    capabilities = {"DELEGATION"}
+    if session.runtime.phase not in {
+        "VERIFICATION_GAPPED",
+        "CORE_SQL_REPAIR_EXHAUSTED",
+        "CORE_SQL_VALIDATOR_INTERNAL_ERROR",
+        "CORE_SQL_NO_PROGRESS",
+        "CORE_SQL_PREPARATION_FAILED",
+        "RECALL_NAVIGATION_DEGRADED",
+    }:
+        capabilities.add("CLARIFICATION")
+    if not session.query_branch_contexts:
+        capabilities.update(
+            {
+                "FILESYSTEM_READ",
+                "SEMANTIC_RECALL",
+                "CONTRACT_VERSION",
+                "GRAPH_CREATE",
+                "RULE_PUBLICATION",
+            }
+        )
+    else:
+        capabilities.add("GRAPH_PREPARE")
+        if session.runtime.phase in {
+            "EXECUTED",
+            "VERIFICATION_GAPPED",
+            "DATASOURCE_RECOVERY_REQUIRED",
+        }:
+            capabilities.add("FILESYSTEM_READ")
+        active_replan_evidence = _current_execution_graph_replan_evidence(
+            session
+        )
+        if (
+            active_replan_evidence
+            and session.execution_graph_revision_count
+            < session.execution_graph_max_revision_count
+        ):
+            capabilities.add("GRAPH_REVISION")
+        if session.execution_graph_receipt is not None and any(
+            context.status == "CONTRACT_GAPPED"
+            for context in session.query_branch_contexts.values()
+        ):
+            capabilities.add("GRAPH_REVISION")
+        if status == "REVISION_DISCOVERY_OPEN":
+            capabilities.update({"FILESYSTEM_READ", "SEMANTIC_RECALL"})
+    if session.parallel_branches:
+        capabilities.add("QUERY_BATCH_EXECUTION")
+    if _authorized_verified_query_artifacts(session):
+        capabilities.update(
+            {
+                "ENTITY_SET_PUBLICATION",
+                "EVIDENCE_FINALIZATION",
+                "ANSWER_COMPOSITION",
+            }
+        )
+        if session.query_branch_contexts:
+            capabilities.add("FILESYSTEM_READ")
+        if session.question_goal_contract is not None and any(
+            str(getattr(goal, "kind", "") or "").upper() == "ANALYSIS"
+            for goal in session.question_goal_contract.goals
+        ):
+            capabilities.add("ANALYSIS_DELEGATION")
+        if (
+            session.analysis_skill_headers_disclosed
+            and session.skill_input_snapshot_generation > 0
+        ):
+            capabilities.add("ANALYSIS_SKILL")
+    return capabilities
+
+
 def _phase_visible_tools(
     session: Optional[GroundedDeepAgentSession],
     tools: list[Any],
 ) -> tuple[list[Any], list[str]]:
+    """Compatibility entry point backed by capability middleware semantics."""
+
     if session is None or not tools:
         return tools, []
     all_names = {_tool_name(item) for item in tools if _tool_name(item)}
@@ -3839,144 +4503,35 @@ def _phase_visible_tools(
         try:
             coverage = GoalCoverageVerifier().verify(
                 session.question_goal_contract,
-                GroundedDeepAgentRuntime._goal_coverage_declarations(
-                    session
-                ),
+                GroundedDeepAgentRuntime._goal_coverage_declarations(session),
             )
-            session.goal_coverage_result = coverage.model_dump(
-                by_alias=True
-            )
+            session.goal_coverage_result = coverage.model_dump(by_alias=True)
             finalization_ready = bool(coverage.finalization_allowed)
         except (RuntimeError, TypeError, ValueError):
             finalization_ready = False
-    allowed: set[str]
-    if session.runtime.clarification is not None:
-        # A typed clarification is a terminal result for this turn.  Keep the
-        # model from issuing more tools if the agent framework performs an
-        # unnecessary tail call after ask_human.
-        allowed = set()
-    elif session.operational_failure:
-        # Internal execution/publication failures are never missing business
-        # input.  Stop the ReAct tool loop and let the governed response expose
-        # the typed operational failure instead of repeatedly asking the user.
-        allowed = set()
-    elif finalization_ready:
-        # Once every required Goal has a typed verified resolution, further
-        # discovery, replanning and clarification can only make a complete
-        # query drift or loop.  Final answer composition performs the same
-        # deterministic coverage check again at the execution boundary.
-        allowed = {"compose_verified_answer"}
-    elif session.skill_execution_in_progress:
-        allowed = set()
-    elif session.runtime.verified_rule_ledger and _required_goals_are_rule_only(session):
-        allowed = {"compose_verified_rule_answer"}
-    elif _grounded_semantic_read_control(session).get("status") == "READY_TO_EXECUTE":
-        # At this point every business binding has already been accepted.  A
-        # later SQL/runtime failure is not missing user input, so do not expose
-        # ask_human as an escape hatch from deterministic execution handling.
-        allowed = set()
-        if _enum_value(session.runtime.active_execution_mode) == "CORE_SQL_REQUIRED":
-            allowed.add("submit_grounded_sql_candidate")
-        else:
-            allowed.add("execute_grounded_query")
-    elif session.question_goal_contract is None:
-        # The first model turn needs only one decision: commit the immutable
-        # original-question goal ledger (or ask for genuinely missing business
-        # input).  Hiding every later-phase schema keeps the largest static
-        # request in the run small and makes the transaction boundary explicit.
-        allowed = {"declare_original_question_goals", "ask_human"}
-    elif _grounded_semantic_read_control(session).get("status") == "NEED_MORE_EVIDENCE":
-        # A rejected direct Contract is a narrow repair phase, not a fresh
-        # planning turn.  Keep only the tools that can satisfy the returned
-        # structured gaps and resubmit the same semantic decision.
-        allowed = {
-            "ls",
-            "read_file",
-            "grep",
-            "retrieve_knowledge",
-            "propose_grounded_contract",
+    read_control = _grounded_semantic_read_control(session)
+    capabilities = _grounded_runtime_tool_capabilities(
+        session,
+        read_control=read_control,
+        finalization_ready=finalization_ready,
+    )
+    allowed = set().union(
+        *(
+            _GROUNDED_CAPABILITY_TOOLS.get(capability, set())
+            for capability in capabilities
+        )
+    ) if capabilities else set()
+    progress_fingerprint = _grounded_tool_progress_fingerprint(session)
+    with session.lock:
+        session.tool_no_progress_blocked = {
+            name: fingerprint
+            for name, fingerprint in session.tool_no_progress_blocked.items()
+            if fingerprint == progress_fingerprint
         }
-    else:
-        allowed = {"delegate_grounded_tasks"}
-        if session.runtime.phase not in {
-            "VERIFICATION_GAPPED",
-            "CORE_SQL_REPAIR_EXHAUSTED",
-            "CORE_SQL_VALIDATOR_INTERNAL_ERROR",
-            "CORE_SQL_NO_PROGRESS",
-            "CORE_SQL_PREPARATION_FAILED",
-            "RECALL_NAVIGATION_DEGRADED",
-        }:
-            allowed.add("ask_human")
-        if not session.query_branch_contexts:
-            allowed.update(
-                {
-                    "propose_grounded_execution_graph",
-                    "ls",
-                    "read_file",
-                    "grep",
-                    "retrieve_knowledge",
-                    "publish_verified_rule_evidence",
-                    "propose_grounded_contract",
-                }
-            )
-        else:
-            allowed.add("prepare_grounded_query_batch")
-            if session.runtime.phase in {
-                "EXECUTED",
-                "VERIFICATION_GAPPED",
-                "DATASOURCE_RECOVERY_REQUIRED",
-            }:
-                # Result/recovery inspection is still permitted after the
-                # execution boundary; the filesystem tools themselves enforce
-                # /artifacts-only visibility once discovery is frozen.
-                allowed.update({"ls", "read_file", "grep"})
-            active_replan_evidence = _current_execution_graph_replan_evidence(session)
-            if (
-                active_replan_evidence
-                and session.execution_graph_revision_count < session.execution_graph_max_revision_count
-            ):
-                allowed.update(
-                    {
-                        "revise_grounded_execution_graph",
-                        "reopen_grounded_execution_graph_discovery",
-                    }
-                )
-            if session.execution_graph_receipt is not None and any(
-                context.status == "CONTRACT_GAPPED" for context in session.query_branch_contexts.values()
-            ):
-                allowed.add("reopen_grounded_execution_graph_discovery")
-            if _grounded_semantic_read_control(session).get("status") == "REVISION_DISCOVERY_OPEN":
-                allowed.update({"ls", "read_file", "grep", "retrieve_knowledge"})
-        if session.parallel_branches:
-            allowed.add("execute_grounded_query_batch")
-        if _authorized_verified_query_artifacts(session):
-            allowed.update(
-                {
-                    "publish_verified_entity_set",
-                    "finalize_evidence_collection",
-                    # Normal verified queries must be able to finish without
-                    # first opening the optional post-query Analysis Skill
-                    # lifecycle.  Goal coverage remains deterministically
-                    # checked inside the answer tool.
-                    "compose_verified_answer",
-                }
-            )
-            if session.query_branch_contexts:
-                # A frozen graph closes governed knowledge discovery, but a
-                # later verified analysis may still need the immutable result
-                # artifacts or the run-scoped recovery summary.  The tool
-                # boundary independently rejects /knowledge in this phase.
-                allowed.update({"ls", "read_file", "grep"})
-            if session.question_goal_contract is not None and any(
-                str(getattr(goal, "kind", "") or "").upper() == "ANALYSIS"
-                for goal in session.question_goal_contract.goals
-            ):
-                allowed.add("delegate_grounded_exploration")
-            if (
-                session.analysis_skill_headers_disclosed
-                and session.skill_input_snapshot_generation > 0
-            ):
-                allowed.add("run_skill")
+        no_progress_blocked_tools = set(
+            session.tool_no_progress_blocked
+        )
+    allowed.difference_update(no_progress_blocked_tools)
     blocked = (all_names - allowed) | always_hidden
     visible = [item for item in tools if _tool_name(item) not in blocked]
     removed = sorted({_tool_name(item) for item in tools if _tool_name(item) in blocked})
@@ -4116,6 +4671,102 @@ def _compact_tool_result_message(
         message,
         json.dumps(payload, ensure_ascii=False, default=str),
     )
+
+
+_GROUNDED_REPAIR_TOOL_NAMES = {
+    "propose_grounded_contract",
+    "prepare_grounded_query_batch",
+    "propose_grounded_execution_graph",
+    "reopen_grounded_execution_graph_discovery",
+    "revise_grounded_execution_graph",
+}
+
+
+def _payload_contains_grounded_repair(value: Any) -> bool:
+    if isinstance(value, dict):
+        status = str(value.get("status") or "").upper()
+        if value.get("repairDirective") or status in {
+            "BLOCKED",
+            "REJECTED",
+            "UNRESOLVED",
+            "REVISE_BINDINGS",
+            "PARTIAL",
+        }:
+            return True
+        return any(
+            _payload_contains_grounded_repair(item)
+            for item in value.values()
+            if isinstance(item, (dict, list))
+        )
+    if isinstance(value, list):
+        return any(_payload_contains_grounded_repair(item) for item in value)
+    return False
+
+
+def _latest_grounded_repair_tool_exchange(
+    messages: Sequence[Any],
+) -> list[Any]:
+    """Preserve the native DeepAgent error feedback pair across compaction.
+
+    The next model turn must see the exact assistant tool call id followed by
+    the ToolMessage carrying the validator error.  A recovery HumanMessage is
+    useful state, but it cannot replace this protocol-level pair.
+    """
+
+    selected_tool_index = -1
+    selected_tool_id = ""
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if str(getattr(message, "type", "") or "") != "tool":
+            continue
+        if str(getattr(message, "name", "") or "") not in (
+            _GROUNDED_REPAIR_TOOL_NAMES
+        ):
+            continue
+        try:
+            payload = json.loads(_message_content_text(message))
+        except (TypeError, ValueError):
+            payload = {}
+        if not _payload_contains_grounded_repair(payload):
+            continue
+        selected_tool_index = index
+        selected_tool_id = str(
+            getattr(message, "tool_call_id", "") or ""
+        )
+        break
+    if selected_tool_index < 0 or not selected_tool_id:
+        return []
+
+    selected_ai = None
+    selected_call: dict[str, Any] | None = None
+    for index in range(selected_tool_index - 1, -1, -1):
+        message = messages[index]
+        if str(getattr(message, "type", "") or "") != "ai":
+            continue
+        for call in list(getattr(message, "tool_calls", None) or []):
+            if str(call.get("id") or "") == selected_tool_id:
+                selected_ai = message
+                selected_call = dict(call)
+                break
+        if selected_call is not None:
+            break
+    if selected_ai is None or selected_call is None:
+        return []
+
+    additional_kwargs = dict(
+        getattr(selected_ai, "additional_kwargs", None) or {}
+    )
+    additional_kwargs.pop("tool_calls", None)
+    model_copy = getattr(selected_ai, "model_copy", None)
+    if callable(model_copy):
+        selected_ai = model_copy(
+            update={
+                "content": "",
+                "tool_calls": [selected_call],
+                "additional_kwargs": additional_kwargs,
+            }
+        )
+    return [selected_ai, messages[selected_tool_index]]
 
 
 def _compact_grounded_model_messages(
@@ -4285,6 +4936,110 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         file_path = str(args.get("file_path") or "")
         filesystem_namespace = _filesystem_tool_namespace(tool_name, args)
         read_control = _grounded_semantic_read_control(session) if isinstance(session, GroundedDeepAgentSession) else {}
+        tool_state_fingerprint = ""
+        tool_action_signature = ""
+        if (
+            isinstance(session, GroundedDeepAgentSession)
+            and bool(tool_name)
+        ):
+            tool_state_fingerprint = (
+                _grounded_tool_progress_fingerprint(session)
+            )
+            tool_action_signature = (
+                _grounded_tool_action_signature(
+                    tool_name,
+                    args,
+                    tool_state_fingerprint,
+                )
+            )
+            with session.lock:
+                session.tool_no_progress_blocked = {
+                    name: fingerprint
+                    for name, fingerprint in (
+                        session.tool_no_progress_blocked.items()
+                    )
+                    if fingerprint == tool_state_fingerprint
+                }
+                previous = session.tool_action_receipts.get(
+                    tool_action_signature
+                )
+                tool_blocked = (
+                    session.tool_no_progress_blocked.get(tool_name)
+                    == tool_state_fingerprint
+                )
+                if previous is not None or tool_blocked:
+                    event = {
+                        "code": "TOOL_CALL_NO_PROGRESS",
+                        "toolName": tool_name,
+                        "toolCallId": tool_call_id,
+                        "previousToolCallId": str(
+                            (previous or {}).get("toolCallId") or ""
+                        ),
+                        "stateFingerprint": tool_state_fingerprint,
+                        "keyArgs": _grounded_tool_key_args(
+                            tool_name,
+                            args,
+                        ),
+                    }
+                    session.tool_no_progress_blocked[
+                        tool_name
+                    ] = tool_state_fingerprint
+                    session.tool_no_progress_events.append(event)
+                    session.tool_no_progress_events = (
+                        session.tool_no_progress_events[-32:]
+                    )
+                    return ToolMessage(
+                        content=json.dumps(
+                            {
+                                "status": "NO_PROGRESS",
+                                **event,
+                                "message": (
+                                    "The same tool action was already attempted "
+                                    "without any new semantic evidence, Contract "
+                                    "version, graph version or verified result."
+                                ),
+                                "readControl": read_control,
+                                "repairOptions": list(
+                                    dict(
+                                        read_control.get(
+                                            "repairDirective"
+                                        )
+                                        or {}
+                                    ).get("repairOptions")
+                                    or []
+                                ),
+                                "nextAction": (
+                                    "USE_A_DIFFERENT_REPAIR_TOOL_OR_ARGUMENTS"
+                                ),
+                                "instruction": (
+                                    "This tool is temporarily hidden for the "
+                                    "current progress state. Choose another safe "
+                                    "repair action; it will be available again "
+                                    "after real state progress."
+                                ),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        name=tool_name,
+                        tool_call_id=tool_call_id,
+                        status="error",
+                    )
+                session.tool_action_receipts[
+                    tool_action_signature
+                ] = {
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "stateFingerprint": tool_state_fingerprint,
+                    "keyArgs": _grounded_tool_key_args(
+                        tool_name,
+                        args,
+                    ),
+                }
+                if len(session.tool_action_receipts) > 256:
+                    session.tool_action_receipts = dict(
+                        list(session.tool_action_receipts.items())[-256:]
+                    )
         workspace_recovery_signature = ""
         if (
             tool_name == "read_file"
@@ -4431,7 +5186,42 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                     status="error",
                 )
-        result = handler(request)
+        try:
+            result = handler(request)
+        except GroundedRuntimeBudgetExceeded:
+            raise
+        except Exception as exc:
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "status": "ERROR",
+                        "code": "TOOL_CALL_FAILED",
+                        "toolName": tool_name,
+                        "toolCallId": tool_call_id,
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:500]),
+                        "readControl": read_control,
+                        "nextAction": (
+                            "CHOOSE_A_DIFFERENT_SAFE_REPAIR_OR_RETRY_AFTER_STATE_CHANGE"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                name=tool_name,
+                tool_call_id=tool_call_id,
+                status="error",
+            )
+        if tool_action_signature and isinstance(
+            session,
+            GroundedDeepAgentSession,
+        ):
+            _record_grounded_tool_post_state(
+                session,
+                tool_name=tool_name,
+                args=args,
+                tool_call_id=tool_call_id,
+            )
         if (
             workspace_recovery_signature
             and getattr(result, "status", "success") != "error"
@@ -4462,6 +5252,12 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                 graph_result.get("status") or ""
             ).upper() in {"ACCEPTED", "FROZEN", "REVISED"}:
                 session.latest_graph_rejection = {}
+            _record_grounded_tool_post_state(
+                session,
+                tool_name=tool_name,
+                args=args,
+                tool_call_id=tool_call_id,
+            )
         if tool_name != "read_file" or getattr(result, "status", "success") == "error":
             return result
         if filesystem_namespace != "knowledge":
@@ -4473,6 +5269,12 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
             file_path,
             offset=int(args.get("offset") or 0),
             limit=int(args.get("limit") or 2000),
+        )
+        _record_grounded_tool_post_state(
+            session,
+            tool_name=tool_name,
+            args=args,
+            tool_call_id=tool_call_id,
         )
         content = _message_content_text(result)
         read_control = _grounded_semantic_read_control(session)
@@ -4837,6 +5639,17 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
                 "entitySetArtifactIds": [
                     item.artifact_id for item in state.verified_entity_sets[:8]
                 ],
+                "descriptors": [
+                    item.trusted_descriptor.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                    for item in [
+                        *_authorized_verified_query_artifacts(session)[:8],
+                        *state.verified_entity_sets[:8],
+                    ]
+                    if item.trusted_descriptor is not None
+                ],
             },
         }
 
@@ -5075,7 +5888,10 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                         payload,
                         artifact_ref,
                     )
-                    compacted = [recovery_message]
+                    repair_exchange = _latest_grounded_repair_tool_exchange(
+                        original
+                    )
+                    compacted = [recovery_message, *repair_exchange]
                     after_count = self.token_counter.count(
                         compacted,
                         system_message,
@@ -5094,7 +5910,8 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                             compact_summary_to_reference_only(
                                 payload,
                                 artifact_ref,
-                            )
+                            ),
+                            *repair_exchange,
                         ]
                         after_count = self.token_counter.count(
                             compacted,
@@ -5125,6 +5942,9 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                             ),
                             "recoveryArtifactRef": artifact_ref,
                             "recoveryFingerprint": str(payload.get("recoveryFingerprint") or ""),
+                            "repairToolExchangePreserved": bool(
+                                repair_exchange
+                            ),
                         }
                     )
                 except Exception as exc:
@@ -5261,10 +6081,10 @@ Decision ownership
 - Subagents and Skills are isolation boundaries, not alternate planning authorities. Query branches are execution units, not agents.
 
 Required lifecycle
-1. If no original-question Goal ledger exists, declare it exactly once. Preserve every requested metric, dimension, time window, comparison, ranking limit/order, entity, detail field, dependency, rule and analysis objective. A Goal dependency does not by itself mean a population dependency.
-2. Progressively read only the formal assets needed for those Goals. For a published scalar metric, table detail plus the exact metric definition is normally sufficient. Bind a separate timeFieldRef only when the user names a governed business clock or the Contract requires it; every submitted ref must first be read.
-3. After evidence is sufficient, either propose one coherent Contract or freeze one execution graph. Use serial edges only when a downstream query consumes a verified upstream artifact; otherwise independent queries may run in parallel.
-4. Follow trustedSessionContext.runtime.semanticReadControl. NEED_MORE_EVIDENCE is a narrow repair phase: satisfy the returned exact gaps and resubmit. READY_TO_EXECUTE closes semantic discovery. Never replace a newer typed state with historical recovery text and never repeat the same recovery page without a state change.
+1. If no original-question Goal ledger exists, declare it exactly once. The Harness binds the original question automatically; do not copy a question field into the declaration. Every TIME_WINDOW Goal must retain the exact user-facing timeExpression (for example, "最近7天") in addition to any parsed days/start/end. Preserve every requested metric, dimension, time window, comparison, ranking limit/order, entity, detail field, dependency, rule and analysis objective. This ledger records answer obligations only: do not bind formal semantic refs, population/result artifacts, query nodes, tables or execution modes. A Goal dependency does not by itself mean a population dependency.
+2. Progressively read only the formal assets needed for those Goals. For a published scalar metric, table detail plus the exact metric definition is normally sufficient. For a generic DETAIL request with no requested columns, submit detailProjectionMode=DEFAULT and no selectedFields; the table's published defaultDetailProjection is authoritative. For an explicit column list, submit detailProjectionMode=EXPLICIT and bind only those columns. For an explicit request for all fields, submit detailProjectionMode=ALL_ALLOWED and use the table's ACL-filtered allowlist; never use SELECT *. Bind a separate timeFieldRef only when the user names a governed business clock or the Contract requires it; every submitted ref must first be read.
+3. After evidence is sufficient, bind every requested metric to its formal owner table, grain and time semantics before choosing topology. Merge Goals into one Contract only when those bindings form one coherent query; metrics on different tables that are independently aggregatable belong in parallel graph nodes, while a JOIN is valid only when one requested result truly requires governed cross-table combination.
+4. Follow trustedSessionContext.runtime.semanticReadControl. REPAIR_REQUIRED preserves ReAct choice: inspect the latest ToolMessage, its repairOptions and readNext, then choose any safe repair tool that can make progress. You may read an alternative formal asset, remove or replace a bad binding, submit Contract vN+1, or create/revise an execution graph; the primary repairType is diagnostic guidance, not a fixed workflow transition. READY_TO_EXECUTE closes semantic discovery. Never replace a newer typed state with historical recovery text and never repeat the same recovery page without a state change.
 5. Execute deterministic modes directly. For CORE_SQL_REQUIRED, author one complete Doris SELECT/WITH SQL implementing the active Contract, without tenant literals or invented tables/columns. Follow typed SQL repair evidence; access denial and internal failures are not reasons to change business semantics.
 6. Treat verified results as immutable evidence. Continue querying until every required Goal and dependency is covered by actual artifact semantics. Do not turn partial or preview results into a complete answer.
 7. Finish only through compose_verified_rule_answer, compose_verified_answer, or ask_human. Never answer from ordinary assistant prose or invent formulas, rows, evidence or provenance.
@@ -5701,14 +6521,28 @@ Use the currently visible tools and the server-provided nextAction as the phase-
 
         @tool("declare_original_question_goals")
         def declare_original_question_goals(
-            contract: OriginalQuestionGoalContract,
+            contract: OriginalQuestionGoalDeclaration,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Commit the immutable, typed coverage ledger for the original question."""
+            """Commit Goals; the Harness binds the exact original question automatically."""
 
             deep_session = runtime.context.session
             try:
-                parsed = parse_original_question_goal_contract(contract)
+                if isinstance(contract, OriginalQuestionGoalContract):
+                    payload = contract.model_dump(by_alias=False)
+                elif isinstance(contract, OriginalQuestionGoalDeclaration):
+                    payload = contract.model_dump(by_alias=False)
+                elif isinstance(contract, Mapping):
+                    payload = dict(contract)
+                else:
+                    payload = OriginalQuestionGoalDeclaration.model_validate(contract).model_dump(
+                        by_alias=False
+                    )
+                # The run's original question is trusted runtime state.  A
+                # model-supplied copy is deliberately ignored so a misplaced
+                # or stale question cannot cause a retry.
+                payload["question"] = deep_session.runtime.question
+                parsed = parse_original_question_goal_contract(payload)
             except Exception as exc:
                 issues = [item.model_dump(by_alias=True) for item in getattr(exc, "issues", ())]
                 return json.dumps(
@@ -5731,10 +6565,31 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     },
                     ensure_ascii=False,
                 )
+            premature_population_goals = [
+                goal.goal_id
+                for goal in parsed.goals
+                if isinstance(goal, RankingQuestionGoal)
+                and (
+                    goal.population_scope != "ALL_MATCHING_ROWS"
+                    or bool(goal.population_goal_ids)
+                )
+            ]
+            if premature_population_goals:
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "code": "GOAL_EXECUTION_SCOPE_FORBIDDEN",
+                        "message": (
+                            "The original-question checklist may record logical "
+                            "dependencies, but population/result-set bindings are "
+                            "late-bound in the execution graph after formal evidence is read."
+                        ),
+                        "goalIds": premature_population_goals,
+                        "nextAction": "REMOVE_POPULATION_BINDINGS_AND_REDECLARE_GOALS",
+                    },
+                    ensure_ascii=False,
+                )
             fingerprint = original_question_goal_contract_fingerprint(parsed)
-            population_goal_result = None
-            population_gate_id = ""
-            population_goal_attestation = None
             with deep_session.lock:
                 existing = deep_session.question_goal_contract
                 existing_fingerprint = ""
@@ -5805,146 +6660,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             },
                             ensure_ascii=False,
                         )
-                goal_gate_already_committed = bool(
-                    existing_fingerprint == fingerprint and deep_session.population_goal_gate_result.get("accepted")
-                )
-                if runtime_owner.population_gate_enforced and not goal_gate_already_committed:
-                    gate = runtime_owner.population_execution_gate
-                    workspace = deep_session.context_workspace
-                    if gate is None or workspace is None:
-                        return json.dumps(
-                            {
-                                "status": "REJECTED",
-                                "code": "POPULATION_GOAL_GATE_UNAVAILABLE",
-                                "nextAction": "STOP_INTERNAL",
-                            },
-                            ensure_ascii=False,
-                        )
-                    population_model_required = (
-                        population_semantic_model_required(parsed)
-                    )
-                    budget = runtime.context.budget
-                    if budget is not None and population_model_required:
-                        budget.consume_llm_call(
-                            name="population_semantic_reviewer"
-                        )
-                        with budget.stage(
-                            "llm.population_semantic_reviewer"
-                        ):
-                            population_goal_result = gate.commit_goal(
-                                context_owner_fingerprint=(workspace.owner_fingerprint),
-                                run_authority_fingerprint=(workspace.request_fingerprint),
-                                exact_question=parsed.question,
-                                goal_contract=parsed,
-                            )
-                    else:
-                        population_goal_result = gate.commit_goal(
-                            context_owner_fingerprint=(workspace.owner_fingerprint),
-                            run_authority_fingerprint=(workspace.request_fingerprint),
-                            exact_question=parsed.question,
-                            goal_contract=parsed,
-                        )
-                    if not population_goal_result.accepted:
-                        semantic_review_issues = []
-                        if population_goal_result.semantic_review is not None:
-                            semantic_review_issues = [
-                                item.model_dump(by_alias=True, mode="json")
-                                for item in population_goal_result.semantic_review.issues
-                            ]
-                        verification_gaps = []
-                        coordinator_issues = []
-                        if population_goal_result.transition is not None:
-                            coordinator_issues = [
-                                item.model_dump(by_alias=True, mode="json")
-                                for item in population_goal_result.transition.issues
-                            ]
-                            verification = (
-                                population_goal_result.transition.verification
-                            )
-                            if verification is not None:
-                                verification_gaps = [
-                                    item.model_dump(by_alias=True, mode="json")
-                                    for item in verification.gaps
-                                ]
-                        semantic_issue_codes = {
-                            str(item.get("code") or "")
-                            for item in semantic_review_issues
-                        }
-                        retryable_provider_codes = {
-                            "PROVIDER_TIMEOUT",
-                            "PROVIDER_FAILED",
-                        }
-                        internal_provider_codes = {
-                            "PROVIDER_AUTHORITY_REQUIRED",
-                            "PROVIDER_AUTHORITY_UNTRUSTED",
-                            "PROVIDER_NOT_INDEPENDENT",
-                            "PROVIDER_OUTPUT_INVALID",
-                            "PROVIDER_OUTPUT_INCOMPLETE",
-                            "PROVIDER_REQUEST_MUTATED",
-                            "PROVIDER_REQUEST_BINDING_MISMATCH",
-                            "PROVIDER_QUESTION_BINDING_MISMATCH",
-                            "PROVIDER_SKELETON_BINDING_MISMATCH",
-                        }
-                        if semantic_issue_codes.intersection(
-                            retryable_provider_codes
-                        ):
-                            next_action = "RETRY_SAME_GOAL_CONTRACT"
-                        elif semantic_issue_codes.intersection(
-                            internal_provider_codes
-                        ):
-                            next_action = "STOP_INTERNAL"
-                        else:
-                            next_action = "REVISE_GOAL_CONTRACT"
-                        return json.dumps(
-                            {
-                                "status": "REJECTED",
-                                "code": "POPULATION_GOAL_REJECTED",
-                                "populationGateCode": (population_goal_result.code),
-                                "message": population_goal_result.message,
-                                "semanticReviewIssues": semantic_review_issues,
-                                "verificationGaps": verification_gaps,
-                                "coordinatorIssues": coordinator_issues,
-                                "nextAction": next_action,
-                            },
-                            ensure_ascii=False,
-                        )
-                    population_goal_attestation = runtime_owner._validated_population_goal_attestation(
-                        population_goal_result,
-                        goal_contract_fingerprint=fingerprint,
-                    )
-                    if population_goal_attestation is None:
-                        return json.dumps(
-                            {
-                                "status": "REJECTED",
-                                "code": ("POPULATION_GOAL_ATTESTATION_INVALID"),
-                                "nextAction": "STOP_INTERNAL",
-                            },
-                            ensure_ascii=False,
-                        )
-                    population_gate_id = gate.gate_id(
-                        context_owner_fingerprint=(workspace.owner_fingerprint),
-                        run_authority_fingerprint=(workspace.request_fingerprint),
-                        goal_contract_fingerprint=fingerprint,
-                    )
                 deep_session.question_goal_contract = parsed.model_copy(deep=True)
-                if population_goal_result is not None:
-                    deep_session.population_goal_gate_id = population_gate_id
-                    deep_session.population_goal_attestation = (
-                        population_goal_attestation.model_copy(deep=True)
-                        if population_goal_attestation is not None
-                        else None
-                    )
-                    deep_session.population_goal_gate_result = {
-                        "accepted": population_goal_result.accepted,
-                        "code": population_goal_result.code,
-                        "stage": str(
-                            getattr(
-                                population_goal_result.stage,
-                                "value",
-                                population_goal_result.stage,
-                            )
-                        ),
-                    }
             rule_goal_ids = [goal.goal_id for goal in parsed.goals if str(goal.kind or "").upper() == "RULE"]
             rule_candidates = verified_rule_candidate_refs(
                 core_semantic_evidence=deep_session.core_semantic_evidence,
@@ -6172,7 +6888,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     ),
                     dependency_query_ids=dependency_query_ids,
                     dependency_goal_ids=sorted(dependency_goals_by_query_id.get(query_id, set())),
-                    status=("WAITING_VERIFIED_ENTITY_SET" if dependency_query_ids else "DECLARED"),
+                    status=("WAITING_VERIFIED_ARTIFACT" if dependency_query_ids else "DECLARED"),
                 )
                 selected_evidence_refs = set(spec.evidence_ref_ids)
                 for evidence in deep_session.core_semantic_evidence:
@@ -6213,7 +6929,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 deep_session.execution_graph_fingerprint = graph_fingerprint
             ready_query_ids = [query_id for query_id, context in created.items() if context.status == "DECLARED"]
             waiting_query_ids = [
-                query_id for query_id, context in created.items() if context.status == "WAITING_VERIFIED_ENTITY_SET"
+                query_id for query_id, context in created.items() if context.status == "WAITING_VERIFIED_ARTIFACT"
             ]
             return json.dumps(
                 {
@@ -6300,6 +7016,21 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "code": ("EXECUTION_GRAPH_IMMUTABLE_AFTER_FREEZE"),
                         "activeVersion": current_version,
                         "activeFingerprint": (deep_session.execution_graph_fingerprint),
+                        "repairType": "TOPOLOGY",
+                        "repairOptions": [
+                            {
+                                "type": "REVISE_ACTIVE_EXECUTION_GRAPH",
+                                "baseVersion": current_version,
+                                "nextAction": (
+                                    "OPEN_REVISION_DISCOVERY_THEN_REVISE_GRAPH"
+                                ),
+                            }
+                        ],
+                        "allowedActions": [
+                            "REOPEN_GROUNDED_EXECUTION_GRAPH_DISCOVERY",
+                            "REVISE_GROUNDED_EXECUTION_GRAPH",
+                        ],
+                        "nextAction": "REVISE_ACTIVE_EXECUTION_GRAPH",
                     },
                     ensure_ascii=False,
                 )
@@ -6316,27 +7047,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     {
                         "status": "REJECTED",
                         "code": "EXECUTION_GRAPH_INVALID",
+                        "repairType": "TOPOLOGY",
+                        "baseVersion": current_version,
+                        "candidateVersion": current_version + 1,
                         "issues": [issue.model_dump(by_alias=True, mode="json") for issue in validation.issues],
+                        "repairOptions": [
+                            {
+                                "type": "RESUBMIT_EXECUTION_GRAPH_PROPOSAL",
+                                "baseVersion": current_version,
+                                "candidateVersion": current_version + 1,
+                                "preserveGoalContract": True,
+                                "preserveDiscoverySnapshot": True,
+                            }
+                        ],
+                        "allowedActions": [
+                            "PROPOSE_GROUNDED_EXECUTION_GRAPH"
+                        ],
                         "nextAction": ("REVISE_EXECUTION_GRAPH_FROM_CURRENT_DISCOVERY"),
-                    },
-                    ensure_ascii=False,
-                )
-
-            unsupported_artifact_edges = [
-                {
-                    "edgeIndex": index,
-                    "artifactKind": edge.artifact_kind,
-                }
-                for index, edge in enumerate(parsed.edges)
-                if edge.dependency_mode == "VERIFIED_ARTIFACT" and edge.artifact_kind != "VERIFIED_ENTITY_SET"
-            ]
-            if unsupported_artifact_edges:
-                return json.dumps(
-                    {
-                        "status": "REJECTED",
-                        "code": ("EXECUTION_GRAPH_ARTIFACT_CAPABILITY_UNAVAILABLE"),
-                        "issues": unsupported_artifact_edges,
-                        "supportedArtifactKinds": ["VERIFIED_ENTITY_SET"],
                     },
                     ensure_ascii=False,
                 )
@@ -6517,6 +7244,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     context.contract_scope_query_ids = []
                     context.dependency_query_ids = []
                     context.dependency_goal_ids = []
+                    context.artifact_dependencies = []
                     context.status = "DECLARED"
 
                 for edge in parsed.edges:
@@ -6529,8 +7257,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         continue
                     if source_query_id not in (target_context.dependency_query_ids):
                         target_context.dependency_query_ids.append(source_query_id)
+                    target_context.artifact_dependencies.append(
+                        {
+                            "sourceQueryId": source_query_id,
+                            "artifactKind": edge.artifact_kind,
+                            "targetBindingRef": edge.target_binding_ref,
+                        }
+                    )
                     target_context.runtime = None
-                    target_context.status = "WAITING_VERIFIED_ENTITY_SET"
+                    target_context.status = "WAITING_VERIFIED_ARTIFACT"
 
                 deep_session.execution_graph_generation = receipt.version
                 deep_session.execution_graph_fingerprint = receipt.fingerprint
@@ -6546,7 +7281,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             waiting_query_ids = [
                 query_id
                 for query_id, context in (deep_session.query_branch_contexts.items())
-                if context.status == "WAITING_VERIFIED_ENTITY_SET"
+                if context.status == "WAITING_VERIFIED_ARTIFACT"
             ]
             return json.dumps(
                 {
@@ -6631,8 +7366,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     or bool(context.runtime is not None and context.runtime.verified_query_ledger)
                     or query_id in deep_session.population_pre_execution_references
                 ]
-                if executed_query_ids:
-                    available_triggers = _current_execution_graph_replan_evidence(deep_session)
+                available_triggers = _current_execution_graph_replan_evidence(
+                    deep_session
+                )
+                if executed_query_ids or available_triggers:
                     if not available_triggers:
                         return json.dumps(
                             {
@@ -6793,44 +7530,22 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     }
                     for context in gapped_contexts
                 ]
-                deep_session.execution_graph_history.append(
+                # A pure binding error belongs to a new Contract attempt on the
+                # same immutable node.  Never erase graph vN merely to let the
+                # model retry its bindings; evidence/topology repairs must have
+                # a typed replan trigger and use the CAS revision path above.
+                return json.dumps(
                     {
-                        "status": "GAPPED_REOPENED",
-                        "receipt": receipt.model_dump(
-                            by_alias=True,
-                            mode="json",
-                        ),
-                        "reason": normalized_reason,
-                        "gaps": gap_reports,
-                        "branches": [context.report() for context in contexts.values()],
-                    }
+                        "status": "VERSION_PRESERVED",
+                        "code": "BRANCH_CONTRACT_RETRY_DOES_NOT_REQUIRE_GRAPH_REOPEN",
+                        "baseVersion": receipt.version,
+                        "activeGraphId": receipt.graph_id,
+                        "typedGaps": gap_reports,
+                        "nextAction": "RESUBMIT_AFFECTED_BRANCH_CONTRACT",
+                    },
+                    ensure_ascii=False,
+                    default=str,
                 )
-                deep_session.query_branch_contexts = {}
-                deep_session.parallel_branches = {}
-                deep_session.parallel_branch_goal_ids = {}
-                deep_session.execution_graph_receipt = None
-                deep_session.execution_graph_proposal = None
-                deep_session.execution_graph_edges = []
-                deep_session.execution_graph_data_snapshot = None
-                deep_session.execution_graph_fingerprint = ""
-                deep_session.execution_graph_revision_discovery_evidence_id = ""
-                deep_session.execution_graph_revision_discovery_evidence_ids = []
-                deep_session.active_goal_ids = []
-
-            return json.dumps(
-                {
-                    "status": "DISCOVERY_REOPENED",
-                    "baseVersion": receipt.version,
-                    "previousGraphId": receipt.graph_id,
-                    "typedGaps": gap_reports,
-                    "discoverySnapshotFingerprint": (
-                        discovery_evidence_snapshot_fingerprint(deep_session.core_semantic_evidence)
-                    ),
-                    "nextAction": ("READ_ONLY_FOR_RETURNED_STRUCTURED_GAPS"),
-                },
-                ensure_ascii=False,
-                default=str,
-            )
 
         @tool("revise_grounded_execution_graph")
         def revise_grounded_execution_graph(
@@ -7032,25 +7747,6 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         },
                         ensure_ascii=False,
                         default=str,
-                    )
-
-                unsupported_artifact_edges = [
-                    {
-                        "edgeIndex": index,
-                        "artifactKind": edge.artifact_kind,
-                    }
-                    for index, edge in enumerate(parsed.graph.edges)
-                    if (edge.dependency_mode == "VERIFIED_ARTIFACT" and edge.artifact_kind != "VERIFIED_ENTITY_SET")
-                ]
-                if unsupported_artifact_edges:
-                    return json.dumps(
-                        {
-                            "status": "REJECTED",
-                            "code": ("EXECUTION_GRAPH_ARTIFACT_CAPABILITY_UNAVAILABLE"),
-                            "issues": unsupported_artifact_edges,
-                            "supportedArtifactKinds": ["VERIFIED_ENTITY_SET"],
-                        },
-                        ensure_ascii=False,
                     )
 
                 preflight_specs = [
@@ -7293,7 +7989,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             limits,
                             parent=runtime.context.budget,
                         ),
-                        status=("WAITING_VERIFIED_ENTITY_SET" if artifact_dependencies else "DECLARED"),
+                        status=("WAITING_VERIFIED_ARTIFACT" if artifact_dependencies else "DECLARED"),
+                        artifact_dependencies=[
+                            {
+                                "sourceQueryId": revised_receipt.node_ids[
+                                    edge.source_client_key
+                                ],
+                                "artifactKind": edge.artifact_kind,
+                                "targetBindingRef": edge.target_binding_ref,
+                            }
+                            for edge in artifact_dependencies
+                        ],
                     )
                     for ref_id in spec.evidence_ref_ids:
                         evidence = evidence_by_ref.get(ref_id)
@@ -7313,6 +8019,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             target_context.contract_scope_query_ids.append(source_query_id)
                         else:
                             target_context.dependency_query_ids.append(source_query_id)
+                            dependency = {
+                                "sourceQueryId": source_query_id,
+                                "artifactKind": edge.artifact_kind,
+                                "targetBindingRef": edge.target_binding_ref,
+                            }
+                            if dependency not in target_context.artifact_dependencies:
+                                target_context.artifact_dependencies.append(
+                                    dependency
+                                )
                             target_context.dependency_goal_ids.extend(
                                 goal_id for goal_id in source_goals if goal_id not in target_context.dependency_goal_ids
                             )
@@ -7347,6 +8062,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             artifact_kind=edge.artifact_kind,
                         )
                         for edge in parsed.graph.edges
+                        if edge.dependency_mode == "CONTRACT_SCOPE"
+                        or edge.artifact_kind
+                        in {
+                            "VERIFIED_ENTITY_SET",
+                            "VERIFIED_RESULT_ARTIFACT",
+                        }
                     )
                     revised_population_receipt = seal_population_dynamic_graph_receipt(
                         PopulationDynamicGraphReceipt(
@@ -7630,7 +8351,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 waiting_query_ids = [
                     query_node_id
                     for query_node_id, context in candidate_contexts.items()
-                    if context.status == "WAITING_VERIFIED_ENTITY_SET"
+                    if context.status == "WAITING_VERIFIED_ARTIFACT"
                 ]
                 return json.dumps(
                     {
@@ -7929,6 +8650,50 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             if not isinstance(binding_hints, GroundedBindingHints):
                 binding_hints = GroundedBindingHints.model_validate(binding_hints)
             binding_hints = _canonical_binding_hints(binding_hints)
+            detail_goals = [
+                session.question_goal_contract.goal_map()[goal_id]
+                for goal_id in assigned_goal_ids
+                if session.question_goal_contract is not None
+                and goal_id in session.question_goal_contract.goal_map()
+                and isinstance(
+                    session.question_goal_contract.goal_map()[goal_id],
+                    DetailQuestionGoal,
+                )
+            ]
+            if detail_goals:
+                request_all = any(item.request_all_fields for item in detail_goals)
+                explicit_phrases = any(
+                    bool(item.requested_field_phrases)
+                    for item in detail_goals
+                )
+                projection_mode = (
+                    "ALL_ALLOWED"
+                    if request_all
+                    else "EXPLICIT"
+                    if explicit_phrases
+                    else "DEFAULT"
+                )
+                # The original Goal ledger is the source of truth for whether
+                # the user asked for a projection.  A generic detail question
+                # must not let Core invent a large selectedFields list after
+                # reading the physical Schema.
+                if projection_mode == "DEFAULT":
+                    binding_hints = binding_hints.model_copy(
+                        update={
+                            "analysis_mode": "DETAIL",
+                            "detail_projection_mode": projection_mode,
+                            "selected_fields": [],
+                        },
+                        deep=True,
+                    )
+                else:
+                    binding_hints = binding_hints.model_copy(
+                        update={
+                            "analysis_mode": "DETAIL",
+                            "detail_projection_mode": projection_mode,
+                        },
+                        deep=True,
+                    )
             requested = list(
                 dict.fromkeys(
                     _canonical_progressive_ref(str(item or "").strip())
@@ -8044,16 +8809,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 gap.model_dump(by_alias=True)
                 for gap in attempt.contract.unresolved_gaps
             ]
-            repair_ref_ids = list(
-                dict.fromkeys(
-                    ref_id
-                    for gap in attempt.contract.unresolved_gaps
-                    for ref_id in gap.rejected_ref_ids
-                    if str(ref_id or "").startswith("semantic:")
-                )
-            )
-            read_next: list[dict[str, str]] = []
-            for ref_id in repair_ref_ids:
+
+            def resolve_repair_ref_path(ref_id: str) -> str:
                 try:
                     resolved = runtime_owner.semantic_catalog.read(
                         ref_id=ref_id,
@@ -8062,18 +8819,42 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     )
                 except Exception:
                     resolved = {}
-                path = str((resolved or {}).get("path") or "")
-                if path:
-                    read_next.append(
-                        {
-                            "refId": ref_id,
-                            "path": "/knowledge/%s"
-                            % path.lstrip("/"),
-                        }
-                    )
+                return str((resolved or {}).get("path") or "")
+
+            repair_directive = build_contract_repair_directive(
+                attempt.contract.unresolved_gaps,
+                contract_status=attempt.contract.status,
+                resolve_ref_path=resolve_repair_ref_path,
+                path_prefix="knowledge",
+                base_attempt_id=attempt.attempt_id,
+                base_contract_fingerprint=contract_fingerprint,
+                contract_version=int(attempt.contract_version or 0),
+                parent_attempt_id=attempt.parent_attempt_id,
+                parent_contract_fingerprint=(
+                    attempt.parent_contract_fingerprint
+                ),
+            )
+            attempt.repair_type = repair_directive.repair_type
+            attempt.repair_directive = repair_directive.model_dump(
+                by_alias=True,
+                mode="json",
+            )
+            public_next_action = (
+                repair_directive.next_action or attempt.next_action
+            )
+            semantic_coverage_status = (
+                "READY_TO_EXECUTE"
+                if attempt.contract.ready and attempt.activated
+                else repair_directive.status
+            )
             return json.dumps(
                 {
                     "attemptId": attempt.attempt_id,
+                    "contractVersion": attempt.contract_version,
+                    "parentAttemptId": attempt.parent_attempt_id,
+                    "parentContractFingerprint": (
+                        attempt.parent_contract_fingerprint
+                    ),
                     "status": attempt.contract.status,
                     "queryShape": attempt.contract.query_shape,
                     "compileStatus": attempt.compile_status,
@@ -8084,7 +8865,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "fastPathEligible": attempt.fast_path_eligible,
                     "fastPathReasonCodes": attempt.fast_path_reason_codes,
                     "fastPathReasonDetails": attempt.fast_path_reason_details,
-                    "nextAction": attempt.next_action,
+                    "nextAction": public_next_action,
                     "activeGeneration": attempt.active_generation,
                     "contractFingerprint": contract_fingerprint,
                     "semanticActivation": (
@@ -8099,25 +8880,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "acceptedBindingHints": _core_visible_binding_hints(attempt.contract),
                     "assignedGoalIds": list(assigned_goal_ids),
                     "semanticCoverage": {
-                        "status": (
-                            "READY_TO_EXECUTE" if attempt.contract.ready and attempt.activated else "NEED_MORE_EVIDENCE"
-                        ),
+                        "status": semantic_coverage_status,
                         "retrievalClosed": bool(attempt.contract.ready and attempt.activated),
                         "blockingGapCount": len([gap for gap in attempt.contract.unresolved_gaps if gap.blocking]),
-                        "nextAction": attempt.next_action,
+                        "nextAction": public_next_action,
                     },
                     "gaps": gap_payloads,
-                    "readNext": read_next,
-                    "repairOptions": (
-                        [
-                            "Read every readNext path completely and resubmit the same Contract bindings.",
-                            (
-                                "If timeFieldRef was optional and the user did not name a business clock, "
-                                "omit it and use the published metric's governed default time semantics."
-                            ),
-                        ]
-                        if read_next
-                        else []
+                    "readNext": repair_directive.read_next,
+                    "repairOptions": repair_directive.repair_options,
+                    "repairDirective": repair_directive.model_dump(
+                        by_alias=True,
+                        mode="json",
                     ),
                     "rejectedBindings": [item.model_dump(by_alias=True) for item in attempt.contract.rejected_bindings],
                 },
@@ -8239,53 +9012,209 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             }
                     hints = _canonical_binding_hints(raw_item.binding_hints)
 
-                    if context.status == "WAITING_VERIFIED_ENTITY_SET":
-                        entity_set_ids = list(
-                            dict.fromkeys(
-                                str(item.entity_set_artifact_id or "").strip()
-                                for item in hints.upstream_entity_bindings
-                                if str(item.entity_set_artifact_id or "").strip()
-                            )
+                    if context.status == "WAITING_VERIFIED_ARTIFACT":
+                        dependency_specs = list(
+                            context.artifact_dependencies
+                            or [
+                                {
+                                    "sourceQueryId": dependency_query_id,
+                                    "artifactKind": "VERIFIED_ENTITY_SET",
+                                    "targetBindingRef": "",
+                                }
+                                for dependency_query_id in context.dependency_query_ids
+                            ]
                         )
-                        if not entity_set_ids:
-                            return {
-                                "queryId": query_id,
-                                "status": "WAITING_VERIFIED_ENTITY_SET",
-                                "code": "DEPENDENT_QUERY_REQUIRES_VERIFIED_ENTITY_SET",
-                                "dependsOnQueryIds": list(context.dependency_query_ids),
-                                "nextAction": "PUBLISH_UPSTREAM_ENTITY_SET",
-                            }
-                        entity_sets = {item.artifact_id: item for item in deep_session.runtime.verified_entity_sets}
-                        missing_entity_sets = [item for item in entity_set_ids if item not in entity_sets]
-                        if missing_entity_sets:
-                            return {
-                                "queryId": query_id,
-                                "status": "WAITING_VERIFIED_ENTITY_SET",
-                                "code": "VERIFIED_ENTITY_SET_NOT_FOUND",
-                                "missingEntitySetArtifactIds": missing_entity_sets,
-                            }
-                        source_artifact_ids = {entity_sets[item].source_query_artifact_id for item in entity_set_ids}
-                        source_mismatches: list[str] = []
-                        for dependency_query_id in context.dependency_query_ids:
-                            upstream_context = deep_session.query_branch_contexts.get(dependency_query_id)
-                            if upstream_context is None or not source_artifact_ids.intersection(
+                        query_artifacts = {
+                            item.artifact_id: item
+                            for item in deep_session.runtime.verified_query_ledger
+                            if item.verified_evidence.passed
+                        }
+                        entity_sets = {
+                            item.artifact_id: item
+                            for item in deep_session.runtime.verified_entity_sets
+                        }
+                        entity_hints = list(hints.upstream_entity_bindings)
+                        entity_set_ids: list[str] = []
+                        query_artifact_ids: list[str] = []
+                        artifact_bindings: list[
+                            GroundedUpstreamArtifactBinding
+                        ] = []
+                        dependency_failures: list[dict[str, Any]] = []
+                        for dependency in dependency_specs:
+                            source_query_id = str(
+                                dependency.get("sourceQueryId") or ""
+                            ).strip()
+                            artifact_kind = str(
+                                dependency.get("artifactKind") or ""
+                            ).strip()
+                            target_binding_ref = str(
+                                dependency.get("targetBindingRef") or ""
+                            ).strip()
+                            upstream_context = (
+                                deep_session.query_branch_contexts.get(
+                                    source_query_id
+                                )
+                            )
+                            source_ids = set(
                                 upstream_context.verified_artifact_ids
-                            ):
-                                source_mismatches.append(dependency_query_id)
-                        if source_mismatches:
+                                if upstream_context is not None
+                                else []
+                            )
+                            if not source_ids:
+                                dependency_failures.append(
+                                    {
+                                        "sourceQueryId": source_query_id,
+                                        "artifactKind": artifact_kind,
+                                        "code": "UPSTREAM_VERIFIED_ARTIFACT_PENDING",
+                                    }
+                                )
+                                continue
+                            if artifact_kind == "VERIFIED_ENTITY_SET":
+                                supplied = [
+                                    item
+                                    for item in entity_hints
+                                    if (
+                                        not target_binding_ref
+                                        or item.target_field_ref
+                                        == target_binding_ref
+                                    )
+                                    and item.entity_set_artifact_id
+                                    in entity_sets
+                                    and entity_sets[
+                                        item.entity_set_artifact_id
+                                    ].source_query_artifact_id
+                                    in source_ids
+                                ]
+                                candidates = [
+                                    item
+                                    for item in entity_sets.values()
+                                    if item.source_query_artifact_id
+                                    in source_ids
+                                ]
+                                selected_entity_set = (
+                                    entity_sets[
+                                        supplied[0].entity_set_artifact_id
+                                    ]
+                                    if len(supplied) == 1
+                                    else candidates[0]
+                                    if len(candidates) == 1
+                                    and target_binding_ref
+                                    else None
+                                )
+                                if selected_entity_set is None:
+                                    dependency_failures.append(
+                                        {
+                                            "sourceQueryId": source_query_id,
+                                            "artifactKind": artifact_kind,
+                                            "code": (
+                                                "PUBLISH_OR_SELECT_VERIFIED_ENTITY_SET"
+                                            ),
+                                            "candidateEntitySetArtifactIds": [
+                                                item.artifact_id
+                                                for item in candidates
+                                            ],
+                                        }
+                                    )
+                                    continue
+                                entity_set_ids.append(
+                                    selected_entity_set.artifact_id
+                                )
+                                if not supplied:
+                                    entity_hints.append(
+                                        GroundedUpstreamEntityHint(
+                                            entity_set_artifact_id=(
+                                                selected_entity_set.artifact_id
+                                            ),
+                                            target_field_ref=target_binding_ref,
+                                        )
+                                    )
+                                continue
+
+                            candidates = [
+                                artifact
+                                for artifact_id, artifact in query_artifacts.items()
+                                if artifact_id in source_ids
+                            ]
+                            compatible = []
+                            for artifact in candidates:
+                                descriptor = (
+                                    artifact.trusted_descriptor
+                                    or trusted_query_artifact_descriptor(
+                                        artifact
+                                    )
+                                )
+                                descriptor_type = str(
+                                    descriptor.artifact_type or ""
+                                )
+                                if artifact_kind == "VERIFIED_SCALAR" and descriptor_type != "SCALAR":
+                                    continue
+                                if artifact_kind == "VERIFIED_BASELINE" and descriptor_type not in {"SCALAR", "BASELINE"}:
+                                    continue
+                                if artifact_kind == "VERIFIED_RESULT_ARTIFACT" and descriptor_type not in {"SCALAR", "RELATION"}:
+                                    continue
+                                compatible.append((artifact, descriptor))
+                            if len(compatible) != 1:
+                                dependency_failures.append(
+                                    {
+                                        "sourceQueryId": source_query_id,
+                                        "artifactKind": artifact_kind,
+                                        "code": (
+                                            "UPSTREAM_ARTIFACT_BINDING_AMBIGUOUS"
+                                            if compatible
+                                            else "UPSTREAM_ARTIFACT_KIND_MISMATCH"
+                                        ),
+                                        "candidateArtifactIds": [
+                                            artifact.artifact_id
+                                            for artifact, _descriptor in compatible
+                                        ],
+                                    }
+                                )
+                                continue
+                            artifact, descriptor = compatible[0]
+                            query_artifact_ids.append(artifact.artifact_id)
+                            artifact_bindings.append(
+                                GroundedUpstreamArtifactBinding(
+                                    artifact_id=artifact.artifact_id,
+                                    artifact_kind=artifact_kind,
+                                    source_query_artifact_id=(
+                                        artifact.artifact_id
+                                    ),
+                                    source_query_node_id=source_query_id,
+                                    target_binding_ref=target_binding_ref,
+                                    descriptor=descriptor,
+                                )
+                            )
+                        if dependency_failures:
                             return {
                                 "queryId": query_id,
-                                "status": "REJECTED",
-                                "code": "ENTITY_SET_SOURCE_BRANCH_MISMATCH",
-                                "dependencyQueryIds": source_mismatches,
+                                "status": "WAITING_VERIFIED_ARTIFACT",
+                                "code": "DEPENDENT_QUERY_ARTIFACTS_NOT_READY",
+                                "dependencies": dependency_failures,
+                                "nextAction": (
+                                    "PUBLISH_OR_SELECT_REQUIRED_VERIFIED_ARTIFACTS"
+                                ),
                             }
+                        hints = hints.model_copy(
+                            update={
+                                "upstream_entity_bindings": entity_hints
+                            },
+                            deep=True,
+                        )
                         try:
                             branch_runtime = runtime_owner.kernel.fork_query_branch(
                                 deep_session.runtime,
                                 query_id,
                                 workspace_topics=context.spec.topic_scope,
                                 objective=context.spec.objective,
-                                inherit_entity_set_ids=entity_set_ids,
+                                inherit_entity_set_ids=list(
+                                    dict.fromkeys(entity_set_ids)
+                                ),
+                                inherit_query_artifact_ids=list(
+                                    dict.fromkeys(query_artifact_ids)
+                                ),
+                                upstream_artifact_bindings=(
+                                    artifact_bindings
+                                ),
                             )
                         except TypeError:
                             return {
@@ -8407,28 +9336,72 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 attempt.contract,
                             )
                             if assignment_issues:
+                                assignment_repair = build_contract_repair_directive(
+                                    assignment_issues,
+                                    contract_status="REVISE_BINDINGS",
+                                    base_attempt_id=attempt.attempt_id,
+                                    base_contract_fingerprint=(
+                                        grounded_query_contract_fingerprint(
+                                            attempt.contract
+                                        )
+                                    ),
+                                    contract_version=int(
+                                        attempt.contract_version or 0
+                                    ),
+                                    parent_attempt_id=(
+                                        attempt.parent_attempt_id
+                                    ),
+                                    parent_contract_fingerprint=(
+                                        attempt.parent_contract_fingerprint
+                                    ),
+                                )
                                 with context.lock:
                                     context.status = "CONTRACT_GAPPED"
                                     context.last_gaps = assignment_issues
-                                replan_evidence = _record_execution_graph_replan_evidence(
-                                    deep_session,
-                                    query_node_id=query_id,
-                                    trigger_kind="DATA_GAP",
-                                    source_stage="CONTRACT",
-                                    code=("QUERY_GOAL_ASSIGNMENT_MISMATCH"),
-                                    details={
-                                        "issues": assignment_issues,
-                                        "goalIds": declared_goal_ids,
-                                    },
-                                    runtime_budget=runtime.context.budget,
-                                )
+                                replan_evidence = None
+                                if assignment_repair.repair_type in {
+                                    "EVIDENCE",
+                                    "TOPOLOGY",
+                                }:
+                                    replan_evidence = _record_execution_graph_replan_evidence(
+                                        deep_session,
+                                        query_node_id=query_id,
+                                        trigger_kind="DATA_GAP",
+                                        source_stage="CONTRACT",
+                                        code=("QUERY_GOAL_ASSIGNMENT_MISMATCH"),
+                                        details={
+                                            "issues": assignment_issues,
+                                            "goalIds": declared_goal_ids,
+                                            "repairDirective": (
+                                                assignment_repair.model_dump(
+                                                    by_alias=True,
+                                                    mode="json",
+                                                )
+                                            ),
+                                        },
+                                        runtime_budget=runtime.context.budget,
+                                    )
                                 return {
                                     "queryId": query_id,
                                     "status": "BLOCKED",
                                     "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
+                                    "contractVersion": (
+                                        attempt.contract_version
+                                    ),
+                                    "parentAttemptId": (
+                                        attempt.parent_attempt_id
+                                    ),
                                     "issues": assignment_issues,
-                                    "nextAction": _goal_assignment_repair_action(
-                                        assignment_issues
+                                    "nextAction": assignment_repair.next_action,
+                                    "readNext": assignment_repair.read_next,
+                                    "repairOptions": (
+                                        assignment_repair.repair_options
+                                    ),
+                                    "repairDirective": (
+                                        assignment_repair.model_dump(
+                                            by_alias=True,
+                                            mode="json",
+                                        )
                                     ),
                                     "replanEvidence": (
                                         _execution_graph_replan_evidence_report(replan_evidence)
@@ -8468,27 +9441,85 @@ Use the currently visible tools and the server-provided nextAction as the phase-
 
                     if not attempt.activated:
                         gaps = [gap.model_dump(by_alias=True) for gap in attempt.contract.unresolved_gaps]
+
+                        def resolve_branch_repair_ref_path(
+                            ref_id: str,
+                        ) -> str:
+                            try:
+                                resolved = runtime_owner.semantic_catalog.read(
+                                    ref_id=ref_id,
+                                    max_chars=1,
+                                    offset=0,
+                                )
+                            except Exception:
+                                resolved = {}
+                            return str((resolved or {}).get("path") or "")
+
+                        branch_repair = build_contract_repair_directive(
+                            attempt.contract.unresolved_gaps,
+                            contract_status=attempt.contract.status,
+                            resolve_ref_path=resolve_branch_repair_ref_path,
+                            path_prefix="knowledge",
+                            base_attempt_id=attempt.attempt_id,
+                            base_contract_fingerprint=(
+                                grounded_query_contract_fingerprint(
+                                    attempt.contract
+                                )
+                            ),
+                            contract_version=int(
+                                attempt.contract_version or 0
+                            ),
+                            parent_attempt_id=attempt.parent_attempt_id,
+                            parent_contract_fingerprint=(
+                                attempt.parent_contract_fingerprint
+                            ),
+                        )
+                        attempt.repair_type = branch_repair.repair_type
+                        attempt.repair_directive = branch_repair.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
                         with context.lock:
                             context.status = "CONTRACT_GAPPED"
                             context.last_gaps = gaps
-                        replan_evidence = _record_execution_graph_replan_evidence(
-                            deep_session,
-                            query_node_id=query_id,
-                            trigger_kind="DATA_GAP",
-                            source_stage="CONTRACT",
-                            code="PARALLEL_CONTRACT_NOT_READY",
-                            details={
-                                "contractStatus": (attempt.contract.status),
-                                "gaps": gaps,
-                                "goalIds": declared_goal_ids,
-                            },
-                            runtime_budget=runtime.context.budget,
-                        )
+                        replan_evidence = None
+                        if branch_repair.repair_type in {
+                            "EVIDENCE",
+                            "TOPOLOGY",
+                        }:
+                            replan_evidence = _record_execution_graph_replan_evidence(
+                                deep_session,
+                                query_node_id=query_id,
+                                trigger_kind="DATA_GAP",
+                                source_stage="CONTRACT",
+                                code="PARALLEL_CONTRACT_NOT_READY",
+                                details={
+                                    "contractStatus": (attempt.contract.status),
+                                    "gaps": gaps,
+                                    "goalIds": declared_goal_ids,
+                                    "repairDirective": (
+                                        branch_repair.model_dump(
+                                            by_alias=True,
+                                            mode="json",
+                                        )
+                                    ),
+                                },
+                                runtime_budget=runtime.context.budget,
+                            )
                         return {
                             "queryId": query_id,
                             "status": attempt.contract.status,
                             "code": "PARALLEL_CONTRACT_NOT_READY",
+                            "contractVersion": attempt.contract_version,
+                            "parentAttemptId": attempt.parent_attempt_id,
                             "gaps": gaps,
+                            "nextAction": branch_repair.next_action,
+                            "readNext": branch_repair.read_next,
+                            "repairOptions": branch_repair.repair_options,
+                            "repairDirective": branch_repair.model_dump(
+                                by_alias=True,
+                                mode="json",
+                            ),
                             "replanEvidence": (
                                 _execution_graph_replan_evidence_report(replan_evidence)
                                 if replan_evidence is not None
@@ -8508,6 +9539,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "queryId": query_id,
                         "status": "PREPARED",
                         "queryShape": attempt.contract.query_shape,
+                        "contractVersion": attempt.contract_version,
+                        "parentAttemptId": attempt.parent_attempt_id,
                         "executionMode": attempt.execution_mode,
                         "activeGeneration": attempt.active_generation,
                         "contractFingerprint": (grounded_query_contract_fingerprint(attempt.contract)),
@@ -9613,6 +10646,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 if not query_id or result is None or not staged_artifacts:
                     return False
                 with deep_session.lock:
+                    population_reference = (
+                        deep_session.population_pre_execution_references.get(
+                            query_id
+                        )
+                    )
+                if population_reference is None:
+                    # This branch has no upstream entity/result-set binding;
+                    # its verified artifact is adopted normally.
+                    return True
+                with deep_session.lock:
                     for artifact in staged_artifacts:
                         deep_session.population_staged_query_artifacts[
                             artifact.artifact_id
@@ -9710,7 +10753,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         deep_session.artifact_goal_ids[artifact_id] = list(
                             deep_session.parallel_branch_goal_ids.get(query_id) or []
                         )
-                        if runtime_owner.population_gate_enforced:
+                        if (
+                            runtime_owner.population_gate_enforced
+                            and query_id
+                            in deep_session.population_pre_execution_references
+                        ):
                             deep_session.population_artifact_query_node_ids[
                                 artifact_id
                             ] = query_id
@@ -9725,6 +10772,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     deep_session.parallel_branch_goal_ids.pop(query_id, None)
             results.sort(key=lambda item: query_ids.index(str(item.get("queryId") or "")))
             accepted_adopted = [item for item in adopted if item.artifact_id in population_accepted_artifact_ids]
+            attach_artifact_goals = getattr(
+                runtime_owner.kernel,
+                "attach_verified_artifact_goals",
+                None,
+            )
+            if callable(attach_artifact_goals):
+                accepted_adopted = [
+                    attach_artifact_goals(
+                        deep_session.runtime,
+                        artifact.artifact_id,
+                        deep_session.artifact_goal_ids.get(
+                            artifact.artifact_id,
+                            [],
+                        ),
+                    )
+                    for artifact in accepted_adopted
+                ]
             replan_required = any(
                 item.get("status") == "REPLAN_REQUIRED"
                 for item in results
@@ -9859,6 +10923,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             internal_error = attempt.status == "VALIDATOR_INTERNAL_ERROR"
             candidate_payload = {
                 "candidateId": attempt.candidate_id,
+                "candidateVersion": attempt.candidate_version,
+                "parentCandidateId": attempt.parent_candidate_id,
+                "parentAstFingerprint": attempt.parent_ast_fingerprint,
                 "status": "BLOCKED" if internal_error else attempt.status,
                 "code": ("SQL_CANDIDATE_VALIDATOR_INTERNAL_ERROR" if internal_error else ""),
                 "activeGeneration": attempt.active_generation,
@@ -9895,6 +10962,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 {
                     "sqlCandidateStatus": "ACCEPTED",
                     "candidateId": attempt.candidate_id,
+                    "candidateVersion": attempt.candidate_version,
+                    "parentCandidateId": attempt.parent_candidate_id,
+                    "parentAstFingerprint": attempt.parent_ast_fingerprint,
                     "activeGeneration": attempt.active_generation,
                     "astFingerprint": attempt.ast_fingerprint,
                     "contractFingerprint": attempt.contract_fingerprint,
@@ -9926,11 +10996,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
             session = deep_session.runtime
             population_post: dict[str, Any] = {}
+            population_execution_kwargs: dict[str, Any] = {}
+            population_reference_active = False
 
             def authorize_serial_artifact(
                 artifact: GroundedVerifiedQueryArtifact,
             ) -> bool:
                 nonlocal population_post
+                if not population_reference_active:
+                    return True
                 with deep_session.lock:
                     deep_session.population_staged_query_artifacts[
                         artifact.artifact_id
@@ -9952,7 +11026,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return True
 
             def verify_serial() -> VerifiedEvidence:
-                if runtime_owner.population_gate_enforced:
+                if (
+                    runtime_owner.population_gate_enforced
+                    and population_reference_active
+                ):
                     return runtime_owner.kernel.verify_active(
                         session,
                         pre_ledger_authorizer=(
@@ -9962,6 +11039,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return runtime_owner.kernel.verify_active(session)
 
             try:
+                population_execution_kwargs = (
+                    runtime_owner._population_execution_kwargs(
+                        deep_session,
+                        session,
+                    )
+                )
+                population_reference_active = bool(
+                    population_execution_kwargs.get(
+                        "population_pre_execution_reference"
+                    )
+                )
                 budget = runtime.context.budget
                 if budget is not None:
                     budget.consume_doris_query(name="serial.grounded_query")
@@ -9969,10 +11057,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     run_result = runtime_owner.kernel.execute_active(
                         session,
                         run_id=runtime.context.run_id,
-                        **runtime_owner._population_execution_kwargs(
-                            deep_session,
-                            session,
-                        ),
+                        **population_execution_kwargs,
                     )
                 else:
                     with budget.stage("doris.serial"):
@@ -9980,10 +11065,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             session,
                             run_id=runtime.context.run_id,
                             runtime_budget=budget,
-                            **runtime_owner._population_execution_kwargs(
-                                deep_session,
-                                session,
-                            ),
+                            **population_execution_kwargs,
                         )
                 execution_failure = (
                     _classify_grounded_execution_result(run_result)
@@ -10386,6 +11468,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         ensure_ascii=False,
                     )
             if query_artifact is not None:
+                attach_artifact_goals = getattr(
+                    runtime_owner.kernel,
+                    "attach_verified_artifact_goals",
+                    None,
+                )
+                if callable(attach_artifact_goals):
+                    query_artifact = attach_artifact_goals(
+                        session,
+                        query_artifact.artifact_id,
+                        deep_session.active_goal_ids,
+                    )
                 with deep_session.lock:
                     deep_session.population_staged_query_artifacts.pop(
                         query_artifact.artifact_id,
@@ -10405,6 +11498,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
                     "reason": str(reason or "")[:500],
                     "queryArtifactId": (query_artifact.artifact_id if query_artifact else ""),
+                    "trustedArtifact": (
+                        query_artifact.trusted_descriptor.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
+                        if query_artifact is not None
+                        and query_artifact.trusted_descriptor is not None
+                        else {}
+                    ),
                     "populationPostGate": population_post,
                     "coveredGoalIds": list(deep_session.active_goal_ids if query_artifact else []),
                     "rowCount": len(run_result.merged_query_bundle.rows),
@@ -10517,6 +11619,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "valueCount": artifact.value_count,
                     "truncated": artifact.truncated,
                     "valuesHash": artifact.values_hash,
+                    "trustedArtifact": (
+                        artifact.trusted_descriptor.model_dump(
+                            by_alias=True,
+                            mode="json",
+                        )
+                        if artifact.trusted_descriptor is not None
+                        else {}
+                    ),
                     "nextAction": (
                         "STOP_WITH_VERIFIED_EMPTY_RESULT"
                         if artifact.value_count == 0
@@ -13315,6 +14425,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     artifact_kind=item.artifact_kind,
                 )
                 for item in graph_edges
+                if item.dependency_mode == "CONTRACT_SCOPE"
+                or item.artifact_kind
+                in {
+                    "VERIFIED_ENTITY_SET",
+                    "VERIFIED_RESULT_ARTIFACT",
+                }
             )
             graph_id = execution_receipt.graph_id
             version = execution_receipt.version
@@ -13339,12 +14455,21 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
                 derived_edges.extend(
                     PopulationDynamicGraphEdge(
-                        source_query_node_id=source_id,
+                        source_query_node_id=str(
+                            dependency.get("sourceQueryId") or ""
+                        ),
                         target_query_node_id=target_id,
                         dependency_mode="VERIFIED_ARTIFACT",
-                        artifact_kind="VERIFIED_RESULT_ARTIFACT",
+                        artifact_kind=str(
+                            dependency.get("artifactKind") or ""
+                        ),
                     )
-                    for source_id in sorted(set(context.dependency_query_ids))
+                    for dependency in context.artifact_dependencies
+                    if str(dependency.get("artifactKind") or "")
+                    in {
+                        "VERIFIED_ENTITY_SET",
+                        "VERIFIED_RESULT_ARTIFACT",
+                    }
                 )
             edges = tuple(derived_edges)
             graph_fingerprint = graph_fingerprint or _stable_json_fingerprint(
@@ -13408,11 +14533,34 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             session.population_gate_enforced = bool(
                 self.population_gate_enforced
             )
-        if not self.population_gate_enforced:
+            legacy_goal_gate_active = bool(
+                session.population_goal_gate_result.get("accepted")
+                and session.population_goal_attestation is not None
+            )
+        contract = execution_session.active_contract
+        upstream_population_required = bool(
+            contract is not None
+            and (
+                contract.upstream_entity_bindings
+                or (
+                    contract.reference_scope.enabled
+                    and contract.reference_scope.population_required
+                )
+            )
+        )
+        if not self.population_gate_enforced or not (
+            legacy_goal_gate_active or upstream_population_required
+        ):
+            # Current-turn population authority is carried by the versioned
+            # execution graph plus server-issued verified entity/result
+            # artifacts.  The legacy population goal gate is retained only
+            # for recovery of already-attested checkpoints; ordinary queries
+            # must not create a second business graph or invoke another model.
+            # A current query enters this gate only after its grounded
+            # Contract explicitly binds an upstream verified population.
             return kwargs
         gate = self.population_execution_gate
         workspace = session.context_workspace
-        contract = execution_session.active_contract
         if gate is None or workspace is None or contract is None:
             raise RuntimeError("POPULATION_ONLINE_GATE_AUTHORITY_REQUIRED")
         graph_receipt = self._population_graph_for_execution(
@@ -13942,7 +15090,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     branch_runtime.question = spec.objective
             if branch.lifecycle == "PRE_AUTHORIZED":
                 restored_status = (
-                    "WAITING_VERIFIED_ENTITY_SET"
+                    "WAITING_VERIFIED_ARTIFACT"
                     if dependency_query_ids
                     else "DECLARED"
                 )
@@ -13950,7 +15098,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     branch_runtime = None
             elif branch.lifecycle == "UNEXECUTED":
                 restored_status = (
-                    "WAITING_VERIFIED_ENTITY_SET"
+                    "WAITING_VERIFIED_ARTIFACT"
                     if dependency_query_ids
                     else "DECLARED"
                 )
@@ -14732,11 +15880,6 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         if self.population_gate_enforced:
             gate = self.population_execution_gate
             with session.lock:
-                contract = (
-                    session.question_goal_contract.model_copy(deep=True)
-                    if session.question_goal_contract is not None
-                    else None
-                )
                 goal_gate_id = session.population_goal_gate_id
                 goal_gate_accepted = bool(session.population_goal_gate_result.get("accepted"))
                 goal_attestation = (
@@ -14745,20 +15888,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     else None
                 )
                 references = tuple(session.population_pre_execution_references.values())
-            if contract is None:
-                raise RuntimeError("ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED")
-            goal_contract_fingerprint = original_question_goal_contract_fingerprint(contract)
-            if (
-                gate is None
-                or not goal_gate_id
-                or not goal_gate_accepted
-                or not self._population_goal_attestation_is_valid(
+            legacy_goal_gate_active = bool(
+                goal_gate_id and goal_gate_accepted and goal_attestation is not None
+            )
+            if legacy_goal_gate_active:
+                contract = session.question_goal_contract
+                if contract is None:
+                    raise RuntimeError("ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED")
+                goal_contract_fingerprint = original_question_goal_contract_fingerprint(contract)
+                if gate is None or not self._population_goal_attestation_is_valid(
                     goal_attestation,
                     goal_contract_fingerprint=goal_contract_fingerprint,
-                )
-            ):
-                raise RuntimeError("POPULATION_GOAL_ATTESTATION_REQUIRED")
-            if goal_attestation.accepted_scopes:
+                ):
+                    raise RuntimeError("POPULATION_GOAL_ATTESTATION_REQUIRED")
+            if legacy_goal_gate_active and goal_attestation.accepted_scopes:
                 if not references:
                     raise RuntimeError("POPULATION_GRAPH_COMPLETION_REQUIRED")
                 completion = gate.require_graph_complete(reference=references[0])
@@ -15651,7 +16794,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     str(item.get("queryId") or "")
                     for item in branch_reports
                     if str(item.get("status") or "")
-                    == "WAITING_VERIFIED_ENTITY_SET"
+                    == "WAITING_VERIFIED_ARTIFACT"
                 ],
                 "verifiedQueryArtifactIds": [
                     item.artifact_id
@@ -15737,7 +16880,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             },
             "topicRouting": session.runtime.routing.model_dump(by_alias=True),
             "topicL0Manifests": manifests,
-            "thinRecallCandidates": _thin_recall(session.runtime.recall, limit=4),
+            "thinRecallCandidates": _thin_recall(
+                session.runtime.recall,
+                limit=4,
+                metric_slots=_metric_recall_slots(
+                    session.runtime.keywords
+                ),
+            ),
             "retrievalNavigation": _retrieval_trace_summary(session.runtime),
             "restoredExecutionState": restored_execution_state,
             "originalQuestionGoalPolicy": {
@@ -15759,6 +16908,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "ANALYSIS",
                 ],
                 "queryAssignmentRequired": True,
+                "coverageOnly": True,
+                "allowedDependencySemantics": (
+                    "Record only the user's logical dependency between answer goals."
+                ),
+                "forbiddenAtGoalDeclaration": [
+                    "table/field/metric semantic bindings",
+                    "population or result-artifact scope",
+                    "SQL shape or execution mode",
+                    "query-node topology",
+                ],
                 "queryTopologyDecision": "LATE_BOUND_AFTER_FORMAL_EVIDENCE",
                 "executionGraphFreezePoint": "IMMEDIATELY_BEFORE_QUERY_PREPARATION",
                 "topologyAuthority": "CORE_LLM_WITHIN_KERNEL_VALIDATED_EVIDENCE",
@@ -15825,7 +16984,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 if restored_execution_state
                 else (
                     "Use Topic/recall only for initial navigation. trustedExecutionScope is authoritative. "
-                    "Declare the immutable original-question Goals first, then progressively read formal assets. "
+                    "Declare only the immutable answer obligations and user-explicit logical dependencies first; "
+                    "do not attach population scopes, formal semantic refs, query nodes, tables or execution modes. "
+                    "Then progressively read formal assets. "
                     "Do not freeze query branches or topology before that evidence is sufficient. Immediately "
                     "before query preparation, either propose one grounded Contract or freeze a validated graph; "
                     "the Core may merge, split, parallelize, or serialize nodes only from formal evidence and "
@@ -15955,11 +17116,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         if session.operational_failure:
             trace["harness"]["operationalFailure"] = dict(session.operational_failure)
             return ChatResponse(
-                answer=(
-                    "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；请稍后重试。"
-                    if session.operational_failure.get("code") == "GROUNDED_PROVIDER_TIMEOUT"
-                    else "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
-                    "请缩小查询范围，或稍后重试。"
+                answer=_grounded_operational_failure_answer(
+                    session.operational_failure
                 ),
                 category_name=state.routing.display_summary(),
                 debug_trace=trace,
@@ -16036,8 +17194,31 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 debug_trace=trace,
             )
         if state.answer:
-            raise RuntimeError("Grounded final answer exists without a matching answer-coverage attestation")
-        raise RuntimeError("Grounded DeepAgent Core ended without verified answer or typed clarification")
+            failure = {
+                "code": "GROUNDED_ANSWER_ATTESTATION_MISSING",
+                "message": (
+                    "Grounded final answer exists without a matching "
+                    "answer-coverage attestation"
+                ),
+                "retryable": False,
+            }
+        else:
+            failure = {
+                "code": "GROUNDED_CORE_INCOMPLETE_TERMINAL_STATE",
+                "message": (
+                    "Grounded DeepAgent Core ended without verified answer "
+                    "or typed clarification"
+                ),
+                "retryable": False,
+            }
+        session.operational_failure = dict(failure)
+        session.runtime.phase = "OPERATIONAL_FAILURE"
+        trace["harness"]["operationalFailure"] = dict(failure)
+        return ChatResponse(
+            answer=_grounded_operational_failure_answer(failure),
+            category_name=state.routing.display_summary(),
+            debug_trace=trace,
+        )
 
 
 def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
@@ -16054,6 +17235,10 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
     )
     return {
         "requiredFinalOutputAliases": [item for item in required_outputs if item],
+        "queryCalculationGraph": contract.calculation_graph.model_dump(
+            by_alias=True,
+            mode="json",
+        ),
         "tables": [
             {
                 "table": item.table,
@@ -16072,8 +17257,47 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
                 "sourceColumns": list(item.source_columns),
                 "timeColumn": item.time_column,
                 "timeSemantics": dict(item.time_semantics),
+                "calculationGraph": item.calculation_graph.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
             }
             for item in contract.metrics
+        ],
+        "internalMetricNodes": [
+            {
+                "semanticRefId": item.semantic_ref_id,
+                "metricKey": item.metric_key,
+                "table": item.table,
+                "formula": item.formula,
+                "outputRole": item.output_role,
+                "calculationGraph": item.calculation_graph.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+            }
+            for item in contract.internal_metrics
+        ],
+        "requestedOutputs": [
+            item.model_dump(by_alias=True, mode="json")
+            for item in contract.requested_outputs
+        ],
+        "upstreamTrustedArtifacts": [
+            {
+                "artifactId": item.artifact_id,
+                "artifactKind": item.artifact_kind,
+                "sourceQueryNodeId": item.source_query_node_id,
+                "targetBindingRef": item.target_binding_ref,
+                "descriptor": item.descriptor.model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                "instruction": (
+                    "This input is server-bound and immutable; use the target "
+                    "binding without inventing or replacing its value set."
+                ),
+            }
+            for item in contract.upstream_artifact_bindings
         ],
         "dimensions": [
             {
@@ -16243,8 +17467,143 @@ def _retrieval_trace_summary(session: GroundedRuntimeSession) -> dict[str, Any]:
     }
 
 
-def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
+def _normalize_metric_recall_text(value: Any) -> str:
+    return "".join(str(value or "").lower().split())
+
+
+def _metric_recall_slots(keywords: Any) -> list[dict[str, Any]]:
+    """Group extracted metric mentions by user phrase for recall coverage.
+
+    A multi-metric question must not lose one metric merely because a global
+    top-k is occupied by several near-neighbours of another metric.  The
+    extracted semantic mentions remain navigation hints only; formal assets
+    still have to be read before any binding decision is accepted.
+    """
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for mention in getattr(keywords, "mentions", None) or []:
+        if str(getattr(mention, "kind", "") or "").lower() != "metric":
+            continue
+        phrase = str(getattr(mention, "phrase", "") or "").strip()
+        normalized = _normalize_metric_recall_text(phrase)
+        if not normalized:
+            continue
+        slot = grouped.setdefault(
+            normalized,
+            {
+                "phrase": phrase,
+                "canonicalKeys": [],
+                "ownerTables": [],
+            },
+        )
+        canonical_key = str(
+            getattr(mention, "canonical_key", "") or ""
+        ).strip()
+        owner_table = str(
+            getattr(mention, "owner_table", "") or ""
+        ).strip()
+        if canonical_key and canonical_key not in slot["canonicalKeys"]:
+            slot["canonicalKeys"].append(canonical_key)
+        if owner_table and owner_table not in slot["ownerTables"]:
+            slot["ownerTables"].append(owner_table)
+    for phrase_value in getattr(keywords, "metric_keywords", None) or []:
+        phrase = str(phrase_value or "").strip()
+        normalized = _normalize_metric_recall_text(phrase)
+        if normalized and normalized not in grouped:
+            grouped[normalized] = {
+                "phrase": phrase,
+                "canonicalKeys": [],
+                "ownerTables": [],
+            }
+    return list(grouped.values())
+
+
+def _metric_slot_candidate_score(
+    item: Any,
+    payload: Mapping[str, Any],
+    slot: Mapping[str, Any],
+) -> tuple[int, int, float]:
+    metadata = dict(getattr(item, "metadata", None) or {})
+    ref_id = str(payload.get("refId") or "")
+    kind = str(payload.get("kind") or "").upper()
+    if ":metric:" not in ref_id and kind not in {
+        "METRIC",
+        "SEMANTIC_METRIC",
+    }:
+        return (0, 0, 0.0)
+    metric_key = str(metadata.get("metricKey") or "").strip()
+    if not metric_key and ":metric:" in ref_id:
+        metric_key = ref_id.rsplit(":metric:", 1)[-1]
+    canonical_keys = {
+        _normalize_metric_recall_text(value)
+        for value in slot.get("canonicalKeys") or []
+        if _normalize_metric_recall_text(value)
+    }
+    normalized_metric_key = _normalize_metric_recall_text(metric_key)
+    exact_key = bool(
+        normalized_metric_key
+        and normalized_metric_key in canonical_keys
+    )
+    aliases = metadata.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    labels = [
+        metadata.get("businessName"),
+        metadata.get("naturalName"),
+        metadata.get("displayName"),
+        metadata.get("matchedMetricLabel"),
+        metric_key,
+        *aliases,
+    ]
+    normalized_labels = {
+        _normalize_metric_recall_text(value)
+        for value in labels
+        if _normalize_metric_recall_text(value)
+    }
+    phrase = _normalize_metric_recall_text(slot.get("phrase"))
+    exact_phrase = bool(phrase and phrase in normalized_labels)
+    searchable = _normalize_metric_recall_text(
+        "%s %s"
+        % (
+            getattr(item, "title", ""),
+            getattr(item, "content", ""),
+        )
+    )
+    phrase_related = bool(
+        phrase
+        and (
+            phrase in searchable
+            or any(
+                phrase in label or label in phrase
+                for label in normalized_labels
+                if len(label) >= 2
+            )
+        )
+    )
+    match_tier = 3 if exact_key else 2 if exact_phrase else 1 if phrase_related else 0
+    owner_tables = {
+        str(value or "").strip()
+        for value in slot.get("ownerTables") or []
+        if str(value or "").strip()
+    }
+    table_match = int(
+        bool(owner_tables and str(getattr(item, "table", "") or "") in owner_tables)
+    )
+    return (
+        match_tier,
+        table_match,
+        float(getattr(item, "fusion_score", 0.0) or 0.0),
+    )
+
+
+def _thin_recall(
+    bundle: RecallBundle,
+    limit: int,
+    *,
+    metric_slots: Sequence[Mapping[str, Any]] | None = None,
+    per_metric_limit: int = 2,
+) -> list[dict[str, Any]]:
+    candidates: list[tuple[Any, dict[str, Any]]] = []
     seen: set[str] = set()
     for item in bundle.items:
         metadata = dict(item.metadata or {})
@@ -16269,23 +17628,71 @@ def _thin_recall(bundle: RecallBundle, limit: int) -> list[dict[str, Any]]:
         if not ref_id or ref_id in seen:
             continue
         seen.add(ref_id)
-        result.append(
-            {
-                "refId": ref_id,
-                "path": path,
-                "kind": kind,
-                "topic": item.topic,
-                "table": item.table,
-                "title": item.title,
-                "snippet": item.content[:600] if inline_only else item.content[:160],
-                "score": float(item.fusion_score or 0.0),
-                "navigationMode": "INLINE_ONLY" if inline_only else "READ_FILE",
-                "bindingEligible": not inline_only,
-            }
+        candidates.append(
+            (
+                item,
+                {
+                    "refId": ref_id,
+                    "path": path,
+                    "kind": kind,
+                    "topic": item.topic,
+                    "table": item.table,
+                    "title": item.title,
+                    "snippet": item.content[:600] if inline_only else item.content[:160],
+                    "score": float(item.fusion_score or 0.0),
+                    "navigationMode": "INLINE_ONLY" if inline_only else "READ_FILE",
+                    "bindingEligible": not inline_only,
+                },
+            )
         )
-        if len(result) >= max(1, int(limit or 1)):
+    base_limit = max(1, int(limit or 1))
+    slots = [dict(slot) for slot in metric_slots or [] if str(slot.get("phrase") or "").strip()]
+    if len(slots) <= 1:
+        return [payload for _, payload in candidates[:base_limit]]
+
+    effective_limit = max(
+        base_limit,
+        len(slots) * max(1, int(per_metric_limit or 1)),
+    )
+    selected: list[dict[str, Any]] = []
+    selected_by_ref: dict[str, dict[str, Any]] = {}
+    for slot in slots:
+        ranked = sorted(
+            candidates,
+            key=lambda pair: _metric_slot_candidate_score(
+                pair[0],
+                pair[1],
+                slot,
+            ),
+            reverse=True,
+        )
+        retained = 0
+        for item, payload in ranked:
+            score = _metric_slot_candidate_score(item, payload, slot)
+            if score[0] <= 0:
+                continue
+            ref_id = str(payload.get("refId") or "")
+            existing = selected_by_ref.get(ref_id)
+            if existing is None:
+                existing = dict(payload)
+                existing["metricSlotPhrases"] = []
+                selected_by_ref[ref_id] = existing
+                selected.append(existing)
+            phrase = str(slot.get("phrase") or "")
+            if phrase and phrase not in existing["metricSlotPhrases"]:
+                existing["metricSlotPhrases"].append(phrase)
+            retained += 1
+            if retained >= max(1, int(per_metric_limit or 1)):
+                break
+    for _, payload in candidates:
+        if len(selected) >= effective_limit:
             break
-    return result
+        ref_id = str(payload.get("refId") or "")
+        if ref_id in selected_by_ref:
+            continue
+        selected_by_ref[ref_id] = payload
+        selected.append(payload)
+    return selected[:effective_limit]
 
 
 def _is_safe_semantic_path(path: str) -> bool:

@@ -847,13 +847,11 @@ def test_contract_scope_population_keeps_both_execution_nodes_ready() -> None:
                     metric_goal_ids=["metric.refund_amount"],
                     dimension_goal_ids=["dimension.order_id"],
                     limit=3,
-                    population_scope="SAME_AS_GOAL",
-                    population_goal_ids=["detail.orders"],
                 ),
                 DependencyQuestionGoal(
                     goal_id="dependency.order_population",
                     label="订单范围作为退款排名总体",
-                    dependency_type="CONTRACT_SCOPE",
+                    dependency_type="logical_dependency",
                     upstream_goal_ids=["detail.orders"],
                     downstream_goal_ids=["ranking.refunds"],
                     artifact_kind="",
@@ -1309,7 +1307,7 @@ def _freeze_reopenable_execution_graph(
     )
 
 
-def test_gapped_unexecuted_graph_reopens_discovery_and_refreezes_with_cas() -> None:
+def test_binding_gapped_unexecuted_graph_preserves_version_for_branch_retry() -> None:
     runtime, kernel, _ = _runtime(require_parallel_overlap=False)
     context = _context(kernel, "primary metric")
     tools = {item.name: item for item in runtime.tools}
@@ -1338,24 +1336,19 @@ def test_gapped_unexecuted_graph_reopens_discovery_and_refreezes_with_cas() -> N
         )
     )
 
-    assert reopened["status"] == "DISCOVERY_REOPENED"
-    assert reopened["baseVersion"] == 1
-    assert context.session.execution_graph_generation == 1
-    assert context.session.execution_graph_receipt is None
-    assert context.session.query_branch_contexts == {}
-    assert context.session.execution_graph_history[-1]["status"] == ("GAPPED_REOPENED")
-
-    second = _freeze_reopenable_execution_graph(
-        runtime,
-        context,
-        base_version=reopened["baseVersion"],
-        evidence_ref_id="semantic:discovery:metric:revised",
+    assert reopened["status"] == "VERSION_PRESERVED"
+    assert reopened["code"] == (
+        "BRANCH_CONTRACT_RETRY_DOES_NOT_REQUIRE_GRAPH_REOPEN"
     )
-
-    assert second["status"] == "FROZEN"
-    assert second["receipt"]["version"] == 2
-    assert context.session.execution_graph_generation == 2
-    assert second["receipt"]["graphId"] != first["receipt"]["graphId"]
+    assert reopened["baseVersion"] == 1
+    assert reopened["activeGraphId"] == first["receipt"]["graphId"]
+    assert reopened["nextAction"] == (
+        "RESUBMIT_AFFECTED_BRANCH_CONTRACT"
+    )
+    assert context.session.execution_graph_generation == 1
+    assert context.session.execution_graph_receipt is not None
+    assert context.session.execution_graph_receipt.version == 1
+    assert set(context.session.query_branch_contexts) == {query_id}
 
 
 def test_execution_graph_reopen_rejects_stale_identity_without_mutation() -> None:

@@ -406,6 +406,7 @@ class GroundedQueryBranchContext:
     contract_scope_query_ids: list[str] = field(default_factory=list)
     dependency_query_ids: list[str] = field(default_factory=list)
     dependency_goal_ids: list[str] = field(default_factory=list)
+    artifact_dependencies: list[dict[str, str]] = field(default_factory=list)
     status: str = "DECLARED"
     last_gaps: list[dict[str, Any]] = field(default_factory=list)
     verified_artifact_ids: list[str] = field(default_factory=list)
@@ -433,6 +434,9 @@ class GroundedQueryBranchContext:
                 ),
                 "dependencyQueryIds": list(self.dependency_query_ids),
                 "dependencyGoalIds": list(self.dependency_goal_ids),
+                "artifactDependencies": [
+                    dict(item) for item in self.artifact_dependencies
+                ],
                 "semanticRefIds": self.semantic_ledger.refs(),
                 "semanticPaths": self.semantic_ledger.paths(),
                 "verifiedArtifactIds": list(self.verified_artifact_ids),

@@ -257,7 +257,8 @@ def scalar_contract() -> GroundedQueryContract:
                 applicable_time_grain="period",
                 time_column="pt",
                 unit="单",
-                anchor_policy="latest_available_partition",
+                calendar_anchor_policy="runtime_current_date",
+                data_as_of_policy="latest_available_partition",
                 time_semantics={
                     "selectionPolicy": "period_window",
                     "asOfPolicy": "latest_available_partition",
@@ -279,7 +280,8 @@ def scalar_contract() -> GroundedQueryContract:
                 applicable_time_grain="period",
                 time_column="pt",
                 unit="元",
-                anchor_policy="latest_available_partition",
+                calendar_anchor_policy="runtime_current_date",
+                data_as_of_policy="latest_available_partition",
                 time_semantics={
                     "selectionPolicy": "period_window",
                     "asOfPolicy": "latest_available_partition",
@@ -294,7 +296,8 @@ def scalar_contract() -> GroundedQueryContract:
             end_date="2026-07-17",
             days=30,
             label="最近30天",
-            anchor_policy="latest_available_partition",
+            calendar_anchor_policy="runtime_current_date",
+            data_as_of_policy="latest_available_partition",
             explicit=True,
         ),
     )
@@ -1528,18 +1531,19 @@ def test_population_server_graph_node_identity_mismatch_never_reaches_doris(
 
 
 @pytest.mark.parametrize(
-    ("inject_gate", "include_reference", "accepted"),
+    ("inject_gate", "include_reference", "accepted", "expected_failure"),
     [
-        (True, False, True),
-        (False, True, True),
-        (True, True, False),
+        (True, False, True, False),
+        (False, True, True, True),
+        (True, True, False, True),
     ],
 )
-def test_population_pre_gate_missing_or_rejected_authority_never_reaches_doris(
+def test_population_pre_gate_applies_only_when_query_binds_a_reference(
     tmp_path: Path,
     inject_gate: bool,
     include_reference: bool,
     accepted: bool,
+    expected_failure: bool,
 ) -> None:
     events: list[str] = []
     gate = RecordingPopulationExecutionGate(
@@ -1554,11 +1558,16 @@ def test_population_pre_gate_missing_or_rejected_authority_never_reaches_doris(
     )
     bundle = values["result"].merged_query_bundle
 
-    assert bundle.failed is True
-    assert "POPULATION_PRE_EXECUTION_REJECTED" in bundle.error
-    assert values["repository"].query_calls == 0
-    assert values["repository"].stream_calls == []
-    assert "stream" not in events
+    assert bundle.failed is expected_failure
+    if expected_failure:
+        assert "POPULATION_PRE_EXECUTION_REJECTED" in bundle.error
+        assert values["repository"].query_calls == 0
+        assert values["repository"].stream_calls == []
+        assert "stream" not in events
+    else:
+        assert gate.calls == []
+        assert len(values["repository"].stream_calls) == 1
+        assert events == ["snapshot", "stream"]
 
 
 def test_publication_revalidates_identity_and_streams_exact_staged_rows(

@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "商品上新全流程全量表，承载商品审核、拒绝、通过、上架、类目和价格信息",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["spu_id", "spu_name", "source_type_name", "level1_category_name", "level2_category_name", "brand_name", "spu_status_name", "spu_auth_price", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 128,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "spu_id",

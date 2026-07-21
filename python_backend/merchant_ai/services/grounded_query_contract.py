@@ -30,6 +30,14 @@ from merchant_ai.models import (
 )
 from merchant_ai.graph.query_graph_contract import query_graph_fingerprint
 from merchant_ai.services.semantic_metrics import seal_semantic_metric_resolution
+from merchant_ai.services.grounded_semantic_ir import (
+    GroundedCalculationGraph,
+    GroundedOutputProjection,
+    GroundedTrustedArtifactDescriptor,
+    bind_calculation_graph_components,
+    calculation_graph_from_metric_asset,
+    compose_query_calculation_graph,
+)
 from merchant_ai.services.time_semantics import (
     extract_temporal_lexical_spans,
     resolve_time_range,
@@ -81,6 +89,7 @@ class GroundedTableBinding(APIModel):
     supports_metrics: bool | None = None
     supported_intents: list[str] = Field(default_factory=list)
     preferred_for: list[str] = Field(default_factory=list)
+    detail_projection_policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class GroundedMetricBinding(APIModel):
@@ -98,12 +107,19 @@ class GroundedMetricBinding(APIModel):
     time_column: str = ""
     unit: str = ""
     aliases: list[str] = Field(default_factory=list)
-    anchor_policy: str = ""
+    data_as_of_policy: str = ""
     time_semantics: dict[str, Any] = Field(default_factory=dict)
     binding_type: str = "published_metric"
     field_aggregation: str = ""
     source_field_ref_id: str = ""
     calculation_capabilities: dict[str, Any] = Field(default_factory=dict)
+    calculation_graph: GroundedCalculationGraph = Field(
+        default_factory=GroundedCalculationGraph
+    )
+    component_metric_refs: list[str] = Field(default_factory=list)
+    component_metric_keys: list[str] = Field(default_factory=list)
+    alignment: dict[str, Any] = Field(default_factory=dict)
+    output_role: str = "REQUESTED"
 
 
 class GroundedDimensionBinding(APIModel):
@@ -296,6 +312,17 @@ class GroundedUpstreamEntityBinding(APIModel):
     requested_phrase: str = ""
 
 
+class GroundedUpstreamArtifactBinding(APIModel):
+    """Server-bound input from one immutable upstream execution-graph edge."""
+
+    artifact_id: str
+    artifact_kind: str
+    source_query_artifact_id: str = ""
+    source_query_node_id: str = ""
+    target_binding_ref: str
+    descriptor: GroundedTrustedArtifactDescriptor
+
+
 class GroundedBindingHints(APIModel):
     table_refs: list[str] = Field(default_factory=list)
     metric_refs: list[str] = Field(default_factory=list)
@@ -311,6 +338,7 @@ class GroundedBindingHints(APIModel):
     relationship_refs: list[str] = Field(default_factory=list)
     ranking: GroundedRankingHint = Field(default_factory=GroundedRankingHint)
     analysis_mode: str = ""
+    detail_projection_mode: str = ""
     time_expression: str = ""
     time_field_ref: str = ""
 
@@ -327,10 +355,18 @@ class GroundedQueryContract(APIModel):
     primary_table: str = ""
     tables: list[GroundedTableBinding] = Field(default_factory=list)
     metrics: list[GroundedMetricBinding] = Field(default_factory=list)
+    internal_metrics: list[GroundedMetricBinding] = Field(default_factory=list)
+    calculation_graph: GroundedCalculationGraph = Field(
+        default_factory=GroundedCalculationGraph
+    )
+    requested_outputs: list[GroundedOutputProjection] = Field(default_factory=list)
     dimensions: list[GroundedDimensionBinding] = Field(default_factory=list)
     selected_fields: list[GroundedSelectedFieldBinding] = Field(default_factory=list)
     entity_filters: list[GroundedEntityFilterBinding] = Field(default_factory=list)
     upstream_entity_bindings: list[GroundedUpstreamEntityBinding] = Field(
+        default_factory=list
+    )
+    upstream_artifact_bindings: list[GroundedUpstreamArtifactBinding] = Field(
         default_factory=list
     )
     relationships: list[GroundedRelationshipBinding] = Field(default_factory=list)
@@ -484,6 +520,7 @@ class GroundedQueryContractBuilder:
                 )
             )
         table_details = self._table_details(documents)
+        hints = self._apply_detail_projection_policy(hints, table_details)
         metrics = self._metric_bindings(
             documents,
             hints.metric_refs,
@@ -498,6 +535,10 @@ class GroundedQueryContractBuilder:
         )
         metrics.extend(field_metrics)
         discovery_gaps.extend(field_metric_gaps)
+        metrics, internal_metrics, dependency_gaps = (
+            self._resolve_metric_dependencies(documents, metrics)
+        )
+        discovery_gaps.extend(dependency_gaps)
         dimensions = self._dimension_bindings(
             documents,
             _dedupe([*hints.dimension_refs, hints.group_by_ref]),
@@ -543,6 +584,7 @@ class GroundedQueryContractBuilder:
 
         selected_tables = _dedupe(
             [binding.table for binding in metrics]
+            + [binding.table for binding in internal_metrics]
             + [binding.table for binding in dimensions]
             + [binding.table for binding in selected_fields]
             + [binding.table for binding in entity_filters]
@@ -562,7 +604,13 @@ class GroundedQueryContractBuilder:
             topic = next(
                 (
                     binding.topic
-                    for binding in [*metrics, *dimensions, *selected_fields, *entity_filters]
+                    for binding in [
+                        *metrics,
+                        *internal_metrics,
+                        *dimensions,
+                        *selected_fields,
+                        *entity_filters,
+                    ]
                     if binding.table == table
                 ),
                 "",
@@ -595,13 +643,18 @@ class GroundedQueryContractBuilder:
             # not evidence that the user supplied a time condition. Entity
             # lookup policy may deliberately remove this fallback entirely.
             time_range.explicit = False
-        anchor_policies = _dedupe(metric.anchor_policy for metric in metrics if metric.anchor_policy)
-        if len(anchor_policies) == 1:
-            time_range.anchor_policy = anchor_policies[0]
+        data_as_of_policies = _dedupe(
+            metric.data_as_of_policy
+            for metric in [*metrics, *internal_metrics]
+            if metric.data_as_of_policy
+        )
+        if len(data_as_of_policies) == 1:
+            time_range.data_as_of_policy = data_as_of_policies[0]
 
         supporting_refs = _dedupe(
             [table.detail_ref_id for table in tables if table.detail_ref_id]
             + [metric.semantic_ref_id for metric in metrics]
+            + [metric.semantic_ref_id for metric in internal_metrics]
             + [dimension.semantic_ref_id for dimension in dimensions]
             + [field.semantic_ref_id for field in selected_fields]
             + [item.semantic_ref_id for item in entity_filters]
@@ -610,6 +663,9 @@ class GroundedQueryContractBuilder:
         )
         evidence_by_ref = {document.ref.ref_id: document.ref for document in documents}
         evidence = [evidence_by_ref[ref_id] for ref_id in supporting_refs if ref_id in evidence_by_ref]
+        query_calculation_graph, output_node_by_ref = (
+            compose_query_calculation_graph(metrics, internal_metrics)
+        )
         contract = GroundedQueryContract(
             question=str(question or "").strip(),
             topics=normalized_topics,
@@ -643,6 +699,19 @@ class GroundedQueryContractBuilder:
             ),
             tables=tables,
             metrics=metrics,
+            internal_metrics=internal_metrics,
+            calculation_graph=query_calculation_graph,
+            requested_outputs=[
+                GroundedOutputProjection(
+                    semantic_ref_id=metric.semantic_ref_id,
+                    output_alias=metric.metric_key,
+                    binding_kind="METRIC",
+                    calculation_node_id=(
+                        output_node_by_ref.get(metric.semantic_ref_id, "")
+                    ),
+                )
+                for metric in metrics
+            ],
             dimensions=dimensions,
             selected_fields=selected_fields,
             entity_filters=entity_filters,
@@ -798,8 +867,69 @@ class GroundedQueryContractBuilder:
                     str(item or "").strip().upper()
                     for item in payload.get("preferredFor") or []
                 ),
+                detail_projection_policy=(
+                    dict(payload.get("detailProjectionPolicy") or {})
+                    if isinstance(payload.get("detailProjectionPolicy"), dict)
+                    else {}
+                ),
             )
         return details
+
+    @staticmethod
+    def _apply_detail_projection_policy(
+        hints: GroundedBindingHints,
+        table_details: dict[str, GroundedTableBinding],
+    ) -> GroundedBindingHints:
+        """Resolve a generic detail request to a reviewed table projection.
+
+        Core may still submit explicit selectedFields.  When it does not, the
+        table's published policy supplies the default projection.  ALL_ALLOWED
+        expands only the policy allowlist; it never becomes SELECT *.
+        """
+
+        mode = str(hints.detail_projection_mode or "").strip().upper()
+        analysis_mode = str(hints.analysis_mode or "").strip().upper()
+        if analysis_mode not in {"DETAIL", "DETAIL_LIST", "LIST", "ENTITY_DETAIL"}:
+            return hints
+        if hints.selected_fields and not mode:
+            return hints
+        if mode in {"EXPLICIT", "FIELDS"} and hints.selected_fields:
+            return hints
+        if len(table_details) != 1:
+            return hints
+        table = next(iter(table_details.values()))
+        policy = table.detail_projection_policy
+        if not policy:
+            return hints
+        if mode in {"ALL", "ALL_ALLOWED", "ALL_VISIBLE"}:
+            refs = [
+                str(item or "").strip()
+                for item in policy.get("allowedFieldRefs") or []
+                if str(item or "").strip()
+            ]
+        else:
+            refs = [
+                str(item.get("fieldRef") or "").strip()
+                for item in policy.get("defaultFields") or []
+                if isinstance(item, dict) and str(item.get("fieldRef") or "").strip()
+            ] or [
+                str(item or "").strip()
+                for item in policy.get("defaultFieldRefs") or []
+                if str(item or "").strip()
+            ]
+        refs = _dedupe(refs)
+        if not refs:
+            return hints
+        return hints.model_copy(
+            update={
+                "detail_projection_mode": mode or "DEFAULT",
+                "selected_fields": [
+                    GroundedSelectedFieldHint(field_ref=ref_id)
+                    for ref_id in refs
+                ],
+            },
+            deep=True,
+        )
 
     @staticmethod
     def _metric_bindings(
@@ -814,58 +944,248 @@ class GroundedQueryContractBuilder:
         for document in metric_documents:
             if document.ref.ref_id not in selected_set:
                 continue
-            payload = document.payload if isinstance(document.payload, dict) else {}
-            metric = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
-            metric_key = str(metric.get("metricKey") or "").strip()
-            table = str(payload.get("tableName") or document.ref.table or "").strip()
-            if not metric_key or not table:
-                continue
-            aliases = _dedupe(
-                [
-                    str(metric.get("businessName") or ""),
-                    str(metric.get("displayName") or ""),
-                    str(metric.get("naturalName") or ""),
-                    *[str(alias) for alias in metric.get("aliases") or []],
-                ]
+            binding = GroundedQueryContractBuilder._metric_binding_from_document(
+                document,
+                requested_phrase=str(label_refs.get(document.ref.ref_id) or ""),
+                question=question,
+                output_role="REQUESTED",
             )
-            phrase = str(
-                label_refs.get(document.ref.ref_id)
-                or _metric_phrase_in_question(question, aliases)
-                or metric.get("businessName")
-                or metric_key
-            )
-            binding = GroundedMetricBinding(
-                requested_phrase=phrase,
-                semantic_ref_id=document.ref.ref_id,
-                topic=str(payload.get("topic") or document.ref.topic or ""),
-                table=table,
-                metric_key=metric_key,
-                business_name=str(metric.get("businessName") or metric_key),
-                formula=str(metric.get("formula") or metric.get("metricFormula") or ""),
-                source_columns=[str(column) for column in metric.get("sourceColumns") or []],
-                aggregation_policy=str(metric.get("aggregationPolicy") or ""),
-                metric_grain=str(metric.get("metricGrain") or ""),
-                applicable_time_grain=str(metric.get("applicableTimeGrain") or ""),
-                time_column=str(metric.get("timeColumn") or ""),
-                unit=str(metric.get("unit") or ""),
-                aliases=aliases,
-                anchor_policy=str((metric.get("timeSemantics") or {}).get("asOfPolicy") or "")
-                if isinstance(metric.get("timeSemantics"), dict)
-                else "",
-                time_semantics=(
-                    dict(metric.get("timeSemantics") or {})
-                    if isinstance(metric.get("timeSemantics"), dict)
-                    else {}
-                ),
-                calculation_capabilities=semantic_evidence_calculation_capabilities(
-                    "METRIC",
-                    payload,
-                ),
-            )
-            bindings.append(binding)
+            if binding is not None:
+                bindings.append(binding)
         order = {ref_id: index for index, ref_id in enumerate(selected_refs)}
         bindings.sort(key=lambda item: (order.get(item.semantic_ref_id, len(order)), item.table, item.metric_key))
         return bindings
+
+    @staticmethod
+    def _metric_binding_from_document(
+        document: _EvidenceDocument,
+        *,
+        requested_phrase: str = "",
+        question: str = "",
+        output_role: str = "REQUESTED",
+    ) -> GroundedMetricBinding | None:
+        payload = document.payload if isinstance(document.payload, dict) else {}
+        metric = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
+        metric_key = str(metric.get("metricKey") or "").strip()
+        table = str(payload.get("tableName") or document.ref.table or "").strip()
+        if not metric_key or not table:
+            return None
+        aliases = _dedupe(
+            [
+                str(metric.get("businessName") or ""),
+                str(metric.get("displayName") or ""),
+                str(metric.get("naturalName") or ""),
+                *[str(alias) for alias in metric.get("aliases") or []],
+            ]
+        )
+        phrase = str(
+            requested_phrase
+            or _metric_phrase_in_question(question, aliases)
+            or metric.get("businessName")
+            or metric_key
+        )
+        topic = str(payload.get("topic") or document.ref.topic or "")
+        calculation_graph = calculation_graph_from_metric_asset(
+            metric,
+            semantic_ref_id=document.ref.ref_id,
+            topic=topic,
+            table=table,
+        )
+        return GroundedMetricBinding(
+            requested_phrase=phrase,
+            semantic_ref_id=document.ref.ref_id,
+            topic=topic,
+            table=table,
+            metric_key=metric_key,
+            business_name=str(metric.get("businessName") or metric_key),
+            formula=str(metric.get("formula") or metric.get("metricFormula") or ""),
+            source_columns=[str(column) for column in metric.get("sourceColumns") or []],
+            aggregation_policy=str(metric.get("aggregationPolicy") or ""),
+            metric_grain=str(metric.get("metricGrain") or ""),
+            applicable_time_grain=str(metric.get("applicableTimeGrain") or ""),
+            time_column=str(metric.get("timeColumn") or ""),
+            unit=str(metric.get("unit") or ""),
+            aliases=aliases,
+            data_as_of_policy=str((metric.get("timeSemantics") or {}).get("asOfPolicy") or "")
+            if isinstance(metric.get("timeSemantics"), dict)
+            else "",
+            time_semantics=(
+                dict(metric.get("timeSemantics") or {})
+                if isinstance(metric.get("timeSemantics"), dict)
+                else {}
+            ),
+            calculation_capabilities=semantic_evidence_calculation_capabilities(
+                "METRIC",
+                payload,
+            ),
+            calculation_graph=calculation_graph,
+            component_metric_refs=list(calculation_graph.component_metric_refs),
+            component_metric_keys=list(calculation_graph.component_metric_keys),
+            alignment=dict(calculation_graph.alignment),
+            output_role=output_role,
+            binding_type=(
+                "composite_metric"
+                if calculation_graph.composite
+                else "published_metric"
+            ),
+        )
+
+    @staticmethod
+    def _resolve_metric_dependencies(
+        documents: Sequence[_EvidenceDocument],
+        requested_metrics: Sequence[GroundedMetricBinding],
+    ) -> tuple[
+        list[GroundedMetricBinding],
+        list[GroundedMetricBinding],
+        list[GroundedContractGap],
+    ]:
+        """Resolve progressively read component metrics without exposing them as outputs."""
+
+        metric_documents = [
+            document for document in documents if document.ref.kind == "METRIC"
+        ]
+        by_ref = {document.ref.ref_id: document for document in metric_documents}
+        by_key: dict[str, list[_EvidenceDocument]] = {}
+        for document in metric_documents:
+            payload = document.payload if isinstance(document.payload, dict) else {}
+            metric = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
+            key = str(metric.get("metricKey") or "").strip()
+            if key:
+                by_key.setdefault(key, []).append(document)
+
+        outputs = [item.model_copy(deep=True) for item in requested_metrics]
+        internals: dict[str, GroundedMetricBinding] = {}
+        gaps: list[GroundedContractGap] = []
+        queue = list(outputs)
+        visited: set[str] = set()
+        while queue:
+            owner = queue.pop(0)
+            if owner.semantic_ref_id in visited:
+                continue
+            visited.add(owner.semantic_ref_id)
+            graph = owner.calculation_graph
+            if not graph.composite:
+                continue
+            resolved_components: list[dict[str, str]] = []
+            component_nodes = [
+                node for node in graph.nodes if node.node_type == "METRIC_REF"
+            ]
+            for node in component_nodes:
+                candidates: list[_EvidenceDocument]
+                if node.semantic_ref_id:
+                    exact = by_ref.get(node.semantic_ref_id)
+                    candidates = [exact] if exact is not None else []
+                else:
+                    candidates = list(by_key.get(node.metric_key, []))
+                if not candidates:
+                    gaps.append(
+                        _gap(
+                            "METRIC_COMPONENT_EVIDENCE_REQUIRED",
+                            "Composite metric %s requires component %s to be progressively read"
+                            % (
+                                owner.metric_key,
+                                node.semantic_ref_id or node.metric_key or "unknown",
+                            ),
+                            "METRIC",
+                            owner.topic,
+                            owner.table,
+                            owner.requested_phrase,
+                            resolution="READ_COMPONENT_METRIC_AND_RESUBMIT",
+                            required_capability={
+                                "candidateRefIds": (
+                                    [node.semantic_ref_id]
+                                    if node.semantic_ref_id
+                                    else []
+                                ),
+                                "requiredMetricKeys": (
+                                    [node.metric_key] if node.metric_key else []
+                                ),
+                            },
+                            rejected_ref_ids=(
+                                [node.semantic_ref_id]
+                                if node.semantic_ref_id
+                                else []
+                            ),
+                        )
+                    )
+                    continue
+                if len(candidates) > 1:
+                    gaps.append(
+                        _gap(
+                            "METRIC_COMPONENT_BINDING_AMBIGUOUS",
+                            "Composite metric component %s resolves to multiple governed metrics"
+                            % (node.metric_key or node.semantic_ref_id),
+                            "METRIC",
+                            owner.topic,
+                            owner.table,
+                            owner.requested_phrase,
+                            resolution="BIND_EXACT_COMPONENT_METRIC_REF",
+                            required_capability={
+                                "candidateRefIds": [
+                                    candidate.ref.ref_id
+                                    for candidate in candidates
+                                ]
+                            },
+                        )
+                    )
+                    continue
+                component = GroundedQueryContractBuilder._metric_binding_from_document(
+                    candidates[0],
+                    requested_phrase=node.metric_key,
+                    output_role="INTERNAL",
+                )
+                if component is None:
+                    continue
+                resolved_components.append(
+                    {
+                        "semanticRefId": component.semantic_ref_id,
+                        "metricKey": component.metric_key,
+                        "table": component.table,
+                        "semanticType": (
+                            next(
+                                (
+                                    node.semantic_type.model_dump(
+                                        by_alias=True,
+                                        mode="json",
+                                    )
+                                    for node in component.calculation_graph.nodes
+                                    if node.node_id
+                                    in component.calculation_graph.output_node_ids
+                                ),
+                                {},
+                            )
+                        ),
+                    }
+                )
+                if component.semantic_ref_id not in internals:
+                    internals[component.semantic_ref_id] = component
+                    queue.append(component)
+            bound_graph = bind_calculation_graph_components(
+                graph,
+                resolved_components,
+            )
+            updated = owner.model_copy(
+                update={
+                    "calculation_graph": bound_graph,
+                    "component_metric_refs": list(
+                        bound_graph.component_metric_refs
+                    ),
+                    "component_metric_keys": list(
+                        bound_graph.component_metric_keys
+                    ),
+                },
+                deep=True,
+            )
+            if owner.output_role == "REQUESTED":
+                outputs = [
+                    updated
+                    if item.semantic_ref_id == owner.semantic_ref_id
+                    else item
+                    for item in outputs
+                ]
+            else:
+                internals[owner.semantic_ref_id] = updated
+        return outputs, list(internals.values()), _dedupe_gaps(gaps)
 
     @staticmethod
     def _field_aggregation_bindings(
@@ -1050,11 +1370,22 @@ class GroundedQueryContractBuilder:
         documents: Sequence[_EvidenceDocument],
         selected: Sequence[GroundedSelectedFieldHint],
     ) -> list[GroundedSelectedFieldBinding]:
-        by_ref = {
-            document.ref.ref_id: document
-            for document in documents
-            if document.ref.kind == "COLUMN"
-        }
+        by_ref: dict[str, tuple[_EvidenceDocument, dict[str, Any]]] = {}
+        for document in documents:
+            if document.ref.kind == "COLUMN":
+                payload = document.payload if isinstance(document.payload, dict) else {}
+                definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else {}
+                by_ref[document.ref.ref_id] = (document, definition)
+            elif document.ref.kind == "TABLE_DETAIL" and isinstance(document.payload, dict):
+                policy = document.payload.get("detailProjectionPolicy")
+                if not isinstance(policy, dict):
+                    continue
+                for item in policy.get("defaultFields") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    ref_id = str(item.get("fieldRef") or "").strip()
+                    if ref_id and ref_id not in by_ref:
+                        by_ref[ref_id] = (document, item)
         bindings: list[GroundedSelectedFieldBinding] = []
         seen: set[str] = set()
         for hint in selected:
@@ -1062,11 +1393,21 @@ class GroundedQueryContractBuilder:
             if not ref_id or ref_id in seen or ref_id not in by_ref:
                 continue
             seen.add(ref_id)
-            document = by_ref[ref_id]
+            document, definition = by_ref[ref_id]
             payload = document.payload if isinstance(document.payload, dict) else {}
-            definition = payload.get("definition") if isinstance(payload.get("definition"), dict) else {}
-            column = str(definition.get("columnName") or definition.get("Field") or "").strip()
-            table = str(payload.get("tableName") or document.ref.table or "").strip()
+            column = str(
+                definition.get("columnName")
+                or definition.get("Field")
+                or definition.get("columnName")
+                or ""
+            ).strip()
+            table = str(
+                payload.get("tableName")
+                or document.ref.table
+                or ""
+            ).strip()
+            if document.ref.kind == "TABLE_DETAIL":
+                column = str(definition.get("columnName") or column).strip()
             if not column or not table:
                 continue
             semantics = _field_usage_semantics(definition)
@@ -1424,7 +1765,8 @@ class GroundedSemanticFitValidator:
     def validate(self, contract: GroundedQueryContract) -> list[GroundedContractGap]:
         gaps: list[GroundedContractGap] = []
         table_by_name = {table.table: table for table in contract.tables}
-        for metric in contract.metrics:
+        all_metrics = [*contract.metrics, *contract.internal_metrics]
+        for metric in all_metrics:
             violations = _metric_usage_policy_violations(contract, metric)
             if not violations:
                 continue
@@ -1479,7 +1821,8 @@ class GroundedSemanticFitValidator:
         """
 
         policies: dict[str, list[GroundedMetricBinding]] = {}
-        for metric in contract.metrics:
+        all_metrics = [*contract.metrics, *contract.internal_metrics]
+        for metric in all_metrics:
             policy = str(
                 metric.time_semantics.get("selectionPolicy") or "period_window"
             ).strip()
@@ -1505,7 +1848,7 @@ class GroundedSemanticFitValidator:
                         "splitExecutionRequired": True,
                     },
                     rejected_ref_ids=[
-                        metric.semantic_ref_id for metric in contract.metrics
+                        metric.semantic_ref_id for metric in all_metrics
                     ],
                 )
             )
@@ -1525,7 +1868,7 @@ class GroundedSemanticFitValidator:
             )
         }
         requested_days = max(0, int(contract.time_range.days or 0))
-        for metric in contract.metrics:
+        for metric in all_metrics:
             policy = str(
                 metric.time_semantics.get("selectionPolicy") or "period_window"
             ).strip()
@@ -1593,6 +1936,7 @@ class GroundedQueryContractValidator:
     def validate(self, contract: GroundedQueryContract) -> GroundedQueryContractValidationResult:
         gaps: list[GroundedContractGap] = []
         evidence_refs = set(contract.evidence_refs)
+        all_metrics = [*contract.metrics, *contract.internal_metrics]
         if not contract.question.strip():
             gaps.append(_gap("QUESTION_REQUIRED", "Original question is required"))
         if not contract.topics:
@@ -1725,7 +2069,10 @@ class GroundedQueryContractValidator:
                         time_field.table,
                     )
                 )
-        for metric in contract.metrics:
+        internal_by_ref = {
+            metric.semantic_ref_id: metric for metric in contract.internal_metrics
+        }
+        for metric in all_metrics:
             if metric.semantic_ref_id not in evidence_refs:
                 gaps.append(_binding_ref_gap("METRIC_EVIDENCE_REF_MISSING", metric.semantic_ref_id, metric.topic, metric.table))
             if not metric.formula:
@@ -1743,6 +2090,162 @@ class GroundedQueryContractValidator:
             )
             if not effective_time_column:
                 gaps.append(_gap("TIME_COLUMN_EVIDENCE_REQUIRED", "Metric %s has no grounded time column" % metric.metric_key, "METRIC", metric.topic, metric.table))
+            if metric.calculation_graph.composite:
+                missing_component_refs = sorted(
+                    set(metric.component_metric_refs) - set(internal_by_ref)
+                )
+                if missing_component_refs:
+                    gaps.append(
+                        _gap(
+                            "METRIC_COMPONENT_BINDING_REQUIRED",
+                            "Composite metric %s is missing grounded component bindings"
+                            % metric.metric_key,
+                            "METRIC",
+                            metric.topic,
+                            metric.table,
+                            metric.requested_phrase,
+                            resolution="READ_COMPONENT_METRIC_AND_RESUBMIT",
+                            required_capability={
+                                "candidateRefIds": missing_component_refs,
+                            },
+                            rejected_ref_ids=missing_component_refs,
+                        )
+                    )
+                component_tables = {
+                    internal_by_ref[ref_id].table
+                    for ref_id in metric.component_metric_refs
+                    if ref_id in internal_by_ref
+                }
+                if len(component_tables) > 1 and not metric.alignment:
+                    gaps.append(
+                        _gap(
+                            "COMPOSITE_METRIC_ALIGNMENT_REQUIRED",
+                            "Cross-table composite metric %s must declare governed grain and time alignment"
+                            % metric.metric_key,
+                            "METRIC",
+                            metric.topic,
+                            metric.table,
+                            metric.requested_phrase,
+                            resolution="READ_OR_PUBLISH_METRIC_ALIGNMENT",
+                            required_capability={
+                                "componentTables": sorted(component_tables),
+                                "requiredAlignment": [
+                                    "entityGrain",
+                                    "timeGrain",
+                                    "timePolicy",
+                                ],
+                            },
+                        )
+                    )
+                if metric.alignment:
+                    required_alignment_fields = {
+                        "entityGrain",
+                        "entityKeys",
+                        "timeGrain",
+                        "timePolicy",
+                        "componentJoinPolicy",
+                        "nullPolicy",
+                    }
+                    missing_alignment_fields = sorted(
+                        field_name
+                        for field_name in required_alignment_fields
+                        if metric.alignment.get(field_name)
+                        in (None, "", [])
+                    )
+                    if missing_alignment_fields:
+                        gaps.append(
+                            _gap(
+                                "COMPOSITE_METRIC_ALIGNMENT_INCOMPLETE",
+                                "Composite metric %s has an incomplete grain/time alignment contract"
+                                % metric.metric_key,
+                                "METRIC",
+                                metric.topic,
+                                metric.table,
+                                metric.requested_phrase,
+                                resolution="READ_OR_PUBLISH_METRIC_ALIGNMENT",
+                                required_capability={
+                                    "missingAlignmentFields": (
+                                        missing_alignment_fields
+                                    )
+                                },
+                            )
+                        )
+                    declared_entity_keys = {
+                        str(item or "").strip()
+                        for item in metric.alignment.get(
+                            "entityKeys",
+                            [],
+                        )
+                        if str(item or "").strip()
+                    }
+                    if len(component_tables) > 1 and not declared_entity_keys:
+                        gaps.append(
+                            _gap(
+                                "COMPOSITE_METRIC_ENTITY_ALIGNMENT_REQUIRED",
+                                "Cross-table composite metric %s has no governed alignment key"
+                                % metric.metric_key,
+                                "METRIC",
+                                metric.topic,
+                                metric.table,
+                                metric.requested_phrase,
+                            )
+                        )
+        artifact_type_compatibility = {
+            "VERIFIED_ENTITY_SET": {"ENTITY_SET"},
+            "VERIFIED_RESULT_ARTIFACT": {"RELATION", "SCALAR"},
+            "VERIFIED_SCALAR": {"SCALAR"},
+            "VERIFIED_BASELINE": {"BASELINE", "SCALAR"},
+        }
+        for upstream in contract.upstream_artifact_bindings:
+            expected_types = artifact_type_compatibility.get(
+                str(upstream.artifact_kind or "").upper(),
+                set(),
+            )
+            if not expected_types:
+                gaps.append(
+                    _gap(
+                        "UPSTREAM_ARTIFACT_KIND_UNSUPPORTED",
+                        "Upstream artifact kind %s is not supported"
+                        % upstream.artifact_kind,
+                        "TRUSTED_ARTIFACT",
+                    )
+                )
+            if upstream.descriptor.artifact_id != upstream.artifact_id:
+                gaps.append(
+                    _gap(
+                        "UPSTREAM_ARTIFACT_IDENTITY_MISMATCH",
+                        "Upstream artifact binding does not match its trusted descriptor",
+                        "TRUSTED_ARTIFACT",
+                    )
+                )
+            if not upstream.descriptor.immutable:
+                gaps.append(
+                    _gap(
+                        "UPSTREAM_ARTIFACT_IMMUTABILITY_REQUIRED",
+                        "Downstream queries may consume only immutable verified artifacts",
+                        "TRUSTED_ARTIFACT",
+                    )
+                )
+            if expected_types and upstream.descriptor.artifact_type not in expected_types:
+                gaps.append(
+                    _gap(
+                        "UPSTREAM_ARTIFACT_TYPE_MISMATCH",
+                        "Upstream artifact type %s cannot satisfy %s"
+                        % (
+                            upstream.descriptor.artifact_type,
+                            upstream.artifact_kind,
+                        ),
+                        "TRUSTED_ARTIFACT",
+                    )
+                )
+            if not upstream.target_binding_ref:
+                gaps.append(
+                    _gap(
+                        "UPSTREAM_ARTIFACT_TARGET_BINDING_REQUIRED",
+                        "Every upstream artifact edge must bind one semantic calculation input",
+                        "TRUSTED_ARTIFACT",
+                    )
+                )
         for table in contract.tables:
             if table.detail_ref_id and table.detail_ref_id not in evidence_refs:
                 gaps.append(_binding_ref_gap("TABLE_EVIDENCE_REF_MISSING", table.detail_ref_id, table.topic, table.table))
@@ -1982,8 +2485,104 @@ class GroundedQueryContractValidator:
                         rejected_ref_ids=[],
                     )
                 )
+        metric_tables = {
+            metric.table for metric in contract.metrics if metric.table
+        }
+        independent_metric_split_required = bool(
+            len(metric_tables) > 1
+            and not any(
+                metric.calculation_graph.composite
+                or metric.component_metric_refs
+                for metric in contract.metrics
+            )
+            and not contract.dimensions
+            and not contract.selected_fields
+            and not contract.entity_filters
+            and not contract.upstream_entity_bindings
+            and not contract.ranking.enabled
+            and not contract.reference_scope.enabled
+        )
         if len(selected_tables) > 1:
-            if not _tables_connected(selected_tables, contract.relationships):
+            if independent_metric_split_required:
+                table_groups = []
+                for table_name in sorted(metric_tables):
+                    table_binding = table_by_name.get(table_name)
+                    metrics = [
+                        metric
+                        for metric in contract.metrics
+                        if metric.table == table_name
+                    ]
+                    table_groups.append(
+                        {
+                            "table": table_name,
+                            "topic": str(
+                                getattr(table_binding, "topic", "") or ""
+                            ),
+                            "tableRef": str(
+                                getattr(
+                                    table_binding,
+                                    "detail_ref_id",
+                                    "",
+                                )
+                                or ""
+                            ),
+                            "metricRefs": [
+                                metric.semantic_ref_id
+                                for metric in metrics
+                            ],
+                            "requestedPhrases": [
+                                metric.requested_phrase
+                                for metric in metrics
+                                if metric.requested_phrase
+                            ],
+                            "metricGrains": sorted(
+                                {
+                                    metric.metric_grain
+                                    for metric in metrics
+                                    if metric.metric_grain
+                                }
+                            ),
+                            "timeColumns": sorted(
+                                {
+                                    metric.time_column
+                                    for metric in metrics
+                                    if metric.time_column
+                                }
+                            ),
+                        }
+                    )
+                gaps.append(
+                    _gap(
+                        "INDEPENDENT_QUERY_SPLIT_REQUIRED",
+                        (
+                            "Metrics bound to different tables are independently "
+                            "aggregatable and must not be converted into an implicit JOIN"
+                        ),
+                        "QUERY_TOPOLOGY",
+                        resolution=(
+                            "REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"
+                        ),
+                        search_scope="CURRENT_READ_EVIDENCE",
+                        required_capability={
+                            "topology": "PARALLEL_INDEPENDENT_QUERIES",
+                            "relationshipEvidenceRequired": False,
+                            "singleContractMergeRequires": {
+                                "sameMetricOwnerTable": True,
+                                "compatibleTimeSemantics": True,
+                                "compatibleGroupingAndPopulation": True,
+                            },
+                            "tableGroups": table_groups,
+                        },
+                        rejected_ref_ids=[
+                            metric.semantic_ref_id
+                            for metric in contract.metrics
+                        ],
+                    )
+                )
+            elif not _tables_connected(
+                selected_tables,
+                contract.relationships,
+            ):
                 gaps.append(
                     _gap(
                         "RELATIONSHIP_EVIDENCE_REQUIRED",
@@ -1991,7 +2590,11 @@ class GroundedQueryContractValidator:
                         "RELATIONSHIPS",
                     )
                 )
-            for relationship in contract.relationships:
+            for relationship in (
+                []
+                if independent_metric_split_required
+                else contract.relationships
+            ):
                 if relationship.semantic_ref_id not in evidence_refs:
                     gaps.append(_binding_ref_gap("RELATIONSHIP_EVIDENCE_REF_MISSING", relationship.semantic_ref_id, relationship.topic, ""))
                 if not relationship.keys:
@@ -2095,7 +2698,7 @@ def materialize_grounded_asset_pack(
             column_evidence[
                 (time_field.table, time_field.partition_pruning_column)
             ] = time_field.semantic_ref_id
-    for metric in grounded.metrics:
+    for metric in [*grounded.metrics, *grounded.internal_metrics]:
         required_columns.setdefault(metric.table, [])
         required_columns[metric.table] = _dedupe(
             [*required_columns[metric.table], *metric.source_columns, metric.time_column]
@@ -2218,6 +2821,7 @@ def materialize_grounded_asset_pack(
             "rowAccessPolicy": deepcopy(asset.get("rowAccessPolicy")),
             "resultAccessPolicies": deepcopy(asset.get("resultAccessPolicies")),
             "tableUsageProfile": execution_usage_policy,
+            "detailProjectionPolicy": deepcopy(table.detail_projection_policy),
             "status": asset.get("status"),
             "version": asset.get("version") or asset.get("semanticVersion"),
             "visibilityPolicy": deepcopy(asset.get("visibilityPolicy")),
@@ -2283,7 +2887,7 @@ def materialize_grounded_asset_pack(
             "timeSemantics": (
                 dict(metric.time_semantics)
                 if metric.time_semantics
-                else {"asOfPolicy": metric.anchor_policy}
+                else {"asOfPolicy": metric.data_as_of_policy}
             ),
             "groundedEvidenceRef": metric.semantic_ref_id,
             "bindingType": metric.binding_type,
@@ -2361,7 +2965,7 @@ def materialize_grounded_asset_pack(
                 "timeSemantics": (
                     dict(metric.time_semantics)
                     if metric.time_semantics
-                    else {"asOfPolicy": metric.anchor_policy}
+                    else {"asOfPolicy": metric.data_as_of_policy}
                 ),
                 "semanticRefId": metric.semantic_ref_id,
                 "bindingType": metric.binding_type,
@@ -2590,7 +3194,7 @@ def compile_grounded_query(
                 "timeSemantics": (
                     dict(metric.time_semantics)
                     if metric.time_semantics
-                    else {"asOfPolicy": metric.anchor_policy}
+                    else {"asOfPolicy": metric.data_as_of_policy}
                 ),
                 "unit": metric.unit,
                 "bindingType": metric.binding_type,
@@ -2627,7 +3231,7 @@ def compile_grounded_query(
             "timeSemantics": (
                 dict(metric.time_semantics)
                 if metric.time_semantics
-                else {"asOfPolicy": metric.anchor_policy}
+                else {"asOfPolicy": metric.data_as_of_policy}
             ),
             "unit": metric.unit,
             "bindingType": metric.binding_type,
@@ -3731,6 +4335,13 @@ def _normalize_binding_hints(
         elif any(token in intent for token in ("METRIC", "SCALAR", "SUMMARY")):
             payload["analysisMode"] = "metric_total"
 
+    if payload.get("detailProjectionMode") or payload.get("detail_projection_mode"):
+        payload["detailProjectionMode"] = str(
+            payload.get("detailProjectionMode")
+            or payload.get("detail_projection_mode")
+            or ""
+        ).strip().upper()
+
     # Core models commonly express the canonical shape as ``RANKED`` and bind
     # the sole grouping field through ``dimensionRefs`` without repeating it
     # as ``groupByRef``.  That proposal is unambiguous when there is exactly
@@ -4072,6 +4683,7 @@ _REVISE_BINDING_GAP_CODES = {
     "METRIC_TIME_GRAIN_MISMATCH",
     "RELATIONSHIP_ENDPOINT_TABLE_BINDING_REQUIRED",
     "DETAIL_RELATIONSHIP_BINDING_AMBIGUOUS",
+    "INDEPENDENT_QUERY_SPLIT_REQUIRED",
 }
 
 

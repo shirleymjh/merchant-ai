@@ -15,7 +15,8 @@ from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.text_parsing import contains_any_literal, is_ascii_identifier
 from merchant_ai.services.time_semantics import (
-    CALENDAR_ANCHOR_POLICY,
+    EXPLICIT_DATE_RANGE_CALENDAR_POLICY,
+    LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY,
     latest_as_of_partition_predicate_sql,
     latest_partition_anchor_sql,
     latest_partition_window_predicate,
@@ -232,7 +233,7 @@ def quick_metric_response(
                 "selectionMode": "latest_as_of",
                 "executionStartValue": latest_partition,
                 "executionEndValue": latest_partition,
-                "executionAnchorPolicy": "resolved_as_of_partition",
+                "executionBoundaryPolicy": "resolved_as_of_partition",
                 "executionRule": "use only the resolved as-of partition",
             }
         )
@@ -497,13 +498,20 @@ def quick_metric_time_filter(
     aggregation_policy: str = "",
     as_of_policy: str = "",
 ) -> tuple[str, list[Any]]:
+    effective_data_as_of_policy = str(
+        as_of_policy or getattr(time_range, "data_as_of_policy", "") or ""
+    ).strip().lower()
     if str(aggregation_policy or "").strip().lower() == "latest_value_only":
         resolved_as_of = str(
             getattr(time_range, "execution_end_value", "")
             or getattr(time_range, "execution_end_date", "")
             or ""
         ).strip()
-        if not resolved_as_of and getattr(time_range, "anchor_policy", "") == CALENDAR_ANCHOR_POLICY:
+        if (
+            not resolved_as_of
+            and getattr(time_range, "calendar_anchor_policy", "")
+            == EXPLICIT_DATE_RANGE_CALENDAR_POLICY
+        ):
             resolved_as_of = str(getattr(time_range, "end_date", "") or "").strip()
         if resolved_as_of:
             params: list[Any] = []
@@ -528,7 +536,8 @@ def quick_metric_time_filter(
         )
         return "`%s` = %s" % (time_column, anchor_sql), [merchant_id] if tenant_column else []
     if (
-        getattr(time_range, "anchor_policy", "") == CALENDAR_ANCHOR_POLICY
+        effective_data_as_of_policy
+        != LATEST_AVAILABLE_PARTITION_DATA_AS_OF_POLICY
         and getattr(time_range, "start_date", "")
         and getattr(time_range, "end_date", "")
     ):

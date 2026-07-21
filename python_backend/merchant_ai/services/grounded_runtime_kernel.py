@@ -47,10 +47,14 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedQueryContract,
     GroundedQueryContractBuilder,
     GroundedReferenceScopeBinding,
+    GroundedUpstreamArtifactBinding,
     GroundedUpstreamEntityBinding,
     compile_deterministic_grounded_query,
     materialize_grounded_asset_pack,
     requested_semantic_label,
+)
+from merchant_ai.services.grounded_contract_repair import (
+    build_contract_repair_directive,
 )
 from merchant_ai.services.grounded_execution_policy import (
     DETERMINISTIC_EXECUTION_MODES,
@@ -88,6 +92,12 @@ from merchant_ai.services.grounded_semantic_activation import (
     semantic_activation_seal_valid,
     valid_semantic_activation_fingerprint,
 )
+from merchant_ai.services.grounded_semantic_ir import (
+    GroundedTrustedArtifactDescriptor,
+    compose_query_calculation_graph,
+    trusted_entity_set_descriptor,
+    trusted_query_artifact_descriptor,
+)
 
 if TYPE_CHECKING:
     from merchant_ai.services.grounded_population_runtime_gate import (
@@ -102,6 +112,11 @@ DEFAULT_ACCESS_ROLE = load_authorization_policy().default_access_role
 class GroundedRuntimeAttempt(APIModel):
     attempt_id: str
     contract: GroundedQueryContract
+    contract_version: int = 1
+    parent_attempt_id: str = ""
+    parent_contract_fingerprint: str = ""
+    repair_type: str = "NONE"
+    repair_directive: dict[str, Any] = Field(default_factory=dict)
     status: str = "PROPOSED"
     compile_status: str = "NOT_ATTEMPTED"
     activation_status: str = "NOT_ATTEMPTED"
@@ -121,6 +136,9 @@ class GroundedRuntimeAttempt(APIModel):
 class GroundedRuntimeSqlCandidateAttempt(APIModel):
     candidate_id: str
     active_generation: int
+    candidate_version: int = 1
+    parent_candidate_id: str = ""
+    parent_ast_fingerprint: str = ""
     status: str = "PROPOSED"
     next_action: str = "REPAIR_SQL"
     ast_fingerprint: str = ""
@@ -162,6 +180,7 @@ class GroundedVerifiedQueryArtifact(APIModel):
     semantic_activation_seal_fingerprint: str = ""
     semantic_activation_topics: list[str] = Field(default_factory=list)
     ledger_fingerprint: str = ""
+    trusted_descriptor: Optional[GroundedTrustedArtifactDescriptor] = None
     created_at: str = ""
 
 
@@ -189,6 +208,7 @@ class GroundedVerifiedEntitySet(APIModel):
     value_count: int = 0
     truncated: bool = False
     values_hash: str = ""
+    trusted_descriptor: Optional[GroundedTrustedArtifactDescriptor] = None
     created_at: str = ""
 
 
@@ -295,6 +315,9 @@ class GroundedRuntimeSession(APIModel):
         default_factory=list
     )
     verified_entity_sets: list[GroundedVerifiedEntitySet] = Field(
+        default_factory=list
+    )
+    upstream_artifact_bindings: list[GroundedUpstreamArtifactBinding] = Field(
         default_factory=list
     )
     answer_plan: Optional[QueryPlan] = None
@@ -407,6 +430,10 @@ class GroundedRuntimeKernel:
         workspace_topics: Sequence[str] | None = None,
         objective: str = "",
         inherit_entity_set_ids: Sequence[str] | None = None,
+        inherit_query_artifact_ids: Sequence[str] | None = None,
+        upstream_artifact_bindings: Sequence[
+            GroundedUpstreamArtifactBinding
+        ] | None = None,
     ) -> GroundedRuntimeSession:
         """Create an isolated execution branch for one independent query goal.
 
@@ -518,6 +545,66 @@ class GroundedRuntimeKernel:
                 for item in requested_entity_set_ids
             ]
             branch.verified_query_ledger = source_queries
+        requested_query_artifact_ids = _dedupe(
+            inherit_query_artifact_ids or []
+        )
+        if requested_query_artifact_ids:
+            with self._lock:
+                query_artifacts = {
+                    item.artifact_id: item.model_copy(deep=True)
+                    for item in session.verified_query_ledger
+                    if item.artifact_id
+                    in set(requested_query_artifact_ids)
+                    and item.verified_evidence.passed
+                }
+            missing_query_artifacts = [
+                artifact_id
+                for artifact_id in requested_query_artifact_ids
+                if artifact_id not in query_artifacts
+            ]
+            if missing_query_artifacts:
+                raise RuntimeError(
+                    "VERIFIED_QUERY_ARTIFACT_NOT_FOUND:%s"
+                    % ",".join(missing_query_artifacts)
+                )
+            inherited = {
+                item.artifact_id: item
+                for item in branch.verified_query_ledger
+            }
+            inherited.update(query_artifacts)
+            branch.verified_query_ledger = list(inherited.values())
+        normalized_upstream_bindings = [
+            item.model_copy(deep=True)
+            for item in (upstream_artifact_bindings or [])
+        ]
+        expected_scope_fingerprint = grounded_context_owner_fingerprint(
+            session.merchant_id,
+            session.access_role,
+            session.user_scope,
+        )
+        inherited_query_ids = {
+            item.artifact_id for item in branch.verified_query_ledger
+        }
+        for binding in normalized_upstream_bindings:
+            descriptor = binding.descriptor
+            if not descriptor.immutable:
+                raise RuntimeError("UPSTREAM_ARTIFACT_MUST_BE_IMMUTABLE")
+            if descriptor.artifact_id != binding.artifact_id:
+                raise RuntimeError("UPSTREAM_ARTIFACT_IDENTITY_MISMATCH")
+            if (
+                descriptor.merchant_scope_fingerprint
+                and descriptor.merchant_scope_fingerprint
+                != expected_scope_fingerprint
+            ):
+                raise RuntimeError("UPSTREAM_ARTIFACT_MERCHANT_SCOPE_MISMATCH")
+            if binding.artifact_id not in inherited_query_ids:
+                raise RuntimeError(
+                    "UPSTREAM_QUERY_ARTIFACT_NOT_INHERITED:%s"
+                    % binding.artifact_id
+                )
+            if not binding.target_binding_ref:
+                raise RuntimeError("UPSTREAM_ARTIFACT_TARGET_BINDING_REQUIRED")
+        branch.upstream_artifact_bindings = normalized_upstream_bindings
         branch.phase = "BRANCH_CREATED"
         self._event(
             branch,
@@ -1122,6 +1209,58 @@ class GroundedRuntimeKernel:
             now=now,
             default_days=default_days,
         )
+        if session.upstream_artifact_bindings:
+            query_calculation_graph, output_node_by_ref = (
+                compose_query_calculation_graph(
+                    contract.metrics,
+                    contract.internal_metrics,
+                    session.upstream_artifact_bindings,
+                )
+            )
+            contract = contract.model_copy(
+                update={
+                    "upstream_artifact_bindings": [
+                        item.model_copy(deep=True)
+                        for item in session.upstream_artifact_bindings
+                    ],
+                    "calculation_graph": query_calculation_graph,
+                    "requested_outputs": [
+                        item.model_copy(
+                            update={
+                                "calculation_node_id": output_node_by_ref.get(
+                                    item.semantic_ref_id,
+                                    item.calculation_node_id,
+                                )
+                            },
+                            deep=True,
+                        )
+                        for item in contract.requested_outputs
+                    ],
+                },
+                deep=True,
+            )
+            validator = getattr(self.contract_builder, "validator", None)
+            if validator is not None and callable(
+                getattr(validator, "validate", None)
+            ):
+                validation = validator.validate(contract)
+                combined_gaps = _dedupe_contract_gaps(
+                    [
+                        *contract.unresolved_gaps,
+                        *validation.gaps,
+                    ]
+                )
+                contract = contract.model_copy(
+                    update={
+                        "status": (
+                            "UNRESOLVED"
+                            if any(gap.blocking for gap in combined_gaps)
+                            else "READY"
+                        ),
+                        "unresolved_gaps": combined_gaps,
+                    },
+                    deep=True,
+                )
         if session.reference_scope.enabled:
             contract = self._attach_reference_scope(
                 contract,
@@ -1149,16 +1288,61 @@ class GroundedRuntimeKernel:
                 },
                 deep=True,
             )
+        attempt_id = "attempt_%s" % uuid.uuid4().hex[:12]
+        with self._lock:
+            parent_attempt = session.attempts[-1] if session.attempts else None
+            parent_attempt_id = str(
+                getattr(parent_attempt, "attempt_id", "") or ""
+            )
+            parent_contract_fingerprint = (
+                grounded_query_contract_fingerprint(parent_attempt.contract)
+                if parent_attempt is not None
+                else ""
+            )
+            contract_version = (
+                int(getattr(parent_attempt, "contract_version", 0) or 0) + 1
+                if parent_attempt is not None
+                else 1
+            )
+        contract_fingerprint = grounded_query_contract_fingerprint(contract)
+        repair_directive = build_contract_repair_directive(
+            contract.unresolved_gaps,
+            contract_status=contract.status,
+            base_attempt_id=attempt_id,
+            base_contract_fingerprint=contract_fingerprint,
+            contract_version=contract_version,
+            parent_attempt_id=parent_attempt_id,
+            parent_contract_fingerprint=parent_contract_fingerprint,
+        )
         attempt = GroundedRuntimeAttempt(
-            attempt_id="attempt_%s" % uuid.uuid4().hex[:12],
+            attempt_id=attempt_id,
             contract=contract,
+            contract_version=contract_version,
+            parent_attempt_id=parent_attempt_id,
+            parent_contract_fingerprint=parent_contract_fingerprint,
+            repair_type=repair_directive.repair_type,
+            repair_directive=repair_directive.model_dump(
+                by_alias=True,
+                mode="json",
+            ),
             status=contract.status,
+            validation_gaps=[
+                gap.model_dump(by_alias=True, mode="json")
+                for gap in contract.unresolved_gaps
+            ],
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._apply_execution_policy(attempt)
+        if repair_directive.repair_type != "NONE":
+            attempt.next_action = repair_directive.next_action
+        repair_phase = (
+            "QUERY_REPAIR_REQUIRED"
+            if repair_directive.repair_type != "NONE"
+            else "CONTRACT_PROPOSED"
+        )
         with self._lock:
             session.attempts.append(attempt)
-            session.phase = "CONTRACT_PROPOSED"
+            session.phase = repair_phase
             self._event(
                 session,
                 "propose_contract",
@@ -1647,10 +1831,25 @@ class GroundedRuntimeKernel:
                 for item in session.sql_candidate_attempts
                 if item.active_generation == generation
             ]
+        parent_candidate = prior_attempts[-1] if prior_attempts else None
+        candidate_version = (
+            max(int(item.candidate_version or 0) for item in prior_attempts) + 1
+            if prior_attempts
+            else 1
+        )
+        parent_candidate_id = str(
+            getattr(parent_candidate, "candidate_id", "") or ""
+        )
+        parent_ast_fingerprint = str(
+            getattr(parent_candidate, "ast_fingerprint", "") or ""
+        )
         if len(prior_attempts) >= 3:
             exhausted = GroundedRuntimeSqlCandidateAttempt(
                 candidate_id="sql_%s" % uuid.uuid4().hex[:12],
                 active_generation=generation,
+                candidate_version=candidate_version,
+                parent_candidate_id=parent_candidate_id,
+                parent_ast_fingerprint=parent_ast_fingerprint,
                 status="REPAIR_EXHAUSTED",
                 next_action="REVISE_BINDINGS",
                 validation_gaps=[
@@ -1707,6 +1906,9 @@ class GroundedRuntimeKernel:
             failed = GroundedRuntimeSqlCandidateAttempt(
                 candidate_id="sql_%s" % uuid.uuid4().hex[:12],
                 active_generation=generation,
+                candidate_version=candidate_version,
+                parent_candidate_id=parent_candidate_id,
+                parent_ast_fingerprint=parent_ast_fingerprint,
                 status="VALIDATOR_INTERNAL_ERROR",
                 next_action="STOP_INTERNAL",
                 contract_fingerprint=contract_fingerprint,
@@ -1778,10 +1980,15 @@ class GroundedRuntimeKernel:
             no_progress = GroundedRuntimeSqlCandidateAttempt(
                 candidate_id="sql_%s" % uuid.uuid4().hex[:12],
                 active_generation=generation,
+                candidate_version=candidate_version,
+                parent_candidate_id=parent_candidate_id,
+                parent_ast_fingerprint=parent_ast_fingerprint,
                 status="NO_PROGRESS",
                 next_action=(
                     "REVISE_BINDINGS"
                     if duplicate.next_action == "REVISE_BINDINGS"
+                    else "REPAIR_SQL_OR_BINDINGS"
+                    if duplicate.next_action == "REPAIR_SQL_OR_BINDINGS"
                     else "REPAIR_SQL"
                 ),
                 ast_fingerprint=validation.ast_fingerprint,
@@ -1809,7 +2016,13 @@ class GroundedRuntimeKernel:
                         progress_fingerprint
                     )
                 self._clear_active_sql_candidate(session)
-                session.phase = "CORE_SQL_NO_PROGRESS"
+                session.phase = (
+                    "CORE_BINDING_REPAIR_REQUIRED"
+                    if no_progress.next_action == "REVISE_BINDINGS"
+                    else "CORE_QUERY_REPAIR_REQUIRED"
+                    if no_progress.next_action == "REPAIR_SQL_OR_BINDINGS"
+                    else "CORE_SQL_NO_PROGRESS"
+                )
                 session.revision += 1
                 self._event(
                     session,
@@ -1824,6 +2037,9 @@ class GroundedRuntimeKernel:
         attempt = GroundedRuntimeSqlCandidateAttempt(
             candidate_id="sql_%s" % uuid.uuid4().hex[:12],
             active_generation=generation,
+            candidate_version=candidate_version,
+            parent_candidate_id=parent_candidate_id,
+            parent_ast_fingerprint=parent_ast_fingerprint,
             status="ACCEPTED" if validation.valid else "REJECTED",
             next_action=(
                 "EXECUTE_GROUNDED_QUERY" if validation.valid else next_action
@@ -1845,7 +2061,13 @@ class GroundedRuntimeKernel:
                     progress_fingerprint
                 )
                 self._clear_active_sql_candidate(session)
-                session.phase = "CORE_SQL_REPAIR_REQUIRED"
+                session.phase = (
+                    "CORE_BINDING_REPAIR_REQUIRED"
+                    if next_action == "REVISE_BINDINGS"
+                    else "CORE_QUERY_REPAIR_REQUIRED"
+                    if next_action == "REPAIR_SQL_OR_BINDINGS"
+                    else "CORE_SQL_REPAIR_REQUIRED"
+                )
                 session.revision += 1
                 self._event(
                     session,
@@ -2745,6 +2967,63 @@ class GroundedRuntimeKernel:
                 return None
             return session.verified_query_ledger[-1].model_copy(deep=True)
 
+    def attach_verified_artifact_goals(
+        self,
+        session: GroundedRuntimeSession,
+        artifact_id: str,
+        goal_ids: Sequence[str],
+    ) -> GroundedVerifiedQueryArtifact:
+        """Version the trusted descriptor with server-assigned Goal coverage."""
+
+        normalized_goal_ids = _dedupe(goal_ids)
+        with self._lock:
+            index = next(
+                (
+                    index
+                    for index, item in enumerate(session.verified_query_ledger)
+                    if item.artifact_id == artifact_id
+                ),
+                -1,
+            )
+            if index < 0:
+                raise RuntimeError(
+                    "VERIFIED_QUERY_ARTIFACT_NOT_FOUND:%s" % artifact_id
+                )
+            artifact = session.verified_query_ledger[index].model_copy(
+                deep=True
+            )
+            descriptor = artifact.trusted_descriptor or (
+                trusted_query_artifact_descriptor(
+                    artifact,
+                    merchant_scope_fingerprint=(
+                        grounded_context_owner_fingerprint(
+                            session.merchant_id,
+                            session.access_role,
+                            session.user_scope,
+                        )
+                    ),
+                )
+            )
+            descriptor = descriptor.model_copy(
+                update={"covered_goal_ids": normalized_goal_ids},
+                deep=True,
+            )
+            artifact.trusted_descriptor = descriptor
+            artifact.ledger_fingerprint = (
+                verified_query_artifact_integrity_fingerprint(artifact)
+            )
+            session.verified_query_ledger[index] = artifact
+            session.revision += 1
+            self._event(
+                session,
+                "attach_verified_artifact_goals",
+                "UPDATED",
+                "artifact=%s;goals=%d"
+                % (artifact_id, len(normalized_goal_ids)),
+                artifact.attempt_id,
+            )
+            return artifact.model_copy(deep=True)
+
     @staticmethod
     def _all_result_bundles(
         run_result: AgentRunResult,
@@ -3416,6 +3695,19 @@ class GroundedRuntimeKernel:
             values_hash=values_hash,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
+        published = published.model_copy(
+            update={
+                "trusted_descriptor": trusted_entity_set_descriptor(
+                    published,
+                    merchant_scope_fingerprint=grounded_context_owner_fingerprint(
+                        session.merchant_id,
+                        session.access_role,
+                        session.user_scope,
+                    ),
+                )
+            },
+            deep=True,
+        )
         with self._lock:
             existing = next(
                 (
@@ -3599,6 +3891,19 @@ class GroundedRuntimeKernel:
                 else []
             ),
             created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        artifact = artifact.model_copy(
+            update={
+                "trusted_descriptor": trusted_query_artifact_descriptor(
+                    artifact,
+                    merchant_scope_fingerprint=grounded_context_owner_fingerprint(
+                        session.merchant_id,
+                        session.access_role,
+                        session.user_scope,
+                    ),
+                )
+            },
+            deep=True,
         )
         artifact.ledger_fingerprint = (
             verified_query_artifact_integrity_fingerprint(artifact)
@@ -3903,18 +4208,26 @@ class GroundedRuntimeKernel:
     ) -> str:
         revise_binding_codes = {
             "GROUNDED_CONTRACT_NOT_READY",
-            "SQL_TABLE_NOT_GROUNDED",
-            "SQL_COLUMN_NOT_GROUNDED",
-            "SQL_JOIN_SOURCE_UNRESOLVED",
-            "SQL_JOIN_NOT_GOVERNED",
-            "SQL_CORRELATED_RELATIONSHIP_UNPROVEN",
             "SQL_GOVERNED_FORMULA_INVALID",
+            "SQL_GOVERNED_COMPOSITE_FORMULA_INVALID",
         }
         if any(
             gap.blocking and gap.code in revise_binding_codes
             for gap in validation.gaps
         ):
             return "REVISE_BINDINGS"
+        sql_or_binding_codes = {
+            "SQL_TABLE_NOT_GROUNDED",
+            "SQL_COLUMN_NOT_GROUNDED",
+            "SQL_JOIN_SOURCE_UNRESOLVED",
+            "SQL_JOIN_NOT_GOVERNED",
+            "SQL_CORRELATED_RELATIONSHIP_UNPROVEN",
+        }
+        if any(
+            gap.blocking and gap.code in sql_or_binding_codes
+            for gap in validation.gaps
+        ):
+            return "REPAIR_SQL_OR_BINDINGS"
         return "REPAIR_SQL"
 
     @staticmethod
@@ -4336,6 +4649,14 @@ def verified_query_artifact_integrity_fingerprint(
             "resultArtifactReceipts": [
                 dict(item) for item in artifact.result_artifact_receipts
             ],
+            "trustedDescriptor": (
+                artifact.trusted_descriptor.model_dump(
+                    by_alias=True,
+                    mode="json",
+                )
+                if artifact.trusted_descriptor is not None
+                else None
+            ),
         }
     )
 
@@ -4457,6 +4778,32 @@ def _namespace_artifact_plan(plan: QueryPlan, artifact_id: str) -> QueryPlan:
         _namespace_task_id(artifact_id, task_id): list(columns)
         for task_id, columns in result.final_evidence_column_hints.items()
     }
+    result.evidence_contracts = [
+        {
+            **dict(contract),
+            **(
+                {
+                    "taskId": _namespace_task_id(
+                        artifact_id,
+                        str(contract.get("taskId") or ""),
+                    )
+                }
+                if str(contract.get("taskId") or "").strip()
+                else {}
+            ),
+            **(
+                {
+                    "task_id": _namespace_task_id(
+                        artifact_id,
+                        str(contract.get("task_id") or ""),
+                    )
+                }
+                if str(contract.get("task_id") or "").strip()
+                else {}
+            ),
+        }
+        for contract in result.evidence_contracts
+    ]
     understanding = dict(result.question_understanding or {})
     understanding["verifiedQueryArtifactId"] = artifact_id
     result.question_understanding = understanding
@@ -4800,6 +5147,22 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
         text = str(value or "").strip()
         if text and text not in result:
             result.append(text)
+    return result
+
+
+def _dedupe_contract_gaps(
+    gaps: Iterable[GroundedContractGap],
+) -> list[GroundedContractGap]:
+    result: list[GroundedContractGap] = []
+    seen: set[str] = set()
+    for gap in gaps:
+        identity = _stable_json_hash(
+            gap.model_dump(by_alias=True, mode="json")
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(gap)
     return result
 
 

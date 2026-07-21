@@ -19,6 +19,7 @@ from merchant_ai.services.grounded_goal_contract import (
     GoalCoverageVerifier,
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
+    OriginalQuestionGoalDeclaration,
     RankingQuestionGoal,
     RuleQuestionGoal,
     TimeWindowQuestionGoal,
@@ -31,6 +32,16 @@ from merchant_ai.services.grounded_goal_contract import (
     required_goal_ids,
     validate_original_question_goal_contract,
 )
+
+
+def test_goal_declaration_schema_matches_runtime_validation() -> None:
+    schema = OriginalQuestionGoalDeclaration.model_json_schema(by_alias=True)
+    assert "question" not in schema.get("properties", {})
+    time_schema = schema["$defs"]["TimeWindowQuestionGoal"]
+    assert "timeExpression" in time_schema.get("required", [])
+    assert "anchorPolicy" not in time_schema.get("properties", {})
+    assert "calendarAnchorPolicy" in time_schema.get("properties", {})
+    assert "dataAsOfPolicy" in time_schema.get("properties", {})
 
 
 def simple_contract() -> OriginalQuestionGoalContract:
@@ -287,7 +298,7 @@ def test_ranking_limit_is_never_silently_defaulted() -> None:
     assert "RANKING_LIMIT_REQUIRED" in {issue.code for issue in result.issues}
 
 
-def test_ranking_population_scope_must_be_declared_by_core() -> None:
+def test_ranking_defaults_to_its_own_matching_rows_without_execution_scope() -> None:
     result = validate_original_question_goal_contract(
         {
             "question": "Return a ranked result",
@@ -304,11 +315,34 @@ def test_ranking_population_scope_must_be_declared_by_core() -> None:
         }
     )
 
-    assert result.valid is False
-    assert result.contract is None
-    assert {issue.code for issue in result.issues} == {
-        "GOAL_CONTRACT_SCHEMA_INVALID"
-    }
+    assert result.valid is True
+    assert result.contract is not None
+    ranking = result.contract.goal_map()["ranking.alpha"]
+    assert ranking.population_scope == "ALL_MATCHING_ROWS"
+    assert ranking.population_goal_ids == []
+
+
+def test_legacy_population_fields_on_detail_are_discarded() -> None:
+    result = validate_original_question_goal_contract(
+        {
+            "question": "Return recent order details",
+            "goals": [
+                {
+                    "goalId": "detail.orders",
+                    "kind": "DETAIL",
+                    "label": "order details",
+                    "populationScope": "VERIFIED_PREDICATE_SCOPE",
+                    "populationGoalIds": ["entity.orders"],
+                }
+            ],
+        }
+    )
+
+    assert result.valid is True
+    assert result.contract is not None
+    detail = result.contract.goal_map()["detail.orders"]
+    assert not hasattr(detail, "population_scope")
+    assert not hasattr(detail, "population_goal_ids")
 
 
 def test_explicit_all_matching_rows_population_is_accepted() -> None:
@@ -906,7 +940,7 @@ def test_scalar_artifact_cannot_claim_anomaly_analysis_is_covered() -> None:
                 days=7,
                 timezone="Asia/Shanghai",
                 explicit=True,
-                anchor_policy="calendar",
+                calendar_anchor_policy="runtime_current_date",
                 window_role="primary",
                 kind="rolling",
             ),
@@ -954,7 +988,7 @@ def test_anomaly_proof_requires_baseline_and_normalization() -> None:
                         "days": 7,
                         "label": "最近7天",
                         "explicit": True,
-                        "anchorPolicy": "calendar",
+                        "calendarAnchorPolicy": "runtime_current_date",
                         "windowRole": "primary",
                         "timeRangeKind": "rolling",
                     },
@@ -1010,7 +1044,7 @@ def test_explicit_insufficient_evidence_resolves_but_does_not_prove_goal() -> No
                         "days": 7,
                         "label": "最近7天",
                         "explicit": True,
-                        "anchorPolicy": "calendar",
+                        "calendarAnchorPolicy": "runtime_current_date",
                         "windowRole": "primary",
                         "timeRangeKind": "rolling",
                     },

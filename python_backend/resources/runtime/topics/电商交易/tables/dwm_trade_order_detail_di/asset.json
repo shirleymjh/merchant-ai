@@ -56,6 +56,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "订单/子订单明细表，承载订单状态、商品、支付金额、发货履约等明细",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["order_id", "sub_order_id", "pt", "sub_order_status_name", "buyer_name", "sku_id", "sku_name", "sku_cnt", "pay_amt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 128,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "order_id",

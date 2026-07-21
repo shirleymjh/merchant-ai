@@ -482,7 +482,9 @@ def test_recovery_keeps_latest_unresolved_contract_and_graph_rejection(
     attempt = payload["latestUnresolvedContractAttempt"]
     assert attempt["attemptId"] == "attempt-unresolved"
     assert attempt["status"] == "UNRESOLVED"
-    assert attempt["nextAction"] == "RESOLVE_CONTRACT"
+    assert attempt["nextAction"] == (
+        "CHOOSE_SAFE_REPAIR_AND_SUBMIT_NEW_VERSION"
+    )
     assert attempt["acceptedBindingHints"]["timeFieldRef"] == time_ref
     assert attempt["gaps"][0]["code"] == "TIME_FIELD_REF_NOT_READ"
     assert attempt["gaps"][0]["rejectedRefIds"] == [time_ref]
@@ -494,27 +496,14 @@ def test_recovery_keeps_latest_unresolved_contract_and_graph_rejection(
             "sourceGapCode": "TIME_FIELD_REF_NOT_READ",
         }
     ]
-    assert attempt["repairOptions"] == [
-        {
-            "gapCode": "TIME_FIELD_REF_NOT_READ",
-            "resolution": (
-                "READ_EXACT_TIME_FIELD_OR_REMOVE_OPTIONAL_HINT"
-            ),
-            "searchScope": "CURRENT_TABLE_COLUMNS",
-            "requiredCapability": {
-                "readNext": [
-                    {
-                        "refId": time_ref,
-                        "path": (
-                            "topics/profile/tables/daily/columns/pt.json"
-                        ),
-                    }
-                ],
-                "candidateTimeFieldRefs": [time_ref],
-            },
-            "rejectedRefIds": [time_ref],
-        }
-    ]
+    assert attempt["repairOptions"][0]["gapCode"] == (
+        "TIME_FIELD_REF_NOT_READ"
+    )
+    assert attempt["repairOptions"][0]["type"] == (
+        "READ_EXACT_TIME_FIELD_OR_REMOVE_OPTIONAL_HINT"
+    )
+    assert attempt["repairDirective"]["status"] == "REPAIR_REQUIRED"
+    assert attempt["repairDirective"]["repairType"] == "EVIDENCE"
     assert payload["latestGraphRejection"]["code"] == (
         "EXECUTION_GRAPH_INVALID"
     )

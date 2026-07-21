@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "客服理赔全流程表，承载赔付单、赔付金额、审批状态、到账状态与赔付原因",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["bill_id", "order_id", "repay_amt", "buyer_name", "repay_status_name", "pay_status_name", "reason_code", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 64,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "bill_id",
@@ -1475,6 +1483,25 @@
       "unit": "%",
       "description": "同一商品、订单集合或日期粒度下，赔付明细单量占订单明细去重下单数的比例；分子来自赔付明细单量，分母来自订单明细去重下单数。",
       "sourceColumns": [],
+      "calculationExpression": "repay_bill_cnt / NULLIF(order_detail_cnt, 0)",
+      "componentMetricRefs": [
+        {
+          "semanticRefId": "semantic:客服理赔:dwm_cs_repay_detail_df:metric:repay_bill_cnt",
+          "metricKey": "repay_bill_cnt"
+        },
+        {
+          "semanticRefId": "semantic:电商交易:dwm_trade_order_detail_di:metric:order_detail_cnt",
+          "metricKey": "order_detail_cnt"
+        }
+      ],
+      "alignment": {
+        "entityGrain": ["merchant", "spu"],
+        "entityKeys": ["seller_id", "spu_id"],
+        "timeGrain": "PERIOD",
+        "timePolicy": "SAME_WINDOW",
+        "componentJoinPolicy": "PRE_AGGREGATE_THEN_ALIGN",
+        "nullPolicy": "NULL_IF_DENOMINATOR_ZERO"
+      },
       "aliases": [
         "商品维度赔付率",
         "compensation_rate",

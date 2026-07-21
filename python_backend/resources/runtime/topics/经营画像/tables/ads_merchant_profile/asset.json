@@ -4516,7 +4516,10 @@
         "direct_refund_cnt_1d",
         "直接退款量",
         "直接退款量-最近1天",
-        "直接退款数"
+        "直接退款数",
+        "退款单量",
+        "退款订单量",
+        "退款单数"
       ],
       "confidence": 0.78,
       "evidence": "schema comment=直接退款量-最近1天; sample evidence is STALE and excluded",

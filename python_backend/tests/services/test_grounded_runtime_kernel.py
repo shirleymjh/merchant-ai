@@ -34,6 +34,7 @@ from merchant_ai.models import (
 from merchant_ai.services.grounded_execution_policy import GroundedExecutionMode
 from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
+    GroundedContractGap,
     GroundedDimensionBinding,
     GroundedEntityFilterBinding,
     GroundedFieldAggregationHint,
@@ -66,6 +67,57 @@ class FakeTopicAssets:
     @staticmethod
     def topic_names_for_categories(categories: list[QuestionCategory]) -> list[str]:
         return ["客服工单" for item in categories if item == QuestionCategory.SERVICE]
+
+
+def test_independent_metric_contract_enters_topology_repair_phase() -> None:
+    class TopologyContractBuilder:
+        @staticmethod
+        def build(*args: Any, **kwargs: Any) -> GroundedQueryContract:
+            del args, kwargs
+            return GroundedQueryContract(
+                question="查询两个独立指标",
+                status="REVISE_BINDINGS",
+                query_shape="MULTI_TABLE",
+                unresolved_gaps=[
+                    GroundedContractGap(
+                        code="INDEPENDENT_QUERY_SPLIT_REQUIRED",
+                        message="split independent metrics",
+                        evidence_kind="QUERY_TOPOLOGY",
+                        resolution=(
+                            "REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"
+                        ),
+                    )
+                ],
+            )
+
+    kernel = GroundedRuntimeKernel(
+        FakeTopicAssets(),
+        keyword_service=FakeKeywordService(),
+        route_slot_extractor=SimpleNamespace(),
+        topic_router=FakeRouter(),
+        contract_builder=TopologyContractBuilder(),
+    )
+    session = kernel.new_session("查询两个独立指标", "merchant-1")
+    session.workspace_topics = ["客服工单"]
+
+    attempt = kernel.propose_contract(session, [], {})
+
+    assert session.phase == "QUERY_REPAIR_REQUIRED"
+    assert attempt.repair_type == "TOPOLOGY"
+    assert attempt.next_action == (
+        "CHOOSE_SAFE_REPAIR_AND_SUBMIT_NEW_VERSION"
+    )
+    assert attempt.contract_version == 1
+    assert attempt.parent_attempt_id == ""
+    assert attempt.activated is False
+
+    repaired = kernel.propose_contract(session, [], {})
+
+    assert repaired.contract_version == 2
+    assert repaired.parent_attempt_id == attempt.attempt_id
+    assert repaired.parent_contract_fingerprint == (
+        grounded_query_contract_fingerprint(attempt.contract)
+    )
 
 
 def test_core_sql_evidence_plan_preserves_dimension_and_selected_field_labels() -> None:
@@ -951,6 +1003,15 @@ def test_verified_portfolio_preserves_multiple_query_graphs_and_namespaces_tasks
                             plan_task_id="same_task_id",
                         )
                     ],
+                    evidence_contracts=[
+                        {
+                            "taskId": "same_task_id",
+                            "table": table,
+                            "semanticLabel": next(iter(row)),
+                            "requiredLevel": "required",
+                            "columns": [next(iter(row))],
+                        }
+                    ],
                     final_evidence_column_hints={
                         "same_task_id": list(row)
                     },
@@ -987,6 +1048,10 @@ def test_verified_portfolio_preserves_multiple_query_graphs_and_namespaces_tasks
         for row in run_result.merged_query_bundle.rows
     } == set(artifact_ids)
     assert len({item.plan_task_id for item in plan.intents}) == 2
+    assert {
+        str(item.get("taskId") or "")
+        for item in plan.evidence_contracts
+    } == {item.plan_task_id for item in plan.intents}
 
     composer = PortfolioComposer()
     runtime.answer_composer = composer

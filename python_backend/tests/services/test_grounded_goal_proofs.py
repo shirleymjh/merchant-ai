@@ -135,6 +135,93 @@ def test_complete_detail_row_set_proves_detail_goal() -> None:
     assert resolutions[0]["rowSetRef"] == "artifact-1"
 
 
+def test_complete_artifact_proves_detail_when_only_inline_preview_is_truncated() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="最近10天订单明细",
+        goals=[DetailQuestionGoal(goal_id="detail", label="订单明细")],
+    )
+    complete_artifact = artifact(
+        shape="DETAIL",
+        result_coverage=ResultCoverage.ALL_ROWS.value,
+        is_truncated=True,
+    )
+
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=complete_artifact,
+        assigned_goal_ids=["detail"],
+        artifact_goal_ids={"artifact-1": ["detail"]},
+        all_artifacts=[complete_artifact],
+    )
+
+    assert resolutions[0]["resolution"] == "PROVED"
+    assert resolutions[0]["proofType"] == "VERIFIED_QUERY_ROW_SET"
+
+
+def test_relative_goal_kind_accepts_rolling_executed_time_contract() -> None:
+    contract = OriginalQuestionGoalContract(
+        question="最近10天订单明细",
+        goals=[
+            TimeWindowQuestionGoal(
+                goal_id="time.10d",
+                label="最近10天",
+                time_expression="最近10天",
+                time_range_kind="relative",
+                days=10,
+            )
+        ],
+    )
+    query_artifact = SimpleNamespace(
+        artifact_id="artifact-time",
+        verified_evidence=SimpleNamespace(passed=True),
+        contract=SimpleNamespace(
+            evidence_refs=[],
+            binding_hints=SimpleNamespace(time_expression="最近10天"),
+            time_range=SimpleNamespace(
+                kind="rolling",
+                label="最近10天",
+                days=10,
+                start_date="2026-07-12",
+                end_date="2026-07-21",
+                timezone="Asia/Shanghai",
+                calendar_anchor_policy="runtime_current_date",
+                data_as_of_policy="latest_available_partition",
+                window_role="primary",
+                explicit=True,
+            ),
+        ),
+        run_result=SimpleNamespace(merged_query_bundle=QueryBundle()),
+        output_columns=[],
+        output_lineage={},
+    )
+    resolutions = derive_query_artifact_goal_resolutions(
+        goal_contract=contract,
+        artifact=query_artifact,
+        assigned_goal_ids=["time.10d"],
+        artifact_goal_ids={"artifact-time": ["time.10d"]},
+        all_artifacts=[query_artifact],
+    )
+    result = GoalCoverageVerifier().verify(
+        contract,
+        [
+            VerifiedArtifactGoalCoverage(
+                artifact_id="artifact-time",
+                goal_contract_fingerprint=original_question_goal_contract_fingerprint(
+                    contract
+                ),
+                covered_goal_ids=["time.10d"],
+                verification_passed=True,
+                goal_resolutions=resolutions,
+            )
+        ],
+    )
+
+    assert result.finalization_allowed is True
+    assert "TIME_WINDOW_PROOF_TIMERANGEKIND_MISMATCH" not in {
+        issue.code for issue in result.issues
+    }
+
+
 def test_equal_visible_and_original_counts_do_not_imply_complete_detail() -> None:
     contract = OriginalQuestionGoalContract(
         question="全部订单明细",
@@ -204,7 +291,8 @@ def test_time_proof_uses_executed_range_and_rejects_goal_range_mismatch() -> Non
                 execution_start_date="2026-06-20",
                 execution_end_date="2026-07-19",
                 timezone="Asia/Shanghai",
-                anchor_policy="latest_partition",
+                calendar_anchor_policy="runtime_current_date",
+                data_as_of_policy="latest_available_partition",
                 window_role="primary",
                 explicit=True,
             ),
@@ -275,7 +363,7 @@ def test_single_filter_time_goal_accepts_primary_execution_role() -> None:
                 start_date="2026-07-14",
                 end_date="2026-07-20",
                 timezone="Asia/Shanghai",
-                anchor_policy="calendar",
+                calendar_anchor_policy="runtime_current_date",
                 window_role="primary",
                 explicit=True,
             ),
@@ -416,7 +504,7 @@ def test_time_goal_granularity_waits_for_an_authoritative_contract_field() -> No
                 start_date="2026-07-14",
                 end_date="2026-07-20",
                 timezone="Asia/Shanghai",
-                anchor_policy="calendar",
+                calendar_anchor_policy="runtime_current_date",
                 window_role="primary",
                 explicit=True,
             ),

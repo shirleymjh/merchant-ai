@@ -131,7 +131,8 @@ def planner_pack(metric_count: int = 36) -> PlanningAssetPack:
                 "timeRange": {
                     "kind": "rolling",
                     "days": 11,
-                    "anchorPolicy": "latest_available_partition",
+                    "calendarAnchorPolicy": "runtime_current_date",
+                    "dataAsOfPolicy": "latest_available_partition",
                     "source": "structured_test_contract",
                 },
             },

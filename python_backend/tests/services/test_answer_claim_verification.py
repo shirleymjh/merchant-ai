@@ -872,6 +872,38 @@ def test_answer_compose_keeps_supported_llm_fact():
     assert len(llm.payloads) == 1
 
 
+def test_verified_detail_portfolio_defers_rows_to_trusted_renderer() -> None:
+    llm = ClaimAnswerLlm("订单金额为999元。")
+    service = AnswerComposeService(llm)
+    plan = detail_plan()
+    plan.question_understanding = {
+        "source": "verified_evidence_portfolio"
+    }
+    run = detail_run(
+        {"order_id": "order_1", "pay_amt": 121.5}
+    )
+    run.merged_query_bundle.source_artifact_refs = {
+        "query_artifact_1": ["query_artifact_1"]
+    }
+
+    answer = service.compose(
+        "给我订单明细",
+        MerchantInfo(merchant_id="100"),
+        plan,
+        run,
+        "",
+    )
+
+    assert answer == "已查询到符合条件的明细，结果如下。"
+    assert "999" not in answer
+    assert "回答完整性校验未通过" not in answer
+    assert llm.payloads == []
+    assert service.last_answer_claim_trace["passed"] is True
+    assert service.last_answer_claim_trace["fallbackReason"] == (
+        "verified_detail_renderer_owned"
+    )
+
+
 def test_answer_compose_keeps_verified_single_metric_fallback_when_llm_fact_is_wrong():
     llm = ClaimAnswerLlm("最近7天总GMV金额为 999元。")
     service = AnswerComposeService(llm)

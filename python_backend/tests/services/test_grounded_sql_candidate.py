@@ -18,6 +18,11 @@ from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlCandidateValidator,
     grounded_query_contract_fingerprint,
 )
+from merchant_ai.services.grounded_semantic_ir import (
+    GroundedCalculationGraph,
+    GroundedCalculationNode,
+    GroundedOutputProjection,
+)
 
 
 def _contract() -> GroundedQueryContract:
@@ -154,6 +159,380 @@ def _metric_contract(*, explicit_time: bool = True) -> GroundedQueryContract:
             source="explicit" if explicit_time else "default_days",
         ),
         evidence_refs=[detail_ref, metric_ref],
+    )
+
+
+def _composite_metric_contract(*, include_third_component: bool = False) -> GroundedQueryContract:
+    component_specs = [
+        (
+            "semantic:commerce:orders:metric:order_amount",
+            "order_amount",
+            "orders",
+            "SUM(amount)",
+            "amount",
+        ),
+        (
+            "semantic:commerce:refunds:metric:refund_amount",
+            "refund_amount",
+            "refunds",
+            "SUM(amount)",
+            "amount",
+        ),
+    ]
+    if include_third_component:
+        component_specs.append(
+            (
+                "semantic:service:tickets:metric:ticket_cnt",
+                "ticket_cnt",
+                "tickets",
+                "COUNT(ticket_id)",
+                "ticket_id",
+            )
+        )
+    internal_metrics: list[GroundedMetricBinding] = []
+    component_nodes: list[GroundedCalculationNode] = []
+    for index, (ref_id, key, table, formula, source_column) in enumerate(
+        component_specs,
+        1,
+    ):
+        component_graph = GroundedCalculationGraph(
+            output_node_ids=["output"],
+            nodes=[
+                GroundedCalculationNode(
+                    node_id="output",
+                    node_type="PHYSICAL_METRIC",
+                    semantic_ref_id=ref_id,
+                    metric_key=key,
+                    table=table,
+                    expression=formula,
+                    source_columns=[source_column],
+                    internal=False,
+                )
+            ],
+            expression=formula,
+        )
+        internal_metrics.append(
+            GroundedMetricBinding(
+                requested_phrase=key,
+                semantic_ref_id=ref_id,
+                topic="commerce",
+                table=table,
+                metric_key=key,
+                formula=formula,
+                source_columns=[source_column],
+                aggregation_policy="period_rollup",
+                time_column="event_date",
+                output_role="INTERNAL",
+                calculation_graph=component_graph,
+            )
+        )
+        component_nodes.append(
+            GroundedCalculationNode(
+                node_id="component_%d" % index,
+                node_type="METRIC_REF",
+                semantic_ref_id=ref_id,
+                metric_key=key,
+                table=table,
+            )
+        )
+
+    output_ref = "semantic:commerce:refunds:metric:service_loss_rate"
+    expression = (
+        "(refund_amount + ticket_cnt) / NULLIF(order_amount, 0)"
+        if include_third_component
+        else "refund_amount / NULLIF(order_amount, 0)"
+    )
+    graph = GroundedCalculationGraph(
+        output_node_ids=["output"],
+        nodes=[
+            *component_nodes,
+            GroundedCalculationNode(
+                node_id="output",
+                node_type="COMPOSITE_METRIC",
+                semantic_ref_id=output_ref,
+                metric_key="service_loss_rate",
+                expression=expression,
+                input_node_ids=[item.node_id for item in component_nodes],
+                internal=False,
+            ),
+        ],
+        expression=expression,
+        component_metric_refs=[item.semantic_ref_id for item in internal_metrics],
+        component_metric_keys=[item.metric_key for item in internal_metrics],
+        alignment={
+            "entityGrain": ["merchant"],
+            "entityKeys": ["tenant_id"],
+            "timeGrain": "PERIOD",
+            "timePolicy": "SAME_WINDOW",
+            "componentJoinPolicy": "PRE_AGGREGATE_THEN_ALIGN",
+            "nullPolicy": "NULL_IF_DENOMINATOR_ZERO",
+        },
+    )
+    output_metric = GroundedMetricBinding(
+        requested_phrase="service loss rate",
+        semantic_ref_id=output_ref,
+        topic="commerce",
+        table="refunds",
+        metric_key="service_loss_rate",
+        formula=expression,
+        aggregation_policy="composite_after_alignment",
+        time_column="event_date",
+        binding_type="composite_metric",
+        calculation_graph=graph,
+        component_metric_refs=list(graph.component_metric_refs),
+        component_metric_keys=list(graph.component_metric_keys),
+        alignment=dict(graph.alignment),
+    )
+    tables = [
+        GroundedTableBinding(
+            topic="commerce",
+            table=table,
+            time_column="event_date",
+            merchant_filter_column="tenant_id",
+            detail_ref_id="semantic:commerce:%s:detail" % table,
+        )
+        for table in ["orders", "refunds", *( ["tickets"] if include_third_component else [])]
+    ]
+    relationships = [
+        GroundedRelationshipBinding(
+            semantic_ref_id="semantic:commerce:relationship:orders_refunds",
+            topic="commerce",
+            name="orders_refunds",
+            left_table="orders",
+            right_table="refunds",
+            join_type="INNER",
+            keys=[["tenant_id", "tenant_id"]],
+            cardinality="MANY_TO_MANY",
+            fanout_policy="PREAGGREGATE_BOTH",
+        )
+    ]
+    if include_third_component:
+        relationships.append(
+            GroundedRelationshipBinding(
+                semantic_ref_id="semantic:commerce:relationship:orders_tickets",
+                topic="commerce",
+                name="orders_tickets",
+                left_table="orders",
+                right_table="tickets",
+                join_type="INNER",
+                keys=[["tenant_id", "tenant_id"]],
+                cardinality="MANY_TO_MANY",
+                fanout_policy="PREAGGREGATE_BOTH",
+            )
+        )
+    evidence_refs = [
+        *(item.detail_ref_id for item in tables),
+        *(item.semantic_ref_id for item in internal_metrics),
+        output_ref,
+        *(item.semantic_ref_id for item in relationships),
+    ]
+    return GroundedQueryContract(
+        status="READY",
+        question="service loss rate for the requested period",
+        topics=["commerce", "service"],
+        query_shape="SCALAR",
+        primary_table="refunds",
+        tables=tables,
+        metrics=[output_metric],
+        internal_metrics=internal_metrics,
+        requested_outputs=[
+            GroundedOutputProjection(
+                semantic_ref_id=output_ref,
+                output_alias="service_loss_rate",
+                calculation_node_id="output",
+            )
+        ],
+        relationships=relationships,
+        time_range=ResolvedTimeRange(
+            kind="absolute",
+            start_date="2026-07-01",
+            end_date="2026-07-07",
+            explicit=True,
+            source="explicit",
+        ),
+        evidence_refs=evidence_refs,
+    )
+
+
+def _window_metric_contract(*, nested: bool = False) -> GroundedQueryContract:
+    detail_ref = "semantic:topic_a:fact_metric:detail"
+    time_ref = "semantic:topic_a:fact_metric:field:event_date"
+    daily_ref = "semantic:topic_a:fact_metric:metric:daily_amount"
+    cumulative_ref = "semantic:topic_a:fact_metric:metric:cumulative_amount"
+    moving_ref = "semantic:topic_a:fact_metric:metric:moving_cumulative_avg"
+    daily_graph = GroundedCalculationGraph(
+        output_node_ids=["output"],
+        nodes=[
+            GroundedCalculationNode(
+                node_id="output",
+                node_type="PHYSICAL_METRIC",
+                semantic_ref_id=daily_ref,
+                metric_key="daily_amount",
+                table="fact_metric",
+                expression="SUM(amount)",
+                source_columns=["amount"],
+                internal=False,
+            )
+        ],
+        expression="SUM(amount)",
+    )
+    daily = GroundedMetricBinding(
+        requested_phrase="daily amount",
+        semantic_ref_id=daily_ref,
+        topic="topic_a",
+        table="fact_metric",
+        metric_key="daily_amount",
+        formula="SUM(amount)",
+        source_columns=["amount"],
+        aggregation_policy="day_rollup",
+        time_column="event_date",
+        output_role="INTERNAL",
+        calculation_graph=daily_graph,
+    )
+
+    def window_metric(
+        *,
+        ref_id: str,
+        key: str,
+        input_ref: str,
+        input_key: str,
+        expression: str,
+        output_role: str,
+    ) -> GroundedMetricBinding:
+        graph = GroundedCalculationGraph(
+            output_node_ids=["output"],
+            nodes=[
+                GroundedCalculationNode(
+                    node_id="metric_input",
+                    node_type="METRIC_REF",
+                    semantic_ref_id=input_ref,
+                    metric_key=input_key,
+                    binding_key=input_key,
+                ),
+                GroundedCalculationNode(
+                    node_id="time_input",
+                    node_type="TIME_REF",
+                    semantic_ref_id=time_ref,
+                    binding_key="event_date",
+                ),
+                GroundedCalculationNode(
+                    node_id="output",
+                    node_type="WINDOW",
+                    semantic_ref_id=ref_id,
+                    metric_key=key,
+                    table="fact_metric",
+                    expression=expression,
+                    input_node_ids=["metric_input", "time_input"],
+                    internal=False,
+                ),
+            ],
+            expression=expression,
+            component_metric_refs=[input_ref],
+            component_metric_keys=[input_key],
+            alignment={
+                "entityGrain": ["day"],
+                "entityKeys": ["event_date"],
+                "timeGrain": "DAY",
+                "timePolicy": "SAME_WINDOW",
+                "componentJoinPolicy": "SAME_TABLE_COMPONENTS",
+                "nullPolicy": "PRESERVE_NULL",
+            },
+        )
+        return GroundedMetricBinding(
+            requested_phrase=key,
+            semantic_ref_id=ref_id,
+            topic="topic_a",
+            table="fact_metric",
+            metric_key=key,
+            formula=expression,
+            aggregation_policy="window_after_day_rollup",
+            time_column="event_date",
+            output_role=output_role,
+            binding_type="window_metric",
+            calculation_graph=graph,
+            component_metric_refs=[input_ref],
+            component_metric_keys=[input_key],
+            alignment=dict(graph.alignment),
+        )
+
+    cumulative_expression = (
+        "SUM(daily_amount) OVER (ORDER BY event_date ROWS BETWEEN "
+        "UNBOUNDED PRECEDING AND CURRENT ROW)"
+    )
+    cumulative = window_metric(
+        ref_id=cumulative_ref,
+        key="cumulative_amount",
+        input_ref=daily_ref,
+        input_key="daily_amount",
+        expression=cumulative_expression,
+        output_role="INTERNAL" if nested else "REQUESTED",
+    )
+    if nested:
+        output = window_metric(
+            ref_id=moving_ref,
+            key="moving_cumulative_avg",
+            input_ref=cumulative_ref,
+            input_key="cumulative_amount",
+            expression=(
+                "AVG(cumulative_amount) OVER (ORDER BY event_date ROWS "
+                "BETWEEN 2 PRECEDING AND CURRENT ROW)"
+            ),
+            output_role="REQUESTED",
+        )
+        internal_metrics = [daily, cumulative]
+    else:
+        output = cumulative
+        internal_metrics = [daily]
+    refs = [
+        detail_ref,
+        time_ref,
+        daily_ref,
+        cumulative_ref,
+        *([moving_ref] if nested else []),
+    ]
+    return GroundedQueryContract(
+        status="READY",
+        question="window metric over the requested period",
+        topics=["topic_a"],
+        query_shape="TREND",
+        primary_table="fact_metric",
+        tables=[
+            GroundedTableBinding(
+                topic="topic_a",
+                table="fact_metric",
+                time_column="event_date",
+                merchant_filter_column="tenant_id",
+                detail_ref_id=detail_ref,
+            )
+        ],
+        metrics=[output],
+        internal_metrics=internal_metrics,
+        requested_outputs=[
+            GroundedOutputProjection(
+                semantic_ref_id=output.semantic_ref_id,
+                output_alias=output.metric_key,
+                calculation_node_id="output",
+            )
+        ],
+        dimensions=[
+            GroundedDimensionBinding(
+                requested_phrase="day",
+                semantic_ref_id=time_ref,
+                topic="topic_a",
+                table="fact_metric",
+                column="event_date",
+                role="DATE",
+                usage="group_by",
+            )
+        ],
+        time_range=ResolvedTimeRange(
+            kind="absolute",
+            start_date="2026-06-01",
+            end_date="2026-06-30",
+            explicit=True,
+            source="explicit",
+        ),
+        evidence_refs=refs,
     )
 
 
@@ -917,3 +1296,195 @@ def test_ungrounded_database_prefix_is_rejected_before_doris_execution() -> None
 
     assert result.valid is False
     assert "SQL_TABLE_QUALIFIER_NOT_GROUNDED" in _codes(result)
+
+
+def test_composite_metric_preserves_component_identity_across_preaggregated_ctes() -> None:
+    contract = _composite_metric_contract()
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH order_component AS (
+          SELECT o.tenant_id, SUM(o.amount) AS order_amount
+          FROM orders o
+          WHERE o.event_date >= '2026-07-01'
+            AND o.event_date <= '2026-07-07'
+          GROUP BY o.tenant_id
+        ),
+        refund_component AS (
+          SELECT r.tenant_id, SUM(r.amount) AS refund_amount
+          FROM refunds r
+          WHERE r.event_date >= '2026-07-01'
+            AND r.event_date <= '2026-07-07'
+          GROUP BY r.tenant_id
+        )
+        SELECT r.refund_amount / NULLIF(o.order_amount, 0) AS service_loss_rate
+        FROM order_component o
+        JOIN refund_component r ON o.tenant_id = r.tenant_id
+        """,
+        contract,
+    )
+
+    assert result.valid is True, result.model_dump(by_alias=True)
+    assert result.output_columns == ["service_loss_rate"]
+    assert result.output_lineage["service_loss_rate"] == [
+        "orders.amount",
+        "refunds.amount",
+    ]
+
+
+def test_three_table_composite_metric_is_proved_edge_by_edge() -> None:
+    contract = _composite_metric_contract(include_third_component=True)
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH order_component AS (
+          SELECT o.tenant_id, SUM(o.amount) AS order_amount
+          FROM orders o
+          WHERE o.event_date >= '2026-07-01'
+            AND o.event_date <= '2026-07-07'
+          GROUP BY o.tenant_id
+        ),
+        refund_component AS (
+          SELECT r.tenant_id, SUM(r.amount) AS refund_amount
+          FROM refunds r
+          WHERE r.event_date >= '2026-07-01'
+            AND r.event_date <= '2026-07-07'
+          GROUP BY r.tenant_id
+        ),
+        ticket_component AS (
+          SELECT t.tenant_id, COUNT(t.ticket_id) AS ticket_cnt
+          FROM tickets t
+          WHERE t.event_date >= '2026-07-01'
+            AND t.event_date <= '2026-07-07'
+          GROUP BY t.tenant_id
+        )
+        SELECT (r.refund_amount + t.ticket_cnt) / NULLIF(o.order_amount, 0)
+          AS service_loss_rate
+        FROM order_component o
+        JOIN refund_component r ON o.tenant_id = r.tenant_id
+        JOIN ticket_component t ON o.tenant_id = t.tenant_id
+        """,
+        contract,
+    )
+
+    assert result.valid is True, result.model_dump(by_alias=True)
+    assert result.relationship_refs == [
+        "semantic:commerce:relationship:orders_refunds",
+        "semantic:commerce:relationship:orders_tickets",
+    ]
+
+
+def test_cross_table_composite_requires_preaggregation_at_alignment_keys() -> None:
+    contract = _composite_metric_contract()
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        SELECT SUM(r.amount) / NULLIF(SUM(o.amount), 0) AS service_loss_rate
+        FROM orders o
+        JOIN refunds r ON o.tenant_id = r.tenant_id
+        WHERE o.event_date >= '2026-07-01'
+          AND o.event_date <= '2026-07-07'
+          AND r.event_date >= '2026-07-01'
+          AND r.event_date <= '2026-07-07'
+        """,
+        contract,
+    )
+
+    assert "SQL_COMPOSITE_PREAGGREGATION_REQUIRED" in _codes(result)
+
+
+def test_composite_metric_rejects_wrong_fusion_formula_and_internal_outputs() -> None:
+    contract = _composite_metric_contract()
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH order_component AS (
+          SELECT o.tenant_id, SUM(o.amount) AS order_amount
+          FROM orders o
+          WHERE o.event_date >= '2026-07-01'
+            AND o.event_date <= '2026-07-07'
+          GROUP BY o.tenant_id
+        ),
+        refund_component AS (
+          SELECT r.tenant_id, SUM(r.amount) AS refund_amount
+          FROM refunds r
+          WHERE r.event_date >= '2026-07-01'
+            AND r.event_date <= '2026-07-07'
+          GROUP BY r.tenant_id
+        )
+        SELECT r.refund_amount * 100 / NULLIF(o.order_amount, 0)
+          AS service_loss_rate,
+          r.refund_amount AS refund_amount
+        FROM order_component o
+        JOIN refund_component r ON o.tenant_id = r.tenant_id
+        """,
+        contract,
+    )
+
+    codes = _codes(result)
+    assert "SQL_OUTPUT_SET_MISMATCH" in codes
+    assert "SQL_OUTPUT_BINDING_MISSING" in codes
+
+
+def test_same_scope_window_nesting_is_rejected_before_doris() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        SELECT SUM(ROW_NUMBER() OVER (ORDER BY f.event_date)) OVER () AS total_amount
+        FROM fact_metric f
+        WHERE f.event_date >= '2026-06-01'
+          AND f.event_date <= '2026-06-30'
+        """,
+        _metric_contract(),
+    )
+
+    assert "SQL_WINDOW_NESTING_INVALID" in _codes(result)
+
+
+def test_window_derived_metric_is_valid_final_output() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH daily AS (
+          SELECT f.event_date, SUM(f.amount) AS daily_amount
+          FROM fact_metric f
+          WHERE f.event_date >= '2026-06-01'
+            AND f.event_date <= '2026-06-30'
+          GROUP BY f.event_date
+        )
+        SELECT event_date,
+               SUM(daily_amount) OVER (
+                 ORDER BY event_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS cumulative_amount
+        FROM daily
+        """,
+        _window_metric_contract(),
+    )
+
+    assert result.valid is True, result.model_dump(by_alias=True)
+
+
+def test_nested_windows_are_valid_when_materialized_across_ctes() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH daily AS (
+          SELECT f.event_date, SUM(f.amount) AS daily_amount
+          FROM fact_metric f
+          WHERE f.event_date >= '2026-06-01'
+            AND f.event_date <= '2026-06-30'
+          GROUP BY f.event_date
+        ),
+        cumulative AS (
+          SELECT event_date,
+                 SUM(daily_amount) OVER (
+                   ORDER BY event_date
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                 ) AS cumulative_amount
+          FROM daily
+        )
+        SELECT event_date,
+               AVG(cumulative_amount) OVER (
+                 ORDER BY event_date
+                 ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+               ) AS moving_cumulative_avg
+        FROM cumulative
+        """,
+        _window_metric_contract(nested=True),
+    )
+
+    assert result.valid is True, result.model_dump(by_alias=True)

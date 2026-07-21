@@ -47,6 +47,7 @@ from merchant_ai.services.text_parsing import (
 )
 from merchant_ai.services.time_semantics import resolve_time_range
 from merchant_ai.services.tools import AgentToolDefinition
+from merchant_ai.services.formulas import compile_metric_formula
 
 
 SUPPORTED_METRIC_AGGREGATION_POLICIES = frozenset(
@@ -1755,6 +1756,12 @@ class SemanticCatalogService:
                 asset.get("tableUsageProfile") if isinstance(asset, dict) else {},
                 table,
             )
+            payload["detailProjectionPolicy"] = normalize_detail_projection_policy(
+                asset.get("detailProjectionPolicy") if isinstance(asset, dict) else {},
+                asset if isinstance(asset, dict) else {},
+                topic,
+                table,
+            )
         if semantic_navigation:
             payload["semanticNavigation"] = semantic_navigation
             self._trim_l1_navigation_to_budget(payload)
@@ -3384,6 +3391,129 @@ def normalize_table_usage_profile(profile: Any, table: str = "") -> Dict[str, An
         "recommendedFor": dedupe_strings([str(item) for item in raw.get("recommendedFor") or []]),
         "notRecommendedFor": dedupe_strings([str(item) for item in raw.get("notRecommendedFor") or []]),
         "exclusionReason": str(raw.get("exclusionReason") or ("TABLE_USAGE_UNDECLARED" if not queryable else "")),
+    }
+
+
+def normalize_detail_projection_policy(
+    policy: Any,
+    asset: Dict[str, Any] | None = None,
+    topic: str = "",
+    table: str = "",
+) -> Dict[str, Any]:
+    """Normalize the reviewed output policy for a detail table.
+
+    The policy is a semantic output contract, not a workflow label.  Default
+    fields are backed by the table-detail document itself; explicit fields may
+    still require their individual COLUMN reads, while ALL_ALLOWED is expanded
+    from the published selectable-field allowlist and remains ACL checked.
+    """
+
+    raw = policy if isinstance(policy, dict) else {}
+    source_asset = asset if isinstance(asset, dict) else {}
+    semantic_columns = [
+        item
+        for item in source_asset.get("semanticColumns") or []
+        if isinstance(item, dict)
+    ]
+    column_by_name = {
+        str(item.get("columnName") or item.get("Field") or "").strip(): item
+        for item in semantic_columns
+        if str(item.get("columnName") or item.get("Field") or "").strip()
+    }
+    merchant_column = str(
+        source_asset.get("merchantFilterColumn")
+        or source_asset.get("scopeFilterColumn")
+        or ""
+    ).strip()
+
+    def normalize_field_names(values: Any) -> List[str]:
+        raw_values = values if isinstance(values, list) else []
+        result: List[str] = []
+        for value in raw_values:
+            text = str(value or "").strip()
+            if text.startswith("semantic:"):
+                result.append(text)
+                continue
+            if text in column_by_name and text != merchant_column:
+                result.append(
+                    semantic_table_entry_ref_id(
+                        topic,
+                        table,
+                        "columns",
+                        text,
+                    )
+                )
+        return dedupe_strings(result)
+
+    default_refs = normalize_field_names(
+        raw.get("defaultFieldRefs")
+        or raw.get("defaultFields")
+        or []
+    )
+    allowed_refs = normalize_field_names(
+        raw.get("allowedFieldRefs")
+        or raw.get("selectableFieldRefs")
+        or []
+    )
+    selectable_columns = [
+        column
+        for column, definition in column_by_name.items()
+        if column != merchant_column
+        and str(
+            definition.get(
+                "detailSelectable",
+                definition.get("selectableInDetail", True),
+            )
+        ).lower()
+        not in {"false", "0", "no"}
+    ]
+    if allowed_refs:
+        default_refs = [ref for ref in default_refs if ref in set(allowed_refs)]
+
+    default_fields: List[Dict[str, Any]] = []
+    for ref_id in default_refs:
+        column = ref_id.rsplit(":", 1)[-1]
+        definition = column_by_name.get(column)
+        if not definition:
+            continue
+        published = progressive_semantic_column_definition(source_asset, definition)
+        default_fields.append(
+            {
+                "fieldRef": ref_id,
+                "columnName": column,
+                "businessName": str(published.get("businessName") or column),
+                "role": str(published.get("role") or published.get("semanticRole") or "").upper(),
+                "aliases": dedupe_strings(
+                    [
+                        column,
+                        str(published.get("businessName") or ""),
+                        *[str(item) for item in published.get("aliases") or []],
+                    ]
+                ),
+                "isUniqueEntityKey": bool(published.get("isUniqueEntityKey")),
+                "canonicalEntityRef": str(published.get("canonicalEntityRef") or ""),
+                "filterOperators": dedupe_strings(
+                    [str(item).upper() for item in published.get("filterOperators") or []]
+                ),
+                "lookupTimePolicy": dict(published.get("lookupTimePolicy") or {}),
+                "schemaContract": dict(published.get("schemaContract") or {}),
+            }
+        )
+
+    hidden_refs = normalize_field_names(raw.get("hiddenFieldRefs") or [])
+    return {
+        "version": str(raw.get("version") or "detail_projection.v1"),
+        "defaultFieldRefs": [item["fieldRef"] for item in default_fields],
+        "defaultFields": default_fields,
+        "allowedFieldRefs": allowed_refs,
+        "allowedFieldSource": "PUBLISHED_SEMANTIC_COLUMNS",
+        "allowedFieldCount": len(selectable_columns),
+        "hiddenFieldRefs": hidden_refs,
+        "allowExplicitFieldSelection": bool(raw.get("allowExplicitFieldSelection", True)),
+        "allowAllVisibleFields": bool(raw.get("allowAllVisibleFields", True)),
+        "maxSelectedFields": max(1, int(raw.get("maxSelectedFields") or 128)),
+        "maxPreviewRows": max(1, int(raw.get("maxPreviewRows") or 100)),
+        "source": "PUBLISHED_DETAIL_PROJECTION",
     }
 
 
@@ -9495,13 +9625,131 @@ def validate_semantic_asset(asset: Dict[str, Any], relationships: List[Dict[str,
         formula = str(metric.get("formula") or metric.get("metricFormula") or "").strip()
         metric_type = str(metric.get("metricType") or "").strip().upper()
         ratio_metric = metric_type == "RATIO" or "/" in formula
+        source_columns = semantic_metric_source_columns(metric)
+        raw_component_refs = metric.get("componentMetricRefs") or []
+        component_refs: list[str] = []
+        component_keys: list[str] = []
+        for component in raw_component_refs:
+            if isinstance(component, dict):
+                ref_id = str(
+                    component.get("semanticRefId")
+                    or component.get("metricRef")
+                    or component.get("refId")
+                    or ""
+                ).strip()
+                component_key = str(
+                    component.get("metricKey")
+                    or component.get("key")
+                    or ""
+                ).strip()
+            else:
+                value = str(component or "").strip()
+                ref_id = value if value.startswith("semantic:") else ""
+                component_key = "" if ref_id else value
+            if ref_id:
+                component_refs.append(ref_id)
+            if component_key:
+                component_keys.append(component_key)
+        calculation_expression = str(
+            metric.get("calculationExpression")
+            or metric.get("compositeExpression")
+            or ""
+        ).strip()
+        formula_executable_from_columns = bool(
+            formula and compile_metric_formula(formula, set(source_columns))
+        )
+        if formula and not formula_executable_from_columns and not component_refs:
+            errors.append(
+                {
+                    "code": "METRIC_EXECUTION_INPUTS_UNDECLARED",
+                    "metricKey": metric_key,
+                    "formula": formula,
+                    "sourceColumns": source_columns,
+                    "message": (
+                        "metric formula is not executable from sourceColumns and has no exact componentMetricRefs"
+                    ),
+                }
+            )
+        if component_refs:
+            if len(component_refs) != len(set(component_refs)):
+                errors.append(
+                    {
+                        "code": "METRIC_COMPONENT_REF_DUPLICATE",
+                        "metricKey": metric_key,
+                    }
+                )
+            invalid_refs = sorted(
+                ref_id
+                for ref_id in component_refs
+                if not ref_id.startswith("semantic:")
+                or ":metric:" not in ref_id
+            )
+            if invalid_refs:
+                errors.append(
+                    {
+                        "code": "METRIC_COMPONENT_REF_INVALID",
+                        "metricKey": metric_key,
+                        "componentRefs": invalid_refs,
+                    }
+                )
+            if not calculation_expression:
+                errors.append(
+                    {
+                        "code": "METRIC_CALCULATION_EXPRESSION_REQUIRED",
+                        "metricKey": metric_key,
+                    }
+                )
+            if not isinstance(metric.get("alignment"), dict) or not metric.get("alignment"):
+                errors.append(
+                    {
+                        "code": "METRIC_COMPONENT_ALIGNMENT_REQUIRED",
+                        "metricKey": metric_key,
+                    }
+                )
+            else:
+                alignment = dict(metric.get("alignment") or {})
+                required_alignment_fields = {
+                    "entityGrain",
+                    "entityKeys",
+                    "timeGrain",
+                    "timePolicy",
+                    "componentJoinPolicy",
+                    "nullPolicy",
+                }
+                missing_alignment_fields = sorted(
+                    field_name
+                    for field_name in required_alignment_fields
+                    if alignment.get(field_name) in (None, "", [])
+                )
+                if missing_alignment_fields:
+                    errors.append(
+                        {
+                            "code": "METRIC_COMPONENT_ALIGNMENT_INCOMPLETE",
+                            "metricKey": metric_key,
+                            "missingFields": missing_alignment_fields,
+                        }
+                    )
+                for field_name in ("entityGrain", "entityKeys"):
+                    values = alignment.get(field_name)
+                    if not isinstance(values, list) or any(
+                        not str(value or "").strip()
+                        for value in (values or [])
+                    ):
+                        errors.append(
+                            {
+                                "code": "METRIC_COMPONENT_ALIGNMENT_TYPE_INVALID",
+                                "metricKey": metric_key,
+                                "field": field_name,
+                                "expected": "non-empty string list",
+                            }
+                        )
         metric_grain = str(metric.get("metricGrain") or "").strip().lower()
         applicable_time_grain = str(metric.get("applicableTimeGrain") or "").strip().lower()
         calculation_validation = validate_calculation_semantics(
             metric.get("calculationSemantics"),
             "METRIC",
             metric_key,
-            semantic_metric_source_columns(metric),
+            source_columns,
         )
         errors.extend(calculation_validation["errors"])
         warnings.extend(calculation_validation["warnings"])

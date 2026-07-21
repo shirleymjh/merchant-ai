@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "商家保证金充值流水表，承载保证金充值/补缴流水与金额",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["deposit_recharge_id", "trans_id", "deposit_recharge_amt", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 32,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "create_time",

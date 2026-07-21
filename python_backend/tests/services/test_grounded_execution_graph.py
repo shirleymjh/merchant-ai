@@ -1122,7 +1122,12 @@ def test_verified_artifact_edge_requires_supported_kind_and_binding(
 
 @pytest.mark.parametrize(
     "artifact_kind",
-    ["VERIFIED_ENTITY_SET", "VERIFIED_RESULT_ARTIFACT"],
+    [
+        "VERIFIED_ENTITY_SET",
+        "VERIFIED_RESULT_ARTIFACT",
+        "VERIFIED_SCALAR",
+        "VERIFIED_BASELINE",
+    ],
 )
 def test_valid_verified_artifact_edge_puts_only_target_into_waiting_state(
     artifact_kind: str,

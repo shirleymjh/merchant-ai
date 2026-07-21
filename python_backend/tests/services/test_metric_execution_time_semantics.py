@@ -75,12 +75,13 @@ def metric_intent(policy: str, *, task_id: str = "measure") -> QuestionIntent:
         time_range=ResolvedTimeRange(
             kind="rolling",
             days=7,
-            anchor_policy="latest_partition_after_tenant_filter",
+            calendar_anchor_policy="runtime_current_date",
+            data_as_of_policy="latest_available_partition",
             execution_start_date="2026-07-10" if policy == "latest_value_only" else "2026-07-04",
             execution_end_date="2026-07-10",
             execution_start_value="2026-07-10" if policy == "latest_value_only" else "2026-07-04",
             execution_end_value="2026-07-10",
-            execution_anchor_policy="common_latest_partition",
+            execution_boundary_policy="common_latest_partition",
         ),
     )
 
@@ -195,7 +196,8 @@ def test_runtime_alignment_uses_one_anchor_but_policy_specific_coverage() -> Non
         intent.time_range = ResolvedTimeRange(
             kind="rolling",
             days=7,
-            anchor_policy="latest_partition_after_tenant_filter",
+            calendar_anchor_policy="runtime_current_date",
+            data_as_of_policy="latest_available_partition",
         )
     plan = QueryPlan(intents=[period, snapshot])
     reports = [

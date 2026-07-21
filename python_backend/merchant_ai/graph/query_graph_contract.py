@@ -107,7 +107,8 @@ _TIME_RANGE_CONTRACT_FIELDS = (
     "endDate",
     "days",
     "timezone",
-    "anchorPolicy",
+    "calendarAnchorPolicy",
+    "dataAsOfPolicy",
     "explicit",
     "windowRole",
     "offsetDays",
@@ -116,7 +117,7 @@ _TIME_RANGE_CONTRACT_FIELDS = (
     "executionEndDate",
     "executionStartValue",
     "executionEndValue",
-    "executionAnchorPolicy",
+    "executionBoundaryPolicy",
 )
 
 _METRIC_RESOLUTION_CONTRACT_FIELDS = {

@@ -52,6 +52,14 @@
   "reviewer": "codex",
   "reviewNote": "由表 DDL 与 Topic Builder 领域启发式语义层生成，待业务复核后可继续微调",
   "manualNotes": "供应链全流程明细表，承载入库、质检、鉴定、出库、履约和发货超时判断",
+  "detailProjectionPolicy": {
+    "version": "detail_projection.v1",
+    "defaultFieldRefs": ["inbound_id", "inbound_express_id", "inbound_status_name", "spu_id", "spu_name", "warehouse_id", "warhouse_name", "inbound_cnt", "pt"],
+    "allowExplicitFieldSelection": true,
+    "allowAllVisibleFields": true,
+    "maxSelectedFields": 128,
+    "maxPreviewRows": 100
+  },
   "schemaColumns": [
     {
       "columnName": "inbound_id",
