@@ -5,6 +5,7 @@ title: 规则与数据核对
 lifecyclePhase: post_query_analysis
 requiresVerifiedEvidence: true
 outputContract: verified_analysis_v1
+executionPlacement: AUTO
 executionMode: structured_renderer
 renderer: verified_evidence
 ---

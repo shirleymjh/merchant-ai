@@ -102,6 +102,11 @@ class _SemanticProvider:
                 else False
             ),
             reference_phrases=("这里面",) if self.reference_detected else (),
+            retrieval_question=(
+                "最近7天订单结果中的退款排名"
+                if self.reference_detected
+                else ""
+            ),
         )
 
 

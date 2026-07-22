@@ -295,6 +295,20 @@ class Settings(BaseSettings):
     agent_node_poll_interval_seconds: float = Field(5.0, validation_alias="YSHOPPING_AGENT_NODE_POLL_INTERVAL_SECONDS")
     agent_node_timeout_grace_seconds: int = Field(60, validation_alias="YSHOPPING_AGENT_NODE_TIMEOUT_GRACE_SECONDS")
     agent_sql_repair_rounds: int = Field(2, validation_alias="YSHOPPING_AGENT_SQL_REPAIR_ROUNDS")
+    governed_query_facade_enabled: bool = Field(
+        True,
+        validation_alias="YSHOPPING_GOVERNED_QUERY_FACADE_ENABLED",
+    )
+    grounded_legacy_query_tools_visible: bool = Field(
+        False,
+        validation_alias="YSHOPPING_GROUNDED_LEGACY_QUERY_TOOLS_VISIBLE",
+    )
+    governed_query_internal_sql_repair_enabled: bool = Field(
+        True,
+        validation_alias=(
+            "YSHOPPING_GOVERNED_QUERY_INTERNAL_SQL_REPAIR_ENABLED"
+        ),
+    )
     agent_max_entity_values: int = Field(200, validation_alias="YSHOPPING_AGENT_MAX_ENTITY_VALUES")
     agent_doris_split_query_enabled: bool = Field(True, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_QUERY_ENABLED")
     agent_doris_split_chunk_days: int = Field(7, validation_alias="YSHOPPING_AGENT_DORIS_SPLIT_CHUNK_DAYS")

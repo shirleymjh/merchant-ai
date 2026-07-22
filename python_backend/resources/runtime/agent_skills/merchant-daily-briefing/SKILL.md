@@ -5,6 +5,7 @@ title: 经营简报
 lifecyclePhase: post_query_analysis
 requiresVerifiedEvidence: true
 outputContract: verified_analysis_v1
+executionPlacement: AUTO
 executionMode: structured_renderer
 renderer: verified_evidence
 ---

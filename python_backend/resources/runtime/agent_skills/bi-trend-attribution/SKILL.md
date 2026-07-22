@@ -5,6 +5,7 @@ title: BI 趋势与归因
 lifecyclePhase: post_query_analysis
 requiresVerifiedEvidence: true
 outputContract: verified_analysis_v1
+executionPlacement: AUTO
 executionMode: python_script
 script: scripts/profile_timeseries.py
 ---

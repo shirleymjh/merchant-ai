@@ -170,6 +170,12 @@ class DetailQuestionGoal(QuestionGoalBase):
     input_goal_ids: list[str] = Field(default_factory=list)
     requested_field_phrases: list[str] = Field(default_factory=list)
     request_all_fields: bool = False
+    # Retained for checkpoint and execution-graph compatibility.  The goal
+    # declaration normalizer still strips these fields from new non-RANKING
+    # model payloads; trusted historical contracts may need them to prove a
+    # cross-query population snapshot.
+    population_scope: PopulationScope = "ALL_MATCHING_ROWS"
+    population_goal_ids: list[str] = Field(default_factory=list)
 
 
 class RankingQuestionGoal(QuestionGoalBase):
@@ -2495,10 +2501,35 @@ def _time_window_roles_equivalent(
         isinstance(candidate, TimeWindowQuestionGoal)
         for candidate in goal_map.values()
     )
-    return time_goal_count == 1 and {
-        expected_role,
-        actual_role,
-    } == {"filter", "primary"}
+    if actual_role != "primary":
+        return False
+    if time_goal_count == 1:
+        return True
+
+    # A multi-branch detail request can contain several independent filter
+    # windows.  Each branch executes its own sole window as ``primary`` even
+    # though Core correctly declares the user-facing role as ``filter``.  Do
+    # not apply this alias to comparison/baseline windows: those roles must
+    # remain exact so evidence cannot be swapped between windows.
+    comparison_markers = {
+        "comparison",
+        "baseline",
+        "previous",
+        "prior",
+        "secondary",
+    }
+    time_goals = [
+        candidate
+        for candidate in goal_map.values()
+        if isinstance(candidate, TimeWindowQuestionGoal)
+    ]
+    return all(
+        str(candidate.window_role or "").strip().casefold() not in comparison_markers
+        and not str(candidate.window_role or "").strip().casefold().startswith(
+            ("comparison_", "baseline_", "previous_", "prior_")
+        )
+        for candidate in time_goals
+    )
 
 
 def _time_range_kinds_equivalent(expected: Any, actual: Any) -> bool:

@@ -329,7 +329,7 @@ def test_single_topic_still_does_not_assign_primary_or_plan_query() -> None:
     assert decision.dimension_topics == []
 
 
-def test_exact_published_metric_topic_is_protected_from_model_deletion() -> None:
+def test_exact_published_metric_topic_skips_model_routing() -> None:
     assets = TopicAssetService(get_settings())
     keyword_service = KeywordExtractService(assets)
     slot_extractor = RouteSlotExtractor(assets)
@@ -364,16 +364,10 @@ def test_exact_published_metric_topic_is_protected_from_model_deletion() -> None
     assert decision.selection_evidence["suppressedTopicNames"] == [
         "电商交易"
     ]
-    assert llm.calls[0]["user"]["publishedSignalBaseline"][
-        "protectedTopics"
-    ] == ["经营画像"]
-    assert llm.calls[0]["user"]["publishedSignalBaseline"][
-        "excludedTopics"
-    ] == ["电商交易"]
-    allowed_topics = llm.calls[0]["tool"]["function"]["parameters"][
-        "properties"
-    ]["relevantTopics"]["items"]["enum"]
-    assert "电商交易" not in allowed_topics
+    assert decision.routing_mode == "semantic_topic_exact_asset"
+    assert decision.selection_evidence["modelCallSkipped"] is True
+    assert decision.selection_evidence["assetConfidence"] >= 0.75
+    assert llm.calls == []
 
 
 def test_invalid_model_topic_is_rejected_and_repaired_once() -> None:
@@ -547,7 +541,7 @@ def test_degraded_router_requests_clarification_instead_of_empty_workspace() -> 
     assert decision.routing_mode == "semantic_topic_open_discovery"
 
 
-def test_kernel_feeds_published_asset_signal_baseline_into_semantic_router() -> None:
+def test_kernel_routes_complete_question_without_pre_retrieval_asset_signals() -> None:
     assets = FakeTopicAssets()
     router = SemanticTopicRouterService(
         settings(),
@@ -574,9 +568,10 @@ def test_kernel_feeds_published_asset_signal_baseline_into_semantic_router() -> 
 
     kernel.route_topic(session)
 
-    assert session.keywords.topic_scores == {"商品管理": 99.0}
+    assert session.keywords.topic_scores == {}
+    assert session.keywords.topic_keywords == []
     assert session.workspace_topics == ["电商交易", "商品管理"]
-    assert session.routing.selection_evidence["keywordRoutingUsed"] is True
+    assert session.routing.selection_evidence["keywordRoutingUsed"] is False
     assert session.routing.selection_evidence["assetSignalBaselineUsed"] is True
     assert session.routing.selection_evidence["candidateTopicNames"] == [
         "商品管理"

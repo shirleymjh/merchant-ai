@@ -990,6 +990,51 @@ def test_direct_executor_preserves_ascending_rank_direction(tmp_path) -> None:
     assert "ORDER BY `order_cnt_1d` ASC LIMIT 5" in compilation.sql
 
 
+def test_authorized_store_scope_is_never_silently_truncated(tmp_path) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    pack.tables[0].columns.append("store_id")
+    pack.tables[0].metadata["storeFilterColumn"] = "store_id"
+    preparation = compile_deterministic_grounded_query(contract, pack)
+    executor = GroundedQueryExecutionKernel(
+        FakeDoris(),
+        settings,
+        access_control=AccessControlService(settings, root=tmp_path),
+    )
+    store_ids = ["store_%03d" % index for index in range(250)]
+
+    compilation = executor.compile_sql(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        access_role="merchant_admin",
+        user_scope={"storeIds": store_ids},
+    )
+
+    assert "'store_249'" in compilation.sql
+    assert compilation.node_contract.authorized_store_ids == store_ids
+
+
+def test_non_ranked_core_sql_with_limit_is_never_all_rows() -> None:
+    rows, coverage, truncated, exact_count = (
+        GroundedQueryExecutionKernel._classify_result_rows(
+            scalar_contract(),
+            SimpleNamespace(limit=20),
+            "SELECT SUM(order_cnt_1d) AS order_cnt_1d "
+            "FROM ads_merchant_profile LIMIT 1",
+            [{"order_cnt_1d": 129}],
+            core_sql_candidate=True,
+        )
+    )
+
+    assert rows == [{"order_cnt_1d": 129}]
+    assert coverage == ResultCoverage.PREVIEW.value
+    assert truncated is True
+    assert exact_count == 0
+
+
 def test_runtime_factory_does_not_construct_node_worker() -> None:
     source = (
         __import__("pathlib").Path(

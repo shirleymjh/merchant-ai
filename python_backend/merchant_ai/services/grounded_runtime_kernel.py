@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from pydantic import Field
 
@@ -238,6 +238,7 @@ class GroundedRuntimeEvent(APIModel):
 class GroundedRuntimeSession(APIModel):
     session_id: str
     question: str
+    retrieval_question: str = ""
     merchant_id: str
     merchant: MerchantInfo = Field(default_factory=MerchantInfo)
     access_role: str = DEFAULT_ACCESS_ROLE
@@ -330,6 +331,35 @@ class GroundedRuntimeSession(APIModel):
     events: list[GroundedRuntimeEvent] = Field(default_factory=list)
 
 
+def _recall_knowledge_ref_ids(recall: RecallBundle) -> set[str]:
+    refs: set[str] = set()
+    for item in recall.items:
+        metadata = item.metadata or {}
+        for raw in (
+            item.doc_id,
+            metadata.get("semanticRefId"),
+            metadata.get("semantic_ref_id"),
+            metadata.get("knowledgeRefId"),
+            metadata.get("knowledge_ref_id"),
+        ):
+            value = str(raw or "").strip()
+            if value:
+                refs.add(value)
+    return refs
+
+
+def _plan_has_knowledge_evidence_contract(plan: QueryPlan) -> bool:
+    return any(
+        str(
+            contract.get("evidenceSource")
+            or contract.get("evidence_source")
+            or ""
+        ).lower()
+        in {"knowledge_ref", "knowledge", "rule"}
+        for contract in plan.evidence_contracts
+    )
+
+
 class GroundedRuntimeKernel:
     """Independent runtime for the progressively grounded query path.
 
@@ -396,17 +426,22 @@ class GroundedRuntimeKernel:
         access_role: str = DEFAULT_ACCESS_ROLE,
         user_scope: dict[str, Any] | None = None,
         reference_scope: GroundedReferenceScopeBinding | dict[str, Any] | None = None,
+        retrieval_question: str = "",
         session_id: str = "",
     ) -> GroundedRuntimeSession:
         normalized_question = str(question or "").strip()
         if not normalized_question:
             raise ValueError("grounded runtime requires a non-empty question")
+        normalized_retrieval_question = str(retrieval_question or "").strip()
+        if not normalized_retrieval_question:
+            normalized_retrieval_question = normalized_question
         normalized_merchant_id = str(merchant_id or "").strip()
         if not normalized_merchant_id:
             raise ValueError("grounded runtime requires merchant_id")
         return GroundedRuntimeSession(
             session_id=session_id or "grounded_%s" % uuid.uuid4().hex[:16],
             question=normalized_question,
+            retrieval_question=normalized_retrieval_question,
             merchant_id=normalized_merchant_id,
             merchant=(merchant or MerchantInfo(merchant_id=normalized_merchant_id)).model_copy(
                 update={"merchant_id": normalized_merchant_id}
@@ -1016,11 +1051,13 @@ class GroundedRuntimeKernel:
         *,
         runtime_budget: Any = None,
     ) -> TopicRoutingDecision:
-        keywords = self.keyword_service.extract(session.question)
-        route_slots = self.route_slot_extractor.extract(
-            session.question,
-            keywords,
+        # Grounded RAG routes from the complete question and published Topic
+        # cards.  It deliberately does not pre-classify metrics, dimensions,
+        # time, ranking shape or analysis intent before initial recall.
+        keywords = ExtractedKeywords(
+            normalized_question=session.question,
         )
+        route_slots = RouteSlots()
         semantic_route = getattr(self.topic_router, "route_with_budget", None)
         if callable(semantic_route):
             routing = semantic_route(
@@ -1062,6 +1099,10 @@ class GroundedRuntimeKernel:
         query: str = "",
         history_rows: Sequence[dict[str, Any]] | None = None,
         knowledge_context: str = "",
+        target_goal_ids: Sequence[str] | None = None,
+        required_capabilities: Sequence[str] | None = None,
+        coverage_receipt_id: str = "",
+        strict_topic_scope: bool = True,
     ) -> RecallBundle:
         if self.recall_service is None:
             raise RuntimeError(
@@ -1074,34 +1115,16 @@ class GroundedRuntimeKernel:
                 category = resolve_category(topic_name)
                 if category and category not in categories:
                     categories.append(category)
-        retrieval_query = str(query or session.question).strip()
-        retrieval_keywords = (
-            session.keywords
-            if retrieval_query == session.question
-            else self.keyword_service.extract(retrieval_query)
-        )
-        retrieval_route_slots = (
-            session.route_slots
-            if retrieval_query == session.question
-            else self.route_slot_extractor.extract(
-                retrieval_query,
-                retrieval_keywords,
-            )
-        )
-        route_slots_payload = retrieval_route_slots.model_dump(
-            by_alias=True,
-            mode="json",
-        )
-        route_slots_payload["dimensions"] = list(
-            retrieval_keywords.dimension_keywords
-        )
+        retrieval_query = str(
+            query or session.retrieval_question or session.question
+        ).strip()
         retrieve = getattr(self.recall_service, "retrieve", None)
         knowledge_bundle = None
         if callable(retrieve):
             knowledge_bundle = retrieve(
                 KnowledgeRetrievalRequest(
                     query=retrieval_query,
-                    keywords=list(retrieval_keywords.keywords),
+                    keywords=[],
                     history_rows=list(history_rows or []),
                     knowledge_context=knowledge_context,
                     merchant_id=session.merchant_id,
@@ -1112,22 +1135,20 @@ class GroundedRuntimeKernel:
                         if str(item or "").strip()
                     ],
                     topic_categories=categories,
-                    route_slots=route_slots_payload,
-                    intent_kind=str(
-                        retrieval_keywords.analysis_intent or ""
-                    ),
-                    complexity=_retrieval_complexity(
-                        retrieval_keywords,
-                        retrieval_route_slots,
-                    ),
-                    strict_topic_scope=True,
+                    route_slots={},
+                    intent_kind="",
+                    complexity="",
+                    target_goal_ids=list(target_goal_ids or []),
+                    required_capabilities=list(required_capabilities or []),
+                    coverage_receipt_id=str(coverage_receipt_id or ""),
+                    strict_topic_scope=bool(strict_topic_scope),
                 )
             )
             bundle = knowledge_bundle.recall_bundle
         else:
             bundle = self.recall_service.recall(
                 retrieval_query,
-                retrieval_keywords,
+                ExtractedKeywords(normalized_question=retrieval_query),
                 list(history_rows or []),
                 knowledge_context,
                 session.merchant_id,
@@ -1172,6 +1193,69 @@ class GroundedRuntimeKernel:
                 % (retrieval_query[:120], len(bundle.items), stop_reason or "unknown"),
             )
         return bundle
+
+    def recall_goal_gaps(
+        self,
+        session: GroundedRuntimeSession,
+        requests: Sequence[Mapping[str, Any]],
+        *,
+        max_requests: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Run bounded Goal-targeted recall without selecting semantic refs."""
+
+        results: list[dict[str, Any]] = []
+        for raw in list(requests)[: max(0, int(max_requests or 0))]:
+            request_id = str(
+                raw.get("requestId") or raw.get("request_id") or ""
+            ).strip()
+            fingerprint = str(
+                raw.get("requestFingerprint")
+                or raw.get("request_fingerprint")
+                or ""
+            ).strip()
+            try:
+                bundle = self.recall_navigation(
+                    session,
+                    query=str(raw.get("query") or "").strip(),
+                    target_goal_ids=list(
+                        raw.get("targetGoalIds")
+                        or raw.get("target_goal_ids")
+                        or []
+                    ),
+                    required_capabilities=list(
+                        raw.get("requiredCapabilities")
+                        or raw.get("required_capabilities")
+                        or []
+                    ),
+                    coverage_receipt_id=str(
+                        raw.get("coverageReceiptId")
+                        or raw.get("coverage_receipt_id")
+                        or ""
+                    ),
+                    strict_topic_scope=False,
+                )
+            except Exception as exc:
+                results.append(
+                    {
+                        "requestId": request_id,
+                        "requestFingerprint": fingerprint,
+                        "status": "DEGRADED",
+                        "code": "GOAL_SUPPLEMENTAL_RECALL_FAILED",
+                        "message": "%s:%s"
+                        % (type(exc).__name__, str(exc)[:400]),
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "requestId": request_id,
+                    "requestFingerprint": fingerprint,
+                    "status": "COMPLETED",
+                    "candidateCount": len(bundle.items),
+                    "recallIndexVersion": session.recall_index_version,
+                }
+            )
+        return results
 
     def propose_contract(
         self,
@@ -2740,6 +2824,7 @@ class GroundedRuntimeKernel:
             publication_required = bool(
                 session.artifact_publication_required
             )
+            allowed_knowledge_refs = _recall_knowledge_ref_ids(session.recall)
         if self.semantic_activation_authority_available():
             self.revalidate_semantic_activation(session)
         verifier_run_result = run_result_source.model_copy(deep=True)
@@ -2749,10 +2834,14 @@ class GroundedRuntimeKernel:
             != authority_fingerprint
         ):
             raise RuntimeError("QUERY_RESULT_PUBLICATION_AUTHORITY_CORRUPT")
+        verifier_kwargs: dict[str, Any] = {}
+        if _plan_has_knowledge_evidence_contract(plan):
+            verifier_kwargs["allowed_knowledge_refs"] = allowed_knowledge_refs
         verified = self.verifier.verify(
             session.question,
             plan,
             verifier_run_result,
+            **verifier_kwargs,
         )
         if not isinstance(verified, VerifiedEvidence):
             verified = VerifiedEvidence.model_validate(verified)
@@ -5119,26 +5208,6 @@ def _combine_artifact_runs(
         list(artifact_ids)
     )
     return combined
-
-
-def _retrieval_complexity(
-    keywords: ExtractedKeywords,
-    route_slots: RouteSlots,
-) -> str:
-    metric_keys = {
-        str(item.canonical_key or item.phrase or "")
-        for item in keywords.mentions
-        if item.kind in {"metric", "lineage"}
-        and str(item.canonical_key or item.phrase or "")
-    }
-    if (
-        len(metric_keys) > 1
-        or len(route_slots.topic_candidates) > 1
-        or bool(keywords.ranking_keywords)
-        or bool(route_slots.analysis_signals)
-    ):
-        return "complex"
-    return "simple"
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:

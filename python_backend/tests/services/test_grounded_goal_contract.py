@@ -964,6 +964,68 @@ def test_scalar_artifact_cannot_claim_anomaly_analysis_is_covered() -> None:
     assert "GOAL_TYPED_PROOF_REQUIRED" in {issue.code for issue in result.issues}
 
 
+def test_independent_filter_windows_accept_branch_local_primary_role() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "最近7天订单明细和最近10天退款明细",
+            "goals": [
+                {
+                    "goalId": "detail.orders",
+                    "kind": "detail",
+                    "label": "订单明细",
+                },
+                {
+                    "goalId": "time.orders",
+                    "kind": "time_window",
+                    "label": "订单时间窗",
+                    "timeExpression": "最近7天",
+                    "windowRole": "filter",
+                    "appliesToGoalIds": ["detail.orders"],
+                },
+                {
+                    "goalId": "detail.refunds",
+                    "kind": "detail",
+                    "label": "退款明细",
+                },
+                {
+                    "goalId": "time.refunds",
+                    "kind": "time_window",
+                    "label": "退款时间窗",
+                    "timeExpression": "最近10天",
+                    "windowRole": "filter",
+                    "appliesToGoalIds": ["detail.refunds"],
+                },
+            ],
+        }
+    )
+
+    assert goal_contract_module._time_window_roles_equivalent(
+        "filter",
+        "primary",
+        goal_map=contract.goal_map(),
+    ) is True
+    assert goal_contract_module._time_window_roles_equivalent(
+        "detail_scope",
+        "primary",
+        goal_map=contract.goal_map(),
+    ) is True
+
+    comparison_contract = contract.model_copy(
+        update={
+            "goals": [
+                *contract.goals[:-1],
+                contract.goals[-1].model_copy(update={"window_role": "comparison"}),
+            ]
+        },
+        deep=True,
+    )
+    assert goal_contract_module._time_window_roles_equivalent(
+        "filter",
+        "primary",
+        goal_map=comparison_contract.goal_map(),
+    ) is False
+
+
 def test_anomaly_proof_requires_baseline_and_normalization() -> None:
     contract = anomaly_contract()
     goal_ids = [goal.goal_id for goal in contract.goals]

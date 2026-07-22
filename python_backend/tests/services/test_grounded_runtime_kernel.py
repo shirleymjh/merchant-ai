@@ -474,12 +474,10 @@ def test_unified_retriever_is_preferred_with_strict_topic_scope_and_supplemental
 
     assert retriever.requests[0].strict_topic_scope is True
     assert retriever.requests[0].topic_categories == [QuestionCategory.SERVICE]
-    assert retriever.requests[0].route_slots["timeWindow"]["days"] == 30
-    assert retriever.requests[0].route_slots["topicCandidates"][0]["topic"] == (
-        QuestionCategory.SERVICE.value
-    )
-    assert retriever.requests[0].intent_kind == "lookup"
-    assert retriever.requests[0].complexity == "simple"
+    assert retriever.requests[0].keywords == []
+    assert retriever.requests[0].route_slots == {}
+    assert retriever.requests[0].intent_kind == ""
+    assert retriever.requests[0].complexity == ""
     assert retriever.requests[1].query == "商品字段"
     assert retriever.requests[1].strict_topic_scope is True
     assert [item.doc_id for item in initial.items] == ["semantic:客服工单:initial"]
@@ -489,7 +487,7 @@ def test_unified_retriever_is_preferred_with_strict_topic_scope_and_supplemental
     }
 
 
-def test_initial_route_extracts_keywords_and_slots_once_for_topic_and_recall() -> None:
+def test_initial_route_and_recall_do_not_run_pre_retrieval_extractors() -> None:
     class CountingKeywordService:
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -554,11 +552,38 @@ def test_initial_route_extracts_keywords_and_slots_once_for_topic_and_recall() -
     runtime.route_topic(session)
     runtime.recall_navigation(session)
 
-    assert keywords.calls == ["最近30天工单量"]
-    assert len(slots.calls) == 1
+    assert keywords.calls == []
+    assert slots.calls == []
     assert router.keywords is session.keywords
     assert router.route_slots is session.route_slots
-    assert retriever.requests[0].route_slots["timeWindow"]["days"] == 30
+    assert router.keywords.normalized_question == "最近30天工单量"
+    assert router.keywords.keywords == []
+    assert retriever.requests[0].route_slots == {}
+
+
+def test_initial_recall_uses_contextualized_question_without_mutating_question() -> None:
+    retriever = FakeKnowledgeRetriever()
+    runtime = GroundedRuntimeKernel(
+        FakeTopicAssets(),
+        keyword_service=FakeKeywordService(),
+        topic_router=FakeRouter(),
+        recall_service=retriever,
+        contract_builder=QueueBuilder([]),
+    )
+    session = runtime.new_session(
+        "那退款呢？",
+        "m-1",
+        retrieval_question="最近7天的退款情况",
+    )
+
+    runtime.route_topic(session)
+    runtime.recall_navigation(session)
+    runtime.recall_navigation(session, query="退款表的时间字段")
+
+    assert session.question == "那退款呢？"
+    assert session.retrieval_question == "最近7天的退款情况"
+    assert retriever.requests[0].query == "最近7天的退款情况"
+    assert retriever.requests[1].query == "退款表的时间字段"
 
 
 def test_unresolved_candidate_is_recorded_without_replacing_active_contract() -> None:

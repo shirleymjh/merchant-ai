@@ -17,6 +17,7 @@ from merchant_ai.models import APIModel
 
 GroundedSubagentCapability = Literal[
     "READ_CONTEXT",
+    "QUERY_DATA",
     "QUERY_BRANCH",
 ]
 

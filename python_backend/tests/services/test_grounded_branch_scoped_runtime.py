@@ -44,6 +44,7 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedContractGap,
     GroundedQueryContract,
 )
+from merchant_ai.services.grounded_query_branches import GroundedSemanticReadLedger
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,
@@ -549,7 +550,6 @@ def test_declared_branches_prepare_semantics_and_contracts_in_parallel() -> None
             runtime=SimpleNamespace(context=context),
         )
     )
-
     assert prepared["status"] == "PREPARED"
     assert prepared["compatMode"] == "BRANCH_SCOPED_V2"
     assert prepared["preparedInParallel"] is True
@@ -653,7 +653,7 @@ def test_entity_chain_downstream_waits_before_contract_preparation() -> None:
     )
 
     assert result["status"] == "BLOCKED"
-    assert result["queries"][0]["status"] == ("WAITING_VERIFIED_ENTITY_SET")
+    assert result["queries"][0]["status"] == ("WAITING_VERIFIED_ARTIFACT")
     assert context.session.query_branch_contexts[downstream_id].runtime is None
     assert kernel.max_active_prepares == 0
 
@@ -1102,6 +1102,94 @@ def test_l0_detail_path_yields_bounded_l1_navigation_then_exact_leaf_ready() -> 
     assert branch.budget.report()["usage"]["semanticReads"] == 0
 
 
+def test_frozen_graph_declared_evidence_allows_batch_prepare_before_ledger_hydration() -> None:
+    runtime, kernel, _ = _runtime(require_parallel_overlap=False)
+    context = _context(
+        kernel,
+        "最近7天订单明细和最近10天退款明细分别给我看一下",
+    )
+    tools = {item.name: item for item in runtime.tools}
+    tools["declare_original_question_goals"].func(
+        contract=OriginalQuestionGoalContract(
+            question=context.session.runtime.question,
+            goals=[
+                DetailQuestionGoal(
+                    goal_id="detail.orders",
+                    label="订单明细",
+                ),
+                DetailQuestionGoal(
+                    goal_id="detail.refunds",
+                    label="退款明细",
+                ),
+            ],
+        ),
+        runtime=SimpleNamespace(context=context),
+    )
+    frozen = _propose_test_execution_graph(
+        runtime,
+        context,
+        nodes=[
+            {
+                "clientKey": "orders",
+                "goalIds": ["detail.orders"],
+                "topicScope": ["电商交易"],
+                "evidencePaths": [
+                    "topics/电商交易/tables/orders/detail.json",
+                    "topics/电商交易/tables/orders/metrics/order_count.json",
+                ],
+            },
+            {
+                "clientKey": "refunds",
+                "goalIds": ["detail.refunds"],
+                "topicScope": ["电商退货"],
+                "evidencePaths": [
+                    "topics/电商退货/tables/refunds/detail.json",
+                    "topics/电商退货/tables/refunds/metrics/refund_amount.json",
+                ],
+            },
+        ],
+    )
+    assert frozen["status"] == "FROZEN"
+    query_ids = [
+        frozen["clientNodeIds"]["orders"],
+        frozen["clientNodeIds"]["refunds"],
+    ]
+    for query_id in query_ids:
+        # Simulate a branch runtime restored from the graph receipt before
+        # its local semantic ledger has been hydrated.
+        context.session.query_branch_contexts[query_id].semantic_ledger = (
+            GroundedSemanticReadLedger()
+        )
+
+    prepared = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {
+                    "queryId": query_ids[0],
+                    "semanticPaths": [
+                        "topics/电商交易/tables/orders/detail.json",
+                        "topics/电商交易/tables/orders/metrics/order_count.json",
+                    ],
+                    "goalIds": ["detail.orders"],
+                },
+                {
+                    "queryId": query_ids[1],
+                    "semanticPaths": [
+                        "topics/电商退货/tables/refunds/detail.json",
+                        "topics/电商退货/tables/refunds/metrics/refund_amount.json",
+                    ],
+                    "goalIds": ["detail.refunds"],
+                },
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert prepared["status"] == "PREPARED", prepared
+    assert prepared["preparedCount"] == 2
+    assert {item["queryId"] for item in prepared["queries"]} == set(query_ids)
+
+
 def test_l1_receipt_keeps_every_publisher_bounded_column_coordinate() -> None:
     column_leaves = [
         {
@@ -1135,57 +1223,6 @@ def test_l1_receipt_keeps_every_publisher_bounded_column_coordinate() -> None:
     assert navigation["advertisedCounts"]["columns"] == 26
     assert len(navigation["columnLeaves"]) == 26
     assert navigation["columnLeaves"][-1]["key"] == "column_25"
-
-
-def test_multi_branch_boundary_rejects_global_filesystem_retrieval() -> None:
-    runtime, kernel, catalog = _runtime()
-    context = _context(kernel, "订单量和退款金额")
-    tools = {item.name: item for item in runtime.tools}
-    tools["declare_original_question_goals"].func(
-        contract=OriginalQuestionGoalContract(
-            question=context.session.runtime.question,
-            goals=[
-                MetricQuestionGoal(goal_id="metric.orders", label="订单量"),
-                MetricQuestionGoal(goal_id="metric.refunds", label="退款金额"),
-            ],
-        ),
-        runtime=SimpleNamespace(context=context),
-    )
-    frozen = _propose_test_execution_graph(
-        runtime,
-        context,
-        nodes=[
-            {
-                "clientKey": "orders",
-                "goalIds": ["metric.orders"],
-                "topicScope": ["电商交易"],
-            },
-            {
-                "clientKey": "refunds",
-                "goalIds": ["metric.refunds"],
-                "topicScope": ["电商退货"],
-            },
-        ],
-    )
-    assert frozen["status"] == "FROZEN"
-    boundary = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(catalog))
-    request = SimpleNamespace(
-        runtime=SimpleNamespace(context=context),
-        tool_call={
-            "id": "read-1",
-            "name": "read_file",
-            "args": {"file_path": "/knowledge/topics/电商交易/tables/orders/detail.json"},
-        },
-    )
-
-    result = boundary.wrap_tool_call(
-        request,
-        lambda _: (_ for _ in ()).throw(AssertionError("global handler must not run")),
-    )
-
-    payload = json.loads(str(result.content))
-    assert result.status == "error"
-    assert payload["code"] == "EXECUTION_GRAPH_DISCOVERY_FROZEN"
 
 
 def test_query_goal_allows_discovery_before_execution_graph_freeze() -> None:

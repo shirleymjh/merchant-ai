@@ -31,6 +31,7 @@ class ConversationSemanticModelDecision(APIModel):
     complete_membership_required: bool = False
     current_turn_replaces_time_scope: bool = False
     reference_phrases: tuple[str, ...] = ()
+    retrieval_question: str = ""
 
     @model_validator(mode="after")
     def validate_structure(self) -> "ConversationSemanticModelDecision":
@@ -43,6 +44,10 @@ class ConversationSemanticModelDecision(APIModel):
             raise ValueError(
                 "reference_phrases must not contain duplicate values"
             )
+        if len(str(self.retrieval_question or "").strip()) > 1200:
+            raise ValueError(
+                "retrieval_question must not exceed 1200 characters"
+            )
         return self
 
 
@@ -52,6 +57,7 @@ class StructuredConversationSemanticProvider:
     _SYSTEM_PROMPT = """You are an isolated semantic reference resolver.
 You receive one current user utterance and a server-retained list of prior result descriptors.
 Decide whether the utterance semantically refers to prior context. If it does, identify exactly one retained artifact or mark the reference ambiguous, classify the referent type and downstream operation, and state whether complete row-population membership is required. Decide whether an explicit scope in the current utterance replaces the retained time scope.
+For an unambiguous reference, also produce retrieval_question: a concise, standalone search question that preserves the current request and resolves only the context supplied by the selected retained descriptor. It is used only for BM25 and vector retrieval. Do not add a metric, time range, entity, filter, table, formula, or business rule that is absent from the current utterance and selected descriptor. Do not include artifact IDs. When the reference is absent or ambiguous, retrieval_question must be an empty string.
 The downstream operation describes only what the user wants to do with a referenced prior result; it does not describe the standalone operation in the current utterance. When reference_detected is false, return the non-reference defaults: ambiguous=false, selected_artifact_id="", referent_type=NONE, downstream_operation=UNSPECIFIED, population_required=false, complete_membership_required=false, current_turn_replaces_time_scope=false, and reference_phrases=[].
 Use only supplied artifact IDs. Do not infer tables, formulas, SQL, row values, metrics, or business rules. Do not treat a shared time label as proof that two artifacts are the same population. Do not treat preview membership as complete. Return only the strict structured decision schema."""
 
@@ -121,15 +127,18 @@ Use only supplied artifact IDs. Do not infer tables, formulas, SQL, row values, 
     def _canonicalize_decision(
         decision: ConversationSemanticModelDecision,
     ) -> ConversationSemanticModelDecision:
-        """Remove conditionally irrelevant fields from a non-reference result.
+        """Remove conditionally irrelevant fields from an unusable reference.
 
         The model owns the semantic decision whether a cross-turn reference is
-        present. Once it says there is no reference, reference-only fields have
-        no meaning and are deterministically projected to their protocol
-        defaults before crossing the independent review boundary.
+        present. Non-reference fields have no meaning, while an ambiguous
+        reference cannot authorize a contextualized retrieval question.
         """
 
         if decision.reference_detected:
+            if decision.ambiguous:
+                return decision.model_copy(
+                    update={"retrieval_question": ""}
+                )
             return decision
         return decision.model_copy(
             update={
@@ -143,6 +152,7 @@ Use only supplied artifact IDs. Do not infer tables, formulas, SQL, row values, 
                 "complete_membership_required": False,
                 "current_turn_replaces_time_scope": False,
                 "reference_phrases": (),
+                "retrieval_question": "",
             }
         )
 

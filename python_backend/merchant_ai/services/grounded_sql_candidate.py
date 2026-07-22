@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -71,6 +72,7 @@ class _Output:
     passthrough: bool = False
     semantic_refs: set[str] = field(default_factory=set)
     exact_metric_refs: set[str] = field(default_factory=set)
+    analytic: bool = False
 
 
 @dataclass
@@ -102,6 +104,7 @@ class _ResolvedColumn:
     origins: set[_Origin] = field(default_factory=set)
     source_alias: str = ""
     derived_output: bool = False
+    analytic_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,6 +150,9 @@ class _TimeObligation:
     column: str
     start_value: str = ""
     end_value: str = ""
+    start_operator: str = "GTE"
+    end_operator: str = "LTE"
+    required: bool = True
 
 
 @dataclass
@@ -264,6 +270,7 @@ class GroundedSqlCandidateValidator:
         self._validate_time_obligations(context)
         self._validate_reference_scope(context)
         self._validate_final_outputs(context)
+        self._validate_non_ranking_shape_obligations(parsed, context)
         self._validate_ranking_obligations(parsed, context)
 
         gaps = _dedupe_gaps(context.gaps)
@@ -380,6 +387,7 @@ class GroundedSqlCandidateValidator:
             self._record_metric_formulas(state, context)
             self._record_entity_predicates(state, context)
             self._record_time_predicates(state, context)
+            self._validate_predicate_authority(state, context)
             state.outputs = self._build_scope_outputs(state, context)
             state.base_tables = set().union(
                 *(source.base_tables for source in state.sources.values())
@@ -791,16 +799,126 @@ class GroundedSqlCandidateValidator:
                         if not matching:
                             continue
                         scan_ids = set().union(*(origin.scan_ids for origin in matching))
-                        if _time_boundary_matches(lower, obligation.start_value):
+                        if _time_boundary_matches(
+                            lower,
+                            obligation.start_value,
+                            obligation.start_operator,
+                        ):
                             context.time_lower_coverage.setdefault(
                                 obligation.obligation_index,
                                 set(),
                             ).update(scan_ids)
-                        if _time_boundary_matches(upper, obligation.end_value):
+                        if _time_boundary_matches(
+                            upper,
+                            obligation.end_value,
+                            obligation.end_operator,
+                        ):
                             context.time_upper_coverage.setdefault(
                                 obligation.obligation_index,
                                 set(),
                             ).update(scan_ids)
+
+    def _validate_predicate_authority(
+        self,
+        state: _ScopeState,
+        context: _ValidationContext,
+    ) -> None:
+        select = state.scope.expression
+        if not isinstance(select, exp.Select):
+            return
+        roots: list[tuple[str, exp.Expression]] = []
+        for key in ("where", "having", "qualify"):
+            wrapper = select.args.get(key)
+            if isinstance(wrapper, exp.Expression) and isinstance(
+                wrapper.this, exp.Expression
+            ):
+                roots.append((key.upper(), wrapper.this))
+        for location, root in roots:
+            for term in _and_terms(root):
+                if self._predicate_is_contract_authorized(term, state, context):
+                    continue
+                resolved = [
+                    _resolve_column(column, state, context.allowed_columns)
+                    for column in _direct_columns(term)
+                ]
+                if resolved and all(
+                    item.status == "ok" and item.analytic_output
+                    for item in resolved
+                ):
+                    # Analytic filters such as ROW_NUMBER() = 1 constrain SQL
+                    # topology without adding a physical business predicate.
+                    continue
+                if any(
+                    context.merchant_columns.get(origin.table) == origin.column
+                    for item in resolved
+                    for origin in item.origins
+                ):
+                    # Tenant predicates already receive a more specific gap.
+                    continue
+                context.gaps.append(
+                    _gap(
+                        "SQL_PREDICATE_NOT_AUTHORIZED",
+                        "SQL contains a filter that is not declared by the grounded contract",
+                        details={
+                            "predicateLocation": location,
+                            "predicate": term.sql(dialect=self.dialect),
+                        },
+                        resolution=(
+                            "Remove the filter or bind it as an exact entity, time, "
+                            "or verified reference-scope obligation."
+                        ),
+                    )
+                )
+
+    @staticmethod
+    def _predicate_is_contract_authorized(
+        term: exp.Expression,
+        state: _ScopeState,
+        context: _ValidationContext,
+    ) -> bool:
+        signature = _predicate_signature(term, state, context.allowed_columns)
+        if signature is not None:
+            origins, operator, values = signature
+            for obligation in context.entity_obligations:
+                expected_origin = (
+                    _identifier(obligation.table),
+                    _identifier(obligation.column),
+                )
+                if not any(
+                    (origin.table, origin.column) == expected_origin
+                    for origin in origins
+                ):
+                    continue
+                if (
+                    _operator_satisfies(operator, obligation.operator)
+                    and _literal_values_equal(
+                        values,
+                        obligation.literal_value,
+                        obligation.operator,
+                    )
+                ):
+                    return True
+        for origins, lower, upper in _time_predicate_signatures(
+            term, state, context.allowed_columns
+        ):
+            for obligation in context.time_obligations:
+                if not any(
+                    origin.table == obligation.table
+                    and origin.column == obligation.column
+                    for origin in origins
+                ):
+                    continue
+                if _time_boundary_matches(
+                    lower,
+                    obligation.start_value,
+                    obligation.start_operator,
+                ) or _time_boundary_matches(
+                    upper,
+                    obligation.end_value,
+                    obligation.end_operator,
+                ):
+                    return True
+        return False
 
     def _build_scope_outputs(
         self,
@@ -849,6 +967,7 @@ class GroundedSqlCandidateValidator:
                             direct_column,
                             state,
                         ),
+                        analytic=resolved.analytic_output,
                     )
                     continue
             origins: set[_Origin] = set()
@@ -902,6 +1021,7 @@ class GroundedSqlCandidateValidator:
                 passthrough=False,
                 semantic_refs=semantic_refs,
                 exact_metric_refs=exact_metric_refs,
+                analytic=any(isinstance(node, exp.Window) for node in expression.walk()),
             )
         return outputs
 
@@ -1169,6 +1289,8 @@ class GroundedSqlCandidateValidator:
 
     def _validate_time_obligations(self, context: _ValidationContext) -> None:
         for obligation in context.time_obligations:
+            if not obligation.required:
+                continue
             expected = context.time_scans.get(obligation.obligation_index, set())
             lower = context.time_lower_coverage.get(obligation.obligation_index, set())
             upper = context.time_upper_coverage.get(obligation.obligation_index, set())
@@ -1187,6 +1309,113 @@ class GroundedSqlCandidateValidator:
                         "missingUpperScanCount": len(expected - upper),
                     },
                     resolution="Apply both grounded time boundaries on the governed time column outside OR/NOT branches.",
+                )
+            )
+
+    def _validate_non_ranking_shape_obligations(
+        self,
+        parsed: exp.Expression,
+        context: _ValidationContext,
+    ) -> None:
+        shape = str(context.contract.query_shape or "").upper()
+        if not context.contract.ranking.enabled and shape not in {
+            "DETAIL",
+            "ENTITY_LOOKUP",
+        }:
+            limits = list(parsed.find_all(exp.Limit))
+            if limits:
+                context.gaps.append(
+                    _gap(
+                        "SQL_LIMIT_NOT_AUTHORIZED",
+                        "A non-ranking aggregate contract does not authorize LIMIT",
+                        details={
+                            "queryShape": shape,
+                            "limits": [
+                                item.sql(dialect=self.dialect) for item in limits
+                            ],
+                        },
+                        resolution=(
+                            "Remove LIMIT, or bind an explicit ranked Top/Bottom N contract."
+                        ),
+                    )
+                )
+        if shape in {"GROUPED", "TREND"}:
+            self._validate_group_grain_obligations(context)
+
+    def _validate_group_grain_obligations(
+        self,
+        context: _ValidationContext,
+    ) -> None:
+        expected_refs = [
+            item.semantic_ref_id
+            for item in context.contract.dimensions
+            if item.semantic_ref_id
+        ]
+        if not expected_refs:
+            return
+        metric_scope_ids = (
+            set().union(*context.metric_formula_scopes.values())
+            if context.metric_formula_scopes
+            else set()
+        )
+        candidate_states: list[_ScopeState] = []
+        for scope_id in metric_scope_ids:
+            state = context.scope_states.get(scope_id)
+            if state is None or not isinstance(state.scope.expression, exp.Select):
+                continue
+            output_refs = (
+                set().union(
+                    *(output.semantic_refs for output in state.outputs.values())
+                )
+                if state.outputs
+                else set()
+            )
+            if output_refs.intersection(expected_refs):
+                candidate_states.append(state)
+        if not candidate_states:
+            context.gaps.append(
+                _gap(
+                    "SQL_GROUP_GRAIN_MISMATCH",
+                    "The grouped metric has no aggregation scope at the contract-bound dimension grain",
+                    details={"expectedDimensionRefIds": expected_refs},
+                    resolution="Group the governed metric by every and only the bound dimensions.",
+                )
+            )
+            return
+        for state in candidate_states:
+            select = state.scope.expression
+            group = select.args.get("group")
+            expressions = (
+                list(group.expressions) if isinstance(group, exp.Group) else []
+            )
+            matched_refs: list[str] = []
+            for expression in expressions:
+                matching = [
+                    ref_id
+                    for ref_id in expected_refs
+                    if _ranking_group_expression_matches(
+                        expression, state, context, ref_id
+                    )
+                ]
+                if len(matching) == 1:
+                    matched_refs.append(matching[0])
+            if (
+                len(expressions) == len(expected_refs)
+                and len(matched_refs) == len(expected_refs)
+                and set(matched_refs) == set(expected_refs)
+            ):
+                continue
+            context.gaps.append(
+                _gap(
+                    "SQL_GROUP_GRAIN_MISMATCH",
+                    "The metric is not aggregated at exactly the contract-bound dimension grain",
+                    details={
+                        "actualGroupExpressions": [
+                            item.sql(dialect=self.dialect) for item in expressions
+                        ],
+                        "expectedDimensionRefIds": expected_refs,
+                    },
+                    resolution="Group the governed metric by every and only the bound dimensions.",
                 )
             )
 
@@ -1830,18 +2059,12 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                 binding = table_bindings.get(table)
                 if binding and binding.time_column:
                     relevant.append((table, _identifier(binding.time_column)))
-        start_value = str(
-            contract.time_range.execution_start_value
-            or contract.time_range.execution_start_date
-            or contract.time_range.start_date
-            or ""
-        ).strip()
-        end_value = str(
-            contract.time_range.execution_end_value
-            or contract.time_range.execution_end_date
-            or contract.time_range.end_date
-            or ""
-        ).strip()
+        start_value, end_value, start_operator, end_operator = (
+            _time_obligation_bounds(
+                contract.time_range,
+                role=(time_field.role if time_field.semantic_ref_id else "DATE"),
+            )
+        )
         for table, column in _dedupe_pairs(relevant):
             time_obligations.append(
                 _TimeObligation(
@@ -1850,6 +2073,38 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                     column=column,
                     start_value=start_value,
                     end_value=end_value,
+                    start_operator=start_operator,
+                    end_operator=end_operator,
+                )
+            )
+        partition_column = _identifier(time_field.partition_pruning_column)
+        partition_table = _identifier(time_field.table)
+        if (
+            time_field.semantic_ref_id
+            and partition_table
+            and partition_column
+            and (partition_table, partition_column) not in set(relevant)
+            and time_field.partition_pruning_policy
+            in {"EXACT_EQUIVALENT", "SAFE_SUPERSET"}
+        ):
+            pruning_start, pruning_end, pruning_lower, pruning_upper = (
+                _time_obligation_bounds(
+                    contract.time_range,
+                    role="DATE",
+                    lower_expansion_days=time_field.partition_lower_expansion_days,
+                    upper_expansion_days=time_field.partition_upper_expansion_days,
+                )
+            )
+            time_obligations.append(
+                _TimeObligation(
+                    obligation_index=len(time_obligations),
+                    table=partition_table,
+                    column=partition_column,
+                    start_value=pruning_start,
+                    end_value=pruning_end,
+                    start_operator=pruning_lower,
+                    end_operator=pruning_upper,
+                    required=False,
                 )
             )
     if reference_predicate_enabled and bool(reference.source_time_range.explicit):
@@ -1893,6 +2148,8 @@ def _build_context(contract: GroundedQueryContract) -> _ValidationContext:
                     column=column,
                     start_value=start_value,
                     end_value=end_value,
+                    start_operator="GTE",
+                    end_operator="LTE",
                 )
             )
 
@@ -2058,6 +2315,7 @@ def _resolve_from_source(
         origins=set(output.origins),
         source_alias=source.alias,
         derived_output=True,
+        analytic_output=output.analytic,
     )
 
 
@@ -2579,19 +2837,21 @@ def _time_predicate_signatures(
     expression: exp.Expression,
     state: _ScopeState,
     allowed_columns: Mapping[str, set[str]],
-) -> list[tuple[set[_Origin], tuple[str, str] | None, tuple[str, str] | None]]:
+) -> list[
+    tuple[
+        set[_Origin],
+        tuple[str, tuple[str, str]] | None,
+        tuple[str, tuple[str, str]] | None,
+    ]
+]:
     predicate = _unwrap(expression)
     if isinstance(predicate, exp.Between) and isinstance(predicate.this, exp.Column):
         resolved = _resolve_column(predicate.this, state, allowed_columns)
         if resolved.status != "ok":
             return []
-        return [
-            (
-                resolved.origins,
-                _sql_literal_token(predicate.args.get("low")),
-                _sql_literal_token(predicate.args.get("high")),
-            )
-        ]
+        low = _sql_literal_token(predicate.args.get("low"))
+        high = _sql_literal_token(predicate.args.get("high"))
+        return [(resolved.origins, ("GTE", low) if low else None, ("LTE", high) if high else None)]
     operators: list[tuple[type[exp.Expression], str]] = [
         (exp.EQ, "EQ"),
         (exp.GT, "GT"),
@@ -2626,21 +2886,70 @@ def _time_predicate_signatures(
             operator,
         )
     if operator == "EQ":
-        return [(resolved.origins, token, token)]
+        return [(resolved.origins, ("EQ", token), ("EQ", token))]
     if operator in {"GT", "GTE"}:
-        return [(resolved.origins, token, None)]
-    return [(resolved.origins, None, token)]
+        return [(resolved.origins, (operator, token), None)]
+    return [(resolved.origins, None, (operator, token))]
 
 
 def _time_boundary_matches(
-    actual: tuple[str, str] | None,
+    actual: tuple[str, tuple[str, str]] | None,
     expected: str,
+    expected_operator: str,
 ) -> bool:
     if actual is None:
         return False
+    operator, token = actual
+    if _normalize_operator(operator) != _normalize_operator(expected_operator):
+        if not (operator == "EQ" and expected_operator in {"GTE", "LTE"}):
+            return False
     if not expected:
         return True
-    return actual[1] == str(expected)
+    return token[1] == str(expected)
+
+
+def _time_obligation_bounds(
+    time_range: Any,
+    *,
+    role: str,
+    lower_expansion_days: int = 0,
+    upper_expansion_days: int = 0,
+) -> tuple[str, str, str, str]:
+    start_raw = str(
+        getattr(time_range, "execution_start_value", "")
+        or getattr(time_range, "execution_start_date", "")
+        or getattr(time_range, "start_date", "")
+        or ""
+    ).strip()
+    end_raw = str(
+        getattr(time_range, "execution_end_value", "")
+        or getattr(time_range, "execution_end_date", "")
+        or getattr(time_range, "end_date", "")
+        or ""
+    ).strip()
+    normalized_role = str(role or "").strip().upper()
+    try:
+        start_date = date.fromisoformat(start_raw[:10]) - timedelta(
+            days=max(0, int(lower_expansion_days or 0))
+        )
+        end_date = date.fromisoformat(end_raw[:10]) + timedelta(
+            days=max(0, int(upper_expansion_days or 0))
+        )
+    except ValueError:
+        upper_operator = (
+            "LT"
+            if normalized_role in {"DATETIME", "TIMESTAMP", "TIME"}
+            else "LTE"
+        )
+        return start_raw, end_raw, "GTE", upper_operator
+    if normalized_role in {"DATETIME", "TIMESTAMP", "TIME"}:
+        return (
+            "%s 00:00:00" % start_date.isoformat(),
+            "%s 00:00:00" % (end_date + timedelta(days=1)).isoformat(),
+            "GTE",
+            "LT",
+        )
+    return start_date.isoformat(), end_date.isoformat(), "GTE", "LTE"
 
 
 def _operator_satisfies(actual: str, expected: str) -> bool:

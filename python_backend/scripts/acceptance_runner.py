@@ -463,10 +463,15 @@ def parse_acceptance_response(
         "clarification": clarification,
         "architectureViolations": [],
         "architecturePassed": False,
+        "performanceViolations": [],
+        "performancePassed": False,
     }
     violations = architecture_violations(case, summary)
+    latency_violations = performance_violations(case, summary)
     summary["architectureViolations"] = violations
     summary["architecturePassed"] = not violations
+    summary["performanceViolations"] = latency_violations
+    summary["performancePassed"] = not latency_violations
     if status_code >= 400:
         summary["status"] = "HTTP_ERROR"
     elif operational_failure:
@@ -881,6 +886,27 @@ def architecture_violations(case: AcceptanceCase, summary: Mapping[str, Any]) ->
     return _dedupe(violations)
 
 
+def performance_violations(
+    case: AcceptanceCase,
+    summary: Mapping[str, Any],
+) -> list[str]:
+    """Enforce stable call-count budgets without asserting provider latency."""
+
+    if case.case_id != "base_single_metric" or not str(
+        summary.get("answer") or ""
+    ).strip():
+        return []
+    usage = _mapping(summary.get("usage"))
+    violations: list[str] = []
+    if int(usage.get("llmCalls") or 0) > 3:
+        violations.append("SINGLE_METRIC_LLM_CALL_BUDGET_EXCEEDED")
+    if int(usage.get("toolCalls") or 0) > 3:
+        violations.append("SINGLE_METRIC_TOOL_CALL_BUDGET_EXCEEDED")
+    if int(usage.get("dorisQueries") or 0) != 1:
+        violations.append("SINGLE_METRIC_DORIS_QUERY_COUNT_INVALID")
+    return violations
+
+
 def select_cases(case_ids: Sequence[str] | None = None, *, include_supplemental: bool = True) -> list[AcceptanceCase]:
     available = ALL_CASES if include_supplemental else USER_ACCEPTANCE_CASES
     selected = {item.strip() for item in (case_ids or []) if item.strip()}
@@ -898,12 +924,13 @@ def run_real_cases(cases: Sequence[AcceptanceCase], merchant_id: str) -> list[di
 
     from fastapi.testclient import TestClient
 
-    from app.main import app
+    from app.main import app, run_manager
 
     results: list[dict[str, Any]] = []
     with TestClient(app) as client:
         for case in cases:
             started = time.perf_counter()
+            existing_run_ids = set(run_manager.runs)
             try:
                 response = client.post(
                     "/api/chat",
@@ -911,6 +938,22 @@ def run_real_cases(cases: Sequence[AcceptanceCase], merchant_id: str) -> list[di
                 )
                 elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
                 payload = response.json() if response.content else {}
+                new_runs = [
+                    run
+                    for run_id, run in run_manager.runs.items()
+                    if run_id not in existing_run_ids
+                    and str(run.merchant_id) == merchant_id
+                    and str(run.question) == case.question
+                ]
+                if len(new_runs) == 1 and new_runs[0].trace_path:
+                    trace_path = Path(new_runs[0].trace_path)
+                    if trace_path.is_file():
+                        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                        if isinstance(trace, Mapping):
+                            payload = {
+                                **_mapping(payload),
+                                "debugTrace": dict(trace),
+                            }
                 results.append(
                     parse_acceptance_response(
                         case,

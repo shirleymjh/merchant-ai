@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Mapping, Sequence
 
 from pydantic import ConfigDict, Field, ValidationError
@@ -375,7 +376,13 @@ def render_verified_query_goal_sections(
         )
         if artifact is None:
             continue
-        span = _artifact_answer_span(answer, artifact, goal_kind=goal.kind)
+        span = _artifact_answer_span(
+            answer,
+            artifact,
+            goal_kind=goal.kind,
+            goal_label=goal.label,
+            require_goal_heading=len(artifacts_by_id) > 1,
+        )
         if not span:
             fragment = _render_artifact_fragment(goal, artifact)
             if not fragment:
@@ -734,8 +741,14 @@ def _artifact_answer_span(
     artifact: Any,
     *,
     goal_kind: str,
+    goal_label: str = "",
+    require_goal_heading: bool = False,
 ) -> str:
     answer = str(answer_markdown or "").strip()
+    scoped_answer = _markdown_goal_section(answer, goal_label)
+    if require_goal_heading and not scoped_answer:
+        return ""
+    candidate_answer = scoped_answer or answer
     rows = _artifact_rows(artifact)
     if not rows:
         # Empty-result coverage is rendered from the verified artifact below;
@@ -748,9 +761,46 @@ def _artifact_answer_span(
         for value in first_row.values()
         if value is not None and str(value).strip() not in {"", "-"}
     ]
-    matched = [value for value in values if _value_is_rendered(answer, value)]
+    matched = [
+        value
+        for value in values
+        if _value_is_rendered(candidate_answer, value)
+    ]
     minimum = 1 if len(values) <= 1 or goal_kind == "DEPENDENCY" else 2
-    return answer if len(matched) >= min(minimum, len(values)) else ""
+    return (
+        candidate_answer
+        if len(matched) >= min(minimum, len(values))
+        else ""
+    )
+
+
+def _markdown_goal_section(answer_markdown: str, goal_label: str) -> str:
+    """Return one exact goal-labelled Markdown section when it exists."""
+
+    answer = str(answer_markdown or "").strip()
+    label = " ".join(str(goal_label or "").strip().split()).casefold()
+    if not answer or not label:
+        return ""
+    lines = answer.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if match is None:
+            continue
+        heading = " ".join(match.group(2).strip().split()).casefold()
+        if heading != label:
+            continue
+        level = len(match.group(1))
+        end = len(lines)
+        for cursor in range(index + 1, len(lines)):
+            next_heading = re.match(
+                r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$",
+                lines[cursor],
+            )
+            if next_heading is not None and len(next_heading.group(1)) <= level:
+                end = cursor
+                break
+        return "\n".join(lines[index:end]).strip()
+    return ""
 
 
 def _render_artifact_fragment(goal: QuestionGoal, artifact: Any) -> str:

@@ -64,6 +64,7 @@ def _reference_output(request, **updates: Any):
         "population_required": True,
         "complete_membership_required": False,
         "reference_phrases": ("referenced result",),
+        "retrieval_question": "rank the retained result by refund amount",
     }
     values.update(updates)
     return ConversationSemanticProviderOutput(**values)
@@ -276,12 +277,31 @@ def test_ambiguous_reference_is_accepted_only_without_selection() -> None:
         request,
         ambiguous=True,
         selected_artifact_id="",
+        retrieval_question="",
     )
     review = _review(_Provider(output), request)
 
     assert review.accepted
     assert review.decision is not None
     assert review.decision.ambiguous is True
+
+
+def test_ambiguous_reference_cannot_publish_retrieval_question() -> None:
+    request = _request(_candidate("artifact-a"), _candidate("artifact-b"))
+    output = _reference_output(
+        request,
+        ambiguous=True,
+        selected_artifact_id="",
+        retrieval_question="an unsafe guessed scope",
+    )
+
+    review = _review(_Provider(output), request)
+
+    assert not review.accepted
+    assert (
+        ConversationSemanticIssueCode.AMBIGUOUS_RETRIEVAL_QUESTION_PRESENT
+        in _issue_codes(review)
+    )
 
 
 def test_provider_timeout_failure_and_invalid_output_fail_closed() -> None:

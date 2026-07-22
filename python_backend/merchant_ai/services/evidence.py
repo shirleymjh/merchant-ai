@@ -23,6 +23,27 @@ from merchant_ai.services.text_parsing import (
 )
 
 
+def _verification_input_is_empty(
+    plan: QueryPlan,
+    run_result: AgentRunResult,
+) -> bool:
+    bundle = run_result.merged_query_bundle
+    return not any(
+        [
+            plan.intents,
+            plan.evidence_contracts,
+            plan.final_required_evidence,
+            run_result.task_results,
+            run_result.query_bundles,
+            run_result.evidence_gaps,
+            bundle.rows,
+            bundle.tables,
+            bundle.sql,
+            bundle.error,
+        ]
+    )
+
+
 class EvidenceVerifier:
     def verify(
         self,
@@ -41,6 +62,16 @@ class EvidenceVerifier:
             gap.model_copy(deep=True)
             for gap in run_result.evidence_gaps or []
         ]
+        if _verification_input_is_empty(plan, run_result):
+            gaps.append(
+                EvidenceGap(
+                    code="EVIDENCE_INPUT_REQUIRED",
+                    reason=(
+                        "No query, result, or explicit evidence obligation was "
+                        "supplied to the verifier"
+                    ),
+                )
+            )
         gaps.extend(execution_operational_evidence_gaps(run_result))
         gaps.extend(entity_filter_evidence_gaps(run_result))
         gaps.extend(semantic_filter_evidence_gaps(run_result))
@@ -573,7 +604,7 @@ class EvidenceVerifier:
         if not normalized:
             return False
         if allowed_knowledge_refs is None:
-            return True
+            return False
         return normalized.issubset({str(ref or "").strip() for ref in allowed_knowledge_refs if str(ref or "").strip()})
 
     def _matching_task_result(self, task_id: str, table: str, run_result: AgentRunResult):

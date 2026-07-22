@@ -55,13 +55,14 @@ class GroundedConversationResolution:
     """Server-side interpretation of one turn before Topic routing.
 
     ``effective_question`` remains byte-semantically equal to the normalized
-    current user utterance. Cross-turn authority travels only through the
-    typed reference Contract and trace fields; display labels are never
-    appended to model instructions.
+    current user utterance. ``retrieval_question`` is a non-authoritative,
+    retrieval-only contextualization. Cross-turn execution authority travels
+    only through the typed reference Contract and trace fields.
     """
 
     original_question: str
     effective_question: str
+    retrieval_question: str = ""
     status: str = "STANDALONE"
     reference_detected: bool = False
     reference_phrases: tuple[str, ...] = ()
@@ -105,6 +106,9 @@ class GroundedConversationResolution:
             "source": self.source,
             "originalQuestion": self.original_question,
             "effectiveQuestion": self.effective_question,
+            "retrievalQuestion": (
+                self.retrieval_question or self.effective_question
+            ),
             "needsClarification": self.needs_clarification,
             "clarificationType": self.clarification_type,
             "semanticAuthorityFingerprint": self.semantic_authority_fingerprint,
@@ -516,6 +520,9 @@ def resolve_grounded_conversation_turn(
     return GroundedConversationResolution(
         original_question=original,
         effective_question=original,
+        retrieval_question=(
+            str(decision.retrieval_question or "").strip() or original
+        ),
         status="RESOLVED_REFERENCE",
         reference_detected=True,
         reference_phrases=tuple(decision.reference_phrases),
@@ -630,6 +637,7 @@ def _non_reference_decision_is_clean(decision: Any) -> bool:
             decision.complete_membership_required,
             decision.current_turn_replaces_time_scope,
             bool(decision.reference_phrases),
+            bool(str(decision.retrieval_question or "").strip()),
         )
     )
 

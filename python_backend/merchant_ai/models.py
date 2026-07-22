@@ -590,7 +590,9 @@ class ExtractedKeywords(APIModel):
     ambiguous_metric_keywords: List[str] = Field(default_factory=list)
 
     def is_empty(self) -> bool:
-        return not (self.keywords or self.business_keywords or self.time_keywords or self.action_keywords or self.mentions)
+        return not (
+            self.keywords or self.business_keywords or self.time_keywords or self.action_keywords or self.mentions
+        )
 
     def summary(self) -> str:
         return "Topic词=%s，指标词=%s，维度词=%s，时间词=%s，动作词=%s，意图=%s，置信度=%.2f" % (
@@ -683,17 +685,29 @@ class RecallBundle(APIModel):
     merged_context: str = ""
 
     def has_strong_match(self) -> bool:
-        versioned_items = [item for item in self.items if str((item.metadata or {}).get("scoreVersion") or "") == "recall_v2"]
+        versioned_score_versions = {"recall_v2", "recall_v3"}
+        versioned_items = [
+            item
+            for item in self.items
+            if str((item.metadata or {}).get("scoreVersion") or "") in versioned_score_versions
+        ]
         if versioned_items:
             versioned_strong = any(
                 int((item.metadata or {}).get("protectionTier") or 0) >= 1
-                or float((item.metadata or {}).get("finalScore") if (item.metadata or {}).get("finalScore") is not None else item.fusion_score or 0.0) >= 0.5
+                or float(
+                    (item.metadata or {}).get("finalScore")
+                    if (item.metadata or {}).get("finalScore") is not None
+                    else (item.metadata or {}).get("retrievalScore")
+                    if (item.metadata or {}).get("retrievalScore") is not None
+                    else item.fusion_score or 0.0
+                )
+                >= 0.5
                 for item in versioned_items
             )
             legacy_strong = any(
                 item.fusion_score >= 4.0
                 for item in self.items
-                if str((item.metadata or {}).get("scoreVersion") or "") != "recall_v2"
+                if str((item.metadata or {}).get("scoreVersion") or "") not in versioned_score_versions
             )
             return versioned_strong or legacy_strong
         return self.top_score >= 4.0 or any(item.fusion_score >= 4.0 for item in self.items)
@@ -812,6 +826,9 @@ class KnowledgeRetrievalRequest(APIModel):
     intent_kind: str = ""
     complexity: str = ""
     round: int = 0
+    target_goal_ids: List[str] = Field(default_factory=list)
+    required_capabilities: List[str] = Field(default_factory=list)
+    coverage_receipt_id: str = ""
     # Initial Topic bootstrap must remain inside the selected workspace.  Broad
     # or cross-Topic recall is permitted only for an explicit supplemental gap.
     strict_topic_scope: bool = False
@@ -2161,10 +2178,7 @@ class DataSnapshotContract(APIModel):
         )
 
     def supports_atomic_multi_query(self) -> bool:
-        return bool(
-            self.consistency_mode == "AS_OF_READ"
-            and self.cache_identity_complete()
-        )
+        return bool(self.consistency_mode == "AS_OF_READ" and self.cache_identity_complete())
 
     def cache_identity(self) -> Dict[str, str]:
         if not self.cache_identity_complete():
@@ -2215,11 +2229,7 @@ class QueryBundle(APIModel):
     def has_complete_detail_coverage(self) -> bool:
         """Return true only for an explicitly complete, inline detail set."""
 
-        return (
-            self.result_coverage == ResultCoverage.ALL_ROWS.value
-            and not self.is_truncated
-            and not self.failed
-        )
+        return self.result_coverage == ResultCoverage.ALL_ROWS.value and not self.is_truncated and not self.failed
 
 
 class ReActStep(APIModel):
@@ -2258,7 +2268,9 @@ class AgentTaskResult(APIModel):
     freshness_reports: List[FreshnessCheckResult] = Field(default_factory=list)
     node_plan_contract: NodePlanContract = Field(default_factory=NodePlanContract)
     entity_filter_verification: EntityFilterVerificationProof = Field(default_factory=EntityFilterVerificationProof)
-    semantic_filter_verification: SemanticFilterVerificationProof = Field(default_factory=SemanticFilterVerificationProof)
+    semantic_filter_verification: SemanticFilterVerificationProof = Field(
+        default_factory=SemanticFilterVerificationProof
+    )
     node_plan_critique: NodePlanCritiqueResult = Field(default_factory=NodePlanCritiqueResult)
     sql_draft_decision: SqlDraftDecision = Field(default_factory=SqlDraftDecision)
     file_tool_results: List[Dict[str, Any]] = Field(default_factory=list)

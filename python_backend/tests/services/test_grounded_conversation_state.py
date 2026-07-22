@@ -272,6 +272,7 @@ def _semantic_review(
     complete_membership_required: bool = False,
     current_turn_replaces_time_scope: bool = False,
     reference_phrases: tuple[str, ...] = ("semantic-reference",),
+    retrieval_question: str = "standalone retrieval question",
 ) -> Any:
     request = build_conversation_semantic_resolver_request(
         question,
@@ -305,6 +306,7 @@ def _semantic_review(
                 current_turn_replaces_time_scope
             ),
             reference_phrases=reference_phrases,
+            retrieval_question=("" if ambiguous else retrieval_question),
         )
     return review_conversation_semantics(
         _Provider(output=output),
@@ -359,6 +361,8 @@ def test_non_reference_review_is_standalone_even_for_reference_like_text() -> No
     assert resolution.status == "STANDALONE"
     assert resolution.reference_detected is False
     assert resolution.effective_question == question
+    assert resolution.retrieval_question == ""
+    assert resolution.trace()["retrievalQuestion"] == question
     assert resolution.source_artifact_ids == ()
     assert resolution.semantic_decision_fingerprint
 
@@ -391,6 +395,10 @@ def test_predicate_scope_binds_only_exact_reviewed_artifact_fields() -> None:
     contract = resolution.reference_contract
     assert resolution.status == "RESOLVED_REFERENCE"
     assert resolution.effective_question == question
+    assert resolution.retrieval_question == "standalone retrieval question"
+    assert resolution.trace()["retrievalQuestion"] == (
+        "standalone retrieval question"
+    )
     assert resolution.antecedent_question == "server-retained prior turn"
     assert resolution.source_artifact_ids == ("artifact-a",)
     assert resolution.inherited_time_expression == "retained-time-scope"

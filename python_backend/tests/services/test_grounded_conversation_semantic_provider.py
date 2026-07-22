@@ -60,6 +60,7 @@ def _decision():
         population_required=True,
         current_turn_replaces_time_scope=False,
         reference_phrases=("retained result",),
+        retrieval_question="rank the retained result by refund amount",
     )
 
 
@@ -86,6 +87,9 @@ def test_provider_uses_strict_structured_model_and_server_bindings() -> None:
         request.candidate_set_fingerprint
     )
     assert output.selected_artifact_id == "artifact-a"
+    assert output.retrieval_question == (
+        "rank the retained result by refund amount"
+    )
 
     supplied = json.loads(model.messages[1][1])
     assert supplied["question"] == request.question
@@ -137,6 +141,7 @@ def test_provider_canonicalizes_reference_only_fields_for_standalone_turn() -> N
             complete_membership_required=True,
             current_turn_replaces_time_scope=True,
             reference_phrases=("订单量",),
+            retrieval_question="不应保留的召回问题",
         )
     )
     provider = StructuredConversationSemanticProvider(
@@ -160,6 +165,7 @@ def test_provider_canonicalizes_reference_only_fields_for_standalone_turn() -> N
     assert output.complete_membership_required is False
     assert output.current_turn_replaces_time_scope is False
     assert output.reference_phrases == ()
+    assert output.retrieval_question == ""
 
 
 def test_provider_requires_model_authority_and_positive_budget() -> None:

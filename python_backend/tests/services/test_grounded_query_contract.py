@@ -424,20 +424,25 @@ def test_generic_detail_uses_published_default_projection_from_table_detail() ->
         [topic],
         [detail],
         binding_hints={
-            "tableRefs": [detail["refId"]],
-            "analysisMode": "DETAIL",
+            "tableRefs": [table],
             "detailProjectionMode": "DEFAULT",
             "timeExpression": "最近10天",
+            "timeFieldRef": "pt",
         },
         now=datetime(2026, 7, 21, 2, 0, tzinfo=timezone.utc),
     )
 
     assert contract.query_shape == "DETAIL"
+    assert contract.binding_hints.table_refs == [detail["refId"]]
+    assert contract.binding_hints.time_field_ref == ""
     assert [item.column for item in contract.selected_fields] == [
         "order_id",
         "pay_amt",
     ]
     assert "OUTPUT_BINDING_EVIDENCE_REQUIRED" not in {
+        gap.code for gap in contract.unresolved_gaps
+    }
+    assert "TIME_FIELD_EVIDENCE_REQUIRED" not in {
         gap.code for gap in contract.unresolved_gaps
     }
 
@@ -639,6 +644,53 @@ def test_builds_ready_same_table_multi_metric_contract_from_core_reads_only() ->
         semantic_metric_temporal_contract_issue(spec) == ""
         for spec in intent.metric_specs
     )
+
+
+def test_question_named_metric_cannot_be_omitted_from_ready_contract() -> None:
+    topic = "经营画像"
+    table = "ads_merchant_profile"
+    detail = table_detail(topic, table)
+    order_metric = metric_read(
+        topic,
+        table,
+        "order_cnt_1d",
+        "总订单日汇总量",
+        ["订单量", "订单数"],
+        "SUM(order_cnt_1d)",
+        ["order_cnt_1d"],
+    )
+    refund_metric = metric_read(
+        topic,
+        table,
+        "refund_amt_1d",
+        "退款日汇总金额",
+        ["退款金额", "退款总额"],
+        "SUM(refund_amt_1d)",
+        ["refund_amt_1d"],
+        unit="元",
+    )
+
+    contract = GroundedQueryContractBuilder().build(
+        "最近30天订单量和退款金额分别是多少",
+        [topic],
+        [detail, order_metric, refund_metric],
+        binding_hints={
+            "tableRefs": [detail["refId"]],
+            "metricRefs": [order_metric["refId"]],
+            "timeExpression": "最近30天",
+        },
+    )
+
+    assert contract.ready is False
+    assert contract.status == "UNRESOLVED"
+    gap = next(
+        item
+        for item in contract.unresolved_gaps
+        if item.code == "QUESTION_METRIC_BINDING_INCOMPLETE"
+    )
+    assert gap.required_capability["candidateMetricRefs"] == [
+        refund_metric["refId"]
+    ]
 
 
 def test_builds_typed_two_table_entity_lookup_without_metric_surrogate() -> None:

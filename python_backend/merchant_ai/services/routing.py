@@ -2034,6 +2034,72 @@ class SemanticTopicRouterService:
             cards,
             topic_names,
         )
+        protected_topics = list(
+            asset_baseline.get("protectedTopicNames") or []
+        )
+        candidate_topics = list(
+            asset_baseline.get("candidateTopicNames") or []
+        )
+        selection_evidence = dict(
+            asset_baseline.get("assetSelectionEvidence") or {}
+        )
+        high_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(
+                        self.settings,
+                        "route_topic_high_confidence",
+                        0.75,
+                    )
+                    or 0.75
+                ),
+            ),
+        )
+        # A unique published metric owner is already stronger routing evidence
+        # than another model pass. Topic is only a recall priority here; the
+        # governed Contract and ACL still validate every actual query asset.
+        if (
+            len(protected_topics) == 1
+            and candidate_topics == protected_topics
+            and float(asset_baseline.get("assetConfidence") or 0.0)
+            >= high_confidence
+            and str(selection_evidence.get("queryShape") or "")
+            == "summary_or_total"
+            and len(selection_evidence.get("matchedMetrics") or []) == 1
+        ):
+            decision = self._deterministic_fallback_decision(
+                question,
+                keywords,
+                route_slots=route_slots,
+                asset_baseline=asset_baseline,
+                status="exact_metric_asset_match",
+                reason="唯一已发布指标归属已确定",
+            )
+            evidence = dict(decision.selection_evidence or {})
+            evidence.update(
+                {
+                    "router": "published_asset_exact_metric",
+                    "status": "resolved_without_llm",
+                    "modelCallSkipped": True,
+                    "assetConfidence": float(
+                        asset_baseline.get("assetConfidence") or 0.0
+                    ),
+                }
+            )
+            return decision.model_copy(
+                update={
+                    "confidence": float(
+                        asset_baseline.get("assetConfidence") or 0.0
+                    ),
+                    "clarification_required": False,
+                    "routing_mode": "semantic_topic_exact_asset",
+                    "selection_mode": "automatic_asset_exact",
+                    "selection_evidence": evidence,
+                    "reason": "唯一已发布指标归属已确定；跳过 Topic 模型调用",
+                }
+            )
         # The model may compare published Topic cards, except a detail owner
         # that the formal metric lineage explicitly marks as inappropriate for
         # this exact summary request. This prevents a bare store total from

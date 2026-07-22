@@ -26,7 +26,7 @@ from typing import (
 )
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from pydantic import Field as PydanticField
 
 try:
@@ -131,7 +131,9 @@ from merchant_ai.models import (
     MerchantInfo,
     QueryBundle,
     RecallBundle,
+    RecallItem,
     SkillLifecycleRecord,
+    SubAgentResultEnvelope,
     VerifiedEvidence,
 )
 from merchant_ai.services.answer_claims import AnswerClaimVerifier
@@ -325,6 +327,22 @@ from merchant_ai.services.grounded_skill_artifact_access import (
 )
 from merchant_ai.services.authorization_policy import (
     load_authorization_policy,
+)
+from merchant_ai.services.goal_recall_coverage import (
+    GoalRecallCoverageService,
+)
+from merchant_ai.services.governed_query_service import (
+    GovernedQueryService,
+    LegacyGroundedQueryBackend,
+    classify_legacy_query_payload,
+)
+from merchant_ai.services.query_request import (
+    QueryAttemptResult,
+    QueryBatchOutcome,
+    QueryOutcome,
+    QueryOutcomeStatus,
+    QueryRequest,
+    QuerySqlCandidate,
 )
 
 
@@ -841,19 +859,10 @@ def _goal_assignment_contract_issues(
                     }
                 )
 
-    assigned_goals = [
-        goal_map[goal_id]
-        for goal_id in goal_ids
-        if goal_id in goal_map
-    ]
-    assigned_goal_kinds = {
-        str(getattr(goal, "kind", "") or "").strip().upper()
-        for goal in assigned_goals
-    }
+    assigned_goals = [goal_map[goal_id] for goal_id in goal_ids if goal_id in goal_map]
+    assigned_goal_kinds = {str(getattr(goal, "kind", "") or "").strip().upper() for goal in assigned_goals}
     metric_goal_ids = [
-        goal.goal_id
-        for goal in assigned_goals
-        if str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC"
+        goal.goal_id for goal in assigned_goals if str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC"
     ]
     scalar_metric_assignment = bool(metric_goal_ids) and assigned_goal_kinds <= {
         "METRIC",
@@ -868,9 +877,7 @@ def _goal_assignment_contract_issues(
         ]
         metric_refs = list(
             dict.fromkeys(
-                str(item or "").strip()
-                for item in (getattr(hints, "metric_refs", ()) or ())
-                if str(item or "").strip()
+                str(item or "").strip() for item in (getattr(hints, "metric_refs", ()) or ()) if str(item or "").strip()
             )
         )
         field_aggregation_refs = [
@@ -878,20 +885,10 @@ def _goal_assignment_contract_issues(
             for item in (getattr(hints, "field_aggregations", ()) or ())
             if str(getattr(item, "field_ref", "") or "").strip()
         ]
-        submitted_metric_output_count = len(metric_refs) + len(
-            field_aggregation_refs
-        )
-        extra_metric_outputs = (
-            submitted_metric_output_count > len(metric_goal_ids)
-        )
-        mixed_metric_binding_modes = bool(
-            metric_refs and field_aggregation_refs
-        )
-        if (
-            selected_field_refs
-            or mixed_metric_binding_modes
-            or extra_metric_outputs
-        ):
+        submitted_metric_output_count = len(metric_refs) + len(field_aggregation_refs)
+        extra_metric_outputs = submitted_metric_output_count > len(metric_goal_ids)
+        mixed_metric_binding_modes = bool(metric_refs and field_aggregation_refs)
+        if selected_field_refs or mixed_metric_binding_modes or extra_metric_outputs:
             issues.append(
                 {
                     "code": "SCALAR_METRIC_EXTRA_OUTPUT_NOT_REQUESTED",
@@ -915,13 +912,551 @@ def _goal_assignment_contract_issues(
     return issues
 
 
+def _normalize_scalar_metric_query_request(
+    session: "GroundedDeepAgentSession",
+    request: QueryRequest,
+) -> QueryRequest:
+    """Remove only provably redundant scalar output bindings.
+
+    This is a mechanical facade repair, not semantic inference.  It applies
+    only when published metric refs already fill every assigned METRIC Goal
+    and the branch has no non-scalar Goal.  Ambiguous mixed bindings continue
+    to fail closed in ``_goal_assignment_contract_issues``.
+    """
+
+    normalized_request = request
+    goal_contract = session.question_goal_contract
+    if goal_contract is None:
+        return normalized_request
+    goal_map = goal_contract.goal_map()
+    assigned_goals = [goal_map[goal_id] for goal_id in request.goal_ids if goal_id in goal_map]
+    assigned_goal_kinds = {str(getattr(goal, "kind", "") or "").strip().upper() for goal in assigned_goals}
+    metric_goal_count = sum(str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC" for goal in assigned_goals)
+    if metric_goal_count <= 0 or not assigned_goal_kinds or not assigned_goal_kinds <= {"METRIC", "TIME_WINDOW"}:
+        return normalized_request
+    hints = request.binding_hints
+    metric_refs = list(dict.fromkeys(str(item or "").strip() for item in hints.metric_refs if str(item or "").strip()))
+    if len(metric_refs) == metric_goal_count and (hints.field_aggregations or hints.selected_fields):
+        hints = hints.model_copy(
+            update={
+                "metric_refs": metric_refs,
+                "field_aggregations": [],
+                "selected_fields": [],
+            },
+            deep=True,
+        )
+
+    # The prefetch is server-owned evidence, so it may mechanically complete
+    # the request envelope. This avoids making Core rediscover a table ref or
+    # resubmit a known time-field gap after the exact assets were already read.
+    prefetch = session.simple_scalar_prefetch
+    if str(prefetch.get("status") or "").upper() == "PREFETCHED":
+        table_ref = str(prefetch.get("tableRefId") or "").strip()
+        time_field_ref = str(prefetch.get("timeFieldRef") or "").strip()
+        prefetched_refs = [
+            str(item or "").strip() for item in prefetch.get("readRefIds", []) if str(item or "").strip()
+        ]
+        merged_read_refs = list(dict.fromkeys([*normalized_request.read_ref_ids, *prefetched_refs]))
+        merged_paths = list(
+            dict.fromkeys(
+                [
+                    *normalized_request.semantic_paths,
+                    *[str(item or "").strip() for item in prefetch.get("semanticPaths", []) if str(item or "").strip()],
+                ]
+            )
+        )
+        hint_updates: dict[str, Any] = {}
+        if table_ref and table_ref not in hints.table_refs:
+            hint_updates["table_refs"] = [*hints.table_refs, table_ref]
+        if time_field_ref and not hints.time_field_ref:
+            hint_updates["time_field_ref"] = time_field_ref
+        if hint_updates:
+            hints = hints.model_copy(update=hint_updates, deep=True)
+        normalized_request = normalized_request.model_copy(
+            update={
+                "read_ref_ids": merged_read_refs,
+                "semantic_paths": merged_paths,
+                "binding_hints": hints,
+            },
+            deep=True,
+        )
+    elif hints is not normalized_request.binding_hints:
+        normalized_request = normalized_request.model_copy(
+            update={"binding_hints": hints},
+            deep=True,
+        )
+    return normalized_request
+
+
+def _normalize_goal_prefetched_query_request(
+    session: "GroundedDeepAgentSession",
+    request: QueryRequest,
+) -> QueryRequest:
+    """Merge only the prefetch receipts belonging to this request's Goals."""
+
+    prefetch = session.semantic_prefetch or session.simple_scalar_prefetch
+    if str(prefetch.get("status") or "").upper() != "PREFETCHED":
+        return request
+    requested_goal_ids = {str(goal_id or "").strip() for goal_id in request.goal_ids if str(goal_id or "").strip()}
+    items = [
+        item
+        for item in (prefetch.get("items") or [])
+        if isinstance(item, dict)
+        and (not requested_goal_ids or str(item.get("goalId") or "").strip() in requested_goal_ids)
+    ]
+    if not items:
+        items = [prefetch]
+    read_refs = list(request.read_ref_ids)
+    semantic_paths = list(request.semantic_paths)
+    table_refs = list(request.binding_hints.table_refs)
+    metric_refs = list(request.binding_hints.metric_refs)
+    time_field_refs: list[str] = []
+    for item in items:
+        read_refs.extend(str(value or "").strip() for value in item.get("readRefIds", []) if str(value or "").strip())
+        semantic_paths.extend(
+            str(value or "").strip() for value in item.get("semanticPaths", []) if str(value or "").strip()
+        )
+        table_ref = str(item.get("tableRefId") or "").strip()
+        metric_ref = str(item.get("metricRefId") or "").strip()
+        time_field_ref = str(item.get("timeFieldRef") or "").strip()
+        if table_ref:
+            table_refs.append(table_ref)
+        if metric_ref:
+            metric_refs.append(metric_ref)
+        if time_field_ref:
+            time_field_refs.append(time_field_ref)
+    time_field_refs = list(dict.fromkeys(time_field_refs))
+    hints = request.binding_hints.model_copy(
+        update={
+            "table_refs": list(dict.fromkeys(table_refs)),
+            "metric_refs": list(dict.fromkeys(metric_refs)),
+            "time_field_ref": (
+                request.binding_hints.time_field_ref or time_field_refs[0]
+                if len(time_field_refs) == 1
+                else request.binding_hints.time_field_ref
+            ),
+        },
+        deep=True,
+    )
+    return request.model_copy(
+        update={
+            "read_ref_ids": list(dict.fromkeys(read_refs)),
+            "semantic_paths": list(dict.fromkeys(semantic_paths)),
+            "binding_hints": hints,
+        },
+        deep=True,
+    )
+
+
+def _normalize_detail_goal_binding_hints(
+    session: "GroundedDeepAgentSession",
+    goal_ids: Sequence[str],
+    hints: GroundedBindingHints,
+) -> GroundedBindingHints:
+    """Apply the immutable DETAIL Goal projection policy at every query entry."""
+
+    goal_contract = session.question_goal_contract
+    if goal_contract is None:
+        return hints
+    goal_map = goal_contract.goal_map()
+    detail_goals = [
+        goal_map[goal_id]
+        for goal_id in goal_ids
+        if goal_id in goal_map and isinstance(goal_map[goal_id], DetailQuestionGoal)
+    ]
+    if not detail_goals:
+        return hints
+
+    question_text = str(getattr(goal_contract, "question", "") or "").strip().lower()
+    explicit_all_field_request = any(
+        marker in question_text
+        for marker in (
+            "全部字段",
+            "所有字段",
+            "全量字段",
+            "全部列",
+            "所有列",
+            "全量列",
+            "完整字段",
+            "all fields",
+            "every field",
+            "all columns",
+            "every column",
+        )
+    )
+    # The Goal object is model-authored. A generic DETAIL request is not an
+    # authorization to widen projection to every visible column; require an
+    # explicit user phrase before honoring requestAllFields.
+    request_all = any(goal.request_all_fields and explicit_all_field_request for goal in detail_goals)
+    explicit_phrases = any(bool(goal.requested_field_phrases) for goal in detail_goals)
+    projection_mode = "ALL_ALLOWED" if request_all else "EXPLICIT" if explicit_phrases else "DEFAULT"
+    updates: dict[str, Any] = {
+        "analysis_mode": "DETAIL",
+        "detail_projection_mode": projection_mode,
+    }
+    if projection_mode == "DEFAULT":
+        # Generic detail Goals are governed by the table's reviewed default
+        # projection. Model-authored selected fields would silently widen it.
+        updates["selected_fields"] = []
+    return hints.model_copy(update=updates, deep=True)
+
+
+def _augment_batch_query_request_semantic_refs(
+    request: QueryRequest,
+) -> QueryRequest:
+    """Keep declared batch bindings inside the exact semantic read set.
+
+    Batch preparation reads only paths declared on each branch. Core can bind
+    a table, time field or explicit output field while omitting the matching
+    ``readRefIds``. Copy only those already-declared semantic refs into the
+    request. Preparation still reads every exact leaf and the Contract Builder
+    still validates its hash and kind.
+    """
+
+    hints = request.binding_hints
+    declared_refs: list[str] = []
+    for raw_ref in [
+        *hints.table_refs,
+        *hints.metric_refs,
+        *[item.field_ref for item in hints.field_aggregations],
+        *hints.dimension_refs,
+        *[item.field_ref for item in hints.selected_fields],
+        *[item.field_ref for item in hints.entity_filters],
+        *[item.target_field_ref for item in hints.upstream_entity_bindings],
+        *hints.relationship_refs,
+        hints.group_by_ref,
+        hints.time_field_ref,
+    ]:
+        value = _canonical_progressive_ref(str(raw_ref or "").strip())
+        if not value:
+            continue
+        # Binding hints may use a physical table/column alias for readability
+        # (for example ``dwm_trade_order_detail_di`` or ``pt``).  Those are
+        # resolved by the Contract Builder against trusted evidence; they are
+        # not semantic read receipts and must never be added to read_ref_ids.
+        if not value.startswith("semantic:"):
+            continue
+        parts = value.split(":")
+        if value.startswith("semantic:") and len(parts) == 3 and parts[1] and parts[2]:
+            value = "%s:detail" % value
+        declared_refs.append(value)
+
+    read_refs = list(request.read_ref_ids)
+    read_ref_set = set(read_refs)
+    for ref_id in declared_refs:
+        if ref_id not in read_ref_set:
+            read_refs.append(ref_id)
+            read_ref_set.add(ref_id)
+    if read_refs == request.read_ref_ids:
+        return request
+    return request.model_copy(
+        update={"read_ref_ids": read_refs},
+        deep=True,
+    )
+
+
+def _record_governed_query_branch_outcome(
+    session: "GroundedDeepAgentSession",
+    request: QueryRequest,
+    outcome: QueryOutcome,
+) -> None:
+    """Keep an optional execution-graph node aligned with query_data."""
+
+    with session.lock:
+        branch = session.query_branch_contexts.get(request.query_id)
+        contexts = dict(session.query_branch_contexts)
+    if branch is None:
+        return
+    with branch.lock:
+        if outcome.status == QueryOutcomeStatus.VERIFIED:
+            branch.status = "VERIFIED"
+            branch.last_gaps = []
+            branch.verified_artifact_ids = list(
+                dict.fromkeys(
+                    [
+                        *branch.verified_artifact_ids,
+                        *outcome.artifact_ids,
+                    ]
+                )
+            )
+        elif outcome.status == QueryOutcomeStatus.NEEDS_REASONING:
+            branch.status = "CONTRACT_GAPPED"
+            branch.last_gaps = [
+                dict(item) for item in (outcome.observation.gaps if outcome.observation is not None else [])
+            ]
+        elif outcome.status == QueryOutcomeStatus.DENIED:
+            branch.status = "TERMINAL_BLOCKED"
+        elif outcome.status == QueryOutcomeStatus.FAILED:
+            branch.status = "FAILED"
+
+    if outcome.status != QueryOutcomeStatus.VERIFIED:
+        return
+    for candidate in contexts.values():
+        if candidate is branch:
+            continue
+        with candidate.lock:
+            if candidate.status != "WAITING_VERIFIED_ARTIFACT":
+                continue
+            dependencies = [contexts.get(query_id) for query_id in candidate.dependency_query_ids]
+            if dependencies and all(
+                dependency is not None and dependency.status == "VERIFIED" and bool(dependency.verified_artifact_ids)
+                for dependency in dependencies
+            ):
+                candidate.status = "DECLARED"
+
+
+def _simple_scalar_goal_contract(
+    session: "GroundedDeepAgentSession",
+) -> bool:
+    contract = session.question_goal_contract
+    if contract is None:
+        return False
+    kinds = [
+        str(getattr(goal, "kind", "") or "").strip().upper()
+        for goal in contract.goals
+        if bool(getattr(goal, "required", True))
+    ]
+    return kinds.count("METRIC") == 1 and kinds.count("TIME_WINDOW") <= 1 and set(kinds) <= {"METRIC", "TIME_WINDOW"}
+
+
+_RULE_INTENT_MARKERS = (
+    "规则",
+    "政策",
+    "口径",
+    "定义",
+    "条件",
+    "要求",
+    "限制",
+    "规范",
+    "标准",
+    "怎么算",
+    "如何计算",
+    "是否允许",
+    "能否",
+    "可不可以",
+    "rule",
+    "policy",
+    "definition",
+    "requirement",
+    "restriction",
+    "allowed",
+    "eligible",
+)
+
+_PRESENTATION_DIRECTIVE_PARTS = (
+    "please",
+    "separately",
+    "respectively",
+    "show",
+    "display",
+    "return",
+    "list",
+    "output",
+    "results",
+    "result",
+    "麻烦",
+    "分别",
+    "各自",
+    "一起",
+    "给我",
+    "展示一下",
+    "显示一下",
+    "返回一下",
+    "列出一下",
+    "输出一下",
+    "看一下",
+    "展示",
+    "显示",
+    "返回",
+    "列出",
+    "输出",
+    "结果",
+    "一下",
+    "请",
+    "都",
+    "看",
+)
+
+
+def _presentation_only_rule_goal_ids(
+    contract: OriginalQuestionGoalContract,
+) -> list[str]:
+    """Find RULE Goals that only restate how existing results are shown."""
+
+    non_rule_goals = [goal for goal in contract.goals if str(goal.kind or "").strip().upper() != "RULE"]
+    question = "".join(str(contract.question or "").lower().split())
+    if not non_rule_goals or any(marker in question for marker in _RULE_INTENT_MARKERS):
+        return []
+
+    redundant: list[str] = []
+    for goal in contract.goals:
+        if str(goal.kind or "").strip().upper() != "RULE" or not goal.source_spans:
+            continue
+        presentation_only = True
+        for source_span in goal.source_spans:
+            remainder = "".join(str(source_span or "").lower().split())
+            for punctuation in "，。！？、,.!?;:：；()（）[]【】":
+                remainder = remainder.replace(punctuation, "")
+            for part in _PRESENTATION_DIRECTIVE_PARTS:
+                remainder = remainder.replace(part, "")
+            if remainder:
+                presentation_only = False
+                break
+        if presentation_only:
+            redundant.append(goal.goal_id)
+    referenced_goal_ids: set[str] = set()
+    for goal in contract.goals:
+        payload = goal.model_dump(by_alias=False)
+        for field_name, values in payload.items():
+            if not field_name.endswith("_goal_ids") or not isinstance(values, list):
+                continue
+            referenced_goal_ids.update(str(value) for value in values)
+    return [goal_id for goal_id in redundant if goal_id not in referenced_goal_ids]
+
+
+def _simple_scalar_exact_metric_recall(
+    session: "GroundedDeepAgentSession",
+) -> Optional[RecallItem]:
+    """Return one unambiguous exact published metric recalled for a scalar."""
+
+    if not _simple_scalar_goal_contract(session):
+        return None
+    candidates: dict[str, RecallItem] = {}
+    for item in session.runtime.recall.items:
+        if str(item.source_type or "").strip().upper() != "SEMANTIC_METRIC":
+            continue
+        metadata = dict(item.metadata or {})
+        resolution_type = str(metadata.get("metricResolutionType") or "").strip().lower()
+        confidence = float(metadata.get("metricResolutionConfidence") or 0.0)
+        exact = resolution_type.startswith("exact_") or int(metadata.get("protectionTier") or 0) >= 2
+        if not exact or confidence < 0.95 or bool(metadata.get("metricResolutionAmbiguous")):
+            continue
+        ref_id = str(metadata.get("semanticRefId") or item.doc_id or "").strip()
+        topic = str(item.topic or metadata.get("topic") or "").strip()
+        table = str(item.table or metadata.get("tableName") or metadata.get("table") or "").strip()
+        path = str(metadata.get("semanticPath") or "").strip()
+        if not ref_id or not topic or not table or not path:
+            continue
+        if topic not in session.effective_topics():
+            continue
+        candidates[ref_id] = item
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
+def _goal_metric_exact_recall_candidates(
+    session: "GroundedDeepAgentSession",
+) -> Optional[list[dict[str, Any]]]:
+    """Resolve every direct metric Goal to one exact published recall item.
+
+    This is deliberately a conservative admission check for server-side
+    prefetch. A tie, low-confidence match, dependency Goal or non-metric query
+    leaves discovery to Core; no guessed semantic asset is prefetched.
+    """
+
+    contract = session.question_goal_contract
+    if contract is None:
+        return None
+    required_goals = [goal for goal in contract.goals if bool(getattr(goal, "required", True))]
+    metric_goals = [goal for goal in required_goals if str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC"]
+    if not metric_goals or any(
+        str(getattr(goal, "kind", "") or "").strip().upper() not in {"METRIC", "TIME_WINDOW"}
+        or bool(getattr(goal, "depends_on_goal_ids", ()) or ())
+        for goal in required_goals
+    ):
+        return None
+
+    resolved: list[dict[str, Any]] = []
+    used_refs: set[str] = set()
+    for goal in metric_goals:
+        phrases = [
+            str(getattr(goal, "label", "") or "").strip(),
+            *[str(item or "").strip() for item in (getattr(goal, "source_spans", ()) or ())],
+        ]
+        phrase_keys = {
+            "".join(character.casefold() for character in phrase if character.isalnum()) for phrase in phrases if phrase
+        }
+        candidates: list[tuple[int, float, str, RecallItem]] = []
+        for item in session.runtime.recall.items:
+            if str(item.source_type or "").strip().upper() != "SEMANTIC_METRIC":
+                continue
+            metadata = dict(item.metadata or {})
+            resolution_type = str(metadata.get("metricResolutionType") or "").strip().lower()
+            confidence = float(metadata.get("metricResolutionConfidence") or 0.0)
+            if (
+                not (resolution_type.startswith("exact_") or int(metadata.get("protectionTier") or 0) >= 2)
+                or confidence < 0.95
+                or bool(metadata.get("metricResolutionAmbiguous"))
+            ):
+                continue
+            ref_id = str(metadata.get("semanticRefId") or item.doc_id or "").strip()
+            topic = str(item.topic or metadata.get("topic") or "").strip()
+            table = str(item.table or metadata.get("tableName") or metadata.get("table") or "").strip()
+            path = str(metadata.get("semanticPath") or "").strip()
+            if (
+                not ref_id
+                or not topic
+                or not table
+                or not path
+                or topic not in session.effective_topics()
+                or ref_id in used_refs
+            ):
+                continue
+            labels = [
+                metadata.get("matchedMetricLabel"),
+                metadata.get("matchedExactMetricLabel"),
+                metadata.get("businessName"),
+                metadata.get("displayName"),
+                metadata.get("naturalName"),
+                metadata.get("metricKey"),
+                metadata.get("canonicalMetricKey"),
+                *(metadata.get("aliases") or []),
+            ]
+            label_keys = {
+                "".join(character.casefold() for character in str(label or "") if character.isalnum())
+                for label in labels
+                if str(label or "").strip()
+            }
+            exact_phrase = bool(phrase_keys.intersection(label_keys))
+            related_phrase = any(
+                len(phrase_key) >= 2 and (phrase_key in label_key or label_key in phrase_key)
+                for phrase_key in phrase_keys
+                for label_key in label_keys
+            )
+            tier = 3 if exact_phrase else 2 if related_phrase else 0
+            if tier:
+                candidates.append(
+                    (
+                        tier,
+                        confidence,
+                        ref_id,
+                        item,
+                    )
+                )
+        if not candidates:
+            return None
+        highest_tier = max(item[0] for item in candidates)
+        top = [item for item in candidates if item[0] == highest_tier]
+        if len(top) != 1:
+            return None
+        _, confidence, ref_id, item = top[0]
+        metadata = dict(item.metadata or {})
+        resolved.append(
+            {
+                "goalId": str(getattr(goal, "goal_id", "") or "").strip(),
+                "metricRefId": ref_id,
+                "metricPath": str(metadata.get("semanticPath") or "").strip(),
+                "topic": str(item.topic or metadata.get("topic") or "").strip(),
+                "table": str(item.table or metadata.get("tableName") or metadata.get("table") or "").strip(),
+                "confidence": confidence,
+            }
+        )
+        used_refs.add(ref_id)
+    return resolved
+
+
 def _goal_assignment_repair_action(issues: Sequence[Mapping[str, Any]]) -> str:
     return next(
-        (
-            str(issue.get("nextAction") or "").strip()
-            for issue in issues
-            if str(issue.get("nextAction") or "").strip()
-        ),
+        (str(issue.get("nextAction") or "").strip() for issue in issues if str(issue.get("nextAction") or "").strip()),
         "REVISE_BINDINGS_OR_GOAL_ASSIGNMENT",
     )
 
@@ -932,6 +1467,10 @@ class GroundedDeepAgentSession:
     context_workspace: Optional[GroundedContextWorkspace] = None
     context_artifact_inline_max_rows: int = 1
     core_semantic_evidence: list[dict[str, Any]] = field(default_factory=list)
+    semantic_prefetch: dict[str, Any] = field(default_factory=dict)
+    simple_scalar_prefetch: dict[str, Any] = field(default_factory=dict)
+    goal_recall_coverage_receipt: dict[str, Any] = field(default_factory=dict)
+    executed_goal_recall_fingerprints: set[str] = field(default_factory=set)
     opened_topics: list[str] = field(default_factory=list)
     topic_index_read: bool = False
     expanded_from_attempt_ids: list[str] = field(default_factory=list)
@@ -941,9 +1480,7 @@ class GroundedDeepAgentSession:
     analysis_skill_started: bool = False
     skill_execution_in_progress: bool = False
     skill_input_snapshot_generation: int = 0
-    verified_skill_ledger: list[GroundedVerifiedSkillArtifact] = field(
-        default_factory=list
-    )
+    verified_skill_ledger: list[GroundedVerifiedSkillArtifact] = field(default_factory=list)
     verified_analysis_ledger: list[GroundedDerivedAnalysisArtifact] = field(default_factory=list)
     analysis_data_input_gate_result: dict[str, Any] = field(default_factory=dict)
     query_branch_contexts: dict[str, GroundedQueryBranchContext] = field(default_factory=dict)
@@ -962,9 +1499,7 @@ class GroundedDeepAgentSession:
     execution_graph_revision_count: int = 0
     execution_graph_max_revision_count: int = 2
     execution_graph_revision_discovery_evidence_id: str = ""
-    execution_graph_revision_discovery_evidence_ids: list[str] = field(
-        default_factory=list
-    )
+    execution_graph_revision_discovery_evidence_ids: list[str] = field(default_factory=list)
     exploration_states: dict[
         str,
         GroundedExplorationCoordinatorState,
@@ -973,6 +1508,7 @@ class GroundedDeepAgentSession:
     subagent_dispatches: list[dict[str, Any]] = field(default_factory=list)
     parallel_branches: dict[str, GroundedRuntimeSession] = field(default_factory=dict)
     parallel_branch_goal_ids: dict[str, list[str]] = field(default_factory=dict)
+    latest_query_batch_observations: list[dict[str, Any]] = field(default_factory=list)
     artifact_goal_ids: dict[str, list[str]] = field(default_factory=dict)
     active_goal_ids: list[str] = field(default_factory=list)
     question_goal_contract: Optional[OriginalQuestionGoalContract] = None
@@ -990,75 +1526,34 @@ class GroundedDeepAgentSession:
         str,
         GroundedVerifiedQueryArtifact,
     ] = field(default_factory=dict)
-    population_artifact_query_node_ids: dict[str, str] = field(
-        default_factory=dict
-    )
+    population_artifact_query_node_ids: dict[str, str] = field(default_factory=dict)
     goal_coverage_result: dict[str, Any] = field(default_factory=dict)
     answer_coverage_result: dict[str, Any] = field(default_factory=dict)
     operational_failure: dict[str, Any] = field(default_factory=dict)
     runtime_budget_report: dict[str, Any] = field(default_factory=dict)
     core_context_reports: list[dict[str, Any]] = field(default_factory=list)
-    trusted_session_context_reports: list[dict[str, Any]] = field(
-        default_factory=list
-    )
+    trusted_session_context_reports: list[dict[str, Any]] = field(default_factory=list)
     workspace_read_signatures: set[str] = field(default_factory=set)
-    tool_action_receipts: dict[str, dict[str, Any]] = field(
-        default_factory=dict
-    )
+    tool_action_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_no_progress_blocked: dict[str, str] = field(default_factory=dict)
-    tool_no_progress_events: list[dict[str, Any]] = field(
-        default_factory=list
-    )
+    tool_no_progress_events: list[dict[str, Any]] = field(default_factory=list)
     latest_graph_rejection: dict[str, Any] = field(default_factory=dict)
     conversation_context: dict[str, Any] = field(default_factory=dict)
+    subagent_query_adoption_lock: Any = field(
+        default_factory=RLock,
+        repr=False,
+    )
     lock: Any = field(default_factory=RLock, repr=False)
 
     def effective_topics(self) -> list[str]:
         return list(dict.fromkeys([*self.runtime.workspace_topics, *self.opened_topics]))
 
     def can_expand_topic(self) -> bool:
-        if (
-            self.runtime.semantic_activation_execution_started
-            or _authorized_verified_query_artifacts(self)
-        ):
-            return False
-        if not self.runtime.attempts:
-            return False
-        latest_attempt = self.runtime.attempts[-1]
-        if latest_attempt.attempt_id in set(self.expanded_from_attempt_ids):
-            return False
-        latest = latest_attempt.contract
-        if latest.status != "REVISE_BINDINGS":
-            return False
-        structured_gaps = [
-            gap
-            for gap in latest.unresolved_gaps
-            if gap.blocking
-            and gap.required_capability
-            and (
-                "TOPIC_INDEX" in str(gap.search_scope or "").upper()
-                or bool(gap.required_capability.get("allowTopicExpansion"))
-            )
-        ]
-        if not structured_gaps:
-            return False
-        evidence_refs = {
-            str(item.get("refId") or "") for item in self.core_semantic_evidence if str(item.get("refId") or "")
-        }
-        evidence_topics = {
-            str(item.get("topic") or "") for item in self.core_semantic_evidence if str(item.get("topic") or "")
-        }
-        for gap in structured_gaps:
-            if evidence_refs.intersection(gap.rejected_ref_ids):
-                return True
-            capability_refs = {
-                str(value) for value in _nested_values(gap.required_capability) if str(value).startswith("semantic:")
-            }
-            if evidence_refs.intersection(capability_refs):
-                return True
-            if gap.topic and gap.topic in evidence_topics:
-                return True
-        return False
+        # Topic routing ranks discovery; it is not a merchant authorization
+        # boundary. Reading the governed Topic index is enough to navigate to
+        # another published manifest. Semantic activation still prevents a
+        # source/version change from being mixed into an in-flight execution.
+        return self.topic_index_read
 
     def mark_topic_expanded(self) -> None:
         if not self.runtime.attempts:
@@ -1170,26 +1665,14 @@ def _core_sql_execution_failure_review(
 
     message = str(failure.message or failure.code or "")[:500]
     normalized = message.casefold()
-    operational = any(
-        marker in normalized for marker in _CORE_SQL_OPERATIONAL_ERROR_MARKERS
-    )
-    table_resolution_error = any(
-        marker in normalized for marker in _CORE_SQL_TABLE_ERROR_MARKERS
-    ) or (
+    operational = any(marker in normalized for marker in _CORE_SQL_OPERATIONAL_ERROR_MARKERS)
+    table_resolution_error = any(marker in normalized for marker in _CORE_SQL_TABLE_ERROR_MARKERS) or (
         "table" in normalized
-        and any(
-            marker in normalized
-            for marker in ("does not exist", "doesn't exist", "not found")
-        )
+        and any(marker in normalized for marker in ("does not exist", "doesn't exist", "not found"))
     )
-    column_resolution_error = any(
-        marker in normalized for marker in _CORE_SQL_COLUMN_ERROR_MARKERS
-    ) or (
+    column_resolution_error = any(marker in normalized for marker in _CORE_SQL_COLUMN_ERROR_MARKERS) or (
         "column" in normalized
-        and any(
-            marker in normalized
-            for marker in ("does not exist", "doesn't exist", "not found")
-        )
+        and any(marker in normalized for marker in ("does not exist", "doesn't exist", "not found"))
     )
     if table_resolution_error:
         category = "TABLE_RESOLUTION"
@@ -1239,8 +1722,7 @@ def _core_sql_execution_failure_review(
     generation_attempts = [
         item
         for item in session.sql_candidate_attempts
-        if item.active_generation == session.active_generation
-        and item.status != "REPAIR_EXHAUSTED"
+        if item.active_generation == session.active_generation and item.status != "REPAIR_EXHAUSTED"
     ]
     remaining_repairs = max(0, 3 - len(generation_attempts))
     contract = session.active_contract
@@ -1253,11 +1735,7 @@ def _core_sql_execution_failure_review(
     )
     candidate = session.active_sql_candidate
     latest_attempt = next(
-        (
-            item
-            for item in reversed(generation_attempts)
-            if item.status == "ACCEPTED"
-        ),
+        (item for item in reversed(generation_attempts) if item.status == "ACCEPTED"),
         None,
     )
     if operational:
@@ -1276,19 +1754,11 @@ def _core_sql_execution_failure_review(
         "category": category,
         "errorCode": str(failure.code or "DORIS_ERROR"),
         "errorMessage": message,
-        "failedCandidateId": str(
-            getattr(latest_attempt, "candidate_id", "") or ""
-        ),
-        "failedAstFingerprint": str(
-            getattr(latest_attempt, "ast_fingerprint", "") or ""
-        ),
+        "failedCandidateId": str(getattr(latest_attempt, "candidate_id", "") or ""),
+        "failedAstFingerprint": str(getattr(latest_attempt, "ast_fingerprint", "") or ""),
         "failedSql": str(getattr(candidate, "sql", "") or "")[:4000],
         "activeGeneration": int(session.active_generation or 0),
-        "contractFingerprint": (
-            grounded_query_contract_fingerprint(contract)
-            if contract is not None
-            else ""
-        ),
+        "contractFingerprint": (grounded_query_contract_fingerprint(contract) if contract is not None else ""),
         "allowedTables": allowed_tables[:24],
         "submittedCandidateCount": len(generation_attempts),
         "remainingRepairAttempts": remaining_repairs,
@@ -1310,18 +1780,11 @@ def _grounded_failed_execution_codes(
             for result in task_result.validation_results
             if str(result.error_code or "").strip()
         ]
-        task_failed = bool(
-            not task_result.success
-            or task_result.query_bundle.failed
-            or validation_codes
-        )
+        task_failed = bool(not task_result.success or task_result.query_bundle.failed or validation_codes)
         if not task_failed:
             continue
         failed_task_observed = True
-        codes.extend(
-            validation_codes
-            or ["EXECUTION_OPERATIONAL_FAILURE"]
-        )
+        codes.extend(validation_codes or ["EXECUTION_OPERATIONAL_FAILURE"])
     if run_result.merged_query_bundle.failed and not failed_task_observed:
         codes.append("EXECUTION_OPERATIONAL_FAILURE")
     return tuple(dict.fromkeys(codes))
@@ -1333,40 +1796,26 @@ def _classify_grounded_execution_result(
 ) -> GroundedExecutionFailureClassification:
     codes = _grounded_failed_execution_codes(run_result)
     if codes:
-        security_codes = [
-            code
-            for code in codes
-            if code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES
-        ]
+        security_codes = [code for code in codes if code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES]
         if security_codes:
             return GroundedExecutionFailureClassification(
                 disposition="SECURITY_TERMINAL",
                 code=security_codes[0],
                 codes=codes,
-                message=str(
-                    run_result.merged_query_bundle.error
-                    or security_codes[0]
-                )[:500],
+                message=str(run_result.merged_query_bundle.error or security_codes[0])[:500],
             )
-        if all(
-            code in _GROUNDED_RECOVERABLE_EXECUTION_CODES
-            for code in codes
-        ):
+        if all(code in _GROUNDED_RECOVERABLE_EXECUTION_CODES for code in codes):
             return GroundedExecutionFailureClassification(
                 disposition="RECOVERABLE_EXECUTION",
                 code=codes[0],
                 codes=codes,
-                message=str(
-                    run_result.merged_query_bundle.error or codes[0]
-                )[:500],
+                message=str(run_result.merged_query_bundle.error or codes[0])[:500],
             )
         return GroundedExecutionFailureClassification(
             disposition="OPERATIONAL_TERMINAL",
             code=codes[0],
             codes=codes,
-            message=str(
-                run_result.merged_query_bundle.error or codes[0]
-            )[:500],
+            message=str(run_result.merged_query_bundle.error or codes[0])[:500],
         )
     if verified is None or verified.passed:
         return GroundedExecutionFailureClassification()
@@ -1377,33 +1826,12 @@ def _classify_grounded_execution_result(
             if str(gap.code or gap.gap_code or "").strip()
         )
     )
-    security_codes = [
-        code
-        for code in gap_codes
-        if code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES
-    ]
+    security_codes = [code for code in gap_codes if code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES]
     return GroundedExecutionFailureClassification(
-        disposition=(
-            "SECURITY_TERMINAL"
-            if security_codes
-            else "EVIDENCE_GAPPED"
-        ),
-        code=(
-            security_codes[0]
-            if security_codes
-            else gap_codes[0]
-            if gap_codes
-            else "EVIDENCE_VERIFICATION_GAPPED"
-        ),
-        codes=(
-            gap_codes
-            if gap_codes
-            else ("EVIDENCE_VERIFICATION_GAPPED",)
-        ),
-        message=str(
-            verified.partial_answer_reason
-            or "The execution result failed independent verification."
-        )[:500],
+        disposition=("SECURITY_TERMINAL" if security_codes else "EVIDENCE_GAPPED"),
+        code=(security_codes[0] if security_codes else gap_codes[0] if gap_codes else "EVIDENCE_VERIFICATION_GAPPED"),
+        codes=(gap_codes if gap_codes else ("EVIDENCE_VERIFICATION_GAPPED",)),
+        message=str(verified.partial_answer_reason or "The execution result failed independent verification.")[:500],
     )
 
 
@@ -1411,12 +1839,8 @@ def _classify_grounded_execution_exception(
     exc: BaseException,
 ) -> GroundedExecutionFailureClassification:
     code = str(exc).partition(":")[0].strip()
-    if isinstance(exc, PermissionError) or (
-        code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES
-    ):
-        disposition: GroundedExecutionFailureDisposition = (
-            "SECURITY_TERMINAL"
-        )
+    if isinstance(exc, PermissionError) or (code in _GROUNDED_SECURITY_TERMINAL_EXECUTION_CODES):
+        disposition: GroundedExecutionFailureDisposition = "SECURITY_TERMINAL"
     else:
         disposition = "OPERATIONAL_TERMINAL"
     return GroundedExecutionFailureClassification(
@@ -1439,11 +1863,7 @@ def _grounded_state_semantics(
     state = session.runtime
     phase = str(state.phase or "").upper()
     failure = dict(session.operational_failure or {})
-    disposition = str(
-        failure.get("failureDisposition")
-        or failure.get("disposition")
-        or ""
-    ).upper()
+    disposition = str(failure.get("failureDisposition") or failure.get("disposition") or "").upper()
     if disposition == "SECURITY_TERMINAL" or phase == "SECURITY_BLOCKED":
         return {
             "stateClass": "SECURITY_BLOCKED",
@@ -1467,9 +1887,7 @@ def _grounded_state_semantics(
         }
     if phase == "QUERY_REPAIR_REQUIRED":
         latest_attempt = state.attempts[-1] if state.attempts else None
-        repair_type = str(
-            getattr(latest_attempt, "repair_type", "") or "UNKNOWN"
-        ).upper()
+        repair_type = str(getattr(latest_attempt, "repair_type", "") or "UNKNOWN").upper()
         return {
             "stateClass": "QUERY_REPAIR",
             "failureCategory": "QUERY_%s" % repair_type,
@@ -1504,17 +1922,9 @@ def _grounded_state_semantics(
         "DATASOURCE_RECOVERY_REQUIRED",
         "RECALL_NAVIGATION_DEGRADED",
     }:
-        category = (
-            "DATASOURCE"
-            if phase == "DATASOURCE_RECOVERY_REQUIRED"
-            else "SEMANTIC_GAP"
-        )
+        category = "DATASOURCE" if phase == "DATASOURCE_RECOVERY_REQUIRED" else "SEMANTIC_GAP"
         return {
-            "stateClass": (
-                "DATASOURCE_RECOVERY"
-                if category == "DATASOURCE"
-                else "SEMANTIC_REPLAN_REQUIRED"
-            ),
+            "stateClass": ("DATASOURCE_RECOVERY" if category == "DATASOURCE" else "SEMANTIC_REPLAN_REQUIRED"),
             "failureCategory": category,
             "terminal": False,
             "retryable": True,
@@ -1563,61 +1973,34 @@ def _grounded_operational_failure_answer(
     payload = dict(failure or {})
     code = str(payload.get("code") or "GROUNDED_OPERATIONAL_FAILURE").strip()
     if code == "GROUNDED_PROVIDER_TIMEOUT":
-        return (
-            "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；"
-            "请稍后重试。"
-        )
+        return "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；请稍后重试。"
     if code == "GROUNDED_RUNTIME_BUDGET_EXHAUSTED":
-        return (
-            "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；"
-            "请缩小查询范围，或稍后重试。"
-        )
+        return "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；请缩小查询范围，或稍后重试。"
 
-    failures = [
-        dict(item)
-        for item in payload.get("failures") or []
-        if isinstance(item, Mapping)
-    ]
+    failures = [dict(item) for item in payload.get("failures") or [] if isinstance(item, Mapping)]
     specific_code = next(
-        (
-            str(item.get("code") or "").strip()
-            for item in failures
-            if str(item.get("code") or "").strip()
-        ),
+        (str(item.get("code") or "").strip() for item in failures if str(item.get("code") or "").strip()),
         code,
     )
     disposition = str(
         payload.get("failureDisposition")
         or payload.get("disposition")
         or next(
-            (
-                item.get("disposition")
-                for item in failures
-                if item.get("disposition")
-            ),
+            (item.get("disposition") for item in failures if item.get("disposition")),
             "",
         )
         or ""
     ).upper()
     if disposition == "SECURITY_TERMINAL" or "SECURITY" in code:
-        return (
-            "本次查询未通过权限或安全校验（%s），系统未执行或展示未经授权的数据。"
-            % specific_code
-        )
+        return "本次查询未通过权限或安全校验（%s），系统未执行或展示未经授权的数据。" % specific_code
     if specific_code == "POPULATION_PRE_EXECUTION_REJECTED":
         return (
             "本次查询在执行前的上游实体集合依赖校验中被拒绝"
             "（POPULATION_PRE_EXECUTION_REJECTED），系统未展示未验证结果。"
         )
     if specific_code == "POPULATION_POST_RESULT_REJECTED":
-        return (
-            "本次查询结果未通过上游实体集合依赖校验"
-            "（POPULATION_POST_RESULT_REJECTED），系统未展示未验证结果。"
-        )
-    return (
-        "本次查询执行失败（%s）。系统没有把未完成或未验证的结果作为最终答案；请稍后重试。"
-        % specific_code
-    )
+        return "本次查询结果未通过上游实体集合依赖校验（POPULATION_POST_RESULT_REJECTED），系统未展示未验证结果。"
+    return "本次查询执行失败（%s）。系统没有把未完成或未验证的结果作为最终答案；请稍后重试。" % specific_code
 
 
 def _artifact_population_authorized(
@@ -1628,11 +2011,7 @@ def _artifact_population_authorized(
         return True
     normalized_artifact_id = str(artifact_id or "").strip()
     artifact = next(
-        (
-            item
-            for item in session.runtime.verified_query_ledger
-            if item.artifact_id == normalized_artifact_id
-        ),
+        (item for item in session.runtime.verified_query_ledger if item.artifact_id == normalized_artifact_id),
         None,
     )
     if artifact is None:
@@ -1640,10 +2019,7 @@ def _artifact_population_authorized(
     contract = artifact.contract
     population_required = bool(
         contract.upstream_entity_bindings
-        or (
-            contract.reference_scope.enabled
-            and contract.reference_scope.population_required
-        )
+        or (contract.reference_scope.enabled and contract.reference_scope.population_required)
     )
     if not population_required:
         return True
@@ -1656,9 +2032,7 @@ def _artifact_population_authorized(
         {},
     )
     return bool(
-        query_node_id
-        and post_result.get("accepted") is True
-        and str(post_result.get("stage") or "") == "POST_RESULT"
+        query_node_id and post_result.get("accepted") is True and str(post_result.get("stage") or "") == "POST_RESULT"
     )
 
 
@@ -1679,9 +2053,7 @@ def _authorized_verified_query_artifacts(
             or (
                 artifact.verified_evidence.passed
                 and artifact.publication_status == "PUBLISHED"
-                and verified_query_artifact_integrity_valid(
-                    artifact
-                )
+                and verified_query_artifact_integrity_valid(artifact)
             )
         )
     ]
@@ -1700,11 +2072,7 @@ def _latest_verified_analysis_artifacts(
     with session.lock:
         analysis_ledger = list(session.verified_analysis_ledger)
         skill_ledger = list(session.verified_skill_ledger)
-    all_linked_ids = {
-        artifact_id
-        for skill in skill_ledger
-        for artifact_id in skill.derived_analysis_artifact_ids
-    }
+    all_linked_ids = {artifact_id for skill in skill_ledger for artifact_id in skill.derived_analysis_artifact_ids}
     valid_rank_by_artifact_id: dict[str, tuple[int, int]] = {}
     for skill_index, skill in enumerate(skill_ledger):
         if not skill.integrity_valid():
@@ -1822,9 +2190,7 @@ def _selected_execution_graph_replan_evidence(
             [
                 *session.execution_graph_revision_discovery_evidence_ids,
                 *(
-                    [
-                        session.execution_graph_revision_discovery_evidence_id
-                    ]
+                    [session.execution_graph_revision_discovery_evidence_id]
                     if session.execution_graph_revision_discovery_evidence_id
                     else []
                 ),
@@ -1833,10 +2199,7 @@ def _selected_execution_graph_replan_evidence(
     )
     if not selected_ids:
         return []
-    current_by_id = {
-        item.evidence_id: item
-        for item in _current_execution_graph_replan_evidence(session)
-    }
+    current_by_id = {item.evidence_id: item for item in _current_execution_graph_replan_evidence(session)}
     if any(evidence_id not in current_by_id for evidence_id in selected_ids):
         return []
     return [current_by_id[evidence_id] for evidence_id in selected_ids]
@@ -1858,10 +2221,7 @@ def _execution_graph_node_runtime_states(
         if context is None:
             lifecycle = "UNEXECUTED"
         else:
-            published = bool(
-                context.verified_artifact_ids
-                or context.status == "VERIFIED"
-            )
+            published = bool(context.verified_artifact_ids or context.status == "VERIFIED")
             if published:
                 lifecycle = "PUBLISHED"
             elif context.status in {
@@ -1893,21 +2253,15 @@ def _build_graph_revision_base_session_checkpoint(
 ) -> GroundedGraphRevisionBaseSessionCheckpoint:
     goal_contract = session.question_goal_contract
     if goal_contract is None:
-        raise GroundedGraphRevisionJournalError(
-            "GRAPH_REVISION_BASE_GOAL_CONTRACT_REQUIRED"
-        )
-    states_by_key = {
-        item.client_key: item for item in node_states
-    }
+        raise GroundedGraphRevisionJournalError("GRAPH_REVISION_BASE_GOAL_CONTRACT_REQUIRED")
+    states_by_key = {item.client_key: item for item in node_states}
     branches: list[GroundedGraphRevisionBaseBranchCheckpoint] = []
     for node in execution_proposal.nodes:
         query_node_id = execution_receipt.node_ids[node.client_key]
         context = session.query_branch_contexts.get(query_node_id)
         state = states_by_key.get(node.client_key)
         if state is None:
-            raise GroundedGraphRevisionJournalError(
-                "GRAPH_REVISION_BASE_NODE_STATE_REQUIRED"
-            )
+            raise GroundedGraphRevisionJournalError("GRAPH_REVISION_BASE_NODE_STATE_REQUIRED")
         branches.append(
             GroundedGraphRevisionBaseBranchCheckpoint(
                 client_key=node.client_key,
@@ -1916,40 +2270,13 @@ def _build_graph_revision_base_session_checkpoint(
                 goal_ids=tuple(node.goal_ids),
                 topic_scope=tuple(node.topic_scope),
                 evidence_ref_ids=tuple(node.evidence_ref_ids),
-                dependency_query_node_ids=tuple(
-                    context.dependency_query_ids
-                    if context is not None
-                    else ()
-                ),
-                contract_scope_query_node_ids=tuple(
-                    context.contract_scope_query_ids
-                    if context is not None
-                    else ()
-                ),
-                opened_topics=tuple(
-                    context.opened_topics
-                    if context is not None
-                    else ()
-                ),
+                dependency_query_node_ids=tuple(context.dependency_query_ids if context is not None else ()),
+                contract_scope_query_node_ids=tuple(context.contract_scope_query_ids if context is not None else ()),
+                opened_topics=tuple(context.opened_topics if context is not None else ()),
                 lifecycle=state.lifecycle,
-                status=(
-                    context.status
-                    if context is not None
-                    else "DECLARED"
-                ),
-                verified_artifact_ids=tuple(
-                    context.verified_artifact_ids
-                    if context is not None
-                    else ()
-                ),
-                last_gaps=tuple(
-                    dict(item)
-                    for item in (
-                        context.last_gaps
-                        if context is not None
-                        else ()
-                    )
-                ),
+                status=(context.status if context is not None else "DECLARED"),
+                verified_artifact_ids=tuple(context.verified_artifact_ids if context is not None else ()),
+                last_gaps=tuple(dict(item) for item in (context.last_gaps if context is not None else ())),
             )
         )
     runtime = session.runtime
@@ -1994,14 +2321,10 @@ def _build_graph_revision_base_session_checkpoint(
         runtime_state={
             "revision": runtime.revision,
             "activeGeneration": runtime.active_generation,
-            "activeGoalContractFingerprint": (
-                runtime.active_goal_contract_fingerprint
-            ),
+            "activeGoalContractFingerprint": (runtime.active_goal_contract_fingerprint),
             "workspaceTopics": list(runtime.workspace_topics),
             "semanticActivationSeal": semantic_activation,
-            "semanticActivationExecutionStarted": bool(
-                runtime.semantic_activation_execution_started
-            ),
+            "semanticActivationExecutionStarted": bool(runtime.semantic_activation_execution_started),
             "subagentDispatches": [
                 json.loads(
                     json.dumps(
@@ -2015,12 +2338,10 @@ def _build_graph_revision_base_session_checkpoint(
                 if isinstance(item, dict)
             ],
             "verifiedSkillArtifacts": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in session.verified_skill_ledger
+                item.model_dump(by_alias=True, mode="json") for item in session.verified_skill_ledger
             ],
             "verifiedAnalysisArtifacts": [
-                item.model_dump(by_alias=True, mode="json")
-                for item in session.verified_analysis_ledger
+                item.model_dump(by_alias=True, mode="json") for item in session.verified_analysis_ledger
             ],
             "skillRuns": [
                 json.loads(
@@ -2034,53 +2355,34 @@ def _build_graph_revision_base_session_checkpoint(
                 for item in session.skill_runs[-16:]
                 if isinstance(item, dict)
             ],
-            "skillInputSnapshotGeneration": (
-                session.skill_input_snapshot_generation
-            ),
-            "analysisSkillHeadersDisclosed": bool(
-                session.analysis_skill_headers_disclosed
-            ),
+            "skillInputSnapshotGeneration": (session.skill_input_snapshot_generation),
+            "analysisSkillHeadersDisclosed": bool(session.analysis_skill_headers_disclosed),
         },
         verified_query_artifacts=tuple(
-            item.model_dump(by_alias=True, mode="json")
-            for item in runtime.verified_query_ledger
+            item.model_dump(by_alias=True, mode="json") for item in runtime.verified_query_ledger
         ),
         verified_entity_sets=tuple(
-            item.model_dump(by_alias=True, mode="json")
-            for item in runtime.verified_entity_sets
+            item.model_dump(by_alias=True, mode="json") for item in runtime.verified_entity_sets
         ),
         verified_rule_artifacts=tuple(
-            item.model_dump(by_alias=True, mode="json")
-            for item in runtime.verified_rule_ledger
+            item.model_dump(by_alias=True, mode="json") for item in runtime.verified_rule_ledger
         ),
         artifact_goal_ids={
-            artifact_id: tuple(goal_ids)
-            for artifact_id, goal_ids in (
-                session.artifact_goal_ids.items()
-            )
+            artifact_id: tuple(goal_ids) for artifact_id, goal_ids in (session.artifact_goal_ids.items())
         },
         population_pre_execution_references={
             query_node_id: reference.model_dump(
                 by_alias=True,
                 mode="json",
             )
-            for query_node_id, reference in (
-                session.population_pre_execution_references.items()
-            )
+            for query_node_id, reference in (session.population_pre_execution_references.items())
         },
         population_post_gate_results={
-            query_node_id: dict(result)
-            for query_node_id, result in (
-                session.population_post_gate_results.items()
-            )
+            query_node_id: dict(result) for query_node_id, result in (session.population_post_gate_results.items())
         },
-        population_artifact_query_node_ids=dict(
-            session.population_artifact_query_node_ids
-        ),
+        population_artifact_query_node_ids=dict(session.population_artifact_query_node_ids),
         population_goal_gate_id=session.population_goal_gate_id,
-        population_goal_gate_result=dict(
-            session.population_goal_gate_result
-        ),
+        population_goal_gate_result=dict(session.population_goal_gate_result),
         population_goal_attestation=(
             session.population_goal_attestation.model_dump(
                 by_alias=True,
@@ -2097,17 +2399,11 @@ def _build_graph_revision_base_session_checkpoint(
             if session.execution_graph_data_snapshot is not None
             else {}
         ),
-        execution_graph_revision_count=(
-            session.execution_graph_revision_count
-        ),
-        execution_graph_max_revision_count=(
-            session.execution_graph_max_revision_count
-        ),
+        execution_graph_revision_count=(session.execution_graph_revision_count),
+        execution_graph_max_revision_count=(session.execution_graph_max_revision_count),
         opened_topics=tuple(session.opened_topics),
     )
-    return seal_grounded_graph_revision_base_session_checkpoint(
-        checkpoint
-    )
+    return seal_grounded_graph_revision_base_session_checkpoint(checkpoint)
 
 
 class _SessionExplorationStateStore:
@@ -2222,10 +2518,8 @@ class GroundedSemanticBackend:
         if manifest_topic:
             if manifest_topic in session.effective_topics():
                 return ""
-            if session.topic_index_read and session.can_expand_topic():
-                return ""
             if session.topic_index_read:
-                return "TOPIC_EXPANSION_REQUIRES_STRUCTURED_GAP"
+                return ""
             return "TOPIC_INDEX_READ_REQUIRED"
         topic = self._topic(normalized)
         if topic and topic not in session.effective_topics():
@@ -2302,8 +2596,6 @@ class GroundedSemanticBackend:
             elif kind == "TOPIC_MANIFEST" and topic_name not in session.effective_topics():
                 if not session.topic_index_read:
                     return ReadResult(error="TOPIC_INDEX_READ_REQUIRED")
-                if not session.can_expand_topic():
-                    return ReadResult(error="TOPIC_EXPANSION_REQUIRES_STRUCTURED_GAP")
                 session.opened_topics.append(topic_name)
                 if topic_name not in session.runtime.workspace_topics:
                     session.runtime.workspace_topics.append(topic_name)
@@ -3346,6 +3638,38 @@ def _message_content_text(message: Any) -> str:
         return str(content or "")
 
 
+def _parse_query_sql_repair(message: Any) -> Optional[QuerySqlCandidate]:
+    content = _message_content_text(message).strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    sql = str(payload.get("sql") or "").strip()
+    if not sql:
+        return None
+    try:
+        return QuerySqlCandidate(
+            sql=sql,
+            rationale=str(payload.get("rationale") or "")[:1000],
+            evidence_ref_ids=[
+                str(item or "").strip()
+                for item in payload.get("evidenceRefIds") or payload.get("evidence_ref_ids") or []
+                if str(item or "").strip()
+            ],
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _knowledge_relative_path(value: str) -> str:
     normalized = GroundedSemanticBackend._path(value)
     if normalized == "knowledge":
@@ -3572,38 +3896,29 @@ def _grounded_branch_read_control(
     ):
         return {
             "status": "READY_TO_EXECUTE",
-            "nextAction": (
-                "AUTHOR_SQL_THEN_EXECUTE_BATCH"
-                if _enum_value(state.active_execution_mode) == "CORE_SQL_REQUIRED"
-                else "EXECUTE_BATCH"
-            ),
-            "retrievalClosed": True,
+            "nextAction": "CORE_REACT_DECIDES",
+            "decisionMode": "CALLER_REACT",
+            "recommendedActions": [
+                "SUBMIT_SQL_VERSION",
+                "EXECUTE_QUERY",
+                "READ_SEMANTIC_EVIDENCE",
+                "REPLAN_QUERY_TOPOLOGY",
+            ],
+            "retrievalClosed": False,
         }
     if branch.status == "CONTRACT_GAPPED" and branch.last_gaps:
         latest = state.attempts[-1] if state is not None and state.attempts else None
-        contract_status = str(
-            getattr(getattr(latest, "contract", None), "status", "") or ""
-        )
+        contract_status = str(getattr(getattr(latest, "contract", None), "status", "") or "")
         directive = build_contract_repair_directive(
             branch.last_gaps,
             contract_status=contract_status or "REVISE_BINDINGS",
-            base_attempt_id=str(
-                getattr(latest, "attempt_id", "") or ""
-            ),
+            base_attempt_id=str(getattr(latest, "attempt_id", "") or ""),
             base_contract_fingerprint=(
-                grounded_query_contract_fingerprint(latest.contract)
-                if latest is not None
-                else ""
+                grounded_query_contract_fingerprint(latest.contract) if latest is not None else ""
             ),
-            contract_version=int(
-                getattr(latest, "contract_version", 0) or 0
-            ),
-            parent_attempt_id=str(
-                getattr(latest, "parent_attempt_id", "") or ""
-            ),
-            parent_contract_fingerprint=str(
-                getattr(latest, "parent_contract_fingerprint", "") or ""
-            ),
+            contract_version=int(getattr(latest, "contract_version", 0) or 0),
+            parent_attempt_id=str(getattr(latest, "parent_attempt_id", "") or ""),
+            parent_contract_fingerprint=str(getattr(latest, "parent_contract_fingerprint", "") or ""),
         )
         if directive.repair_type != "NONE":
             return {
@@ -3627,7 +3942,8 @@ def _grounded_branch_read_control(
     column_count = sum(item in {"COLUMN", "FIELD"} for item in exact_kinds)
     return {
         "status": "FROZEN_EVIDENCE_READY_FOR_CONTRACT",
-        "nextAction": "PROPOSE_BRANCH_CONTRACT",
+        "nextAction": "CORE_REACT_DECIDES",
+        "decisionMode": "CALLER_REACT",
         "retrievalClosed": False,
         "evidenceCounts": {
             "tableDetails": table_count,
@@ -3697,15 +4013,330 @@ def _read_exact_branch_semantic_path(
     return evidence, True
 
 
+def _read_exact_core_semantic_path(
+    semantic_backend: GroundedSemanticBackend,
+    session: GroundedDeepAgentSession,
+    file_path: str,
+) -> tuple[dict[str, Any], bool]:
+    """Read one exact leaf for query_batch compatibility mode."""
+
+    # Older Core prompts sometimes put a semantic ref in ``semanticPaths``
+    # even though that field nominally contains filesystem paths.  Resolve it
+    # to the same canonical leaf path used by the semantic catalog before
+    # looking up or reading evidence.  This also makes the compatibility
+    # adapter tolerant of ``knowledge/`` and leading-slash variants.
+    normalized = _knowledge_relative_path(file_path)
+    if normalized.startswith("semantic:"):
+        normalized = _canonical_recall_path(normalized, "")
+    if not normalized:
+        raise RuntimeError("CORE_SEMANTIC_PATH_REQUIRED")
+    if normalized.endswith("/asset.json"):
+        raise RuntimeError("FULL_TABLE_ASSET_DENIED")
+    if normalized.endswith("/index.json"):
+        raise RuntimeError("BROAD_SEMANTIC_INDEX_DENIED")
+    with session.lock:
+        existing = next(
+            (
+                dict(item)
+                for item in session.core_semantic_evidence
+                if bool(item.get("contentComplete"))
+                and (
+                    _knowledge_relative_path(str(item.get("path") or "")) == normalized
+                    or _canonical_recall_path(
+                        str(item.get("refId") or ""),
+                        str(item.get("path") or ""),
+                    )
+                    == normalized
+                )
+            ),
+            None,
+        )
+    if existing is not None:
+        return existing, False
+    evidence = semantic_backend.record_core_read_receipt(
+        session,
+        normalized,
+        offset=0,
+        limit=2_000_000,
+    )
+    if not evidence:
+        raise RuntimeError("UNTRUSTED_CORE_SEMANTIC_EVIDENCE")
+    kind = str(evidence.get("kind") or "").upper()
+    if kind in {"TOPIC_INDEX", "TOPIC_MANIFEST"} or "INDEX" in kind:
+        raise RuntimeError("EXACT_BINDING_LEAF_REQUIRED")
+    return evidence, True
+
+
+_DIRECT_GOAL_EVIDENCE_KINDS: dict[str, set[str]] = {
+    "METRIC": {"METRIC"},
+    "DIMENSION": {"COLUMN", "FIELD"},
+    "ENTITY": {"COLUMN", "FIELD"},
+    "DETAIL": {"TABLE_DETAIL"},
+}
+
+
+def _semantic_match_key(value: Any) -> str:
+    return "".join(character.casefold() for character in str(value or "") if character.isalnum())
+
+
+def _semantic_evidence_aliases(evidence: Mapping[str, Any]) -> set[str]:
+    """Return published aliases from one complete semantic leaf."""
+
+    content = str(evidence.get("contentSnippet") or "")
+    try:
+        payload = json.loads(content) if content else {}
+    except (TypeError, ValueError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    kind = str(evidence.get("kind") or "").strip().upper()
+    definition: Mapping[str, Any]
+    if kind == "METRIC":
+        nested = payload.get("metric")
+        definition = nested if isinstance(nested, dict) else payload
+        values = [
+            definition.get("metricKey"),
+            definition.get("canonicalMetricKey"),
+            definition.get("businessName"),
+            definition.get("displayName"),
+            definition.get("naturalName"),
+            *(definition.get("aliases") or []),
+        ]
+    elif kind in {"COLUMN", "FIELD"}:
+        nested = payload.get("definition")
+        definition = nested if isinstance(nested, dict) else payload
+        values = [
+            payload.get("key"),
+            definition.get("columnName"),
+            definition.get("businessName"),
+            *(definition.get("aliases") or []),
+        ]
+    elif kind == "TABLE_DETAIL":
+        values = [
+            payload.get("tableName"),
+            payload.get("title"),
+            payload.get("businessSummary"),
+        ]
+    else:
+        values = []
+    values.extend(
+        [
+            evidence.get("refId"),
+            evidence.get("table"),
+        ]
+    )
+    return {normalized for value in values if (normalized := _semantic_match_key(value))}
+
+
+def _semantic_evidence_closure(
+    session: GroundedDeepAgentSession,
+) -> dict[str, Any]:
+    """Evaluate Goal-to-evidence closure without selecting a query topology.
+
+    Closure is derived from the declared Goal ledger and exact semantic leaves.
+    It is intentionally independent of metric count, owner table names, time
+    column names and whether Core will choose one query or a batch.
+    """
+
+    goal_contract = session.question_goal_contract
+    if goal_contract is None:
+        return {"closed": False, "code": "GOAL_CONTRACT_REQUIRED"}
+    evidence = [
+        dict(item)
+        for item in session.core_semantic_evidence
+        if bool(item.get("contentComplete")) and str(item.get("refId") or "").strip()
+    ]
+    evidence_by_ref = {str(item.get("refId") or "").strip(): item for item in evidence}
+    evidence_aliases = {ref_id: _semantic_evidence_aliases(item) for ref_id, item in evidence_by_ref.items()}
+    table_details = {
+        (
+            str(item.get("topic") or "").strip(),
+            str(item.get("table") or "").strip(),
+        ): item
+        for item in evidence
+        if str(item.get("kind") or "").strip().upper() == "TABLE_DETAIL"
+    }
+    required_goals = [goal for goal in goal_contract.goals if bool(getattr(goal, "required", True))]
+    query_goal_kinds = {
+        "METRIC",
+        "DIMENSION",
+        "ENTITY",
+        "DETAIL",
+        "TIME_WINDOW",
+        "COMPARISON",
+        "DEPENDENCY",
+        "RANKING",
+    }
+    if not required_goals or any(
+        str(getattr(goal, "kind", "") or "").strip().upper() not in query_goal_kinds for goal in required_goals
+    ):
+        return {
+            "closed": False,
+            "code": "NON_QUERY_GOAL_REQUIRES_OPEN_DISCOVERY",
+        }
+
+    goal_bindings: dict[str, list[str]] = {}
+    missing_goal_ids: list[str] = []
+    ambiguous_goal_ids: list[str] = []
+    for goal in required_goals:
+        goal_id = str(getattr(goal, "goal_id", "") or "").strip()
+        kind = str(getattr(goal, "kind", "") or "").strip().upper()
+        if kind == "TIME_WINDOW":
+            if not (
+                str(getattr(goal, "time_expression", "") or "").strip()
+                or (str(getattr(goal, "start", "") or "").strip() and str(getattr(goal, "end", "") or "").strip())
+            ):
+                missing_goal_ids.append(goal_id)
+            continue
+        accepted_kinds = _DIRECT_GOAL_EVIDENCE_KINDS.get(kind)
+        if accepted_kinds is None:
+            # Structural Goals are proved by their referenced query Goals and
+            # do not require another semantic leaf of their own.
+            continue
+        declared_refs = {
+            str(item or "").strip() for item in (getattr(goal, "semantic_ref_ids", ()) or ()) if str(item or "").strip()
+        }
+        for attribute in (
+            "metric_ref_id",
+            "dimension_ref_id",
+            "entity_ref_id",
+        ):
+            ref_id = str(getattr(goal, attribute, "") or "").strip()
+            if ref_id:
+                declared_refs.add(ref_id)
+        if declared_refs:
+            candidates = [
+                ref_id
+                for ref_id in declared_refs
+                if ref_id in evidence_by_ref
+                and str(evidence_by_ref[ref_id].get("kind") or "").strip().upper() in accepted_kinds
+            ]
+        else:
+            goal_aliases = {
+                normalized
+                for value in [
+                    getattr(goal, "label", ""),
+                    *(getattr(goal, "source_spans", ()) or ()),
+                ]
+                if (normalized := _semantic_match_key(value))
+            }
+            candidates = [
+                ref_id
+                for ref_id, item in evidence_by_ref.items()
+                if str(item.get("kind") or "").strip().upper() in accepted_kinds
+                and goal_aliases.intersection(evidence_aliases[ref_id])
+            ]
+        candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            missing_goal_ids.append(goal_id)
+            continue
+        if len(candidates) > 1:
+            ambiguous_goal_ids.append(goal_id)
+            continue
+        goal_bindings[goal_id] = candidates
+
+    bound_ref_ids = list(dict.fromkeys(ref_id for refs in goal_bindings.values() for ref_id in refs))
+    owner_keys = {
+        (
+            str(evidence_by_ref[ref_id].get("topic") or "").strip(),
+            str(evidence_by_ref[ref_id].get("table") or "").strip(),
+        )
+        for ref_id in bound_ref_ids
+        if str(evidence_by_ref[ref_id].get("kind") or "").strip().upper() != "TABLE_DETAIL"
+    }
+    missing_owner_keys = sorted(key for key in owner_keys if all(key) and key not in table_details)
+    if missing_goal_ids or ambiguous_goal_ids or missing_owner_keys:
+        return {
+            "closed": False,
+            "code": "GOAL_EVIDENCE_OPEN",
+            "missingGoalIds": missing_goal_ids,
+            "ambiguousGoalIds": ambiguous_goal_ids,
+            "missingOwnerTables": [{"topic": topic, "table": table} for topic, table in missing_owner_keys],
+        }
+
+    selected_table_details = [table_details[key] for key in sorted(owner_keys) if key in table_details]
+    time_field_refs = [
+        str(item.get("refId") or "").strip()
+        for item in evidence
+        if str(item.get("kind") or "").strip().upper() in {"COLUMN", "FIELD"}
+        and (
+            str(
+                _semantic_payload_summary(
+                    str(item.get("kind") or ""),
+                    str(item.get("contentSnippet") or ""),
+                ).get("role")
+                or ""
+            )
+            .strip()
+            .upper()
+            in {"TIME", "DATE", "DATETIME", "TIMESTAMP"}
+        )
+        and (
+            str(item.get("topic") or "").strip(),
+            str(item.get("table") or "").strip(),
+        )
+        in owner_keys
+    ]
+    selected_refs = list(
+        dict.fromkeys(
+            [
+                *(str(item.get("refId") or "").strip() for item in selected_table_details),
+                *bound_ref_ids,
+                *time_field_refs,
+            ]
+        )
+    )
+    selected_evidence = [evidence_by_ref[ref_id] for ref_id in selected_refs]
+    metric_refs = [
+        ref_id for ref_id in bound_ref_ids if str(evidence_by_ref[ref_id].get("kind") or "").strip().upper() == "METRIC"
+    ]
+    dimension_refs = [
+        ref_id
+        for ref_id in bound_ref_ids
+        if str(evidence_by_ref[ref_id].get("kind") or "").strip().upper() in {"COLUMN", "FIELD"}
+    ]
+    return {
+        "closed": True,
+        "code": "DECLARED_GOALS_EXACTLY_BOUND",
+        "goalBindings": goal_bindings,
+        "bindingSeed": {
+            "goalIds": [str(getattr(goal, "goal_id", "") or "").strip() for goal in required_goals],
+            "readRefIds": selected_refs,
+            "semanticPaths": [
+                str(item.get("path") or "").strip() for item in selected_evidence if str(item.get("path") or "").strip()
+            ],
+            "bindingHints": {
+                "tableRefs": [str(item.get("refId") or "").strip() for item in selected_table_details],
+                "metricRefs": metric_refs,
+                "dimensionRefs": dimension_refs,
+                "timeFieldRefs": list(dict.fromkeys(time_field_refs)),
+                "timeFieldRef": (time_field_refs[0] if len(set(time_field_refs)) == 1 else ""),
+            },
+            "timeWindows": [
+                {
+                    "goalId": str(getattr(goal, "goal_id", "") or "").strip(),
+                    "timeExpression": str(getattr(goal, "time_expression", "") or "").strip(),
+                    "appliesToGoalIds": list(getattr(goal, "applies_to_goal_ids", ()) or ()),
+                }
+                for goal in required_goals
+                if str(getattr(goal, "kind", "") or "").strip().upper() == "TIME_WINDOW"
+            ],
+        },
+    }
+
+
 def _grounded_semantic_read_control(
     session: GroundedDeepAgentSession,
 ) -> dict[str, Any]:
     discovery_snapshot_fingerprint = discovery_evidence_snapshot_fingerprint(session.core_semantic_evidence)
+    evidence_closure = _semantic_evidence_closure(session)
+    evidence_closed = bool(evidence_closure.get("closed"))
 
     def with_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         state_semantics = _grounded_state_semantics(session)
         return {
             **payload,
+            "decisionMode": str(payload.get("decisionMode") or "CALLER_REACT"),
             "stateClass": state_semantics["stateClass"],
             "failureCategory": state_semantics["failureCategory"],
             "discoverySnapshotFingerprint": (discovery_snapshot_fingerprint),
@@ -3717,35 +4348,23 @@ def _grounded_semantic_read_control(
         (
             item
             for item in reversed(state.sql_candidate_attempts)
-            if not state.active_generation
-            or item.active_generation == state.active_generation
+            if not state.active_generation or item.active_generation == state.active_generation
         ),
         None,
     )
-    sql_repair_action = str(
-        getattr(latest_sql_attempt, "next_action", "") or ""
-    ).upper()
-    if (
-        state.active_contract is not None
-        and sql_repair_action in {
-            "REVISE_BINDINGS",
-            "REPAIR_SQL_OR_BINDINGS",
-        }
-    ):
+    sql_repair_action = str(getattr(latest_sql_attempt, "next_action", "") or "").upper()
+    if state.active_contract is not None and sql_repair_action in {
+        "REVISE_BINDINGS",
+        "REPAIR_SQL_OR_BINDINGS",
+    }:
         return with_snapshot(
             {
                 "status": "REPAIR_REQUIRED",
-                "repairType": (
-                    "BINDING"
-                    if sql_repair_action == "REVISE_BINDINGS"
-                    else "BINDING_OR_SQL"
-                ),
+                "repairType": ("BINDING" if sql_repair_action == "REVISE_BINDINGS" else "BINDING_OR_SQL"),
                 "nextAction": sql_repair_action,
                 "activeGeneration": state.active_generation,
                 "activeAttemptId": state.active_attempt_id,
-                "contractFingerprint": grounded_query_contract_fingerprint(
-                    state.active_contract
-                ),
+                "contractFingerprint": grounded_query_contract_fingerprint(state.active_contract),
                 "sqlCandidateRepair": (
                     latest_sql_attempt.model_dump(
                         by_alias=True,
@@ -3778,44 +4397,40 @@ def _grounded_semantic_read_control(
         return with_snapshot(
             {
                 "status": "READY_TO_EXECUTE",
-                "nextAction": (
-                    "SUBMIT_GROUNDED_SQL_CANDIDATE"
-                    if _enum_value(state.active_execution_mode) == "CORE_SQL_REQUIRED"
-                    else "EXECUTE_GROUNDED_QUERY"
-                ),
+                "nextAction": "CORE_REACT_DECIDES",
+                "decisionMode": "CALLER_REACT",
+                "recommendedActions": [
+                    "SUBMIT_SQL_VERSION",
+                    "EXECUTE_QUERY",
+                    "READ_SEMANTIC_EVIDENCE",
+                    "REPLAN_QUERY_TOPOLOGY",
+                ],
                 "activeGeneration": state.active_generation,
                 "activeAttemptId": state.active_attempt_id,
                 "executionMode": state.active_execution_mode,
-                "sqlExecutionRepair": dict(
-                    state.sql_execution_repair_context or {}
-                ),
-                "retrievalClosed": True,
+                "sqlExecutionRepair": dict(state.sql_execution_repair_context or {}),
+                "retrievalClosed": evidence_closed,
+                "goalBindings": (dict(evidence_closure.get("goalBindings") or {}) if evidence_closed else {}),
+                "bindingSeed": (dict(evidence_closure.get("bindingSeed") or {}) if evidence_closed else {}),
             }
         )
     if session.query_branch_contexts:
-        revision_evidences = (
-            _selected_execution_graph_replan_evidence(session)
-        )
+        revision_evidences = _selected_execution_graph_replan_evidence(session)
         if revision_evidences:
             return with_snapshot(
                 {
                     "status": "REVISION_DISCOVERY_OPEN",
                     "nextAction": ("READ_ONLY_FOR_STRUCTURED_REPLAN_TRIGGER_THEN_REVISE_GRAPH"),
                     "triggerEvidence": (
-                        _execution_graph_replan_evidence_report(
-                            revision_evidences[0]
-                        )
+                        _execution_graph_replan_evidence_report(revision_evidences[0])
                         if len(revision_evidences) == 1
                         else {}
                     ),
                     "triggerEvidenceSet": [
-                        _execution_graph_replan_evidence_report(item)
-                        for item in revision_evidences
+                        _execution_graph_replan_evidence_report(item) for item in revision_evidences
                     ],
                     "triggerEvidenceSetFingerprint": (
-                        grounded_execution_graph_replan_evidence_set_fingerprint(
-                            revision_evidences
-                        )
+                        grounded_execution_graph_replan_evidence_set_fingerprint(revision_evidences)
                     ),
                     "retrievalClosed": False,
                 }
@@ -3827,11 +4442,7 @@ def _grounded_semantic_read_control(
             if context.status != "CONTRACT_GAPPED" or not context.last_gaps:
                 continue
             branch_state = context.runtime
-            latest_attempt = (
-                branch_state.attempts[-1]
-                if branch_state is not None and branch_state.attempts
-                else None
-            )
+            latest_attempt = branch_state.attempts[-1] if branch_state is not None and branch_state.attempts else None
             directive = build_contract_repair_directive(
                 context.last_gaps,
                 contract_status=str(
@@ -3842,22 +4453,12 @@ def _grounded_semantic_read_control(
                     )
                     or ""
                 ),
-                base_attempt_id=str(
-                    getattr(latest_attempt, "attempt_id", "") or ""
-                ),
+                base_attempt_id=str(getattr(latest_attempt, "attempt_id", "") or ""),
                 base_contract_fingerprint=(
-                    grounded_query_contract_fingerprint(
-                        latest_attempt.contract
-                    )
-                    if latest_attempt is not None
-                    else ""
+                    grounded_query_contract_fingerprint(latest_attempt.contract) if latest_attempt is not None else ""
                 ),
-                contract_version=int(
-                    getattr(latest_attempt, "contract_version", 0) or 0
-                ),
-                parent_attempt_id=str(
-                    getattr(latest_attempt, "parent_attempt_id", "") or ""
-                ),
+                contract_version=int(getattr(latest_attempt, "contract_version", 0) or 0),
+                parent_attempt_id=str(getattr(latest_attempt, "parent_attempt_id", "") or ""),
                 parent_contract_fingerprint=str(
                     getattr(
                         latest_attempt,
@@ -3887,22 +4488,34 @@ def _grounded_semantic_read_control(
                 {
                     "status": "BRANCH_REPAIR_REQUIRED",
                     "repairType": dominant_repair_type,
-                    "nextAction": (
-                        "REPAIR_AFFECTED_BRANCH_CONTRACT_VERSION"
-                        if dominant_repair_type == "BINDING"
-                        else "OPEN_VERSIONED_GRAPH_REVISION_FOR_REQUIRED_EVIDENCE"
-                        if dominant_repair_type == "EVIDENCE"
-                        else "REVISE_ACTIVE_EXECUTION_GRAPH"
-                    ),
+                    "nextAction": "CORE_REACT_DECIDES",
+                    "recommendedActions": [
+                        "READ_EXACT_SEMANTIC_LEAF",
+                        "REVISE_BRANCH_BINDING",
+                        "REVISE_QUERY_TOPOLOGY",
+                        "QUERY_DATA",
+                        "QUERY_BATCH",
+                        "DELEGATE_FOR_ISOLATION",
+                    ],
                     "branches": gapped_branches,
-                    "retrievalClosed": True,
+                    "retrievalClosed": False,
                 }
             )
         return with_snapshot(
             {
-                "status": "EXECUTION_GRAPH_DISCOVERY_FROZEN",
-                "nextAction": "PREPARE_OR_EXECUTE_ACTIVE_GRAPH",
-                "retrievalClosed": True,
+                "status": "EXECUTION_GRAPH_ACTIVE",
+                "nextAction": "CORE_REACT_DECIDES",
+                "instruction": (
+                    "The current graph is an immutable execution receipt for "
+                    "already-bound nodes. The caller may query, replan or "
+                    "delegate; the graph boundary validates any new evidence "
+                    "or topology before execution. Exact semantic navigation "
+                    "is available only when the Goal/evidence closure remains "
+                    "open or a structured gap reopens it."
+                ),
+                "retrievalClosed": evidence_closed,
+                "goalBindings": (dict(evidence_closure.get("goalBindings") or {}) if evidence_closed else {}),
+                "bindingSeed": (dict(evidence_closure.get("bindingSeed") or {}) if evidence_closed else {}),
             }
         )
     if state.attempts:
@@ -3911,9 +4524,7 @@ def _grounded_semantic_read_control(
         if blocking:
             directive_payload = dict(latest.repair_directive or {})
             if directive_payload:
-                repair_type = str(
-                    directive_payload.get("repairType") or ""
-                ).upper()
+                repair_type = str(directive_payload.get("repairType") or "").upper()
             else:
                 repair_type = ""
             if repair_type not in {"EVIDENCE", "BINDING", "TOPOLOGY"}:
@@ -3921,15 +4532,9 @@ def _grounded_semantic_read_control(
                     blocking,
                     contract_status=latest.contract.status,
                     base_attempt_id=latest.attempt_id,
-                    base_contract_fingerprint=(
-                        grounded_query_contract_fingerprint(latest.contract)
-                    ),
-                    contract_version=int(
-                        getattr(latest, "contract_version", 0) or 0
-                    ),
-                    parent_attempt_id=str(
-                        getattr(latest, "parent_attempt_id", "") or ""
-                    ),
+                    base_contract_fingerprint=(grounded_query_contract_fingerprint(latest.contract)),
+                    contract_version=int(getattr(latest, "contract_version", 0) or 0),
+                    parent_attempt_id=str(getattr(latest, "parent_attempt_id", "") or ""),
                     parent_contract_fingerprint=str(
                         getattr(
                             latest,
@@ -3948,26 +4553,17 @@ def _grounded_semantic_read_control(
                 {
                     "status": "REPAIR_REQUIRED",
                     "repairType": repair_type,
-                    "nextAction": str(
-                        directive_payload.get("nextAction") or ""
-                    ),
+                    "nextAction": str(directive_payload.get("nextAction") or ""),
                     "attemptId": latest.attempt_id,
-                    "contractVersion": int(
-                        getattr(latest, "contract_version", 0) or 0
-                    ),
-                    "parentAttemptId": str(
-                        getattr(latest, "parent_attempt_id", "") or ""
-                    ),
+                    "contractVersion": int(getattr(latest, "contract_version", 0) or 0),
+                    "parentAttemptId": str(getattr(latest, "parent_attempt_id", "") or ""),
                     "blockingGapCount": len(blocking),
                     "gaps": [gap.model_dump(by_alias=True) for gap in blocking[:8]],
                     "repairDirective": directive_payload,
                     "relationshipEvidenceRequired": not (
                         repair_type == "TOPOLOGY"
                         and all(
-                            gap.required_capability.get(
-                                "relationshipEvidenceRequired"
-                            )
-                            is False
+                            gap.required_capability.get("relationshipEvidenceRequired") is False
                             for gap in blocking
                             if gap.required_capability
                         )
@@ -3984,6 +4580,110 @@ def _grounded_semantic_read_control(
     metric_count = sum(kind == "METRIC" for kind in exact_kinds)
     column_count = sum(kind in {"COLUMN", "FIELD"} for kind in exact_kinds)
     relationship_count = sum(kind == "RELATIONSHIP" for kind in exact_kinds)
+    goal_contract = session.question_goal_contract
+    required_goals = list(goal_contract.goals) if goal_contract is not None else []
+    detail_goal_count = sum(
+        str(getattr(goal, "kind", "") or "").strip().upper() == "DETAIL" and bool(getattr(goal, "required", True))
+        for goal in required_goals
+    )
+    goal_kinds = {
+        str(getattr(goal, "kind", "") or "").strip().upper()
+        for goal in required_goals
+        if str(getattr(goal, "kind", "") or "").strip()
+    }
+    if session.latest_query_batch_observations:
+        return with_snapshot(
+            {
+                "status": "BATCH_REPAIR_REQUIRED",
+                "nextAction": "CORE_REACT_DECIDES",
+                "decisionMode": "CALLER_REACT",
+                "retrievalClosed": False,
+                "queryBatchObservations": list(session.latest_query_batch_observations),
+                "instruction": (
+                    "This is diagnostic context, not a prescribed transition. "
+                    "Inspect the branch Observation and choose any safe next "
+                    "action: read an exact semantic leaf, retry query_data or "
+                    "query_batch, replan topology, or delegate when isolation "
+                    "is useful. The repairReceipt and server checks define the "
+                    "authority boundary."
+                ),
+                "recommendedActions": [
+                    "READ_EXACT_SEMANTIC_LEAF",
+                    "RETRY_QUERY_DATA",
+                    "RETRY_QUERY_BATCH",
+                    "REPLAN_QUERY_TOPOLOGY",
+                    "DELEGATE_FOR_ISOLATION",
+                ],
+                "evidenceCounts": {
+                    "tableDetails": table_count,
+                    "metrics": metric_count,
+                    "columns": column_count,
+                    "relationships": relationship_count,
+                },
+            }
+        )
+    if evidence_closed:
+        return with_snapshot(
+            {
+                "status": "DECLARED_GOALS_EVIDENCE_BOUND",
+                "nextAction": "CORE_REACT_DECIDES",
+                "decisionMode": "CALLER_REACT",
+                "retrievalClosed": True,
+                "closureCode": str(evidence_closure.get("code") or ""),
+                "goalBindings": dict(evidence_closure.get("goalBindings") or {}),
+                "bindingSeed": dict(evidence_closure.get("bindingSeed") or {}),
+                "evidenceCounts": {
+                    "tableDetails": table_count,
+                    "metrics": metric_count,
+                    "columns": column_count,
+                    "relationships": relationship_count,
+                },
+                "instruction": (
+                    "Every declared query Goal now has a unique exact semantic "
+                    "binding and each owner table is grounded. Semantic navigation "
+                    "is closed for this evidence snapshot; choose query_data, "
+                    "query_batch, topology planning or isolated delegation. A "
+                    "structured Contract/Observation gap reopens the exact reads "
+                    "needed for repair. bindingSeed is evidence authority, not a "
+                    "prescribed query topology."
+                ),
+                "recommendedActions": [
+                    "QUERY_DATA",
+                    "QUERY_BATCH",
+                    "REPLAN_QUERY_TOPOLOGY",
+                    "DELEGATE_FOR_ISOLATION",
+                ],
+            }
+        )
+    if detail_goal_count and goal_kinds <= {"DETAIL", "TIME_WINDOW"} and table_count >= detail_goal_count:
+        return with_snapshot(
+            {
+                "status": "READY_FOR_QUERY_BATCH",
+                "nextAction": "CORE_REACT_DECIDES",
+                "decisionMode": "CALLER_REACT",
+                "retrievalClosed": False,
+                "evidenceCounts": {
+                    "tableDetails": table_count,
+                    "metrics": metric_count,
+                    "columns": column_count,
+                    "relationships": relationship_count,
+                },
+                "instruction": (
+                    "The formal table-detail evidence is sufficient for query "
+                    "planning. This is an advisory readiness signal, not a "
+                    "required tool transition. The caller may choose query_data, "
+                    "query_batch, further semantic reading, re-planning or "
+                    "delegation based on the complete request."
+                ),
+                "recommendedActions": [
+                    "QUERY_DATA",
+                    "QUERY_BATCH",
+                    "CONTINUE_SEMANTIC_READ",
+                    "REPLAN_QUERY_TOPOLOGY",
+                    "DELEGATE_FOR_ISOLATION",
+                ],
+            }
+        )
     return with_snapshot(
         {
             "status": "DISCOVERY_OPEN",
@@ -4102,37 +4802,20 @@ def _grounded_tool_progress_fingerprint(
     branches: dict[str, Any] = {}
     for query_id, context in sorted(session.query_branch_contexts.items()):
         branch_runtime = getattr(context, "runtime", None)
-        branch_attempt = (
-            branch_runtime.attempts[-1]
-            if branch_runtime is not None and branch_runtime.attempts
-            else None
-        )
+        branch_attempt = branch_runtime.attempts[-1] if branch_runtime is not None and branch_runtime.attempts else None
         semantic_ledger = getattr(context, "semantic_ledger", None)
         branches[query_id] = {
             "status": str(getattr(context, "status", "") or ""),
-            "semanticRefs": sorted(
-                semantic_ledger.refs()
-                if semantic_ledger is not None
-                else ()
-            ),
+            "semanticRefs": sorted(semantic_ledger.refs() if semantic_ledger is not None else ()),
             "contractFingerprint": (
-                grounded_query_contract_fingerprint(
-                    branch_attempt.contract
-                )
-                if branch_attempt is not None
-                else ""
+                grounded_query_contract_fingerprint(branch_attempt.contract) if branch_attempt is not None else ""
             ),
             "activeContractFingerprint": (
-                grounded_query_contract_fingerprint(
-                    branch_runtime.active_contract
-                )
-                if branch_runtime is not None
-                and branch_runtime.active_contract is not None
+                grounded_query_contract_fingerprint(branch_runtime.active_contract)
+                if branch_runtime is not None and branch_runtime.active_contract is not None
                 else ""
             ),
-            "verifiedArtifactIds": sorted(
-                getattr(context, "verified_artifact_ids", ()) or ()
-            ),
+            "verifiedArtifactIds": sorted(getattr(context, "verified_artifact_ids", ()) or ()),
         }
     return _stable_json_fingerprint(
         {
@@ -4149,15 +4832,9 @@ def _grounded_tool_progress_fingerprint(
                 if str(item.get("refId") or "")
             ),
             "latestContractFingerprint": (
-                grounded_query_contract_fingerprint(
-                    latest_attempt.contract
-                )
-                if latest_attempt is not None
-                else ""
+                grounded_query_contract_fingerprint(latest_attempt.contract) if latest_attempt is not None else ""
             ),
-            "latestAttemptStatus": str(
-                getattr(latest_attempt, "status", "") or ""
-            ),
+            "latestAttemptStatus": str(getattr(latest_attempt, "status", "") or ""),
             "activeContractFingerprint": (
                 grounded_query_contract_fingerprint(runtime.active_contract)
                 if runtime.active_contract is not None
@@ -4173,25 +4850,14 @@ def _grounded_tool_progress_fingerprint(
                 )
             ),
             "branches": branches,
-            "verifiedQueryArtifactIds": sorted(
-                artifact.artifact_id
-                for artifact in runtime.verified_query_ledger
-            ),
-            "verifiedRuleArtifactIds": sorted(
-                artifact.artifact_id
-                for artifact in runtime.verified_rule_ledger
-            ),
-            "verifiedEntitySetIds": sorted(
-                artifact.artifact_id
-                for artifact in runtime.verified_entity_sets
-            ),
+            "verifiedQueryArtifactIds": sorted(artifact.artifact_id for artifact in runtime.verified_query_ledger),
+            "verifiedRuleArtifactIds": sorted(artifact.artifact_id for artifact in runtime.verified_rule_ledger),
+            "verifiedEntitySetIds": sorted(artifact.artifact_id for artifact in runtime.verified_entity_sets),
             "latestSqlCandidate": (
                 {
                     "status": runtime.sql_candidate_attempts[-1].status,
                     "nextAction": runtime.sql_candidate_attempts[-1].next_action,
-                    "progressFingerprint": (
-                        runtime.sql_candidate_attempts[-1].progress_fingerprint
-                    ),
+                    "progressFingerprint": (runtime.sql_candidate_attempts[-1].progress_fingerprint),
                 }
                 if runtime.sql_candidate_attempts
                 else {}
@@ -4234,8 +4900,14 @@ def _grounded_tool_key_args(
         }
     elif tool_name == "retrieve_knowledge":
         selected = {
-            "query": " ".join(
-                str(args.get("query") or "").lower().split()
+            "query": " ".join(str(args.get("query") or "").lower().split()),
+            "coverageReceiptId": str(args.get("coverage_receipt_id") or args.get("coverageReceiptId") or "").strip(),
+            "goalIds": sorted(
+                {
+                    str(item or "").strip()
+                    for item in (args.get("goal_ids") or args.get("goalIds") or [])
+                    if str(item or "").strip()
+                }
             ),
         }
     else:
@@ -4244,7 +4916,8 @@ def _grounded_tool_key_args(
         selected = {
             str(key): value
             for key, value in args.items()
-            if str(key) not in {
+            if str(key)
+            not in {
                 "reason",
                 "rationale",
                 "instruction",
@@ -4253,9 +4926,7 @@ def _grounded_tool_key_args(
         }
     for key in ("path", "file_path"):
         if key in selected:
-            selected[key] = "/%s" % str(
-                selected[key] or ""
-            ).strip().strip("/")
+            selected[key] = "/%s" % str(selected[key] or "").strip().strip("/")
     return selected
 
 
@@ -4326,6 +4997,57 @@ def _tool_name(item: Any) -> str:
     return str(getattr(item, "name", "") or "")
 
 
+def _validate_native_task_contract(
+    args: Mapping[str, Any],
+    session: Any,
+) -> tuple[Optional[GroundedSubagentGoalContract], str]:
+    """Validate the JSON envelope used by the native Deep Agents ``task``.
+
+    Native ``task`` only accepts a free-form description and a subagent name.
+    Keep the typed contract at the boundary so a read-only worker cannot turn
+    that convenience API into an unscoped query or publication channel.
+    Governed QUERY_DATA tasks continue through ``delegate_grounded_tasks``.
+    """
+
+    subagent_type = str(args.get("subagent_type") or "").strip()
+    if subagent_type != "grounded-researcher":
+        return None, "NATIVE_TASK_SUBAGENT_TYPE_NOT_ALLOWED"
+    description = str(args.get("description") or "").strip()
+    if not description or len(description) > 24_000:
+        return None, "NATIVE_TASK_DESCRIPTION_INVALID"
+    try:
+        payload = json.loads(description)
+    except (TypeError, ValueError):
+        return None, "NATIVE_TASK_CONTRACT_JSON_REQUIRED"
+    if not isinstance(payload, Mapping):
+        return None, "NATIVE_TASK_CONTRACT_OBJECT_REQUIRED"
+    if str(payload.get("protocol") or "") != "grounded_native_task.v1":
+        return None, "NATIVE_TASK_PROTOCOL_INVALID"
+    raw_contract = payload.get("subGoalContract") or payload.get("task")
+    try:
+        contract = GroundedSubagentGoalContract.model_validate(raw_contract)
+    except Exception:
+        return None, "NATIVE_TASK_CONTRACT_INVALID"
+    capability_set = set(contract.allowed_capabilities)
+    if capability_set != {"READ_CONTEXT"}:
+        return None, "NATIVE_TASK_CAPABILITY_REQUIRES_GOVERNED_DELEGATION"
+    if contract.skill_names or contract.query_branch_ids or contract.artifact_ids:
+        return None, "NATIVE_TASK_SCOPE_MUST_BE_READ_ONLY"
+    if contract.input_artifact_refs:
+        return None, "NATIVE_TASK_INPUT_ARTIFACTS_NOT_ALLOWED"
+    if not isinstance(session, GroundedDeepAgentSession):
+        return None, "NATIVE_TASK_SESSION_REQUIRED"
+    goal_contract = session.question_goal_contract
+    if goal_contract is None:
+        return None, "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED"
+    known_goals = set(goal_contract.goal_map())
+    if not contract.parent_goal_ids or not set(contract.parent_goal_ids).issubset(known_goals):
+        return None, "NATIVE_TASK_PARENT_GOAL_SCOPE_INVALID"
+    if not contract.required_outputs or not contract.evidence_requirements:
+        return None, "NATIVE_TASK_OUTPUT_CONTRACT_REQUIRED"
+    return contract, ""
+
+
 _GROUNDED_CAPABILITY_TOOLS: dict[str, set[str]] = {
     "GOAL_DECLARATION": {"declare_original_question_goals"},
     "CLARIFICATION": {"ask_human"},
@@ -4346,9 +5068,14 @@ _GROUNDED_CAPABILITY_TOOLS: dict[str, set[str]] = {
     "ENTITY_SET_PUBLICATION": {"publish_verified_entity_set"},
     "EVIDENCE_FINALIZATION": {"finalize_evidence_collection"},
     "ANSWER_COMPOSITION": {"compose_verified_answer"},
-    "DELEGATION": {"delegate_grounded_tasks"},
+    # ``task`` is Deep Agents' native isolated-context entry point. The
+    # boundary accepts only the read-only grounded-researcher contract; query
+    # and Skill grants remain on their typed governed adapters.
+    "DELEGATION": {"delegate_grounded_tasks", "task"},
     "ANALYSIS_DELEGATION": {"delegate_grounded_exploration"},
-    "ANALYSIS_SKILL": {"run_skill"},
+    "ANALYSIS_SKILL": {"load_skill", "run_skill"},
+    "GOVERNED_QUERY": {"query_data"},
+    "GOVERNED_QUERY_BATCH": {"query_batch"},
 }
 
 
@@ -4366,93 +5093,47 @@ def _grounded_runtime_tool_capabilities(
     those preconditions at invocation time.
     """
 
-    if (
-        session.runtime.clarification is not None
-        or session.operational_failure
-        or session.skill_execution_in_progress
-    ):
+    if session.runtime.clarification is not None or session.operational_failure or session.skill_execution_in_progress:
         return set()
     if finalization_ready:
         return {"ANSWER_COMPOSITION"}
     if session.runtime.verified_rule_ledger and _required_goals_are_rule_only(session):
         return {"RULE_ANSWER"}
 
-    status = str(read_control.get("status") or "").upper()
-    if status == "READY_TO_EXECUTE":
-        return {
-            "SQL_VERSION"
-            if _enum_value(session.runtime.active_execution_mode)
-            == "CORE_SQL_REQUIRED"
-            else "QUERY_EXECUTION"
-        }
-    if session.question_goal_contract is None:
+    if session.question_goal_contract is None and session.runtime.active_contract is None:
         return {"GOAL_DECLARATION", "CLARIFICATION"}
-    if status == "REPAIR_REQUIRED":
-        capabilities = {
-            "FILESYSTEM_READ",
-            "SEMANTIC_RECALL",
-            "CONTRACT_VERSION",
-            "GRAPH_CREATE",
-            "SQL_VERSION",
-            "QUERY_EXECUTION",
-            "CLARIFICATION",
-        }
-        if session.execution_graph_receipt is not None:
-            capabilities.add("GRAPH_REVISION")
-        return capabilities
-    if status == "BRANCH_REPAIR_REQUIRED":
-        return {
-            "FILESYSTEM_READ",
-            "SEMANTIC_RECALL",
-            "GRAPH_PREPARE",
-            "GRAPH_REVISION",
-            "CLARIFICATION",
-        }
 
-    capabilities = {"DELEGATION"}
-    if session.runtime.phase not in {
+    # Query tools and semantic navigation remain caller capabilities.  The
+    # Core/SubAgent chooses the next ReAct action; each tool validates its own
+    # request against the current trusted evidence and repair receipt.
+    capabilities = {
+        "GOVERNED_QUERY",
+        "GOVERNED_QUERY_BATCH",
+        "FILESYSTEM_READ",
+        "SEMANTIC_RECALL",
+        "CLARIFICATION",
+        "CONTRACT_VERSION",
+        "GRAPH_CREATE",
+        "GRAPH_PREPARE",
+        "DELEGATION",
+    }
+    if bool(read_control.get("retrievalClosed")):
+        # Navigation is governed by the Goal/evidence closure receipt, not by
+        # a business query shape. Contract or Observation gaps return a read
+        # control with retrievalClosed=false and reopen the same capabilities.
+        capabilities.difference_update({"FILESYSTEM_READ", "SEMANTIC_RECALL"})
+    if session.execution_graph_receipt is not None:
+        capabilities.add("GRAPH_REVISION")
+    if session.runtime.active_contract is not None:
+        capabilities.update({"SQL_VERSION", "QUERY_EXECUTION"})
+    if session.runtime.phase in {
+        "EXECUTED",
         "VERIFICATION_GAPPED",
-        "CORE_SQL_REPAIR_EXHAUSTED",
-        "CORE_SQL_VALIDATOR_INTERNAL_ERROR",
-        "CORE_SQL_NO_PROGRESS",
-        "CORE_SQL_PREPARATION_FAILED",
-        "RECALL_NAVIGATION_DEGRADED",
+        "DATASOURCE_RECOVERY_REQUIRED",
     }:
-        capabilities.add("CLARIFICATION")
-    if not session.query_branch_contexts:
-        capabilities.update(
-            {
-                "FILESYSTEM_READ",
-                "SEMANTIC_RECALL",
-                "CONTRACT_VERSION",
-                "GRAPH_CREATE",
-                "RULE_PUBLICATION",
-            }
-        )
-    else:
-        capabilities.add("GRAPH_PREPARE")
-        if session.runtime.phase in {
-            "EXECUTED",
-            "VERIFICATION_GAPPED",
-            "DATASOURCE_RECOVERY_REQUIRED",
-        }:
-            capabilities.add("FILESYSTEM_READ")
-        active_replan_evidence = _current_execution_graph_replan_evidence(
-            session
-        )
-        if (
-            active_replan_evidence
-            and session.execution_graph_revision_count
-            < session.execution_graph_max_revision_count
-        ):
-            capabilities.add("GRAPH_REVISION")
-        if session.execution_graph_receipt is not None and any(
-            context.status == "CONTRACT_GAPPED"
-            for context in session.query_branch_contexts.values()
-        ):
-            capabilities.add("GRAPH_REVISION")
-        if status == "REVISION_DISCOVERY_OPEN":
-            capabilities.update({"FILESYSTEM_READ", "SEMANTIC_RECALL"})
+        capabilities.add("FILESYSTEM_READ")
+    if session.runtime.verified_rule_ledger:
+        capabilities.add("RULE_PUBLICATION")
     if session.parallel_branches:
         capabilities.add("QUERY_BATCH_EXECUTION")
     if _authorized_verified_query_artifacts(session):
@@ -4466,14 +5147,10 @@ def _grounded_runtime_tool_capabilities(
         if session.query_branch_contexts:
             capabilities.add("FILESYSTEM_READ")
         if session.question_goal_contract is not None and any(
-            str(getattr(goal, "kind", "") or "").upper() == "ANALYSIS"
-            for goal in session.question_goal_contract.goals
+            str(getattr(goal, "kind", "") or "").upper() == "ANALYSIS" for goal in session.question_goal_contract.goals
         ):
             capabilities.add("ANALYSIS_DELEGATION")
-        if (
-            session.analysis_skill_headers_disclosed
-            and session.skill_input_snapshot_generation > 0
-        ):
+        if session.analysis_skill_headers_disclosed and session.skill_input_snapshot_generation > 0:
             capabilities.add("ANALYSIS_SKILL")
     return capabilities
 
@@ -4488,7 +5165,6 @@ def _phase_visible_tools(
         return tools, []
     all_names = {_tool_name(item) for item in tools if _tool_name(item)}
     always_hidden = {
-        "task",
         "execute",
         "write_file",
         "edit_file",
@@ -4496,10 +5172,7 @@ def _phase_visible_tools(
         "write_todos",
     }
     finalization_ready = False
-    if (
-        session.question_goal_contract is not None
-        and _authorized_verified_query_artifacts(session)
-    ):
+    if session.question_goal_contract is not None and _authorized_verified_query_artifacts(session):
         try:
             coverage = GoalCoverageVerifier().verify(
                 session.question_goal_contract,
@@ -4515,12 +5188,11 @@ def _phase_visible_tools(
         read_control=read_control,
         finalization_ready=finalization_ready,
     )
-    allowed = set().union(
-        *(
-            _GROUNDED_CAPABILITY_TOOLS.get(capability, set())
-            for capability in capabilities
-        )
-    ) if capabilities else set()
+    allowed = (
+        set().union(*(_GROUNDED_CAPABILITY_TOOLS.get(capability, set()) for capability in capabilities))
+        if capabilities
+        else set()
+    )
     progress_fingerprint = _grounded_tool_progress_fingerprint(session)
     with session.lock:
         session.tool_no_progress_blocked = {
@@ -4528,9 +5200,7 @@ def _phase_visible_tools(
             for name, fingerprint in session.tool_no_progress_blocked.items()
             if fingerprint == progress_fingerprint
         }
-        no_progress_blocked_tools = set(
-            session.tool_no_progress_blocked
-        )
+        no_progress_blocked_tools = set(session.tool_no_progress_blocked)
     allowed.difference_update(no_progress_blocked_tools)
     blocked = (all_names - allowed) | always_hidden
     visible = [item for item in tools if _tool_name(item) not in blocked]
@@ -4676,6 +5346,8 @@ def _compact_tool_result_message(
 _GROUNDED_REPAIR_TOOL_NAMES = {
     "propose_grounded_contract",
     "prepare_grounded_query_batch",
+    "query_data",
+    "query_batch",
     "propose_grounded_execution_graph",
     "reopen_grounded_execution_graph_discovery",
     "revise_grounded_execution_graph",
@@ -4685,19 +5357,24 @@ _GROUNDED_REPAIR_TOOL_NAMES = {
 def _payload_contains_grounded_repair(value: Any) -> bool:
     if isinstance(value, dict):
         status = str(value.get("status") or "").upper()
-        if value.get("repairDirective") or status in {
-            "BLOCKED",
-            "REJECTED",
-            "UNRESOLVED",
-            "REVISE_BINDINGS",
-            "PARTIAL",
-        }:
+        if (
+            value.get("repairDirective")
+            or value.get("observation")
+            or value.get("repairReceipt")
+            or status
+            in {
+                "BLOCKED",
+                "REJECTED",
+                "UNRESOLVED",
+                "REVISE_BINDINGS",
+                "PARTIAL",
+                "NEEDS_REASONING",
+                "FAILED",
+                "DENIED",
+            }
+        ):
             return True
-        return any(
-            _payload_contains_grounded_repair(item)
-            for item in value.values()
-            if isinstance(item, (dict, list))
-        )
+        return any(_payload_contains_grounded_repair(item) for item in value.values() if isinstance(item, (dict, list)))
     if isinstance(value, list):
         return any(_payload_contains_grounded_repair(item) for item in value)
     return False
@@ -4719,9 +5396,7 @@ def _latest_grounded_repair_tool_exchange(
         message = messages[index]
         if str(getattr(message, "type", "") or "") != "tool":
             continue
-        if str(getattr(message, "name", "") or "") not in (
-            _GROUNDED_REPAIR_TOOL_NAMES
-        ):
+        if str(getattr(message, "name", "") or "") not in (_GROUNDED_REPAIR_TOOL_NAMES):
             continue
         try:
             payload = json.loads(_message_content_text(message))
@@ -4730,9 +5405,7 @@ def _latest_grounded_repair_tool_exchange(
         if not _payload_contains_grounded_repair(payload):
             continue
         selected_tool_index = index
-        selected_tool_id = str(
-            getattr(message, "tool_call_id", "") or ""
-        )
+        selected_tool_id = str(getattr(message, "tool_call_id", "") or "")
         break
     if selected_tool_index < 0 or not selected_tool_id:
         return []
@@ -4753,9 +5426,7 @@ def _latest_grounded_repair_tool_exchange(
     if selected_ai is None or selected_call is None:
         return []
 
-    additional_kwargs = dict(
-        getattr(selected_ai, "additional_kwargs", None) or {}
-    )
+    additional_kwargs = dict(getattr(selected_ai, "additional_kwargs", None) or {})
     additional_kwargs.pop("tool_calls", None)
     model_copy = getattr(selected_ai, "model_copy", None)
     if callable(model_copy):
@@ -4918,76 +5589,72 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         tool_call = dict(getattr(request, "tool_call", None) or {})
         tool_name = str(tool_call.get("name") or "")
         tool_call_id = str(tool_call.get("id") or "")
-        if tool_name == "task":
-            return ToolMessage(
-                content=(
-                    "Generic task dispatch is disabled. Use the governed advisory "
-                    "exploration or post-query Skill isolation boundary instead."
-                ),
-                name=tool_name,
-                tool_call_id=tool_call_id,
-                status="error",
-            )
 
         runtime = getattr(request, "runtime", None)
         context = getattr(runtime, "context", None)
         session = getattr(context, "session", None)
         args = dict(tool_call.get("args") or {})
+        native_task_contract: Optional[GroundedSubagentGoalContract] = None
+        if tool_name == "task":
+            native_task_contract, native_task_error = _validate_native_task_contract(
+                args,
+                session,
+            )
+            if native_task_error:
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "CAPABILITY_DENIED",
+                            "code": native_task_error,
+                            "tool": tool_name,
+                            "toolCallId": tool_call_id,
+                            "instruction": (
+                                "Use task only for a grounded-researcher READ_CONTEXT "
+                                "contract. Governed QUERY_DATA, QUERY_BRANCH and Skill "
+                                "tasks must use their typed governed boundary."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
         file_path = str(args.get("file_path") or "")
         filesystem_namespace = _filesystem_tool_namespace(tool_name, args)
         read_control = _grounded_semantic_read_control(session) if isinstance(session, GroundedDeepAgentSession) else {}
         tool_state_fingerprint = ""
         tool_action_signature = ""
-        if (
-            isinstance(session, GroundedDeepAgentSession)
-            and bool(tool_name)
-        ):
-            tool_state_fingerprint = (
-                _grounded_tool_progress_fingerprint(session)
-            )
-            tool_action_signature = (
-                _grounded_tool_action_signature(
-                    tool_name,
-                    args,
-                    tool_state_fingerprint,
-                )
+        if isinstance(session, GroundedDeepAgentSession) and bool(tool_name):
+            tool_state_fingerprint = _grounded_tool_progress_fingerprint(session)
+            tool_action_signature = _grounded_tool_action_signature(
+                tool_name,
+                args,
+                tool_state_fingerprint,
             )
             with session.lock:
                 session.tool_no_progress_blocked = {
                     name: fingerprint
-                    for name, fingerprint in (
-                        session.tool_no_progress_blocked.items()
-                    )
+                    for name, fingerprint in (session.tool_no_progress_blocked.items())
                     if fingerprint == tool_state_fingerprint
                 }
-                previous = session.tool_action_receipts.get(
-                    tool_action_signature
-                )
-                tool_blocked = (
-                    session.tool_no_progress_blocked.get(tool_name)
-                    == tool_state_fingerprint
-                )
+                previous = session.tool_action_receipts.get(tool_action_signature)
+                tool_blocked = session.tool_no_progress_blocked.get(tool_name) == tool_state_fingerprint
                 if previous is not None or tool_blocked:
                     event = {
                         "code": "TOOL_CALL_NO_PROGRESS",
                         "toolName": tool_name,
                         "toolCallId": tool_call_id,
-                        "previousToolCallId": str(
-                            (previous or {}).get("toolCallId") or ""
-                        ),
+                        "previousToolCallId": str((previous or {}).get("toolCallId") or ""),
                         "stateFingerprint": tool_state_fingerprint,
                         "keyArgs": _grounded_tool_key_args(
                             tool_name,
                             args,
                         ),
                     }
-                    session.tool_no_progress_blocked[
-                        tool_name
-                    ] = tool_state_fingerprint
+                    session.tool_no_progress_blocked[tool_name] = tool_state_fingerprint
                     session.tool_no_progress_events.append(event)
-                    session.tool_no_progress_events = (
-                        session.tool_no_progress_events[-32:]
-                    )
+                    session.tool_no_progress_events = session.tool_no_progress_events[-32:]
                     return ToolMessage(
                         content=json.dumps(
                             {
@@ -5000,17 +5667,9 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                                 ),
                                 "readControl": read_control,
                                 "repairOptions": list(
-                                    dict(
-                                        read_control.get(
-                                            "repairDirective"
-                                        )
-                                        or {}
-                                    ).get("repairOptions")
-                                    or []
+                                    dict(read_control.get("repairDirective") or {}).get("repairOptions") or []
                                 ),
-                                "nextAction": (
-                                    "USE_A_DIFFERENT_REPAIR_TOOL_OR_ARGUMENTS"
-                                ),
+                                "nextAction": ("USE_A_DIFFERENT_REPAIR_TOOL_OR_ARGUMENTS"),
                                 "instruction": (
                                     "This tool is temporarily hidden for the "
                                     "current progress state. Choose another safe "
@@ -5025,9 +5684,7 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                         tool_call_id=tool_call_id,
                         status="error",
                     )
-                session.tool_action_receipts[
-                    tool_action_signature
-                ] = {
+                session.tool_action_receipts[tool_action_signature] = {
                     "toolName": tool_name,
                     "toolCallId": tool_call_id,
                     "stateFingerprint": tool_state_fingerprint,
@@ -5037,34 +5694,22 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                     ),
                 }
                 if len(session.tool_action_receipts) > 256:
-                    session.tool_action_receipts = dict(
-                        list(session.tool_action_receipts.items())[-256:]
-                    )
+                    session.tool_action_receipts = dict(list(session.tool_action_receipts.items())[-256:])
         workspace_recovery_signature = ""
         if (
             tool_name == "read_file"
             and filesystem_namespace == "workspace"
             and isinstance(session, GroundedDeepAgentSession)
-            and _knowledge_relative_path(file_path).startswith(
-                "workspace/context/recovery_"
-            )
+            and _knowledge_relative_path(file_path).startswith("workspace/context/recovery_")
         ):
-            latest_attempt = (
-                session.runtime.attempts[-1]
-                if session.runtime.attempts
-                else None
-            )
+            latest_attempt = session.runtime.attempts[-1] if session.runtime.attempts else None
             state_fingerprint = _stable_json_fingerprint(
                 {
                     "phase": session.runtime.phase,
                     "revision": session.runtime.revision,
                     "attemptCount": len(session.runtime.attempts),
-                    "latestAttemptId": str(
-                        getattr(latest_attempt, "attempt_id", "") or ""
-                    ),
-                    "latestAttemptStatus": str(
-                        getattr(latest_attempt, "status", "") or ""
-                    ),
+                    "latestAttemptId": str(getattr(latest_attempt, "attempt_id", "") or ""),
+                    "latestAttemptStatus": str(getattr(latest_attempt, "status", "") or ""),
                     "graphGeneration": session.execution_graph_generation,
                     "latestGraphRejection": session.latest_graph_rejection,
                 }
@@ -5098,51 +5743,11 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                 )
         if (
-            isinstance(session, GroundedDeepAgentSession)
-            and bool(session.query_branch_contexts)
-            and tool_name in {"ls", "read_file", "grep", "retrieve_knowledge"}
-            and filesystem_namespace not in {"artifacts", "workspace"}
-            and read_control.get("status") != "REVISION_DISCOVERY_OPEN"
-        ):
-            return ToolMessage(
-                content=json.dumps(
-                    {
-                        "status": "READ_BLOCKED",
-                        "code": "EXECUTION_GRAPH_DISCOVERY_FROZEN",
-                        "message": (
-                            "The Execution Graph is bound to an immutable Discovery "
-                            "snapshot. Prepare only its declared nodes and evidence."
-                        ),
-                        "branchIds": list(session.query_branch_contexts),
-                        "nextAction": "PREPARE_GROUNDED_QUERY_BATCH",
-                    },
-                    ensure_ascii=False,
-                ),
-                name=tool_name,
-                tool_call_id=tool_call_id,
-                status="error",
-            )
-        if (
             tool_name == "read_file"
             and filesystem_namespace == "knowledge"
             and isinstance(session, GroundedDeepAgentSession)
         ):
             normalized = _knowledge_relative_path(file_path)
-            if read_control["status"] == "READY_TO_EXECUTE":
-                return ToolMessage(
-                    content=json.dumps(
-                        {
-                            "status": "READ_BLOCKED",
-                            "code": "GROUNDED_CONTRACT_READY",
-                            "message": "The active Contract is complete; semantic retrieval is closed until it is executed.",
-                            "readControl": read_control,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    name=tool_name,
-                    tool_call_id=tool_call_id,
-                    status="error",
-                )
             existing = next(
                 (
                     item
@@ -5187,7 +5792,11 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                     status="error",
                 )
         try:
-            result = handler(request)
+            if native_task_contract is not None and isinstance(session, GroundedDeepAgentSession):
+                with self.semantic_backend.scope(session):
+                    result = handler(request)
+            else:
+                result = handler(request)
         except GroundedRuntimeBudgetExceeded:
             raise
         except Exception as exc:
@@ -5198,12 +5807,9 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                         "code": "TOOL_CALL_FAILED",
                         "toolName": tool_name,
                         "toolCallId": tool_call_id,
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         "readControl": read_control,
-                        "nextAction": (
-                            "CHOOSE_A_DIFFERENT_SAFE_REPAIR_OR_RETRY_AFTER_STATE_CHANGE"
-                        ),
+                        "nextAction": ("CHOOSE_A_DIFFERENT_SAFE_REPAIR_OR_RETRY_AFTER_STATE_CHANGE"),
                     },
                     ensure_ascii=False,
                     default=str,
@@ -5227,30 +5833,26 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
             and getattr(result, "status", "success") != "error"
             and isinstance(session, GroundedDeepAgentSession)
         ):
-            session.workspace_read_signatures.add(
-                workspace_recovery_signature
-            )
-        if (
-            tool_name
-            in {
-                "propose_grounded_execution_graph",
-                "revise_grounded_execution_graph",
-            }
-            and isinstance(session, GroundedDeepAgentSession)
-        ):
+            session.workspace_read_signatures.add(workspace_recovery_signature)
+        if tool_name in {
+            "propose_grounded_execution_graph",
+            "revise_grounded_execution_graph",
+        } and isinstance(session, GroundedDeepAgentSession):
             try:
                 graph_result = json.loads(_message_content_text(result))
             except (TypeError, ValueError):
                 graph_result = {}
-            if (
-                isinstance(graph_result, dict)
-                and str(graph_result.get("status") or "").upper()
-                in {"BLOCKED", "REJECTED", "INVALID"}
-            ):
+            if isinstance(graph_result, dict) and str(graph_result.get("status") or "").upper() in {
+                "BLOCKED",
+                "REJECTED",
+                "INVALID",
+            }:
                 session.latest_graph_rejection = dict(graph_result)
-            elif isinstance(graph_result, dict) and str(
-                graph_result.get("status") or ""
-            ).upper() in {"ACCEPTED", "FROZEN", "REVISED"}:
+            elif isinstance(graph_result, dict) and str(graph_result.get("status") or "").upper() in {
+                "ACCEPTED",
+                "FROZEN",
+                "REVISED",
+            }:
                 session.latest_graph_rejection = {}
             _record_grounded_tool_post_state(
                 session,
@@ -5354,41 +5956,21 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
     ) -> bool:
         scope = item.get("scope") if isinstance(item.get("scope"), dict) else {}
         scoped_user = str(scope.get("userId") or scope.get("user_id") or "").strip()
-        principal_user = str(
-            principal.get("userId") or principal.get("user_id") or ""
-        ).strip()
+        principal_user = str(principal.get("userId") or principal.get("user_id") or "").strip()
         if not scoped_user or scoped_user != principal_user:
             return False
-        scoped_merchant = str(
-            scope.get("merchantId") or scope.get("merchant_id") or ""
-        ).strip()
+        scoped_merchant = str(scope.get("merchantId") or scope.get("merchant_id") or "").strip()
         if scoped_merchant and scoped_merchant != str(merchant_id or "").strip():
             return False
-        scoped_stores = {
-            str(value)
-            for value in (scope.get("storeIds") or scope.get("store_ids") or [])
-            if str(value)
-        }
+        scoped_stores = {str(value) for value in (scope.get("storeIds") or scope.get("store_ids") or []) if str(value)}
         principal_stores = {
-            str(value)
-            for value in (
-                principal.get("storeIds") or principal.get("store_ids") or []
-            )
-            if str(value)
+            str(value) for value in (principal.get("storeIds") or principal.get("store_ids") or []) if str(value)
         }
         if scoped_stores and not scoped_stores.issubset(principal_stores):
             return False
-        scoped_permissions = {
-            str(value)
-            for value in (scope.get("permissions") or [])
-            if str(value)
-        }
-        principal_permissions = {
-            str(value) for value in (principal.get("permissions") or []) if str(value)
-        }
-        return not scoped_permissions or scoped_permissions.issubset(
-            principal_permissions
-        )
+        scoped_permissions = {str(value) for value in (scope.get("permissions") or []) if str(value)}
+        principal_permissions = {str(value) for value in (principal.get("permissions") or []) if str(value)}
+        return not scoped_permissions or scoped_permissions.issubset(principal_permissions)
 
     @classmethod
     def _personal_payload(
@@ -5418,9 +6000,7 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
             # prevents that aggregate from crossing the Memory/Knowledge or
             # user boundary.
             "recentFocus": {},
-            "relevantPreferences": scoped(
-                injection.get("relevantPreferences")
-            ),
+            "relevantPreferences": scoped(injection.get("relevantPreferences")),
             "relevantEvents": scoped(injection.get("relevantEvents")),
         }
 
@@ -5435,9 +6015,7 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
                 continue
             recent = dict(bounded.get("recentFocus") or {})
             if set(recent) != {"summary"}:
-                bounded["recentFocus"] = {
-                    "summary": str(recent.get("summary") or "")[:500]
-                }
+                bounded["recentFocus"] = {"summary": str(recent.get("summary") or "")[:500]}
                 continue
             bounded["recentFocus"] = {}
             if not bounded.get("relevantPreferences"):
@@ -5549,9 +6127,7 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
             return str(state.active_goal_contract_fingerprint)
         if session.question_goal_contract is None:
             return ""
-        return original_question_goal_contract_fingerprint(
-            session.question_goal_contract
-        )
+        return original_question_goal_contract_fingerprint(session.question_goal_contract)
 
     @staticmethod
     def _trusted_runtime_state(
@@ -5575,9 +6151,7 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
             "runId": str(getattr(context, "run_id", "") or ""),
             "effectiveTopics": topics[:12],
             "dataDirectories": {
-                "knowledgeTopicRoots": [
-                    "/knowledge/topics/%s" % topic for topic in topics[:12]
-                ],
+                "knowledgeTopicRoots": ["/knowledge/topics/%s" % topic for topic in topics[:12]],
                 "artifactsRoot": "/artifacts",
                 "workspaceRoot": "/workspace",
             },
@@ -5591,54 +6165,29 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
                 "failureCategory": state_semantics["failureCategory"],
                 "terminal": state_semantics["terminal"],
                 "retryable": state_semantics["retryable"],
-                "sqlExecutionRepair": dict(
-                    state.sql_execution_repair_context or {}
-                ),
+                "sqlExecutionRepair": dict(state.sql_execution_repair_context or {}),
                 "semanticReadControl": semantic_read_control,
-                "nextAction": str(
-                    semantic_read_control.get("nextAction") or ""
-                ),
+                "queryBatchObservations": [dict(item) for item in session.latest_query_batch_observations],
+                "nextAction": str(semantic_read_control.get("nextAction") or ""),
             },
             "goal": {
-                "contractFingerprint": GroundedTrustedSessionContextMiddleware._goal_fingerprint(
-                    session
-                ),
+                "contractFingerprint": GroundedTrustedSessionContextMiddleware._goal_fingerprint(session),
                 "requiredGoalIds": goal_ids[:24],
             },
             "executionGraph": {
                 "generation": int(session.execution_graph_generation or 0),
                 "fingerprint": str(session.execution_graph_fingerprint or ""),
-                "graphId": str(
-                    getattr(graph_receipt, "graph_id", "")
-                    or getattr(graph_proposal, "graph_id", "")
-                    or ""
-                ),
-                "version": int(
-                    getattr(graph_receipt, "version", 0)
-                    or getattr(graph_proposal, "version", 0)
-                    or 0
-                ),
+                "graphId": str(getattr(graph_receipt, "graph_id", "") or getattr(graph_proposal, "graph_id", "") or ""),
+                "version": int(getattr(graph_receipt, "version", 0) or getattr(graph_proposal, "version", 0) or 0),
             },
             "semanticActivation": {
-                "fingerprint": str(
-                    getattr(semantic_seal, "semantic_activation_fingerprint", "")
-                    or ""
-                ),
-                "sealFingerprint": str(
-                    getattr(semantic_seal, "seal_fingerprint", "") or ""
-                ),
+                "fingerprint": str(getattr(semantic_seal, "semantic_activation_fingerprint", "") or ""),
+                "sealFingerprint": str(getattr(semantic_seal, "seal_fingerprint", "") or ""),
             },
             "verifiedArtifacts": {
-                "queryArtifactIds": [
-                    item.artifact_id
-                    for item in _authorized_verified_query_artifacts(session)[:8]
-                ],
-                "ruleArtifactIds": [
-                    item.artifact_id for item in state.verified_rule_ledger[:8]
-                ],
-                "entitySetArtifactIds": [
-                    item.artifact_id for item in state.verified_entity_sets[:8]
-                ],
+                "queryArtifactIds": [item.artifact_id for item in _authorized_verified_query_artifacts(session)[:8]],
+                "ruleArtifactIds": [item.artifact_id for item in state.verified_rule_ledger[:8]],
+                "entitySetArtifactIds": [item.artifact_id for item in state.verified_entity_sets[:8]],
                 "descriptors": [
                     item.trusted_descriptor.model_dump(
                         by_alias=True,
@@ -5683,9 +6232,9 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
         # payload so a stored value cannot forge the XML boundary or append a
         # sibling instruction block. JSON decoding still restores the original
         # value for diagnostics and tests.
-        serialized = json.dumps(envelope, ensure_ascii=False, default=str).replace(
-            "<", "\\u003c"
-        ).replace(">", "\\u003e")
+        serialized = (
+            json.dumps(envelope, ensure_ascii=False, default=str).replace("<", "\\u003c").replace(">", "\\u003e")
+        )
         system_message = getattr(request, "system_message", None)
         base = _message_content_text(system_message).rstrip()
         if self.START_MARKER in base:
@@ -5712,9 +6261,7 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
         }
         with session.lock:
             session.trusted_session_context_reports.append(report)
-            session.trusted_session_context_reports = (
-                session.trusted_session_context_reports[-32:]
-            )
+            session.trusted_session_context_reports = session.trusted_session_context_reports[-32:]
         override = getattr(request, "override", None)
         if callable(override):
             request = override(system_message=updated_system)
@@ -5846,9 +6393,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                     6,
                 ),
             }
-            if first_pass_count.tokens < int(
-                window_tokens * threshold_ratio
-            ):
+            if first_pass_count.tokens < int(window_tokens * threshold_ratio):
                 compacted = first_pass
                 after_count = first_pass_count
                 report.update(
@@ -5864,9 +6409,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                 report.update(
                     {
                         "compactionTriggered": compacted is not original,
-                        "decision": (
-                            "DEFER_RECOVERY_WORKSPACE_REQUIRED_KEEP_STRUCTURED_COMPACTION"
-                        ),
+                        "decision": ("DEFER_RECOVERY_WORKSPACE_REQUIRED_KEEP_STRUCTURED_COMPACTION"),
                         **first_pass_report,
                     }
                 )
@@ -5888,9 +6431,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                         payload,
                         artifact_ref,
                     )
-                    repair_exchange = _latest_grounded_repair_tool_exchange(
-                        original
-                    )
+                    repair_exchange = _latest_grounded_repair_tool_exchange(original)
                     compacted = [recovery_message, *repair_exchange]
                     after_count = self.token_counter.count(
                         compacted,
@@ -5903,9 +6444,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                     # reference-only summary only when the complete typed
                     # recovery message itself cannot fit below the safety
                     # watermark.
-                    if after_count.tokens >= int(
-                        window_tokens * threshold_ratio
-                    ):
+                    if after_count.tokens >= int(window_tokens * threshold_ratio):
                         compacted = [
                             compact_summary_to_reference_only(
                                 payload,
@@ -5942,9 +6481,7 @@ class GroundedContextManagementMiddleware(AgentMiddleware):
                             ),
                             "recoveryArtifactRef": artifact_ref,
                             "recoveryFingerprint": str(payload.get("recoveryFingerprint") or ""),
-                            "repairToolExchangePreserved": bool(
-                                repair_exchange
-                            ),
+                            "repairToolExchangePreserved": bool(repair_exchange),
                         }
                     )
                 except Exception as exc:
@@ -6072,24 +6609,25 @@ class GroundedDeepAgentRuntime:
 
 Authority and scope
 - trustedExecutionScope and trustedSessionContext are server-owned state. Never change or bypass merchant, role, store, ACL or tenant scope. Never author a merchant literal predicate; trusted execution injects it.
-- Recall, Topic manifests and search ranks are navigation only. Query bindings require exact governed /knowledge reads retained by the Kernel.
+- Topic routing, manifests and search ranks are navigation priority only, never merchant authorization. Every published Topic may be discovered through the governed Topic index. Query bindings still require exact governed /knowledge reads retained by the Kernel.
 - /knowledge is governed read-only semantic context, /artifacts contains immutable verified run results, and /workspace is run-scoped scratch/recovery context.
 
 Decision ownership
 - You own business understanding, progressive asset exploration, table/metric/field selection, query count and topology, complex SQL, and genuine user clarification.
 - The Harness owns deterministic schema/evidence/relationship checks, SQL safety and ACL, tenant injection, execution, result verification and final Goal coverage.
-- Subagents and Skills are isolation boundaries, not alternate planning authorities. Query branches are execution units, not agents.
+- Subagents and complex Skills are isolation boundaries, not alternate planning authorities. You decide per invocation: load_skill keeps a short bounded procedure in this Core loop; run_skill isolates a long or complex procedure in a SubAgent. The Harness may force isolation for scripts, oversized procedures or hard resource requirements. Both Core and a granted SubAgent use the same query_data protocol. Query branches are execution units, not agents.
+- Deep Agents native task is available as the grounded-researcher isolation primitive for long read-only semantic investigations. Call it only with a JSON grounded_native_task.v1 contract and READ_CONTEXT capability. Governed query or Skill work must use the typed governed delegation boundary, which issues the required grant before execution.
 
 Required lifecycle
-1. If no original-question Goal ledger exists, declare it exactly once. The Harness binds the original question automatically; do not copy a question field into the declaration. Every TIME_WINDOW Goal must retain the exact user-facing timeExpression (for example, "最近7天") in addition to any parsed days/start/end. Preserve every requested metric, dimension, time window, comparison, ranking limit/order, entity, detail field, dependency, rule and analysis objective. This ledger records answer obligations only: do not bind formal semantic refs, population/result artifacts, query nodes, tables or execution modes. A Goal dependency does not by itself mean a population dependency.
-2. Progressively read only the formal assets needed for those Goals. For a published scalar metric, table detail plus the exact metric definition is normally sufficient. For a generic DETAIL request with no requested columns, submit detailProjectionMode=DEFAULT and no selectedFields; the table's published defaultDetailProjection is authoritative. For an explicit column list, submit detailProjectionMode=EXPLICIT and bind only those columns. For an explicit request for all fields, submit detailProjectionMode=ALL_ALLOWED and use the table's ACL-filtered allowlist; never use SELECT *. Bind a separate timeFieldRef only when the user names a governed business clock or the Contract requires it; every submitted ref must first be read.
+1. If no original-question Goal ledger exists, declare it exactly once. The Harness binds the original question automatically; do not copy a question field into the declaration. Every TIME_WINDOW Goal must retain the exact user-facing timeExpression (for example, "最近7天") in addition to any parsed days/start/end. Preserve every requested metric, dimension, time window, comparison, ranking limit/order, entity, detail field, dependency, rule and analysis objective. RULE means the merchant explicitly asks about a business rule, policy, definition, condition or restriction; presentation instructions such as "分别展示" or "给我看一下" are not RULE Goals. This ledger records answer obligations only: do not bind formal semantic refs, population/result artifacts, query nodes, tables or execution modes. A Goal dependency does not by itself mean a population dependency.
+2. Inspect goalRecallCoverage after Goal declaration. It evaluates navigation candidates only and never counts as Evidence. When selected required Goals are MISSING and another recall can make progress, call retrieve_knowledge with the live coverageReceiptId and only those goalIds; do not repeat recall for COVERED Goals. AMBIGUOUS means candidates exist and should be resolved through exact governed reads or business clarification, not broader recall by default. Then progressively read only the formal assets needed for the Goals. For a published scalar metric, table detail plus the exact metric definition is normally sufficient. For a generic DETAIL request with no requested columns, submit detailProjectionMode=DEFAULT and no selectedFields; the table's published defaultDetailProjection is authoritative. For an explicit column list, submit detailProjectionMode=EXPLICIT and bind only those columns. For an explicit request for all fields, submit detailProjectionMode=ALL_ALLOWED and use the table's ACL-filtered allowlist; never use SELECT *. Bind a separate timeFieldRef only when the user names a governed business clock or the Contract requires it; every submitted ref must first be read.
 3. After evidence is sufficient, bind every requested metric to its formal owner table, grain and time semantics before choosing topology. Merge Goals into one Contract only when those bindings form one coherent query; metrics on different tables that are independently aggregatable belong in parallel graph nodes, while a JOIN is valid only when one requested result truly requires governed cross-table combination.
-4. Follow trustedSessionContext.runtime.semanticReadControl. REPAIR_REQUIRED preserves ReAct choice: inspect the latest ToolMessage, its repairOptions and readNext, then choose any safe repair tool that can make progress. You may read an alternative formal asset, remove or replace a bad binding, submit Contract vN+1, or create/revise an execution graph; the primary repairType is diagnostic guidance, not a fixed workflow transition. READY_TO_EXECUTE closes semantic discovery. Never replace a newer typed state with historical recovery text and never repeat the same recovery page without a state change.
-5. Execute deterministic modes directly. For CORE_SQL_REQUIRED, author one complete Doris SELECT/WITH SQL implementing the active Contract, without tenant literals or invented tables/columns. Follow typed SQL repair evidence; access denial and internal failures are not reasons to change business semantics.
+4. Treat trustedSessionContext.runtime.semanticReadControl and every ToolMessage Observation as advisory runtime context, not a workflow. Inspect repairOptions, readNext and repairReceipt, then choose the next ReAct action that can make progress: read an exact semantic leaf, revise a binding or topology, call query_data, call query_batch, delegate for isolation, or ask the merchant only when the business question is genuinely ambiguous. The Harness validates the chosen action at the tool boundary; it does not prescribe a fixed transition. Never replace newer typed evidence with historical recovery text or repeat an unchanged action.
+5. Use query_data for one governed query and query_batch when the caller's reasoning identifies mutually independent requests. Both tools own Contract construction, SQL validation, execution, ACL/tenant injection and Evidence verification. For CORE_SQL_REQUIRED, submit the QueryRequest with one complete Doris SELECT/WITH sqlCandidate implementing the returned Contract obligations, without tenant literals or invented tables/columns. The facade repairs bounded mechanical SQL/execution errors internally. When a tool returns NEEDS_REASONING, inspect the structured Observation, preserve its repairReceipt, and decide whether to read, replan, retry the same tool, choose the other query tool, or delegate. DENIED is terminal for that request and must never be bypassed.
 6. Treat verified results as immutable evidence. Continue querying until every required Goal and dependency is covered by actual artifact semantics. Do not turn partial or preview results into a complete answer.
 7. Finish only through compose_verified_rule_answer, compose_verified_answer, or ask_human. Never answer from ordinary assistant prose or invent formulas, rows, evidence or provenance.
 
-Use the currently visible tools and the server-provided nextAction as the phase-specific procedure. Ask the user only for genuine business ambiguity, never for internal failures, merchant identity already bound by runtime, or information available in governed assets.
+Use the currently visible tools and server-owned evidence as capabilities and constraints, not as a prewritten procedure. Delegate only when isolation or real parallel reasoning is useful. Ask the user only for genuine business ambiguity, never for Topic selection, internal failures, merchant identity already bound by runtime, or information available in governed assets.
 """
     SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
 
@@ -6113,9 +6651,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         conversation_online_authority: Optional[GroundedConversationOnlineAuthorityFacade] = None,
         population_execution_gate: GroundedPopulationExecutionGate | None = None,
         population_gate_enforced: bool = False,
-        graph_revision_fault_injector: Optional[
-            Callable[[str, str], None]
-        ] = None,
+        graph_revision_fault_injector: Optional[Callable[[str, str], None]] = None,
     ):
         self.kernel = kernel
         self.semantic_catalog = semantic_catalog
@@ -6125,9 +6661,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         self.conversation_online_authority = conversation_online_authority
         self.population_execution_gate = population_execution_gate
         self.population_gate_enforced = bool(population_gate_enforced)
-        self.graph_revision_fault_injector = (
-            graph_revision_fault_injector
-        )
+        self.graph_revision_fault_injector = graph_revision_fault_injector
         self.checkpointer = checkpointer
         self.checkpoint_config_factory = checkpoint_config_factory
         self.parallel_max_workers = max(1, min(int(parallel_max_workers or 1), 8))
@@ -6191,16 +6725,31 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             settings=settings,
         )
         self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(self.knowledge_backend)
-        self.trusted_session_context_middleware = (
-            GroundedTrustedSessionContextMiddleware(
-                settings=settings,
-                memory_store=memory_store,
-            )
+        self.trusted_session_context_middleware = GroundedTrustedSessionContextMiddleware(
+            settings=settings,
+            memory_store=memory_store,
         )
         self.context_middleware = GroundedContextManagementMiddleware(
             settings=settings,
         )
         self.budget_middleware = GroundedRuntimeBudgetMiddleware(settings)
+        self.governed_query_facade_enabled = bool(getattr(settings, "governed_query_facade_enabled", True))
+        self.legacy_query_tools_visible = bool(getattr(settings, "grounded_legacy_query_tools_visible", True))
+        self.internal_sql_repair_enabled = bool(
+            getattr(
+                settings,
+                "governed_query_internal_sql_repair_enabled",
+                True,
+            )
+        )
+        self.governed_query_service = GovernedQueryService(
+            max_internal_repairs=max(
+                0,
+                int(getattr(settings, "agent_sql_repair_rounds", 2) or 0),
+            ),
+            max_batch_workers=self.parallel_max_workers,
+        )
+        self.goal_recall_coverage_service = GoalRecallCoverageService()
         self.backend = backend or self._build_backend()
         self.tools = self._build_tools()
         self.initialization_error = ""
@@ -6218,6 +6767,30 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         self.context_middleware.bind_model(model)
         self._agent_factory = agent_factory
         subagent_model = self._resolve_model(isolated_subagent_model) or model
+        native_task_permissions = [
+            FilesystemPermission(
+                operations=["write"],
+                paths=[
+                    "/knowledge",
+                    "/knowledge/**",
+                    "/artifacts",
+                    "/artifacts/**",
+                    "/workspace",
+                    "/workspace/**",
+                ],
+                mode="deny",
+            ),
+            FilesystemPermission(
+                operations=["read"],
+                paths=[
+                    "/artifacts",
+                    "/artifacts/**",
+                    "/workspace",
+                    "/workspace/**",
+                ],
+                mode="deny",
+            ),
+        ]
         self.subagent_runtime = IsolatedSubagentRuntime(
             model=subagent_model,
             agent_factory=agent_factory,
@@ -6249,7 +6822,32 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         ),
                         "tools": [],
                         "skills": None,
-                    }
+                    },
+                    {
+                        "name": "grounded-researcher",
+                        "description": (
+                            "Read-only semantic investigation for a validated "
+                            "READ_CONTEXT SubGoal. Use this to isolate long or "
+                            "context-heavy evidence navigation."
+                        ),
+                        "system_prompt": (
+                            "You are a grounded read-only researcher. The user message "
+                            "contains one validated grounded_native_task.v1 contract. "
+                            "Pursue only its objective using /knowledge exact reads. "
+                            "Do not call task, query data, execute SQL, mutate Goals, "
+                            "publish evidence, or ask the merchant. Return a concise "
+                            "structured result with evidenceRefs, gaps and summary."
+                        ),
+                        "model": subagent_model,
+                        "tools": [],
+                        # Deep Agents automatically injects its filesystem
+                        # middleware for every raw task spec.  Supplying a
+                        # second FilesystemMiddleware here makes graph
+                        # compilation fail with a duplicate-middleware error;
+                        # the permissions above configure that native instance.
+                        "permissions": native_task_permissions,
+                        "response_format": SubAgentResultEnvelope,
+                    },
                 ],
                 skills=None,
                 permissions=[
@@ -6284,6 +6882,489 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         if hasattr(value, "chat_model"):
             return value.chat_model()
         return value
+
+    def _prefetch_simple_scalar_semantic_assets(
+        self,
+        context: GroundedDeepAgentRunContext,
+    ) -> dict[str, Any]:
+        """Hydrate an exact scalar's governed table and metric leaves."""
+
+        session = context.session
+        recalled = _simple_scalar_exact_metric_recall(session)
+        if recalled is None:
+            report = {
+                "status": "SKIPPED",
+                "code": "EXACT_SINGLE_METRIC_RECALL_REQUIRED",
+            }
+            session.simple_scalar_prefetch = report
+            return report
+        metadata = dict(recalled.metadata or {})
+        metric_ref_id = str(metadata.get("semanticRefId") or recalled.doc_id or "").strip()
+        topic = str(recalled.topic or metadata.get("topic") or "").strip()
+        table = str(recalled.table or metadata.get("tableName") or metadata.get("table") or "").strip()
+        metric_path = str(metadata.get("semanticPath") or "").strip()
+        detail_path = "topics/%s/tables/%s/detail.json" % (topic, table)
+        base_specs = [
+            (
+                "semantic:%s:%s:detail" % (topic, table),
+                detail_path,
+            ),
+            (metric_ref_id, metric_path),
+        ]
+        receipts: list[dict[str, Any]] = []
+        budget = context.budget
+        stage = budget.stage("semantic.simple_scalar_prefetch") if budget is not None else nullcontext()
+        with stage:
+            for expected_ref_id, path in base_specs:
+                receipt = self.knowledge_backend.record_core_read_receipt(
+                    session,
+                    path,
+                    offset=0,
+                    limit=2000,
+                )
+                if not receipt or str(receipt.get("refId") or "") != expected_ref_id:
+                    report = {
+                        "status": "SKIPPED",
+                        "code": "SIMPLE_SCALAR_PREFETCH_INCOMPLETE",
+                        "expectedRefIds": [item[0] for item in base_specs],
+                        "loadedRefIds": [str(item.get("refId") or "") for item in receipts],
+                    }
+                    session.simple_scalar_prefetch = report
+                    return report
+                receipts.append(receipt)
+            time_column = str(metadata.get("timeColumn") or "").strip()
+            if not time_column:
+                for item in receipts:
+                    summary = item.get("summary")
+                    if isinstance(summary, dict):
+                        time_column = str(summary.get("timeColumn") or "").strip()
+                    if not time_column:
+                        try:
+                            payload = json.loads(str(item.get("contentSnippet") or ""))
+                        except (TypeError, ValueError):
+                            payload = {}
+                        if isinstance(payload, dict):
+                            definition = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
+                            time_column = str(definition.get("timeColumn") or "").strip()
+                    if time_column:
+                        break
+            time_field_ref = ""
+            time_field_path = ""
+            if time_column:
+                time_field_ref = "semantic:%s:%s:field:%s" % (
+                    topic,
+                    table,
+                    time_column,
+                )
+                time_field_path = "topics/%s/tables/%s/columns/%s.json" % (topic, table, time_column)
+                time_receipt = self.knowledge_backend.record_core_read_receipt(
+                    session,
+                    time_field_path,
+                    offset=0,
+                    limit=2000,
+                )
+                if not time_receipt or str(time_receipt.get("refId") or "") != time_field_ref:
+                    time_field_ref = ""
+                    time_field_path = ""
+                else:
+                    receipts.append(time_receipt)
+        specs = [*base_specs]
+        if time_field_ref and time_field_path:
+            specs.append((time_field_ref, time_field_path))
+        report = {
+            "status": "PREFETCHED",
+            "metricRefId": metric_ref_id,
+            "tableRefId": specs[0][0],
+            "timeFieldRef": time_field_ref,
+            "readRefIds": [item[0] for item in specs],
+            "semanticPaths": [item[1] for item in specs],
+            "receipts": [_core_visible_semantic_receipt(item) for item in receipts],
+        }
+        session.simple_scalar_prefetch = report
+        return report
+
+    def _goal_recall_scope_fingerprint(
+        self,
+        session: GroundedDeepAgentSession,
+    ) -> str:
+        payload = {
+            "merchantId": session.runtime.merchant_id,
+            "accessRole": session.runtime.access_role,
+            "permissions": sorted(
+                str(item or "").strip()
+                for item in session.runtime.user_scope.get("permissions", [])
+                if str(item or "").strip()
+            ),
+            "topics": sorted(session.effective_topics()),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _evaluate_goal_recall_coverage(
+        self,
+        context: GroundedDeepAgentRunContext,
+    ) -> dict[str, Any]:
+        """Evaluate current candidates without performing network retrieval."""
+
+        session = context.session
+        contract = session.question_goal_contract
+        if contract is None:
+            return {
+                "status": "SKIPPED",
+                "code": "ORIGINAL_QUESTION_GOAL_CONTRACT_REQUIRED",
+            }
+        receipt = self.goal_recall_coverage_service.evaluate(
+            contract,
+            session.runtime.recall.items,
+            index_version=session.runtime.recall_index_version,
+            scope_fingerprint=self._goal_recall_scope_fingerprint(session),
+        )
+        report = receipt.model_dump(by_alias=True, mode="json")
+        with session.lock:
+            session.goal_recall_coverage_receipt = dict(report)
+        return report
+
+    def _execute_goal_recall_supplements(
+        self,
+        context: GroundedDeepAgentRunContext,
+        *,
+        coverage_receipt_id: str,
+        goal_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Execute only caller-selected requests from a live coverage receipt."""
+
+        session = context.session
+        current = self._evaluate_goal_recall_coverage(context)
+        current_receipt_id = str(current.get("receiptId") or "")
+        if not coverage_receipt_id or coverage_receipt_id != current_receipt_id:
+            return {
+                "status": "REJECTED",
+                "code": "GOAL_RECALL_COVERAGE_RECEIPT_STALE",
+                "goalRecallCoverage": current,
+            }
+        missing = {str(item or "").strip() for item in current.get("missingGoalIds") or [] if str(item or "").strip()}
+        requested = {str(item or "").strip() for item in goal_ids if str(item or "").strip()} or missing
+        invalid = sorted(requested - missing)
+        if invalid:
+            return {
+                "status": "REJECTED",
+                "code": "GOAL_RECALL_SUPPLEMENT_NOT_REQUIRED",
+                "invalidGoalIds": invalid,
+                "goalRecallCoverage": current,
+            }
+        supplemental = [
+            item
+            for item in current.get("supplementalRequests") or []
+            if requested.intersection(str(goal_id or "").strip() for goal_id in item.get("targetGoalIds") or [])
+            and str(item.get("requestFingerprint") or "") not in session.executed_goal_recall_fingerprints
+        ]
+        if not supplemental:
+            return {
+                "status": "NO_PROGRESS",
+                "code": "GOAL_RECALL_SUPPLEMENT_ALREADY_EXECUTED",
+                "goalRecallCoverage": current,
+            }
+        recall_goal_gaps = getattr(self.kernel, "recall_goal_gaps", None)
+        if not callable(recall_goal_gaps):
+            return {
+                "status": "DEGRADED",
+                "code": "GOAL_RECALL_BACKEND_UNAVAILABLE",
+                "goalRecallCoverage": current,
+            }
+        configured_limit = int(
+            getattr(
+                self.settings,
+                "es_multi_query_max_queries",
+                self.parallel_max_workers,
+            )
+            or self.parallel_max_workers
+        )
+        max_requests = max(
+            1,
+            min(self.parallel_max_workers, configured_limit),
+        )
+        attempted = supplemental[:max_requests]
+        payloads = [{**item, "coverageReceiptId": current_receipt_id} for item in attempted]
+        stage = context.budget.stage("recall.goal_gap_supplement") if context.budget is not None else nullcontext()
+        with stage:
+            try:
+                results = list(
+                    recall_goal_gaps(
+                        session.runtime,
+                        payloads,
+                        max_requests=max_requests,
+                    )
+                    or []
+                )
+            except Exception as exc:
+                results = [
+                    {
+                        "status": "DEGRADED",
+                        "code": "GOAL_SUPPLEMENTAL_RECALL_FAILED",
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
+                    }
+                ]
+        with session.lock:
+            session.executed_goal_recall_fingerprints.update(
+                str(item.get("requestFingerprint") or "")
+                for item in attempted
+                if str(item.get("requestFingerprint") or "")
+            )
+            requested_goal_ids = {
+                str(goal_id or "").strip()
+                for item in attempted
+                for goal_id in item.get("targetGoalIds") or []
+                if str(goal_id or "").strip()
+            }
+            opened = [
+                str(item.topic or "").strip()
+                for item in session.runtime.recall.items
+                if str(item.topic or "").strip()
+                and requested_goal_ids.intersection(
+                    str(value or "").strip() for value in ((item.metadata or {}).get("targetGoalIds") or [])
+                )
+            ]
+            session.opened_topics = list(dict.fromkeys([*session.opened_topics, *opened]))
+
+        final = self._evaluate_goal_recall_coverage(context)
+        return {
+            "status": ("COMPLETE" if not final.get("missingGoalIds") else "PARTIAL"),
+            "goalRecallCoverage": final,
+            "executedRequestIds": [str(item.get("requestId") or "") for item in attempted],
+            "results": results,
+        }
+
+    def _prefetch_goal_metric_semantic_assets(
+        self,
+        context: GroundedDeepAgentRunContext,
+    ) -> dict[str, Any]:
+        """Prefetch only uniquely resolved metric Goal assets.
+
+        The admission decision is semantic-candidate uniqueness, not a query
+        shape. Independent metrics may belong to different tables; each owner
+        table and its time semantics are hydrated independently. Any
+        ambiguity, dependency or unsupported Goal leaves Core discovery open.
+        """
+
+        session = context.session
+        if _simple_scalar_goal_contract(session):
+            report = self._prefetch_simple_scalar_semantic_assets(context)
+            report = {
+                **dict(report),
+                "mode": "UNIQUE_GOAL_METRIC",
+                "goalBindings": {
+                    str(getattr(goal, "goal_id", "") or "").strip(): [str(report.get("metricRefId") or "").strip()]
+                    for goal in (session.question_goal_contract.goals if session.question_goal_contract else [])
+                    if str(getattr(goal, "kind", "") or "").strip().upper() == "METRIC"
+                    and str(report.get("metricRefId") or "").strip()
+                },
+            }
+            session.semantic_prefetch = report
+            return report
+
+        candidates = _goal_metric_exact_recall_candidates(session)
+        if not candidates:
+            report = {
+                "status": "SKIPPED",
+                "mode": "UNIQUE_GOAL_METRIC",
+                "code": "UNIQUE_GOAL_METRIC_RECALL_REQUIRED",
+            }
+            session.semantic_prefetch = report
+            return report
+
+        detail_specs: dict[tuple[str, str], tuple[str, str]] = {}
+        metric_specs: list[tuple[str, str]] = []
+        for item in candidates:
+            topic = str(item.get("topic") or "").strip()
+            table = str(item.get("table") or "").strip()
+            metric_ref = str(item.get("metricRefId") or "").strip()
+            metric_path = str(item.get("metricPath") or "").strip()
+            if not topic or not table or not metric_ref or not metric_path:
+                report = {
+                    "status": "SKIPPED",
+                    "mode": "UNIQUE_GOAL_METRIC",
+                    "code": "UNIQUE_GOAL_METRIC_METADATA_INCOMPLETE",
+                }
+                session.semantic_prefetch = report
+                return report
+            detail_specs[(topic, table)] = (
+                "semantic:%s:%s:detail" % (topic, table),
+                "topics/%s/tables/%s/detail.json" % (topic, table),
+            )
+            metric_specs.append((metric_ref, metric_path))
+
+        receipts_by_ref: dict[str, dict[str, Any]] = {}
+        budget = context.budget
+        stage = budget.stage("semantic.unique_goal_metric_prefetch") if budget is not None else nullcontext()
+        with stage:
+            specs = [
+                *detail_specs.values(),
+                *metric_specs,
+            ]
+            for expected_ref_id, path in specs:
+                if expected_ref_id in receipts_by_ref:
+                    continue
+                receipt = self.knowledge_backend.record_core_read_receipt(
+                    session,
+                    path,
+                    offset=0,
+                    limit=2_000,
+                )
+                if not receipt or str(receipt.get("refId") or "") != expected_ref_id:
+                    report = {
+                        "status": "SKIPPED",
+                        "mode": "UNIQUE_GOAL_METRIC",
+                        "code": "UNIQUE_GOAL_METRIC_PREFETCH_INCOMPLETE",
+                        "expectedRefIds": [item[0] for item in specs],
+                        "loadedRefIds": list(receipts_by_ref),
+                    }
+                    session.semantic_prefetch = report
+                    return report
+                receipts_by_ref[expected_ref_id] = receipt
+
+            time_specs: dict[tuple[str, str], tuple[str, str, str]] = {}
+            for (topic, table), (detail_ref, _) in detail_specs.items():
+                detail = receipts_by_ref.get(detail_ref) or {}
+                time_column = str(
+                    (detail.get("summary") or {}).get("timeColumn") if isinstance(detail.get("summary"), dict) else ""
+                ).strip()
+                if not time_column:
+                    try:
+                        payload = json.loads(str(detail.get("contentSnippet") or ""))
+                    except (TypeError, ValueError):
+                        payload = {}
+                    if isinstance(payload, dict):
+                        time_column = str(payload.get("timeColumn") or "").strip()
+                if not time_column:
+                    for candidate in candidates:
+                        if (
+                            str(candidate.get("topic") or "").strip() == topic
+                            and str(candidate.get("table") or "").strip() == table
+                        ):
+                            metric_ref = str(candidate.get("metricRefId") or "").strip()
+                            metric = receipts_by_ref.get(metric_ref) or {}
+                            try:
+                                metric_payload = json.loads(str(metric.get("contentSnippet") or ""))
+                            except (TypeError, ValueError):
+                                metric_payload = {}
+                            if isinstance(metric_payload, dict):
+                                definition = (
+                                    metric_payload.get("metric")
+                                    if isinstance(metric_payload.get("metric"), dict)
+                                    else metric_payload
+                                )
+                                time_column = str(definition.get("timeColumn") or "").strip()
+                            if time_column:
+                                break
+                if not time_column:
+                    continue
+                field_ref = "semantic:%s:%s:field:%s" % (
+                    topic,
+                    table,
+                    time_column,
+                )
+                field_path = "topics/%s/tables/%s/columns/%s.json" % (topic, table, time_column)
+                time_specs[(topic, table)] = (
+                    field_ref,
+                    field_path,
+                    detail_ref,
+                )
+            for field_ref, field_path, _ in time_specs.values():
+                if field_ref in receipts_by_ref:
+                    continue
+                receipt = self.knowledge_backend.record_core_read_receipt(
+                    session,
+                    field_path,
+                    offset=0,
+                    limit=2_000,
+                )
+                if receipt and str(receipt.get("refId") or "") == field_ref:
+                    receipts_by_ref[field_ref] = receipt
+
+        items: list[dict[str, Any]] = []
+        for candidate in candidates:
+            topic = str(candidate.get("topic") or "").strip()
+            table = str(candidate.get("table") or "").strip()
+            metric_ref = str(candidate.get("metricRefId") or "").strip()
+            detail_ref, detail_path = detail_specs[(topic, table)]
+            refs = [detail_ref, metric_ref]
+            paths = [detail_path, str(candidate.get("metricPath") or "").strip()]
+            time_spec = time_specs.get((topic, table))
+            if time_spec and time_spec[0] in receipts_by_ref:
+                refs.append(time_spec[0])
+                paths.append(time_spec[1])
+            items.append(
+                {
+                    "goalId": str(candidate.get("goalId") or "").strip(),
+                    "metricRefId": metric_ref,
+                    "tableRefId": detail_ref,
+                    "timeFieldRef": time_spec[0] if time_spec and time_spec[0] in receipts_by_ref else "",
+                    "readRefIds": list(dict.fromkeys(refs)),
+                    "semanticPaths": list(dict.fromkeys(paths)),
+                    "topic": topic,
+                    "table": table,
+                }
+            )
+        all_refs = list(dict.fromkeys(ref_id for item in items for ref_id in item["readRefIds"]))
+        all_paths = list(dict.fromkeys(path for item in items for path in item["semanticPaths"]))
+        report = {
+            "status": "PREFETCHED",
+            "mode": "UNIQUE_GOAL_METRIC",
+            "items": items,
+            "goalBindings": {item["goalId"]: [item["metricRefId"]] for item in items},
+            "readRefIds": all_refs,
+            "semanticPaths": all_paths,
+            "receipts": [
+                _core_visible_semantic_receipt(receipts_by_ref[ref_id])
+                for ref_id in all_refs
+                if ref_id in receipts_by_ref
+            ],
+        }
+        if len(items) == 1:
+            report.update(
+                {
+                    "metricRefId": items[0]["metricRefId"],
+                    "tableRefId": items[0]["tableRefId"],
+                    "timeFieldRef": items[0]["timeFieldRef"],
+                }
+            )
+        session.semantic_prefetch = report
+        return report
+
+    def _prefetch_after_goal_recall_coverage(
+        self,
+        context: GroundedDeepAgentRunContext,
+        coverage: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Prefetch exact assets only after candidate gaps are resolved.
+
+        Coverage is a deterministic navigation check.  This gate does not
+        choose whether supplemental retrieval runs; it only prevents an exact
+        read optimization from racing ahead while required Goals are still
+        missing recall candidates.
+        """
+
+        missing_goal_ids = list(
+            dict.fromkeys(
+                str(item or "").strip() for item in coverage.get("missingGoalIds") or [] if str(item or "").strip()
+            )
+        )
+        if missing_goal_ids:
+            report = {
+                "status": "SKIPPED",
+                "mode": "UNIQUE_GOAL_METRIC",
+                "code": "GOAL_RECALL_COVERAGE_INCOMPLETE",
+                "missingGoalIds": missing_goal_ids,
+            }
+            context.session.semantic_prefetch = report
+            return report
+        return self._prefetch_goal_metric_semantic_assets(context)
 
     def _verified_exploration_source_views(
         self,
@@ -6446,24 +7527,34 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             description = str(metadata.get("description") or "").strip()
             if not name or not description or name != skill_dir.name:
                 continue
-            headers.append(
-                {
-                    "name": name,
-                    "description": description,
-                    "title": str(metadata.get("title") or "").strip(),
-                    "lifecyclePhase": str(
-                        metadata.get("lifecyclePhase") or metadata.get("lifecycle_phase") or "post_query_analysis"
-                    ).strip(),
-                    "requiresVerifiedEvidence": str(
-                        metadata.get("requiresVerifiedEvidence") or metadata.get("requires_verified_evidence") or "true"
-                    )
-                    .strip()
-                    .lower(),
-                    "outputContract": str(
-                        metadata.get("outputContract") or metadata.get("output_contract") or ""
-                    ).strip(),
-                }
+            execution_placement = (
+                str(metadata.get("executionPlacement") or metadata.get("execution_placement") or "SUBAGENT")
+                .strip()
+                .upper()
             )
+            if execution_placement not in {"AUTO", "CORE", "SUBAGENT"}:
+                continue
+            header = {
+                "name": name,
+                "description": description,
+                "title": str(metadata.get("title") or "").strip(),
+                "lifecyclePhase": str(
+                    metadata.get("lifecyclePhase") or metadata.get("lifecycle_phase") or "post_query_analysis"
+                ).strip(),
+                "requiresVerifiedEvidence": str(
+                    metadata.get("requiresVerifiedEvidence") or metadata.get("requires_verified_evidence") or "true"
+                )
+                .strip()
+                .lower(),
+                "outputContract": str(metadata.get("outputContract") or metadata.get("output_contract") or "").strip(),
+                "executionPlacement": execution_placement,
+            }
+            if execution_placement == "CORE":
+                procedure = _load_core_skill_procedure(skill_file)
+                if not procedure:
+                    continue
+                header["coreProcedure"] = procedure
+            headers.append(header)
         return headers
 
     def _build_tools(self) -> list[Any]:
@@ -6473,11 +7564,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str | None:
             try:
-                recovered = (
-                    runtime_owner._recover_pending_graph_revisions(
-                        runtime.context.session,
-                        runtime_budget=runtime.context.budget,
-                    )
+                recovered = runtime_owner._recover_pending_graph_revisions(
+                    runtime.context.session,
+                    runtime_budget=runtime.context.budget,
                 )
             except (
                 GroundedGraphRevisionJournalError,
@@ -6487,20 +7576,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return json.dumps(
                     {
                         "status": "BLOCKED",
-                        "code": (
-                            "GRAPH_REVISION_RECOVERY_FAILED"
-                        ),
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        "code": ("GRAPH_REVISION_RECOVERY_FAILED"),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
                 )
             if not recovered:
                 return None
-            receipt = (
-                runtime.context.session.execution_graph_receipt
-            )
+            receipt = runtime.context.session.execution_graph_receipt
             return json.dumps(
                 {
                     "status": "GRAPH_REVISION_RECOVERED",
@@ -6535,9 +7619,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 elif isinstance(contract, Mapping):
                     payload = dict(contract)
                 else:
-                    payload = OriginalQuestionGoalDeclaration.model_validate(contract).model_dump(
-                        by_alias=False
-                    )
+                    payload = OriginalQuestionGoalDeclaration.model_validate(contract).model_dump(by_alias=False)
                 # The run's original question is trusted runtime state.  A
                 # model-supplied copy is deliberately ignored so a misplaced
                 # or stale question cannot cause a retry.
@@ -6565,14 +7647,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     },
                     ensure_ascii=False,
                 )
+            normalized_away_goal_ids = _presentation_only_rule_goal_ids(parsed)
+            if normalized_away_goal_ids:
+                parsed = parsed.model_copy(
+                    update={
+                        "goals": [goal for goal in parsed.goals if goal.goal_id not in set(normalized_away_goal_ids)]
+                    },
+                    deep=True,
+                )
             premature_population_goals = [
                 goal.goal_id
                 for goal in parsed.goals
                 if isinstance(goal, RankingQuestionGoal)
-                and (
-                    goal.population_scope != "ALL_MATCHING_ROWS"
-                    or bool(goal.population_goal_ids)
-                )
+                and (goal.population_scope != "ALL_MATCHING_ROWS" or bool(goal.population_goal_ids))
             ]
             if premature_population_goals:
                 return json.dumps(
@@ -6597,18 +7684,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     existing_fingerprint = original_question_goal_contract_fingerprint(existing)
                     if existing_fingerprint == fingerprint:
                         existing_rule_goal_ids = [
-                            goal.goal_id
-                            for goal in existing.goals
-                            if str(goal.kind or "").upper() == "RULE"
+                            goal.goal_id for goal in existing.goals if str(goal.kind or "").upper() == "RULE"
                         ]
                         existing_rule_candidates = (
                             verified_rule_candidate_refs(
-                                core_semantic_evidence=(
-                                    deep_session.core_semantic_evidence
-                                ),
-                                recall_items=(
-                                    deep_session.runtime.recall.items
-                                ),
+                                core_semantic_evidence=(deep_session.core_semantic_evidence),
+                                recall_items=(deep_session.runtime.recall.items),
                             )
                             if existing_rule_goal_ids
                             else []
@@ -6625,19 +7706,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                         "kind": goal.kind,
                                         "label": goal.label,
                                         "required": goal.required,
-                                        "dependsOnGoalIds": list(
-                                            goal.depends_on_goal_ids
-                                        ),
+                                        "dependsOnGoalIds": list(goal.depends_on_goal_ids),
                                     }
                                     for goal in existing.goals
                                 ],
-                                "availableRuleEvidenceRefs": (
-                                    existing_rule_candidates
-                                ),
+                                "availableRuleEvidenceRefs": (existing_rule_candidates),
+                                "goalRecallCoverage": dict(deep_session.goal_recall_coverage_receipt),
                                 "nextAction": (
                                     "PUBLISH_VERIFIED_RULE_EVIDENCE"
-                                    if existing_rule_goal_ids
-                                    and existing_rule_candidates
+                                    if existing_rule_goal_ids and existing_rule_candidates
                                     else "READ_EXACT_RULE_EVIDENCE"
                                     if existing_rule_goal_ids
                                     else "DISCOVER_SEMANTIC_EVIDENCE"
@@ -6661,6 +7738,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             ensure_ascii=False,
                         )
                 deep_session.question_goal_contract = parsed.model_copy(deep=True)
+            goal_recall_coverage = runtime_owner._evaluate_goal_recall_coverage(runtime.context)
+            semantic_prefetch = runtime_owner._prefetch_after_goal_recall_coverage(
+                runtime.context,
+                goal_recall_coverage,
+            )
+            scalar_prefetch = semantic_prefetch if _simple_scalar_goal_contract(deep_session) else {}
             rule_goal_ids = [goal.goal_id for goal in parsed.goals if str(goal.kind or "").upper() == "RULE"]
             rule_candidates = verified_rule_candidate_refs(
                 core_semantic_evidence=deep_session.core_semantic_evidence,
@@ -6683,11 +7766,24 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         for goal in parsed.goals
                     ],
                     "availableRuleEvidenceRefs": (rule_candidates if rule_goal_ids else []),
+                    "goalRecallCoverage": goal_recall_coverage,
+                    "simpleScalarPrefetch": scalar_prefetch,
+                    "semanticPrefetch": semantic_prefetch,
+                    "goalNormalization": (
+                        {
+                            "code": "PRESENTATION_DIRECTIVE_RULE_REMOVED",
+                            "removedGoalIds": normalized_away_goal_ids,
+                        }
+                        if normalized_away_goal_ids
+                        else {}
+                    ),
                     "nextAction": (
                         "PUBLISH_VERIFIED_RULE_EVIDENCE"
                         if rule_goal_ids and rule_candidates
                         else "READ_EXACT_RULE_EVIDENCE"
                         if rule_goal_ids
+                        else "QUERY_DATA_WITH_PREFETCHED_ASSETS"
+                        if semantic_prefetch.get("status") == "PREFETCHED"
                         else "DISCOVER_SEMANTIC_EVIDENCE"
                     ),
                 },
@@ -6961,7 +8057,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             proposal: GroundedExecutionGraphProposal,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Validate and freeze a versioned graph after evidence discovery."""
+            """Validate a Core-chosen multi-query or dependency topology."""
 
             deep_session = runtime.context.session
             if deep_session.question_goal_contract is None:
@@ -7021,9 +8117,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             {
                                 "type": "REVISE_ACTIVE_EXECUTION_GRAPH",
                                 "baseVersion": current_version,
-                                "nextAction": (
-                                    "OPEN_REVISION_DISCOVERY_THEN_REVISE_GRAPH"
-                                ),
+                                "nextAction": ("OPEN_REVISION_DISCOVERY_THEN_REVISE_GRAPH"),
                             }
                         ],
                         "allowedActions": [
@@ -7060,9 +8154,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "preserveDiscoverySnapshot": True,
                             }
                         ],
-                        "allowedActions": [
-                            "PROPOSE_GROUNDED_EXECUTION_GRAPH"
-                        ],
+                        "allowedActions": ["PROPOSE_GROUNDED_EXECUTION_GRAPH"],
                         "nextAction": ("REVISE_EXECUTION_GRAPH_FROM_CURRENT_DISCOVERY"),
                     },
                     ensure_ascii=False,
@@ -7312,18 +8404,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             """Open typed discovery without mutating executed graph history."""
 
             deep_session = runtime.context.session
-            reconciliation = reconcile_graph_revision_before_mutation(
-                runtime
-            )
+            reconciliation = reconcile_graph_revision_before_mutation(runtime)
             if reconciliation is not None:
                 return reconciliation
             if deep_session.operational_failure:
                 return json.dumps(
                     {
                         "status": "REJECTED",
-                        "code": (
-                            "EXECUTION_GRAPH_REVISION_TERMINALLY_CLOSED"
-                        ),
+                        "code": ("EXECUTION_GRAPH_REVISION_TERMINALLY_CLOSED"),
                         "nextAction": "STOP",
                     },
                     ensure_ascii=False,
@@ -7366,9 +8454,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     or bool(context.runtime is not None and context.runtime.verified_query_ledger)
                     or query_id in deep_session.population_pre_execution_references
                 ]
-                available_triggers = _current_execution_graph_replan_evidence(
-                    deep_session
-                )
+                available_triggers = _current_execution_graph_replan_evidence(deep_session)
                 if executed_query_ids or available_triggers:
                     if not available_triggers:
                         return json.dumps(
@@ -7382,15 +8468,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             },
                             ensure_ascii=False,
                         )
-                    available_by_id = {
-                        item.evidence_id: item
-                        for item in available_triggers
-                    }
+                    available_by_id = {item.evidence_id: item for item in available_triggers}
                     selected_ids = list(
                         dict.fromkeys(
-                            str(item or "").strip()
-                            for item in (trigger_evidence_ids or [])
-                            if str(item or "").strip()
+                            str(item or "").strip() for item in (trigger_evidence_ids or []) if str(item or "").strip()
                         )
                     )
                     if not selected_ids and len(available_triggers) == 1:
@@ -7406,30 +8487,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             },
                             ensure_ascii=False,
                         )
-                    unavailable_ids = sorted(
-                        set(selected_ids) - set(available_by_id)
-                    )
+                    unavailable_ids = sorted(set(selected_ids) - set(available_by_id))
                     if unavailable_ids:
                         return json.dumps(
                             {
                                 "status": "REJECTED",
-                                "code": (
-                                    "EXECUTION_GRAPH_REPLAN_TRIGGER_SELECTION_INVALID"
-                                ),
+                                "code": ("EXECUTION_GRAPH_REPLAN_TRIGGER_SELECTION_INVALID"),
                                 "unavailableEvidenceIds": unavailable_ids,
                                 "availableTriggers": [
-                                    _execution_graph_replan_evidence_report(
-                                        item
-                                    )
-                                    for item in available_triggers
+                                    _execution_graph_replan_evidence_report(item) for item in available_triggers
                                 ],
                             },
                             ensure_ascii=False,
                         )
-                    selected_triggers = [
-                        available_by_id[evidence_id]
-                        for evidence_id in selected_ids
-                    ]
+                    selected_triggers = [available_by_id[evidence_id] for evidence_id in selected_ids]
                     failed_query_ids = {
                         query_id
                         for query_id, context in contexts.items()
@@ -7439,26 +8510,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "SNAPSHOT_BLOCKED",
                         }
                     }
-                    selected_failed_query_ids = {
-                        item.source_query_node_id
-                        for item in selected_triggers
-                    }.intersection(failed_query_ids)
+                    selected_failed_query_ids = {item.source_query_node_id for item in selected_triggers}.intersection(
+                        failed_query_ids
+                    )
                     if selected_failed_query_ids != failed_query_ids:
                         return json.dumps(
                             {
                                 "status": "REJECTED",
-                                "code": (
-                                    "EXECUTION_GRAPH_REPLAN_TRIGGER_SET_INCOMPLETE"
-                                ),
-                                "missingFailedQueryIds": sorted(
-                                    failed_query_ids
-                                    - selected_failed_query_ids
-                                ),
+                                "code": ("EXECUTION_GRAPH_REPLAN_TRIGGER_SET_INCOMPLETE"),
+                                "missingFailedQueryIds": sorted(failed_query_ids - selected_failed_query_ids),
                                 "availableTriggers": [
-                                    _execution_graph_replan_evidence_report(
-                                        item
-                                    )
-                                    for item in available_triggers
+                                    _execution_graph_replan_evidence_report(item) for item in available_triggers
                                 ],
                             },
                             ensure_ascii=False,
@@ -7471,13 +8533,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             },
                             ensure_ascii=False,
                         )
-                    deep_session.execution_graph_revision_discovery_evidence_ids = list(
-                        selected_ids
-                    )
+                    deep_session.execution_graph_revision_discovery_evidence_ids = list(selected_ids)
                     deep_session.execution_graph_revision_discovery_evidence_id = (
-                        selected_ids[0]
-                        if len(selected_ids) == 1
-                        else ""
+                        selected_ids[0] if len(selected_ids) == 1 else ""
                     )
                     return json.dumps(
                         {
@@ -7486,20 +8544,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "activeGraphId": receipt.graph_id,
                             "executedQueryIds": executed_query_ids,
                             "triggerEvidence": (
-                                _execution_graph_replan_evidence_report(
-                                    selected_triggers[0]
-                                )
+                                _execution_graph_replan_evidence_report(selected_triggers[0])
                                 if len(selected_triggers) == 1
                                 else {}
                             ),
                             "triggerEvidenceSet": [
-                                _execution_graph_replan_evidence_report(item)
-                                for item in selected_triggers
+                                _execution_graph_replan_evidence_report(item) for item in selected_triggers
                             ],
                             "triggerEvidenceSetFingerprint": (
-                                grounded_execution_graph_replan_evidence_set_fingerprint(
-                                    selected_triggers
-                                )
+                                grounded_execution_graph_replan_evidence_set_fingerprint(selected_triggers)
                             ),
                             "discoverySnapshotFingerprint": (
                                 discovery_evidence_snapshot_fingerprint(deep_session.core_semantic_evidence)
@@ -7556,11 +8609,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
 
             deep_session = runtime.context.session
             try:
-                recovered_transactions = (
-                    runtime_owner._recover_pending_graph_revisions(
-                        deep_session,
-                        runtime_budget=runtime.context.budget,
-                    )
+                recovered_transactions = runtime_owner._recover_pending_graph_revisions(
+                    deep_session,
+                    runtime_budget=runtime.context.budget,
                 )
             except (
                 GroundedGraphRevisionJournalError,
@@ -7570,31 +8621,22 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return json.dumps(
                     {
                         "status": "REJECTED",
-                        "code": (
-                            "GRAPH_REVISION_RECOVERY_FAILED"
-                        ),
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        "code": ("GRAPH_REVISION_RECOVERY_FAILED"),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         "nextAction": "STOP_INTERNAL",
                     },
                     ensure_ascii=False,
                 )
             if recovered_transactions:
                 latest = recovered_transactions[-1]
-                receipt_payload = dict(
-                    latest.get("executionReceipt") or {}
-                )
+                receipt_payload = dict(latest.get("executionReceipt") or {})
                 return json.dumps(
                     {
                         "status": "REVISED",
                         "recovered": True,
-                        "journalTransactions": (
-                            recovered_transactions
-                        ),
+                        "journalTransactions": (recovered_transactions),
                         "receipt": receipt_payload,
-                        "clientNodeIds": dict(
-                            receipt_payload.get("nodeIds") or {}
-                        ),
+                        "clientNodeIds": dict(receipt_payload.get("nodeIds") or {}),
                         "nextAction": "PREPARE_READY_GRAPH_NODES",
                     },
                     ensure_ascii=False,
@@ -7624,23 +8666,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 active_proposal = deep_session.execution_graph_proposal
                 goal_contract = deep_session.question_goal_contract
                 proposed_trigger_fingerprints = sorted(
-                    binding.evidence_fingerprint
-                    for binding in parsed.trigger_evidence_set
+                    binding.evidence_fingerprint for binding in parsed.trigger_evidence_set
                 )
                 if (
                     active_receipt is not None
-                    and active_receipt.parent_graph_id
-                    == parsed.base_graph_id
-                    and active_receipt.parent_version
-                    == parsed.base_version
-                    and active_receipt.parent_fingerprint
-                    == parsed.base_fingerprint
-                    and active_receipt.replan_evidence_fingerprints
-                    == proposed_trigger_fingerprints
-                    and active_receipt.fingerprint
-                    == grounded_execution_graph_fingerprint(
-                        parsed.graph
-                    )
+                    and active_receipt.parent_graph_id == parsed.base_graph_id
+                    and active_receipt.parent_version == parsed.base_version
+                    and active_receipt.parent_fingerprint == parsed.base_fingerprint
+                    and active_receipt.replan_evidence_fingerprints == proposed_trigger_fingerprints
+                    and active_receipt.fingerprint == grounded_execution_graph_fingerprint(parsed.graph)
                 ):
                     return json.dumps(
                         {
@@ -7650,20 +8684,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 by_alias=True,
                                 mode="json",
                             ),
-                            "clientNodeIds": dict(
-                                active_receipt.node_ids
-                            ),
-                            "nextAction": (
-                                "PREPARE_READY_GRAPH_NODES"
-                            ),
+                            "clientNodeIds": dict(active_receipt.node_ids),
+                            "nextAction": ("PREPARE_READY_GRAPH_NODES"),
                         },
                         ensure_ascii=False,
                         default=str,
                     )
                 trigger_evidences = [
-                    deep_session.execution_graph_replan_evidence.get(
-                        binding.evidence_id
-                    )
+                    deep_session.execution_graph_replan_evidence.get(binding.evidence_id)
                     for binding in parsed.trigger_evidence_set
                 ]
                 if active_receipt is None or active_proposal is None or goal_contract is None:
@@ -7682,35 +8710,21 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         },
                         ensure_ascii=False,
                     )
-                selected_trigger_evidences = [
-                    item
-                    for item in trigger_evidences
-                    if item is not None
-                ]
+                selected_trigger_evidences = [item for item in trigger_evidences if item is not None]
                 opened_evidence_ids = set(
                     deep_session.execution_graph_revision_discovery_evidence_ids
                     or (
-                        [
-                            deep_session.execution_graph_revision_discovery_evidence_id
-                        ]
+                        [deep_session.execution_graph_revision_discovery_evidence_id]
                         if deep_session.execution_graph_revision_discovery_evidence_id
                         else []
                     )
                 )
-                proposed_evidence_ids = {
-                    item.evidence_id
-                    for item in selected_trigger_evidences
-                }
-                if (
-                    opened_evidence_ids
-                    and opened_evidence_ids != proposed_evidence_ids
-                ):
+                proposed_evidence_ids = {item.evidence_id for item in selected_trigger_evidences}
+                if opened_evidence_ids and opened_evidence_ids != proposed_evidence_ids:
                     return json.dumps(
                         {
                             "status": "REJECTED",
-                            "code": (
-                                "EXECUTION_GRAPH_REVISION_DISCOVERY_BINDING_MISMATCH"
-                            ),
+                            "code": ("EXECUTION_GRAPH_REVISION_DISCOVERY_BINDING_MISMATCH"),
                         },
                         ensure_ascii=False,
                     )
@@ -7858,15 +8872,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         )
 
                 carried_keys = set(validation.carried_forward_client_keys)
-                trigger_evidence_set_fingerprint = (
-                    grounded_execution_graph_replan_evidence_set_fingerprint(
-                        selected_trigger_evidences
-                    )
+                trigger_evidence_set_fingerprint = grounded_execution_graph_replan_evidence_set_fingerprint(
+                    selected_trigger_evidences
                 )
-                trigger_evidence_fingerprints = sorted(
-                    item.evidence_fingerprint
-                    for item in selected_trigger_evidences
-                )
+                trigger_evidence_fingerprints = sorted(item.evidence_fingerprint for item in selected_trigger_evidences)
                 preserved_node_ids = {key: active_receipt.node_ids[key] for key in carried_keys}
                 retired_client_keys = set(active_receipt.node_ids) - carried_keys
                 retired_node_ids = [active_receipt.node_ids[key] for key in sorted(retired_client_keys)]
@@ -7898,12 +8907,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         or []
                     ),
                     parent_receipt=active_receipt,
-                    replan_evidence_fingerprint=(
-                        trigger_evidence_set_fingerprint
-                    ),
-                    replan_evidence_fingerprints=(
-                        trigger_evidence_fingerprints
-                    ),
+                    replan_evidence_fingerprint=(trigger_evidence_set_fingerprint),
+                    replan_evidence_fingerprints=(trigger_evidence_fingerprints),
                     preserved_node_ids=preserved_node_ids,
                     retired_node_ids=retired_node_ids,
                 )
@@ -7992,9 +8997,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         status=("WAITING_VERIFIED_ARTIFACT" if artifact_dependencies else "DECLARED"),
                         artifact_dependencies=[
                             {
-                                "sourceQueryId": revised_receipt.node_ids[
-                                    edge.source_client_key
-                                ],
+                                "sourceQueryId": revised_receipt.node_ids[edge.source_client_key],
                                 "artifactKind": edge.artifact_kind,
                                 "targetBindingRef": edge.target_binding_ref,
                             }
@@ -8025,18 +9028,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "targetBindingRef": edge.target_binding_ref,
                             }
                             if dependency not in target_context.artifact_dependencies:
-                                target_context.artifact_dependencies.append(
-                                    dependency
-                                )
+                                target_context.artifact_dependencies.append(dependency)
                             target_context.dependency_goal_ids.extend(
                                 goal_id for goal_id in source_goals if goal_id not in target_context.dependency_goal_ids
                             )
 
                 old_population_receipt = deep_session.population_graph_receipt
                 revised_population_receipt = None
-                revision_journal: (
-                    GroundedGraphRevisionTransactionJournal | None
-                ) = None
+                revision_journal: GroundedGraphRevisionTransactionJournal | None = None
                 revision_journal_record = None
                 if old_population_receipt is not None or runtime_owner.population_gate_enforced:
                     if old_population_receipt is None:
@@ -8077,9 +9076,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             nodes=population_nodes,
                             edges=population_edges,
                             parent_receipt_fingerprint=(old_population_receipt.receipt_fingerprint),
-                            revision_evidence_fingerprint=(
-                                trigger_evidence_set_fingerprint
-                            ),
+                            revision_evidence_fingerprint=(trigger_evidence_set_fingerprint),
                             carried_forward_query_node_ids=tuple(revised_receipt.carried_forward_node_ids),
                             retired_query_node_ids=tuple(revised_receipt.retired_node_ids),
                         )
@@ -8087,87 +9084,45 @@ Use the currently visible tools and the server-provided nextAction as the phase-
 
                 if runtime_owner.population_gate_enforced:
                     workspace = deep_session.context_workspace
-                    if (
-                        workspace is None
-                        or old_population_receipt is None
-                        or revised_population_receipt is None
-                    ):
+                    if workspace is None or old_population_receipt is None or revised_population_receipt is None:
                         return json.dumps(
                             {
                                 "status": "REJECTED",
-                                "code": (
-                                    "POPULATION_GRAPH_REVISION_BASE_REQUIRED"
-                                ),
+                                "code": ("POPULATION_GRAPH_REVISION_BASE_REQUIRED"),
                             },
                             ensure_ascii=False,
                         )
                     try:
-                        revision_journal = (
-                            GroundedGraphRevisionTransactionJournal(
-                                workspace
-                            )
+                        revision_journal = GroundedGraphRevisionTransactionJournal(workspace)
+                        base_session_checkpoint = _build_graph_revision_base_session_checkpoint(
+                            deep_session,
+                            execution_proposal=active_proposal,
+                            execution_receipt=active_receipt,
+                            population_receipt=(old_population_receipt),
+                            node_states=node_states,
                         )
-                        base_session_checkpoint = (
-                            _build_graph_revision_base_session_checkpoint(
-                                deep_session,
-                                execution_proposal=active_proposal,
-                                execution_receipt=active_receipt,
-                                population_receipt=(
-                                    old_population_receipt
-                                ),
-                                node_states=node_states,
-                            )
+                        base_session_checkpoint_reference = revision_journal.persist_base_session_checkpoint(
+                            base_session_checkpoint
                         )
-                        base_session_checkpoint_reference = (
-                            revision_journal.persist_base_session_checkpoint(
-                                base_session_checkpoint
-                            )
-                        )
-                        recovery_payload = (
-                            build_grounded_graph_revision_recovery_payload(
-                                execution_proposal=parsed.graph,
-                                execution_receipt=revised_receipt,
-                                population_receipt=(
-                                    revised_population_receipt
-                                ),
-                                base_session_checkpoint=(
-                                    base_session_checkpoint_reference
-                                ),
-                                assigned_goal_ids_by_client_key={
-                                    client_key: list(
-                                        candidate_contexts[
-                                            revised_receipt.node_ids[
-                                                client_key
-                                            ]
-                                        ].spec.goal_ids
-                                    )
-                                    for client_key in (
-                                        revised_receipt.node_ids
-                                    )
-                                },
-                            )
+                        recovery_payload = build_grounded_graph_revision_recovery_payload(
+                            execution_proposal=parsed.graph,
+                            execution_receipt=revised_receipt,
+                            population_receipt=(revised_population_receipt),
+                            base_session_checkpoint=(base_session_checkpoint_reference),
+                            assigned_goal_ids_by_client_key={
+                                client_key: list(candidate_contexts[revised_receipt.node_ids[client_key]].spec.goal_ids)
+                                for client_key in (revised_receipt.node_ids)
+                            },
                         )
                         prepared_transaction = revision_journal.prepare(
-                            base_execution_receipt_fingerprint=(
-                                active_receipt.fingerprint
-                            ),
-                            new_execution_receipt_fingerprint=(
-                                revised_receipt.fingerprint
-                            ),
-                            base_population_receipt_fingerprint=(
-                                old_population_receipt.receipt_fingerprint
-                            ),
-                            new_population_receipt_fingerprint=(
-                                revised_population_receipt.receipt_fingerprint
-                            ),
-                            evidence_set_fingerprint=(
-                                trigger_evidence_set_fingerprint
-                            ),
+                            base_execution_receipt_fingerprint=(active_receipt.fingerprint),
+                            new_execution_receipt_fingerprint=(revised_receipt.fingerprint),
+                            base_population_receipt_fingerprint=(old_population_receipt.receipt_fingerprint),
+                            new_population_receipt_fingerprint=(revised_population_receipt.receipt_fingerprint),
+                            evidence_set_fingerprint=(trigger_evidence_set_fingerprint),
                             recovery_payload=recovery_payload,
                         )
-                        revision_journal_record = (
-                            prepared_transaction.record
-                        )
+                        revision_journal_record = prepared_transaction.record
                         runtime_owner._graph_revision_fault_checkpoint(
                             "AFTER_PREPARE",
                             revision_journal_record.transaction_id,
@@ -8204,9 +9159,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         goal_contract_fingerprint=(original_question_goal_contract_fingerprint(goal_contract)),
                         previous_graph_receipt_fingerprint=(old_population_receipt.receipt_fingerprint),
                         revised_graph_receipt=(revised_population_receipt),
-                        revision_evidence_fingerprint=(
-                            trigger_evidence_set_fingerprint
-                        ),
+                        revision_evidence_fingerprint=(trigger_evidence_set_fingerprint),
                     )
                     if not gate_result.accepted:
                         return json.dumps(
@@ -8227,16 +9180,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     population_transaction = revision_journal.advance(
                         revision_journal_record.transaction_id,
                         target_status="POPULATION_COMMITTED",
-                        expected_revision=(
-                            revision_journal_record.revision
-                        ),
-                        expected_record_fingerprint=(
-                            revision_journal_record.record_fingerprint
-                        ),
+                        expected_revision=(revision_journal_record.revision),
+                        expected_record_fingerprint=(revision_journal_record.record_fingerprint),
                     )
-                    revision_journal_record = (
-                        population_transaction.record
-                    )
+                    revision_journal_record = population_transaction.record
                     runtime_owner._graph_revision_fault_checkpoint(
                         "AFTER_POPULATION_COMMITTED",
                         revision_journal_record.transaction_id,
@@ -8265,12 +9212,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             mode="json",
                         ),
                         "triggerEvidenceSet": [
-                            _execution_graph_replan_evidence_report(item)
-                            for item in selected_trigger_evidences
+                            _execution_graph_replan_evidence_report(item) for item in selected_trigger_evidences
                         ],
-                        "triggerEvidenceSetFingerprint": (
-                            trigger_evidence_set_fingerprint
-                        ),
+                        "triggerEvidenceSetFingerprint": (trigger_evidence_set_fingerprint),
                         "carriedForwardQueryNodeIds": list(revised_receipt.carried_forward_node_ids),
                         "retiredQueryNodeIds": list(revised_receipt.retired_node_ids),
                     }
@@ -8287,10 +9231,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 deep_session.execution_graph_used_replan_fingerprints.extend(
                     fingerprint
                     for fingerprint in trigger_evidence_fingerprints
-                    if fingerprint
-                    not in set(
-                        deep_session.execution_graph_used_replan_fingerprints
-                    )
+                    if fingerprint not in set(deep_session.execution_graph_used_replan_fingerprints)
                 )
                 deep_session.execution_graph_revision_discovery_evidence_id = ""
                 deep_session.execution_graph_revision_discovery_evidence_ids = []
@@ -8316,11 +9257,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 }
                 deep_session.population_artifact_query_node_ids = {
                     artifact_id: query_node_id
-                    for artifact_id, query_node_id in (
-                        deep_session.population_artifact_query_node_ids.items()
-                    )
-                    if query_node_id
-                    in set(revised_receipt.carried_forward_node_ids)
+                    for artifact_id, query_node_id in (deep_session.population_artifact_query_node_ids.items())
+                    if query_node_id in set(revised_receipt.carried_forward_node_ids)
                 }
 
                 if revision_journal is not None:
@@ -8332,16 +9270,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     execution_transaction = revision_journal.advance(
                         revision_journal_record.transaction_id,
                         target_status="EXECUTION_COMMITTED",
-                        expected_revision=(
-                            revision_journal_record.revision
-                        ),
-                        expected_record_fingerprint=(
-                            revision_journal_record.record_fingerprint
-                        ),
+                        expected_revision=(revision_journal_record.revision),
+                        expected_record_fingerprint=(revision_journal_record.record_fingerprint),
                     )
-                    revision_journal_record = (
-                        execution_transaction.record
-                    )
+                    revision_journal_record = execution_transaction.record
 
                 ready_query_ids = [
                     query_node_id
@@ -8362,19 +9294,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             mode="json",
                         ),
                         "triggerEvidence": (
-                            _execution_graph_replan_evidence_report(
-                                selected_trigger_evidences[0]
-                            )
+                            _execution_graph_replan_evidence_report(selected_trigger_evidences[0])
                             if len(selected_trigger_evidences) == 1
                             else {}
                         ),
                         "triggerEvidenceSet": [
-                            _execution_graph_replan_evidence_report(item)
-                            for item in selected_trigger_evidences
+                            _execution_graph_replan_evidence_report(item) for item in selected_trigger_evidences
                         ],
-                        "triggerEvidenceSetFingerprint": (
-                            trigger_evidence_set_fingerprint
-                        ),
+                        "triggerEvidenceSetFingerprint": (trigger_evidence_set_fingerprint),
                         "clientNodeIds": dict(revised_receipt.node_ids),
                         "carriedForwardQueryNodeIds": list(revised_receipt.carried_forward_node_ids),
                         "retiredQueryNodeIds": list(revised_receipt.retired_node_ids),
@@ -8385,9 +9312,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "maximum": (deep_session.execution_graph_max_revision_count),
                         },
                         "revisionTransactionId": (
-                            revision_journal_record.transaction_id
-                            if revision_journal_record is not None
-                            else ""
+                            revision_journal_record.transaction_id if revision_journal_record is not None else ""
                         ),
                         "nextAction": "PREPARE_READY_GRAPH_NODES",
                     },
@@ -8400,8 +9325,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             query: str,
             reason: str,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
+            coverage_receipt_id: str = "",
+            goal_ids: Optional[list[str]] = None,
         ) -> str:
-            """Run one targeted supplemental recall inside the active Topic scope."""
+            """Recall freely, or execute selected gaps from a coverage receipt."""
 
             if runtime.context.session.skill_execution_in_progress:
                 return json.dumps(
@@ -8411,6 +9338,36 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "message": "Analysis Skill execution cannot drive new retrieval or query planning.",
                     },
                     ensure_ascii=False,
+                )
+
+            if coverage_receipt_id or goal_ids:
+                if not coverage_receipt_id:
+                    return json.dumps(
+                        {
+                            "status": "REJECTED",
+                            "code": "GOAL_RECALL_COVERAGE_RECEIPT_REQUIRED",
+                        },
+                        ensure_ascii=False,
+                    )
+                result = runtime_owner._execute_goal_recall_supplements(
+                    runtime.context,
+                    coverage_receipt_id=str(coverage_receipt_id or "").strip(),
+                    goal_ids=list(goal_ids or []),
+                )
+                result["reason"] = str(reason or "")[:500]
+                coverage = result.get("goalRecallCoverage") or {}
+                result["semanticPrefetch"] = (
+                    runtime_owner._prefetch_after_goal_recall_coverage(
+                        runtime.context,
+                        coverage,
+                    )
+                    if str(result.get("status") or "").upper() in {"COMPLETE", "PARTIAL"}
+                    else {}
+                )
+                return json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    default=str,
                 )
 
             try:
@@ -8439,9 +9396,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "reason": str(reason or "")[:500],
                     "recallCandidates": _thin_recall(bundle, limit=8),
                     "scope": runtime.context.session.effective_topics(),
-                    "retrievalTrace": _retrieval_trace_summary(
-                        runtime.context.session.runtime
-                    ),
+                    "retrievalTrace": _retrieval_trace_summary(runtime.context.session.runtime),
                 },
                 ensure_ascii=False,
             )
@@ -8650,50 +9605,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             if not isinstance(binding_hints, GroundedBindingHints):
                 binding_hints = GroundedBindingHints.model_validate(binding_hints)
             binding_hints = _canonical_binding_hints(binding_hints)
-            detail_goals = [
-                session.question_goal_contract.goal_map()[goal_id]
-                for goal_id in assigned_goal_ids
-                if session.question_goal_contract is not None
-                and goal_id in session.question_goal_contract.goal_map()
-                and isinstance(
-                    session.question_goal_contract.goal_map()[goal_id],
-                    DetailQuestionGoal,
-                )
-            ]
-            if detail_goals:
-                request_all = any(item.request_all_fields for item in detail_goals)
-                explicit_phrases = any(
-                    bool(item.requested_field_phrases)
-                    for item in detail_goals
-                )
-                projection_mode = (
-                    "ALL_ALLOWED"
-                    if request_all
-                    else "EXPLICIT"
-                    if explicit_phrases
-                    else "DEFAULT"
-                )
-                # The original Goal ledger is the source of truth for whether
-                # the user asked for a projection.  A generic detail question
-                # must not let Core invent a large selectedFields list after
-                # reading the physical Schema.
-                if projection_mode == "DEFAULT":
-                    binding_hints = binding_hints.model_copy(
-                        update={
-                            "analysis_mode": "DETAIL",
-                            "detail_projection_mode": projection_mode,
-                            "selected_fields": [],
-                        },
-                        deep=True,
-                    )
-                else:
-                    binding_hints = binding_hints.model_copy(
-                        update={
-                            "analysis_mode": "DETAIL",
-                            "detail_projection_mode": projection_mode,
-                        },
-                        deep=True,
-                    )
+            binding_hints = _normalize_detail_goal_binding_hints(
+                session,
+                assigned_goal_ids,
+                binding_hints,
+            )
             requested = list(
                 dict.fromkeys(
                     _canonical_progressive_ref(str(item or "").strip())
@@ -8759,9 +9675,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "status": "BLOCKED",
                             "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
                             "issues": assignment_issues,
-                            "nextAction": _goal_assignment_repair_action(
-                                assignment_issues
-                            ),
+                            "nextAction": _goal_assignment_repair_action(assignment_issues),
                         },
                         ensure_ascii=False,
                     )
@@ -8805,10 +9719,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 with session.lock:
                     session.active_goal_ids = list(assigned_goal_ids)
             contract_fingerprint = grounded_query_contract_fingerprint(attempt.contract)
-            gap_payloads = [
-                gap.model_dump(by_alias=True)
-                for gap in attempt.contract.unresolved_gaps
-            ]
+            gap_payloads = [gap.model_dump(by_alias=True) for gap in attempt.contract.unresolved_gaps]
 
             def resolve_repair_ref_path(ref_id: str) -> str:
                 try:
@@ -8830,31 +9741,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 base_contract_fingerprint=contract_fingerprint,
                 contract_version=int(attempt.contract_version or 0),
                 parent_attempt_id=attempt.parent_attempt_id,
-                parent_contract_fingerprint=(
-                    attempt.parent_contract_fingerprint
-                ),
+                parent_contract_fingerprint=(attempt.parent_contract_fingerprint),
             )
             attempt.repair_type = repair_directive.repair_type
             attempt.repair_directive = repair_directive.model_dump(
                 by_alias=True,
                 mode="json",
             )
-            public_next_action = (
-                repair_directive.next_action or attempt.next_action
-            )
+            public_next_action = repair_directive.next_action or attempt.next_action
             semantic_coverage_status = (
-                "READY_TO_EXECUTE"
-                if attempt.contract.ready and attempt.activated
-                else repair_directive.status
+                "READY_TO_EXECUTE" if attempt.contract.ready and attempt.activated else repair_directive.status
             )
             return json.dumps(
                 {
                     "attemptId": attempt.attempt_id,
                     "contractVersion": attempt.contract_version,
                     "parentAttemptId": attempt.parent_attempt_id,
-                    "parentContractFingerprint": (
-                        attempt.parent_contract_fingerprint
-                    ),
+                    "parentContractFingerprint": (attempt.parent_contract_fingerprint),
                     "status": attempt.contract.status,
                     "queryShape": attempt.contract.query_shape,
                     "compileStatus": attempt.compile_status,
@@ -8903,12 +9806,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             queries: list[GroundedParallelQuerySpec],
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Prepare isolated Contract generations for independent query goals."""
+            """Prepare Core-chosen independent or graph-ready query branches."""
 
             deep_session = runtime.context.session
-            reconciliation = reconcile_graph_revision_before_mutation(
-                runtime
-            )
+            reconciliation = reconcile_graph_revision_before_mutation(runtime)
             if reconciliation is not None:
                 return reconciliation
             if deep_session.skill_execution_in_progress:
@@ -9010,7 +9911,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "declaredGoalIds": declared_goal_ids,
                                 "submittedGoalIds": assigned_goal_ids,
                             }
-                    hints = _canonical_binding_hints(raw_item.binding_hints)
+                    hints = _normalize_detail_goal_binding_hints(
+                        deep_session,
+                        declared_goal_ids,
+                        _canonical_binding_hints(raw_item.binding_hints),
+                    )
 
                     if context.status == "WAITING_VERIFIED_ARTIFACT":
                         dependency_specs = list(
@@ -9029,36 +9934,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             for item in deep_session.runtime.verified_query_ledger
                             if item.verified_evidence.passed
                         }
-                        entity_sets = {
-                            item.artifact_id: item
-                            for item in deep_session.runtime.verified_entity_sets
-                        }
+                        entity_sets = {item.artifact_id: item for item in deep_session.runtime.verified_entity_sets}
                         entity_hints = list(hints.upstream_entity_bindings)
                         entity_set_ids: list[str] = []
                         query_artifact_ids: list[str] = []
-                        artifact_bindings: list[
-                            GroundedUpstreamArtifactBinding
-                        ] = []
+                        artifact_bindings: list[GroundedUpstreamArtifactBinding] = []
                         dependency_failures: list[dict[str, Any]] = []
                         for dependency in dependency_specs:
-                            source_query_id = str(
-                                dependency.get("sourceQueryId") or ""
-                            ).strip()
-                            artifact_kind = str(
-                                dependency.get("artifactKind") or ""
-                            ).strip()
-                            target_binding_ref = str(
-                                dependency.get("targetBindingRef") or ""
-                            ).strip()
-                            upstream_context = (
-                                deep_session.query_branch_contexts.get(
-                                    source_query_id
-                                )
-                            )
+                            source_query_id = str(dependency.get("sourceQueryId") or "").strip()
+                            artifact_kind = str(dependency.get("artifactKind") or "").strip()
+                            target_binding_ref = str(dependency.get("targetBindingRef") or "").strip()
+                            upstream_context = deep_session.query_branch_contexts.get(source_query_id)
                             source_ids = set(
-                                upstream_context.verified_artifact_ids
-                                if upstream_context is not None
-                                else []
+                                upstream_context.verified_artifact_ids if upstream_context is not None else []
                             )
                             if not source_ids:
                                 dependency_failures.append(
@@ -9073,32 +9961,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 supplied = [
                                     item
                                     for item in entity_hints
-                                    if (
-                                        not target_binding_ref
-                                        or item.target_field_ref
-                                        == target_binding_ref
-                                    )
-                                    and item.entity_set_artifact_id
-                                    in entity_sets
-                                    and entity_sets[
-                                        item.entity_set_artifact_id
-                                    ].source_query_artifact_id
-                                    in source_ids
+                                    if (not target_binding_ref or item.target_field_ref == target_binding_ref)
+                                    and item.entity_set_artifact_id in entity_sets
+                                    and entity_sets[item.entity_set_artifact_id].source_query_artifact_id in source_ids
                                 ]
                                 candidates = [
-                                    item
-                                    for item in entity_sets.values()
-                                    if item.source_query_artifact_id
-                                    in source_ids
+                                    item for item in entity_sets.values() if item.source_query_artifact_id in source_ids
                                 ]
                                 selected_entity_set = (
-                                    entity_sets[
-                                        supplied[0].entity_set_artifact_id
-                                    ]
+                                    entity_sets[supplied[0].entity_set_artifact_id]
                                     if len(supplied) == 1
                                     else candidates[0]
-                                    if len(candidates) == 1
-                                    and target_binding_ref
+                                    if len(candidates) == 1 and target_binding_ref
                                     else None
                                 )
                                 if selected_entity_set is None:
@@ -9106,25 +9980,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                         {
                                             "sourceQueryId": source_query_id,
                                             "artifactKind": artifact_kind,
-                                            "code": (
-                                                "PUBLISH_OR_SELECT_VERIFIED_ENTITY_SET"
-                                            ),
-                                            "candidateEntitySetArtifactIds": [
-                                                item.artifact_id
-                                                for item in candidates
-                                            ],
+                                            "code": ("PUBLISH_OR_SELECT_VERIFIED_ENTITY_SET"),
+                                            "candidateEntitySetArtifactIds": [item.artifact_id for item in candidates],
                                         }
                                     )
                                     continue
-                                entity_set_ids.append(
-                                    selected_entity_set.artifact_id
-                                )
+                                entity_set_ids.append(selected_entity_set.artifact_id)
                                 if not supplied:
                                     entity_hints.append(
                                         GroundedUpstreamEntityHint(
-                                            entity_set_artifact_id=(
-                                                selected_entity_set.artifact_id
-                                            ),
+                                            entity_set_artifact_id=(selected_entity_set.artifact_id),
                                             target_field_ref=target_binding_ref,
                                         )
                                     )
@@ -9137,20 +10002,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             ]
                             compatible = []
                             for artifact in candidates:
-                                descriptor = (
-                                    artifact.trusted_descriptor
-                                    or trusted_query_artifact_descriptor(
-                                        artifact
-                                    )
-                                )
-                                descriptor_type = str(
-                                    descriptor.artifact_type or ""
-                                )
+                                descriptor = artifact.trusted_descriptor or trusted_query_artifact_descriptor(artifact)
+                                descriptor_type = str(descriptor.artifact_type or "")
                                 if artifact_kind == "VERIFIED_SCALAR" and descriptor_type != "SCALAR":
                                     continue
-                                if artifact_kind == "VERIFIED_BASELINE" and descriptor_type not in {"SCALAR", "BASELINE"}:
+                                if artifact_kind == "VERIFIED_BASELINE" and descriptor_type not in {
+                                    "SCALAR",
+                                    "BASELINE",
+                                }:
                                     continue
-                                if artifact_kind == "VERIFIED_RESULT_ARTIFACT" and descriptor_type not in {"SCALAR", "RELATION"}:
+                                if artifact_kind == "VERIFIED_RESULT_ARTIFACT" and descriptor_type not in {
+                                    "SCALAR",
+                                    "RELATION",
+                                }:
                                     continue
                                 compatible.append((artifact, descriptor))
                             if len(compatible) != 1:
@@ -9164,8 +10028,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                             else "UPSTREAM_ARTIFACT_KIND_MISMATCH"
                                         ),
                                         "candidateArtifactIds": [
-                                            artifact.artifact_id
-                                            for artifact, _descriptor in compatible
+                                            artifact.artifact_id for artifact, _descriptor in compatible
                                         ],
                                     }
                                 )
@@ -9176,9 +10039,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 GroundedUpstreamArtifactBinding(
                                     artifact_id=artifact.artifact_id,
                                     artifact_kind=artifact_kind,
-                                    source_query_artifact_id=(
-                                        artifact.artifact_id
-                                    ),
+                                    source_query_artifact_id=(artifact.artifact_id),
                                     source_query_node_id=source_query_id,
                                     target_binding_ref=target_binding_ref,
                                     descriptor=descriptor,
@@ -9190,14 +10051,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "status": "WAITING_VERIFIED_ARTIFACT",
                                 "code": "DEPENDENT_QUERY_ARTIFACTS_NOT_READY",
                                 "dependencies": dependency_failures,
-                                "nextAction": (
-                                    "PUBLISH_OR_SELECT_REQUIRED_VERIFIED_ARTIFACTS"
-                                ),
+                                "nextAction": ("PUBLISH_OR_SELECT_REQUIRED_VERIFIED_ARTIFACTS"),
                             }
                         hints = hints.model_copy(
-                            update={
-                                "upstream_entity_bindings": entity_hints
-                            },
+                            update={"upstream_entity_bindings": entity_hints},
                             deep=True,
                         )
                         try:
@@ -9206,15 +10063,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 query_id,
                                 workspace_topics=context.spec.topic_scope,
                                 objective=context.spec.objective,
-                                inherit_entity_set_ids=list(
-                                    dict.fromkeys(entity_set_ids)
-                                ),
-                                inherit_query_artifact_ids=list(
-                                    dict.fromkeys(query_artifact_ids)
-                                ),
-                                upstream_artifact_bindings=(
-                                    artifact_bindings
-                                ),
+                                inherit_entity_set_ids=list(dict.fromkeys(entity_set_ids)),
+                                inherit_query_artifact_ids=list(dict.fromkeys(query_artifact_ids)),
+                                upstream_artifact_bindings=(artifact_bindings),
                             )
                         except TypeError:
                             return {
@@ -9265,11 +10116,37 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         )
                     )
                     if deep_session.execution_graph_receipt is not None:
-                        undeclared_paths = [
-                            path for path in semantic_paths if not context.semantic_ledger.has_path(path)
-                        ]
-                        declared_refs = set(context.semantic_ledger.refs())
-                        undeclared_refs = [ref_id for ref_id in requested_ref_ids if ref_id not in declared_refs]
+                        # A frozen graph carries the branch's trusted evidence
+                        # refs in ``context.spec``.  The branch ledger is
+                        # populated from the discovery snapshot when possible,
+                        # but it may legitimately be empty when the graph was
+                        # created from a receipt that is being materialized by
+                        # this preparation call.  Treat both as the same
+                        # authorization source; preparation must not reject a
+                        # ref/path merely because the ledger has not been
+                        # hydrated yet.
+                        declared_refs = set(
+                            str(ref_id or "").strip()
+                            for ref_id in (context.spec.evidence_ref_ids or [])
+                            if str(ref_id or "").strip()
+                        )
+                        ledger_refs = set(context.semantic_ledger.refs())
+                        allowed_refs = declared_refs | ledger_refs
+                        declared_paths = set(context.semantic_ledger.paths())
+                        core_evidence_by_ref = {
+                            str(item.get("refId") or "").strip(): item
+                            for item in deep_session.core_semantic_evidence
+                            if str(item.get("refId") or "").strip()
+                        }
+                        for ref_id in declared_refs:
+                            evidence = core_evidence_by_ref.get(ref_id)
+                            if evidence is None:
+                                continue
+                            evidence_path = str(evidence.get("path") or "").strip()
+                            if evidence_path:
+                                declared_paths.add(_knowledge_relative_path(evidence_path))
+                        undeclared_paths = [path for path in semantic_paths if path not in declared_paths]
+                        undeclared_refs = [ref_id for ref_id in requested_ref_ids if ref_id not in allowed_refs]
                         if undeclared_paths or undeclared_refs:
                             return {
                                 "queryId": query_id,
@@ -9340,20 +10217,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                     assignment_issues,
                                     contract_status="REVISE_BINDINGS",
                                     base_attempt_id=attempt.attempt_id,
-                                    base_contract_fingerprint=(
-                                        grounded_query_contract_fingerprint(
-                                            attempt.contract
-                                        )
-                                    ),
-                                    contract_version=int(
-                                        attempt.contract_version or 0
-                                    ),
-                                    parent_attempt_id=(
-                                        attempt.parent_attempt_id
-                                    ),
-                                    parent_contract_fingerprint=(
-                                        attempt.parent_contract_fingerprint
-                                    ),
+                                    base_contract_fingerprint=(grounded_query_contract_fingerprint(attempt.contract)),
+                                    contract_version=int(attempt.contract_version or 0),
+                                    parent_attempt_id=(attempt.parent_attempt_id),
+                                    parent_contract_fingerprint=(attempt.parent_contract_fingerprint),
                                 )
                                 with context.lock:
                                     context.status = "CONTRACT_GAPPED"
@@ -9385,18 +10252,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                     "queryId": query_id,
                                     "status": "BLOCKED",
                                     "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
-                                    "contractVersion": (
-                                        attempt.contract_version
-                                    ),
-                                    "parentAttemptId": (
-                                        attempt.parent_attempt_id
-                                    ),
+                                    "contractVersion": (attempt.contract_version),
+                                    "parentAttemptId": (attempt.parent_attempt_id),
                                     "issues": assignment_issues,
                                     "nextAction": assignment_repair.next_action,
                                     "readNext": assignment_repair.read_next,
-                                    "repairOptions": (
-                                        assignment_repair.repair_options
-                                    ),
+                                    "repairOptions": (assignment_repair.repair_options),
                                     "repairDirective": (
                                         assignment_repair.model_dump(
                                             by_alias=True,
@@ -9461,18 +10322,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             resolve_ref_path=resolve_branch_repair_ref_path,
                             path_prefix="knowledge",
                             base_attempt_id=attempt.attempt_id,
-                            base_contract_fingerprint=(
-                                grounded_query_contract_fingerprint(
-                                    attempt.contract
-                                )
-                            ),
-                            contract_version=int(
-                                attempt.contract_version or 0
-                            ),
+                            base_contract_fingerprint=(grounded_query_contract_fingerprint(attempt.contract)),
+                            contract_version=int(attempt.contract_version or 0),
                             parent_attempt_id=attempt.parent_attempt_id,
-                            parent_contract_fingerprint=(
-                                attempt.parent_contract_fingerprint
-                            ),
+                            parent_contract_fingerprint=(attempt.parent_contract_fingerprint),
                         )
                         attempt.repair_type = branch_repair.repair_type
                         attempt.repair_directive = branch_repair.model_dump(
@@ -9625,12 +10478,6 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     ensure_ascii=False,
                     default=str,
                 )
-            with deep_session.lock:
-                evidence_by_ref = {
-                    str(item.get("refId") or ""): dict(item)
-                    for item in deep_session.core_semantic_evidence
-                    if str(item.get("refId") or "")
-                }
             prepared: list[dict[str, Any]] = []
             for raw_item, query_id in zip(normalized, query_ids):
                 assigned_goal_ids = goal_assignments_by_query_id[query_id]
@@ -9643,7 +10490,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         }
                     )
                     continue
-                hints = _canonical_binding_hints(raw_item.binding_hints)
+                hints = _normalize_detail_goal_binding_hints(
+                    deep_session,
+                    assigned_goal_ids,
+                    _canonical_binding_hints(raw_item.binding_hints),
+                )
                 if hints.upstream_entity_bindings:
                     prepared.append(
                         {
@@ -9664,6 +10515,94 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         if str(ref_id or "").strip()
                     )
                 )
+                semantic_paths = list(
+                    dict.fromkeys(
+                        _knowledge_relative_path(str(path or ""))
+                        for path in raw_item.semantic_paths
+                        if str(path or "").strip()
+                    )
+                )
+                with deep_session.lock:
+                    evidence_by_ref = {
+                        str(item.get("refId") or ""): dict(item)
+                        for item in deep_session.core_semantic_evidence
+                        if str(item.get("refId") or "")
+                    }
+                exact_read_errors: list[dict[str, str]] = []
+                for semantic_path in semantic_paths:
+                    try:
+                        evidence, _newly_read = _read_exact_core_semantic_path(
+                            runtime_owner.knowledge_backend,
+                            deep_session,
+                            semantic_path,
+                        )
+                    except Exception as exc:
+                        exact_read_errors.append(
+                            {
+                                "path": semantic_path,
+                                "error": "%s:%s" % (type(exc).__name__, str(exc)[:300]),
+                            }
+                        )
+                        continue
+                    ref_id = str(evidence.get("refId") or "").strip()
+                    if ref_id:
+                        evidence_by_ref[ref_id] = evidence
+                        if ref_id not in requested:
+                            requested.append(ref_id)
+                for ref_id in list(requested):
+                    if ref_id in evidence_by_ref:
+                        continue
+                    ref_path = _canonical_recall_path(ref_id, "")
+                    if not ref_path:
+                        exact_read_errors.append(
+                            {
+                                "refId": ref_id,
+                                "error": "SEMANTIC_REF_PATH_UNRESOLVED",
+                            }
+                        )
+                        continue
+                    try:
+                        evidence, _newly_read = _read_exact_core_semantic_path(
+                            runtime_owner.knowledge_backend,
+                            deep_session,
+                            ref_path,
+                        )
+                    except Exception as exc:
+                        exact_read_errors.append(
+                            {
+                                "refId": ref_id,
+                                "path": ref_path,
+                                "error": "%s:%s" % (type(exc).__name__, str(exc)[:300]),
+                            }
+                        )
+                        continue
+                    evidence_ref_id = str(evidence.get("refId") or "").strip()
+                    if evidence_ref_id:
+                        evidence_by_ref[evidence_ref_id] = evidence
+                if exact_read_errors:
+                    read_next = [
+                        {
+                            key: value
+                            for key, value in {
+                                "refId": issue.get("refId", ""),
+                                "path": issue.get("path", ""),
+                                "reason": issue.get("error", ""),
+                            }.items()
+                            if value
+                        }
+                        for issue in exact_read_errors
+                        if issue.get("refId") or issue.get("path")
+                    ]
+                    prepared.append(
+                        {
+                            "queryId": query_id,
+                            "status": "BLOCKED",
+                            "code": "BATCH_EXACT_SEMANTIC_READ_FAILED",
+                            "issues": exact_read_errors,
+                            "readNext": read_next,
+                        }
+                    )
+                    continue
                 missing = [ref_id for ref_id in requested if ref_id not in evidence_by_ref]
                 if missing:
                     prepared.append(
@@ -9672,6 +10611,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "status": "BLOCKED",
                             "code": "SEMANTIC_REF_NOT_READ",
                             "missingRefs": missing,
+                            "readNext": [
+                                {
+                                    "refId": ref_id,
+                                    "path": _canonical_recall_path(ref_id, ""),
+                                    "reason": "required semantic evidence is not in the Core ledger",
+                                }
+                                for ref_id in missing
+                            ],
                         }
                     )
                     continue
@@ -9699,9 +10646,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "status": "BLOCKED",
                                 "code": "QUERY_GOAL_ASSIGNMENT_MISMATCH",
                                 "issues": assignment_issues,
-                                "nextAction": _goal_assignment_repair_action(
-                                    assignment_issues
-                                ),
+                                "nextAction": _goal_assignment_repair_action(assignment_issues),
                             }
                         )
                         continue
@@ -9773,9 +10718,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             """Execute prepared independent branches concurrently and adopt verified artifacts."""
 
             deep_session = runtime.context.session
-            reconciliation = reconcile_graph_revision_before_mutation(
-                runtime
-            )
+            reconciliation = reconcile_graph_revision_before_mutation(runtime)
             if reconciliation is not None:
                 return reconciliation
             if runtime.context.budget is not None:
@@ -10161,10 +11104,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             by_alias=True,
                             mode="json",
                         )
-                        for task_result in list(
-                            getattr(run_result, "task_results", [])
-                            or []
-                        )
+                        for task_result in list(getattr(run_result, "task_results", []) or [])
                         for report in list(
                             getattr(
                                 task_result,
@@ -10181,36 +11121,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                     True,
                                 )
                             )
-                            or str(
-                                getattr(report, "status", "")
-                                or ""
-                            )
-                            == "STALE_REQUIRES_GRAPH_REPREPARATION"
+                            or str(getattr(report, "status", "") or "") == "STALE_REQUIRES_GRAPH_REPREPARATION"
                         )
                     ]
-                    pre_verification_failure = (
-                        _classify_grounded_execution_result(run_result)
-                    )
-                    if (
-                        pre_verification_failure.disposition == "NONE"
-                        and not delayed_reports
-                    ):
+                    pre_verification_failure = _classify_grounded_execution_result(run_result)
+                    if pre_verification_failure.disposition == "NONE" and not delayed_reports:
                         if branch_context is not None:
                             with branch_context.budget.stage("evidence"):
-                                verified = runtime_owner.kernel.verify_active(
-                                    branch
-                                )
+                                verified = runtime_owner.kernel.verify_active(branch)
                         elif budget is None:
-                            verified = runtime_owner.kernel.verify_active(
-                                branch
-                            )
+                            verified = runtime_owner.kernel.verify_active(branch)
                         else:
-                            with budget.stage(
-                                "evidence.parallel.%s" % query_id
-                            ):
-                                verified = runtime_owner.kernel.verify_active(
-                                    branch
-                                )
+                            with budget.stage("evidence.parallel.%s" % query_id):
+                                verified = runtime_owner.kernel.verify_active(branch)
                     else:
                         verified = VerifiedEvidence(passed=False)
                     replan_evidence = None
@@ -10232,9 +11155,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             with branch_context.lock:
                                 branch_context.status = "TERMINAL_BLOCKED"
                         result_status = (
-                            "ACCESS_DENIED"
-                            if failure.disposition == "SECURITY_TERMINAL"
-                            else "OPERATIONAL_FAILURE"
+                            "ACCESS_DENIED" if failure.disposition == "SECURITY_TERMINAL" else "OPERATIONAL_FAILURE"
                         )
                         result_code = failure.code
                     elif delayed_reports:
@@ -10243,9 +11164,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 branch_context.status = "FAILED"
                         result_status = "REPLAN_REQUIRED"
                         result_disposition = "RECOVERABLE_EXECUTION"
-                        result_code = (
-                            "TABLE_FRESHNESS_COVERAGE_INCOMPLETE"
-                        )
+                        result_code = "TABLE_FRESHNESS_COVERAGE_INCOMPLETE"
                         replan_evidence = _record_execution_graph_replan_evidence(
                             deep_session,
                             query_node_id=query_id,
@@ -10284,8 +11203,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             with branch_context.lock:
                                 branch_context.status = "CONTRACT_GAPPED"
                                 branch_context.last_gaps = [
-                                    gap.model_dump(by_alias=True)
-                                    for gap in verified.blocking_gaps
+                                    gap.model_dump(by_alias=True) for gap in verified.blocking_gaps
                                 ]
                         result_status = "REPLAN_REQUIRED"
                         result_code = failure.code
@@ -10298,18 +11216,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             details={
                                 "failureCodes": list(failure.codes),
                                 "message": failure.message,
-                                "blockingGaps": [
-                                    gap.model_dump(by_alias=True)
-                                    for gap in verified.blocking_gaps
-                                ],
+                                "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                                 "verificationPassed": False,
                             },
                             runtime_budget=budget,
                         )
                     artifact = (
-                        runtime_owner.kernel.latest_verified_query_artifact(
-                            branch
-                        )
+                        runtime_owner.kernel.latest_verified_query_artifact(branch)
                         if result_status == "VERIFIED"
                         else None
                     )
@@ -10348,9 +11261,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "queryId": query_id,
                             "status": "OPERATIONAL_FAILURE",
                             "code": exc.code,
-                            "failureDisposition": (
-                                "OPERATIONAL_TERMINAL"
-                            ),
+                            "failureDisposition": ("OPERATIONAL_TERMINAL"),
                             "branchBudget": exc.report,
                         },
                     )
@@ -10365,10 +11276,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         {
                             "queryId": query_id,
                             "status": (
-                                "ACCESS_DENIED"
-                                if failure.disposition
-                                == "SECURITY_TERMINAL"
-                                else "OPERATIONAL_FAILURE"
+                                "ACCESS_DENIED" if failure.disposition == "SECURITY_TERMINAL" else "OPERATIONAL_FAILURE"
                             ),
                             "code": failure.code,
                             "message": failure.message,
@@ -10405,9 +11313,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             ]
             if terminal_results:
                 security_terminal = any(
-                    item.get("failureDisposition")
-                    == "SECURITY_TERMINAL"
-                    for item in terminal_results
+                    item.get("failureDisposition") == "SECURITY_TERMINAL" for item in terminal_results
                 )
                 operational_failure = {
                     "code": (
@@ -10419,9 +11325,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         {
                             "queryId": item.get("queryId"),
                             "code": item.get("code"),
-                            "disposition": item.get(
-                                "failureDisposition"
-                            ),
+                            "disposition": item.get("failureDisposition"),
                             "message": item.get("message"),
                         }
                         for item in terminal_results
@@ -10432,13 +11336,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     if deep_session.execution_graph_replan_evidence:
                         deep_session.execution_graph_history.append(
                             {
-                                "status": (
-                                    "REPLAN_EVIDENCE_REVOKED_BY_TERMINAL_BATCH"
-                                ),
+                                "status": ("REPLAN_EVIDENCE_REVOKED_BY_TERMINAL_BATCH"),
                                 "evidence": [
-                                    _execution_graph_replan_evidence_report(
-                                        item
-                                    )
+                                    _execution_graph_replan_evidence_report(item)
                                     for item in deep_session.execution_graph_replan_evidence.values()
                                 ],
                             }
@@ -10446,20 +11346,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     deep_session.execution_graph_replan_evidence = {}
                     deep_session.execution_graph_revision_discovery_evidence_id = ""
                     deep_session.execution_graph_revision_discovery_evidence_ids = []
-                    deep_session.operational_failure = dict(
-                        operational_failure
-                    )
-                    deep_session.runtime.phase = (
-                        "SECURITY_BLOCKED"
-                        if security_terminal
-                        else "OPERATIONAL_FAILURE"
-                    )
+                    deep_session.operational_failure = dict(operational_failure)
+                    deep_session.runtime.phase = "SECURITY_BLOCKED" if security_terminal else "OPERATIONAL_FAILURE"
                     for query_id in query_ids:
-                        context = (
-                            deep_session.query_branch_contexts.get(
-                                query_id
-                            )
-                        )
+                        context = deep_session.query_branch_contexts.get(query_id)
                         if context is not None:
                             with context.lock:
                                 context.status = "TERMINAL_BLOCKED"
@@ -10476,21 +11366,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     item["resultArtifacts"] = []
                     item["replanEvidence"] = {}
                     if item.get("status") == "VERIFIED":
-                        item["status"] = (
-                            "CANCELLED_BY_TERMINAL_BATCH_FAILURE"
-                        )
-                results.sort(
-                    key=lambda item: query_ids.index(
-                        str(item.get("queryId") or "")
-                    )
-                )
+                        item["status"] = "CANCELLED_BY_TERMINAL_BATCH_FAILURE"
+                results.sort(key=lambda item: query_ids.index(str(item.get("queryId") or "")))
                 return json.dumps(
                     {
-                        "status": (
-                            "ACCESS_DENIED"
-                            if security_terminal
-                            else "OPERATIONAL_FAILURE"
-                        ),
+                        "status": ("ACCESS_DENIED" if security_terminal else "OPERATIONAL_FAILURE"),
                         "code": operational_failure["code"],
                         "adoptedArtifactIds": [],
                         "queries": results,
@@ -10521,10 +11401,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     affected_query_ids = [
                         query_id
                         for query_id in query_ids
-                        if any(
-                            branch_by_id.get(query_id) is branch
-                            for branch in successful_branches
-                        )
+                        if any(branch_by_id.get(query_id) is branch for branch in successful_branches)
                     ]
                     with deep_session.lock:
                         for query_id in affected_query_ids:
@@ -10538,26 +11415,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         evidence
                         for query_id in affected_query_ids
                         if (
-                            evidence
-                            := _record_execution_graph_replan_evidence(
+                            evidence := _record_execution_graph_replan_evidence(
                                 deep_session,
                                 query_node_id=query_id,
                                 trigger_kind="DATA_GAP",
                                 source_stage="DATASOURCE",
-                                code=(
-                                    "MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED"
-                                ),
+                                code=("MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED"),
                                 details={
-                                    "snapshotIssues": (
-                                        snapshot_postflight_issues
-                                    ),
+                                    "snapshotIssues": (snapshot_postflight_issues),
                                     "requiredCapability": (
                                         snapshot_requirement.model_dump(
                                             by_alias=True,
                                             mode="json",
                                         )
-                                        if snapshot_requirement
-                                        is not None
+                                        if snapshot_requirement is not None
                                         else {}
                                     ),
                                 },
@@ -10566,26 +11437,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         )
                     ]
                     for result in results:
-                        if result.get("queryId") not in set(
-                            affected_query_ids
-                        ):
+                        if result.get("queryId") not in set(affected_query_ids):
                             continue
                         result.update(
                             {
                                 "status": "REPLAN_REQUIRED",
-                                "code": (
-                                    "MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED"
-                                ),
+                                "code": ("MULTI_QUERY_SNAPSHOT_POSTFLIGHT_FAILED"),
                                 "queryArtifactId": "",
                                 "resultArtifacts": [],
                                 "replanEvidence": next(
                                     (
-                                        _execution_graph_replan_evidence_report(
-                                            evidence
-                                        )
+                                        _execution_graph_replan_evidence_report(evidence)
                                         for evidence in snapshot_replan_evidences
-                                        if evidence.source_query_node_id
-                                        == result.get("queryId")
+                                        if evidence.source_query_node_id == result.get("queryId")
                                     ),
                                     {},
                                 ),
@@ -10606,37 +11470,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "adoptedArtifactIds": [],
                             "queries": results,
                             "replanEvidenceSet": [
-                                _execution_graph_replan_evidence_report(
-                                    evidence
-                                )
+                                _execution_graph_replan_evidence_report(evidence)
                                 for evidence in snapshot_replan_evidences
                             ],
                             "replanEvidenceSetFingerprint": (
-                                grounded_execution_graph_replan_evidence_set_fingerprint(
-                                    snapshot_replan_evidences
-                                )
+                                grounded_execution_graph_replan_evidence_set_fingerprint(snapshot_replan_evidences)
                             ),
-                            "nextAction": (
-                                "REOPEN_GRAPH_FOR_SNAPSHOT_RECOVERY"
-                            ),
+                            "nextAction": ("REOPEN_GRAPH_FOR_SNAPSHOT_RECOVERY"),
                         },
                         ensure_ascii=False,
                         default=str,
                     )
-            result_by_query_id = {
-                str(item.get("queryId") or ""): item
-                for item in results
-            }
-            query_id_by_branch_identity = {
-                id(branch): query_id
-                for query_id, branch in branch_by_id.items()
-            }
+            result_by_query_id = {str(item.get("queryId") or ""): item for item in results}
+            query_id_by_branch_identity = {id(branch): query_id for query_id, branch in branch_by_id.items()}
 
             def authorize_population_before_adoption(
                 branch: GroundedRuntimeSession,
-                staged_artifacts: Sequence[
-                    GroundedVerifiedQueryArtifact
-                ],
+                staged_artifacts: Sequence[GroundedVerifiedQueryArtifact],
             ) -> bool:
                 query_id = query_id_by_branch_identity.get(
                     id(branch),
@@ -10646,26 +11496,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 if not query_id or result is None or not staged_artifacts:
                     return False
                 with deep_session.lock:
-                    population_reference = (
-                        deep_session.population_pre_execution_references.get(
-                            query_id
-                        )
-                    )
+                    population_reference = deep_session.population_pre_execution_references.get(query_id)
                 if population_reference is None:
                     # This branch has no upstream entity/result-set binding;
                     # its verified artifact is adopted normally.
                     return True
                 with deep_session.lock:
                     for artifact in staged_artifacts:
-                        deep_session.population_staged_query_artifacts[
-                            artifact.artifact_id
-                        ] = artifact.model_copy(deep=True)
-                try:
-                    result["populationPostGate"] = (
-                        runtime_owner._commit_population_node_post(
-                            deep_session,
-                            query_id,
+                        deep_session.population_staged_query_artifacts[artifact.artifact_id] = artifact.model_copy(
+                            deep=True
                         )
+                try:
+                    result["populationPostGate"] = runtime_owner._commit_population_node_post(
+                        deep_session,
+                        query_id,
                     )
                     return True
                 except RuntimeError as exc:
@@ -10678,20 +11522,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     result.update(
                         {
                             "status": "BLOCKED",
-                            "code": (
-                                "POPULATION_POST_RESULT_REJECTED"
-                            ),
+                            "code": ("POPULATION_POST_RESULT_REJECTED"),
                             "message": str(exc)[:500],
                             "queryArtifactId": "",
                             "resultArtifacts": [],
-                            "failureDisposition": (
-                                "OPERATIONAL_TERMINAL"
-                            ),
+                            "failureDisposition": ("OPERATIONAL_TERMINAL"),
                         }
                     )
-                    branch_context = (
-                        deep_session.query_branch_contexts.get(query_id)
-                    )
+                    branch_context = deep_session.query_branch_contexts.get(query_id)
                     if branch_context is not None:
                         with branch_context.lock:
                             branch_context.status = "TERMINAL_BLOCKED"
@@ -10701,40 +11539,29 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 adopted = runtime_owner.kernel.adopt_verified_branches(
                     deep_session.runtime,
                     successful_branches,
-                    pre_adoption_authorizer=(
-                        authorize_population_before_adoption
-                    ),
+                    pre_adoption_authorizer=(authorize_population_before_adoption),
                 )
             else:
                 adopted = runtime_owner.kernel.adopt_verified_branches(
                     deep_session.runtime,
                     successful_branches,
                 )
-            artifact_ids = {
-                artifact.artifact_id for artifact in adopted
-            }
+            artifact_ids = {artifact.artifact_id for artifact in adopted}
             population_accepted_artifact_ids = set(artifact_ids)
             with deep_session.lock:
-                for artifact_id in list(
-                    deep_session.population_staged_query_artifacts
-                ):
+                for artifact_id in list(deep_session.population_staged_query_artifacts):
                     if artifact_id in artifact_ids:
                         deep_session.population_staged_query_artifacts.pop(
                             artifact_id,
                             None,
                         )
             population_post_rejections = [
-                item
-                for item in results
-                if item.get("code")
-                == "POPULATION_POST_RESULT_REJECTED"
+                item for item in results if item.get("code") == "POPULATION_POST_RESULT_REJECTED"
             ]
             if population_post_rejections:
                 with deep_session.lock:
                     deep_session.operational_failure = {
-                        "code": (
-                            "POPULATION_POST_RESULT_REJECTED"
-                        ),
+                        "code": ("POPULATION_POST_RESULT_REJECTED"),
                         "failures": [
                             {
                                 "queryId": item.get("queryId"),
@@ -10755,12 +11582,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         )
                         if (
                             runtime_owner.population_gate_enforced
-                            and query_id
-                            in deep_session.population_pre_execution_references
+                            and query_id in deep_session.population_pre_execution_references
                         ):
-                            deep_session.population_artifact_query_node_ids[
-                                artifact_id
-                            ] = query_id
+                            deep_session.population_artifact_query_node_ids[artifact_id] = query_id
                         branch_context = deep_session.query_branch_contexts.get(query_id)
                         if branch_context is not None:
                             with branch_context.lock:
@@ -10789,27 +11613,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     )
                     for artifact in accepted_adopted
                 ]
-            replan_required = any(
-                item.get("status") == "REPLAN_REQUIRED"
-                for item in results
-            )
+            replan_required = any(item.get("status") == "REPLAN_REQUIRED" for item in results)
             batch_replan_evidence_ids = {
-                str(
-                    (item.get("replanEvidence") or {}).get(
-                        "evidenceId"
-                    )
-                    or ""
-                )
+                str((item.get("replanEvidence") or {}).get("evidenceId") or "")
                 for item in results
                 if isinstance(item.get("replanEvidence"), dict)
             }
             batch_replan_evidences = [
                 evidence
-                for evidence in _current_execution_graph_replan_evidence(
-                    deep_session
-                )
-                if evidence.evidence_id
-                in batch_replan_evidence_ids
+                for evidence in _current_execution_graph_replan_evidence(deep_session)
+                if evidence.evidence_id in batch_replan_evidence_ids
             ]
             return json.dumps(
                 {
@@ -10831,15 +11644,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "queries": results,
                     "replanRequired": replan_required,
                     "replanEvidenceSet": [
-                        _execution_graph_replan_evidence_report(
-                            evidence
-                        )
-                        for evidence in batch_replan_evidences
+                        _execution_graph_replan_evidence_report(evidence) for evidence in batch_replan_evidences
                     ],
                     "replanEvidenceSetFingerprint": (
-                        grounded_execution_graph_replan_evidence_set_fingerprint(
-                            batch_replan_evidences
-                        )
+                        grounded_execution_graph_replan_evidence_set_fingerprint(batch_replan_evidences)
                         if batch_replan_evidences
                         else ""
                     ),
@@ -11006,15 +11814,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 if not population_reference_active:
                     return True
                 with deep_session.lock:
-                    deep_session.population_staged_query_artifacts[
-                        artifact.artifact_id
-                    ] = artifact.model_copy(deep=True)
+                    deep_session.population_staged_query_artifacts[artifact.artifact_id] = artifact.model_copy(
+                        deep=True
+                    )
                 try:
-                    population_post = (
-                        runtime_owner._commit_population_node_post(
-                            deep_session,
-                            execution_session=session,
-                        )
+                    population_post = runtime_owner._commit_population_node_post(
+                        deep_session,
+                        execution_session=session,
                     )
                 except Exception:
                     with deep_session.lock:
@@ -11026,29 +11832,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return True
 
             def verify_serial() -> VerifiedEvidence:
-                if (
-                    runtime_owner.population_gate_enforced
-                    and population_reference_active
-                ):
+                if runtime_owner.population_gate_enforced and population_reference_active:
                     return runtime_owner.kernel.verify_active(
                         session,
-                        pre_ledger_authorizer=(
-                            authorize_serial_artifact
-                        ),
+                        pre_ledger_authorizer=(authorize_serial_artifact),
                     )
                 return runtime_owner.kernel.verify_active(session)
 
             try:
-                population_execution_kwargs = (
-                    runtime_owner._population_execution_kwargs(
-                        deep_session,
-                        session,
-                    )
+                population_execution_kwargs = runtime_owner._population_execution_kwargs(
+                    deep_session,
+                    session,
                 )
                 population_reference_active = bool(
-                    population_execution_kwargs.get(
-                        "population_pre_execution_reference"
-                    )
+                    population_execution_kwargs.get("population_pre_execution_reference")
                 )
                 budget = runtime.context.budget
                 if budget is not None:
@@ -11067,9 +11864,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             runtime_budget=budget,
                             **population_execution_kwargs,
                         )
-                execution_failure = (
-                    _classify_grounded_execution_result(run_result)
-                )
+                execution_failure = _classify_grounded_execution_result(run_result)
                 if execution_failure.disposition == "NONE":
                     if budget is None:
                         verified = verify_serial()
@@ -11088,9 +11883,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "code": "POPULATION_POST_RESULT_REJECTED",
                             "retryable": False,
                         }
-                        deep_session.runtime.phase = (
-                            "OPERATIONAL_FAILURE"
-                        )
+                        deep_session.runtime.phase = "OPERATIONAL_FAILURE"
                     return json.dumps(
                         {
                             "status": "BLOCKED",
@@ -11154,29 +11947,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 repair_review: dict[str, Any] = {}
                 recovery_evidence: Optional[GroundedExecutionGraphReplanEvidence] = None
 
-                def record_datasource_recovery() -> Optional[
-                    GroundedExecutionGraphReplanEvidence
-                ]:
+                def record_datasource_recovery() -> Optional[GroundedExecutionGraphReplanEvidence]:
                     query_node_id = ""
                     with deep_session.lock:
                         graph_receipt = deep_session.execution_graph_receipt
                         if graph_receipt is not None:
                             preparation = session.active_preparation
                             plan = getattr(preparation, "plan", None)
-                            intents = tuple(
-                                getattr(plan, "intents", ()) or ()
-                            )
+                            intents = tuple(getattr(plan, "intents", ()) or ())
                             if len(intents) == 1:
-                                query_node_id = str(
-                                    intents[0].plan_task_id or ""
-                                ).strip()
-                            if (
-                                not query_node_id
-                                and len(graph_receipt.node_ids) == 1
-                            ):
-                                query_node_id = next(
-                                    iter(graph_receipt.node_ids.values())
-                                )
+                                query_node_id = str(intents[0].plan_task_id or "").strip()
+                            if not query_node_id and len(graph_receipt.node_ids) == 1:
+                                query_node_id = next(iter(graph_receipt.node_ids.values()))
                         session.phase = "DATASOURCE_RECOVERY_REQUIRED"
                     if not query_node_id:
                         return None
@@ -11198,23 +11980,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     with deep_session.lock:
                         deep_session.operational_failure = {
                             "code": execution_failure.code,
-                            "failureDisposition": (
-                                execution_failure.disposition
-                            ),
+                            "failureDisposition": (execution_failure.disposition),
                             "retryable": False,
                         }
                         deep_session.runtime.phase = (
                             "SECURITY_BLOCKED"
-                            if execution_failure.disposition
-                            == "SECURITY_TERMINAL"
+                            if execution_failure.disposition == "SECURITY_TERMINAL"
                             else "OPERATIONAL_FAILURE"
                         )
                         deep_session.runtime.sql_execution_repair_context = {}
-                elif (
-                    execution_failure.disposition
-                    == "RECOVERABLE_EXECUTION"
-                    and not core_sql_mode
-                ):
+                elif execution_failure.disposition == "RECOVERABLE_EXECUTION" and not core_sql_mode:
                     # A datasource outage/resource error is retryable, but it
                     # is not a semantic binding error.  If this query belongs
                     # to a frozen graph, record a graph-scoped recovery trigger
@@ -11227,27 +12002,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     )
                     decision = str(repair_review.get("decision") or "")
                     with deep_session.lock:
-                        session.sql_execution_repair_context = dict(
-                            repair_review
-                        )
+                        session.sql_execution_repair_context = dict(repair_review)
                         if decision == "REPAIR_SQL":
-                            session.phase = (
-                                "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
-                            )
+                            session.phase = "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
                         elif decision == "REVISE_BINDINGS":
                             session.phase = "CORE_SQL_REPAIR_EXHAUSTED"
-                            contract_fingerprint = str(
-                                repair_review.get("contractFingerprint")
-                                or ""
-                            )
+                            contract_fingerprint = str(repair_review.get("contractFingerprint") or "")
                             if (
                                 contract_fingerprint
-                                and contract_fingerprint
-                                not in session.repair_exhausted_contract_fingerprints
+                                and contract_fingerprint not in session.repair_exhausted_contract_fingerprints
                             ):
-                                session.repair_exhausted_contract_fingerprints.append(
-                                    contract_fingerprint
-                                )
+                                session.repair_exhausted_contract_fingerprints.append(contract_fingerprint)
                         else:
                             # STOP_OPERATIONAL is a datasource availability
                             # classification, not an internal Harness failure.
@@ -11261,8 +12026,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 detail=(
                                     "%s:%s"
                                     % (
-                                        repair_review.get("category")
-                                        or "UNKNOWN",
+                                        repair_review.get("category") or "UNKNOWN",
                                         execution_failure.message,
                                     )
                                 )[:500],
@@ -11271,24 +12035,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         )
                     if decision == "STOP_OPERATIONAL":
                         recovery_evidence = record_datasource_recovery()
-                repair_decision = str(
-                    repair_review.get("decision") or ""
-                )
+                repair_decision = str(repair_review.get("decision") or "")
                 return json.dumps(
                     {
                         "status": (
                             "ACCESS_DENIED"
-                            if execution_failure.disposition
-                            == "SECURITY_TERMINAL"
+                            if execution_failure.disposition == "SECURITY_TERMINAL"
                             else "REPLAN_REQUIRED"
-                            if execution_failure.disposition
-                            == "RECOVERABLE_EXECUTION"
+                            if execution_failure.disposition == "RECOVERABLE_EXECUTION"
                             and not core_sql_mode
                             and recovery_evidence is not None
                             else "DATASOURCE_FAILURE"
-                            if execution_failure.disposition
-                            == "RECOVERABLE_EXECUTION"
-                            and not core_sql_mode
+                            if execution_failure.disposition == "RECOVERABLE_EXECUTION" and not core_sql_mode
                             else "OPERATIONAL_FAILURE"
                             if execution_failure.terminal
                             else "SQL_EXECUTION_REPAIR_REQUIRED"
@@ -11296,8 +12054,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             else "SQL_EXECUTION_REPAIR_EXHAUSTED"
                             if repair_decision == "REVISE_BINDINGS"
                             else "REPLAN_REQUIRED"
-                            if repair_decision == "STOP_OPERATIONAL"
-                            and recovery_evidence is not None
+                            if repair_decision == "STOP_OPERATIONAL" and recovery_evidence is not None
                             else "DATASOURCE_FAILURE"
                             if repair_decision == "STOP_OPERATIONAL"
                             else "EXECUTION_FAILED"
@@ -11312,21 +12069,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             "STOP"
                             if execution_failure.terminal
                             else "REOPEN_GRAPH_FOR_RECOVERY"
-                            if execution_failure.disposition
-                            == "RECOVERABLE_EXECUTION"
+                            if execution_failure.disposition == "RECOVERABLE_EXECUTION"
                             and not core_sql_mode
                             and recovery_evidence is not None
                             else "RETRY_LATER"
-                            if execution_failure.disposition
-                            == "RECOVERABLE_EXECUTION"
-                            and not core_sql_mode
+                            if execution_failure.disposition == "RECOVERABLE_EXECUTION" and not core_sql_mode
                             else "SUBMIT_GROUNDED_SQL_CANDIDATE"
                             if repair_decision == "REPAIR_SQL"
                             else "PROPOSE_GROUNDED_CONTRACT"
                             if repair_decision == "REVISE_BINDINGS"
                             else "REOPEN_GRAPH_FOR_RECOVERY"
-                            if repair_decision == "STOP_OPERATIONAL"
-                            and recovery_evidence is not None
+                            if repair_decision == "STOP_OPERATIONAL" and recovery_evidence is not None
                             else "RETRY_LATER"
                             if repair_decision == "STOP_OPERATIONAL"
                             else "REVISE_BINDINGS"
@@ -11334,22 +12087,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "message": execution_failure.message,
                         "repairReview": repair_review,
                         "replanEvidence": (
-                            _execution_graph_replan_evidence_report(
-                                recovery_evidence
-                            )
+                            _execution_graph_replan_evidence_report(recovery_evidence)
                             if recovery_evidence is not None
                             else {}
                         ),
                         "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                         "instruction": (
                             "Access denial is terminal for this request; do not alter SQL to bypass policy."
-                            if execution_failure.disposition
-                            == "SECURITY_TERMINAL"
+                            if execution_failure.disposition == "SECURITY_TERMINAL"
                             else "Stop: this failure is not a SQL/data recovery trigger."
                             if execution_failure.terminal
                             else str(
-                                repair_review.get("instruction")
-                                or "Revise the grounded bindings before retrying."
+                                repair_review.get("instruction") or "Revise the grounded bindings before retrying."
                             )
                         ),
                     },
@@ -11358,19 +12107,15 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
             with deep_session.lock:
                 session.sql_execution_repair_context = {}
-            verification_failure = (
-                _classify_grounded_execution_result(
-                    run_result,
-                    verified,
-                )
+            verification_failure = _classify_grounded_execution_result(
+                run_result,
+                verified,
             )
             if verification_failure.terminal:
                 with deep_session.lock:
                     deep_session.operational_failure = {
                         "code": verification_failure.code,
-                        "failureDisposition": (
-                            verification_failure.disposition
-                        ),
+                        "failureDisposition": (verification_failure.disposition),
                         "retryable": False,
                     }
                     deep_session.runtime.phase = "OPERATIONAL_FAILURE"
@@ -11378,9 +12123,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     {
                         "status": "OPERATIONAL_FAILURE",
                         "code": verification_failure.code,
-                        "failureDisposition": (
-                            verification_failure.disposition
-                        ),
+                        "failureDisposition": (verification_failure.disposition),
                         "message": verification_failure.message,
                         "nextAction": "STOP",
                     },
@@ -11396,15 +12139,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         plan = getattr(preparation, "plan", None)
                         intents = tuple(getattr(plan, "intents", ()) or ())
                         if len(intents) == 1:
-                            query_node_id = str(
-                                intents[0].plan_task_id or ""
-                            ).strip()
-                        if not query_node_id and len(
-                            graph_receipt.node_ids
-                        ) == 1:
-                            query_node_id = next(
-                                iter(graph_receipt.node_ids.values())
-                            )
+                            query_node_id = str(intents[0].plan_task_id or "").strip()
+                        if not query_node_id and len(graph_receipt.node_ids) == 1:
+                            query_node_id = next(iter(graph_receipt.node_ids.values()))
                 if query_node_id:
                     replan_evidence = _record_execution_graph_replan_evidence(
                         deep_session,
@@ -11413,14 +12150,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         source_stage="DATASOURCE",
                         code=verification_failure.code,
                         details={
-                            "failureCodes": list(
-                                verification_failure.codes
-                            ),
+                            "failureCodes": list(verification_failure.codes),
                             "message": verification_failure.message,
-                            "blockingGaps": [
-                                gap.model_dump(by_alias=True)
-                                for gap in verified.blocking_gaps
-                            ],
+                            "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                             "verificationPassed": False,
                         },
                         runtime_budget=runtime.context.budget,
@@ -11431,14 +12163,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "code": verification_failure.code,
                         "failureDisposition": "EVIDENCE_GAPPED",
                         "message": verification_failure.message,
-                        "blockingGaps": [
-                            gap.model_dump(by_alias=True)
-                            for gap in verified.blocking_gaps
-                        ],
+                        "blockingGaps": [gap.model_dump(by_alias=True) for gap in verified.blocking_gaps],
                         "replanEvidence": (
-                            _execution_graph_replan_evidence_report(
-                                replan_evidence
-                            )
+                            _execution_graph_replan_evidence_report(replan_evidence)
                             if replan_evidence is not None
                             else {}
                         ),
@@ -11486,13 +12213,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     )
                     deep_session.artifact_goal_ids[query_artifact.artifact_id] = list(deep_session.active_goal_ids)
                     if runtime_owner.population_gate_enforced:
-                        population_query_node_id = str(
-                            population_post.get("queryNodeId") or ""
-                        ).strip()
+                        population_query_node_id = str(population_post.get("queryNodeId") or "").strip()
                         if population_query_node_id:
-                            deep_session.population_artifact_query_node_ids[
-                                query_artifact.artifact_id
-                            ] = population_query_node_id
+                            deep_session.population_artifact_query_node_ids[query_artifact.artifact_id] = (
+                                population_query_node_id
+                            )
             return json.dumps(
                 {
                     "status": "VERIFIED" if verified.passed else "VERIFICATION_GAPPED",
@@ -11503,8 +12228,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             by_alias=True,
                             mode="json",
                         )
-                        if query_artifact is not None
-                        and query_artifact.trusted_descriptor is not None
+                        if query_artifact is not None and query_artifact.trusted_descriptor is not None
                         else {}
                     ),
                     "populationPostGate": population_post,
@@ -11559,9 +12283,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 return json.dumps(
                     {
                         "status": "REJECTED",
-                        "code": (
-                            "POPULATION_POST_ATTESTATION_REQUIRED"
-                        ),
+                        "code": ("POPULATION_POST_ATTESTATION_REQUIRED"),
                         "nextAction": "STOP",
                     },
                     ensure_ascii=False,
@@ -11798,10 +12520,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     }
                 )
                 artifact_by_id = {
-                    artifact.artifact_id: artifact
-                    for artifact in _authorized_verified_query_artifacts(
-                        deep_session
-                    )
+                    artifact.artifact_id: artifact for artifact in _authorized_verified_query_artifacts(deep_session)
                 }
                 time_scope_fingerprint = _stable_json_fingerprint(
                     [
@@ -12078,9 +12797,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 runtime.context.session.question_goal_contract,
                 goal_coverage,
                 answer,
-                _authorized_verified_query_artifacts(
-                    runtime.context.session
-                ),
+                _authorized_verified_query_artifacts(runtime.context.session),
             )
             answer = rendered.answer_markdown
             if rule_answer_span and rule_answer_span not in answer:
@@ -12088,12 +12805,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             state.answer = answer
             state.answer_rule_artifact_ids = list(verified_rule_artifact_ids)
             bindings = list(rendered.bindings)
-            for analysis_artifact in _latest_verified_analysis_artifacts(
-                runtime.context.session
-            ):
-                analysis_render = render_grounded_analysis_artifact(
-                    analysis_artifact
-                )
+            for analysis_artifact in _latest_verified_analysis_artifacts(runtime.context.session):
+                analysis_render = render_grounded_analysis_artifact(analysis_artifact)
                 if analysis_render.answer_markdown not in answer:
                     answer = "\n\n".join(
                         item
@@ -12243,15 +12956,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 {
                     "status": "SKILL_INPUT_SNAPSHOT_READY",
                     "reason": str(reason or "")[:500],
-                    "skillInputSnapshotGeneration": (
-                        deep_session.skill_input_snapshot_generation
-                    ),
+                    "skillInputSnapshotGeneration": (deep_session.skill_input_snapshot_generation),
                     "verifiedQueryArtifactIds": artifact_ids,
                     "skillInputArtifactIds": list(
                         (
                             analysis_gate.verified_input_artifact_ids
-                            if analysis_gate is not None
-                            and analysis_gate.verified_input_artifact_ids
+                            if analysis_gate is not None and analysis_gate.verified_input_artifact_ids
                             else artifact_ids
                         )
                     ),
@@ -12266,9 +12976,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "tables": list(run_result.merged_query_bundle.tables),
                     "availableAnalysisSkillHeaders": list(runtime_owner.skill_headers),
                     "queryCollectionClosed": False,
-                    "nextAction": (
-                        "RUN_MATCHING_SKILL_CONTINUE_QUERYING_OR_COMPOSE"
-                    ),
+                    "nextAction": ("RUN_MATCHING_SKILL_CONTINUE_QUERYING_OR_COMPOSE"),
                 },
                 ensure_ascii=False,
                 default=str,
@@ -12289,8 +12997,462 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     else GroundedSubagentDispatchPlan.model_validate(plan)
                 ),
                 execute_branch_tool=execute_grounded_query_batch,
+                query_data_tool=query_data,
             )
             return json.dumps(result, ensure_ascii=False, default=str)
+
+        def query_caller_id(
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            return "core:%s:%s" % (
+                str(runtime.context.thread_id or "").strip(),
+                str(runtime.context.run_id or "").strip(),
+            )
+
+        def active_contract_receipt(
+            request: QueryRequest,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> Optional[dict[str, Any]]:
+            repair_receipt = request.repair_receipt
+            if repair_receipt is None or repair_receipt.stage not in {
+                "SQL_GENERATION",
+                "SQL_VALIDATION",
+                "EXECUTION",
+            }:
+                return None
+            active = runtime.context.session.runtime.active_contract
+            if active is None:
+                return None
+            active_fingerprint = grounded_query_contract_fingerprint(active)
+            if repair_receipt.contract_fingerprint and repair_receipt.contract_fingerprint != active_fingerprint:
+                return None
+            session = runtime.context.session.runtime
+            return {
+                "status": "READY",
+                "activated": True,
+                "executionMode": _enum_value(session.active_execution_mode),
+                "activeGeneration": session.active_generation,
+                "contractFingerprint": active_fingerprint,
+                "sqlObligations": _grounded_contract_sql_obligations(active),
+                "assignedGoalIds": list(runtime.context.session.active_goal_ids),
+                "resumedFromRepairReceipt": repair_receipt.receipt_id,
+            }
+
+        def build_serial_query_backend(
+            request: QueryRequest,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> LegacyGroundedQueryBackend:
+            def prepare_contract(
+                current: QueryRequest,
+            ) -> Mapping[str, Any]:
+                resumed = active_contract_receipt(current, runtime)
+                if resumed is not None:
+                    return resumed
+                return json.loads(
+                    propose_grounded_contract.func(
+                        read_ref_ids=current.read_ref_ids,
+                        binding_hints=current.binding_hints,
+                        goal_ids=current.goal_ids,
+                        runtime=runtime,
+                    )
+                )
+
+            def execute_compiled(
+                current: QueryRequest,
+            ) -> Mapping[str, Any]:
+                return json.loads(
+                    execute_grounded_query.func(
+                        reason=(current.reason or "query_data executes the validated Contract"),
+                        runtime=runtime,
+                    )
+                )
+
+            def submit_sql(
+                current: QueryRequest,
+                candidate: QuerySqlCandidate,
+                prepared: Mapping[str, Any],
+            ) -> Mapping[str, Any]:
+                return json.loads(
+                    submit_grounded_sql_candidate.func(
+                        sql=candidate.sql,
+                        expected_generation=int(prepared.get("activeGeneration") or 0),
+                        contract_fingerprint=str(prepared.get("contractFingerprint") or ""),
+                        rationale=candidate.rationale,
+                        evidence_ref_ids=(candidate.evidence_ref_ids or current.read_ref_ids),
+                        runtime=runtime,
+                    )
+                )
+
+            def repair_sql(
+                current: QueryRequest,
+                result: QueryAttemptResult,
+                repair_number: int,
+            ) -> Optional[QuerySqlCandidate]:
+                return runtime_owner._repair_query_sql_candidate(
+                    runtime.context,
+                    current,
+                    result,
+                    repair_number=repair_number,
+                )
+
+            return LegacyGroundedQueryBackend(
+                prepare_contract=prepare_contract,
+                execute_compiled=execute_compiled,
+                submit_sql=submit_sql,
+                repair_sql=(repair_sql if runtime_owner.internal_sql_repair_enabled else None),
+            )
+
+        @tool("query_data")
+        def query_data(
+            request: QueryRequest,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Execute one governed query and return a verified artifact or Observation."""
+
+            normalized = request if isinstance(request, QueryRequest) else QueryRequest.model_validate(request)
+            normalized = _normalize_goal_prefetched_query_request(
+                runtime.context.session,
+                normalized,
+            )
+            normalized = _normalize_scalar_metric_query_request(
+                runtime.context.session,
+                normalized,
+            )
+            normalized = _augment_batch_query_request_semantic_refs(normalized)
+            outcome = runtime_owner.governed_query_service.execute(
+                normalized,
+                backend=build_serial_query_backend(normalized, runtime),
+                caller_id=query_caller_id(runtime),
+            )
+            _record_governed_query_branch_outcome(
+                runtime.context.session,
+                normalized,
+                outcome,
+            )
+            if outcome.status == QueryOutcomeStatus.VERIFIED:
+                with runtime.context.session.lock:
+                    runtime.context.session.latest_query_batch_observations = []
+            core_observation = outcome.to_core_observation()
+            return json.dumps(
+                core_observation.model_dump(by_alias=True, mode="json"),
+                ensure_ascii=False,
+                default=str,
+            )
+
+        def query_batch_outcome(
+            outcomes: Sequence[QueryOutcome],
+        ) -> QueryBatchOutcome:
+            verified = sum(item.status == QueryOutcomeStatus.VERIFIED for item in outcomes)
+            denied = sum(item.status == QueryOutcomeStatus.DENIED for item in outcomes)
+            needs_reasoning = sum(item.status == QueryOutcomeStatus.NEEDS_REASONING for item in outcomes)
+            failed = sum(item.status == QueryOutcomeStatus.FAILED for item in outcomes)
+            return QueryBatchOutcome(
+                status=(
+                    "VERIFIED"
+                    if verified == len(outcomes)
+                    else "PARTIAL"
+                    if verified
+                    else "DENIED"
+                    if denied == len(outcomes)
+                    else "NEEDS_REASONING"
+                    if needs_reasoning
+                    else "FAILED"
+                ),
+                outcomes=list(outcomes),
+                verified_count=verified,
+                denied_count=denied,
+                needs_reasoning_count=needs_reasoning,
+                failed_count=failed,
+            )
+
+        @tool("query_batch")
+        def query_batch(
+            requests: list[QueryRequest],
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Prepare and execute mutually independent governed queries concurrently."""
+
+            normalized = [
+                item if isinstance(item, QueryRequest) else QueryRequest.model_validate(item) for item in requests
+            ]
+            normalized = [
+                _normalize_goal_prefetched_query_request(
+                    runtime.context.session,
+                    item,
+                )
+                for item in normalized
+            ]
+            normalized = [
+                _normalize_scalar_metric_query_request(
+                    runtime.context.session,
+                    item,
+                )
+                for item in normalized
+            ]
+            normalized = [_augment_batch_query_request_semantic_refs(item) for item in normalized]
+            query_ids = [item.query_id for item in normalized]
+            if not normalized or len(set(query_ids)) != len(query_ids):
+                return json.dumps(
+                    {
+                        "status": "REJECTED",
+                        "summary": (
+                            "query_batch requires at least one request"
+                            if not normalized
+                            else "query_batch requires unique queryId values"
+                        ),
+                        "decisionMode": "CALLER_REACT",
+                        "branches": [],
+                        "outcomes": [],
+                        "verifiedCount": 0,
+                        "deniedCount": 0,
+                        "needsReasoningCount": 0,
+                        "failedCount": len(normalized),
+                        "code": ("QUERY_BATCH_EMPTY" if not normalized else "QUERY_BATCH_ID_DUPLICATE"),
+                    },
+                    ensure_ascii=False,
+                )
+            prepared_payload = json.loads(
+                prepare_grounded_query_batch.func(
+                    queries=[
+                        GroundedParallelQuerySpec(
+                            query_id=item.query_id,
+                            semantic_paths=item.semantic_paths,
+                            read_ref_ids=item.read_ref_ids,
+                            binding_hints=item.binding_hints,
+                            goal_ids=item.goal_ids,
+                        )
+                        for item in normalized
+                    ],
+                    runtime=runtime,
+                )
+            )
+            prepared_items = {
+                str(item.get("queryId") or ""): dict(item)
+                for item in prepared_payload.get("queries") or []
+                if isinstance(item, Mapping)
+            }
+            caller_id = query_caller_id(runtime)
+            outcomes_by_id: dict[str, QueryOutcome] = {}
+            prepared_requests: list[QueryRequest] = []
+            for item in normalized:
+                payload = prepared_items.get(item.query_id) or {
+                    "status": "BLOCKED",
+                    "code": "QUERY_BATCH_PREPARATION_MISSING",
+                }
+                if str(payload.get("status") or "").upper() == "PREPARED":
+                    prepared_requests.append(item)
+                    continue
+                attempt = classify_legacy_query_payload(
+                    item,
+                    payload,
+                    stage="CONTRACT",
+                )
+                outcomes_by_id[item.query_id] = runtime_owner.governed_query_service.outcome_from_attempt(
+                    item,
+                    attempt,
+                    caller_id=caller_id,
+                )
+
+            def execute_one_batch_branch(
+                current: QueryRequest,
+                candidate: Optional[QuerySqlCandidate],
+            ) -> Mapping[str, Any]:
+                execution_payload = json.loads(
+                    execute_grounded_query_batch.func(
+                        queries=[
+                            GroundedParallelExecutionSpec(
+                                query_id=current.query_id,
+                                sql=(candidate.sql if candidate is not None else ""),
+                                rationale=(candidate.rationale if candidate is not None else current.reason),
+                                evidence_ref_ids=(
+                                    candidate.evidence_ref_ids
+                                    if candidate is not None and candidate.evidence_ref_ids
+                                    else current.read_ref_ids
+                                ),
+                            )
+                        ],
+                        reason=("query_batch executes one independent governed branch"),
+                        runtime=runtime,
+                    )
+                )
+                branch_payload = next(
+                    (
+                        dict(raw)
+                        for raw in execution_payload.get("queries") or []
+                        if isinstance(raw, Mapping) and str(raw.get("queryId") or "") == current.query_id
+                    ),
+                    None,
+                )
+                return branch_payload or {
+                    "status": execution_payload.get("status") or "FAILED",
+                    "code": execution_payload.get("code") or "QUERY_BATCH_EXECUTION_MISSING",
+                    "message": execution_payload.get("message") or "",
+                    "failureDisposition": execution_payload.get("failureDisposition") or "",
+                }
+
+            def build_prepared_batch_backend(
+                item: QueryRequest,
+            ) -> LegacyGroundedQueryBackend:
+                prepared = {
+                    **prepared_items[item.query_id],
+                    "activated": True,
+                }
+                branch_context = runtime.context.session.query_branch_contexts.get(item.query_id)
+                branch_contract = (
+                    branch_context.runtime.active_contract
+                    if branch_context is not None and branch_context.runtime is not None
+                    else None
+                )
+
+                def repair_sql(
+                    current: QueryRequest,
+                    result: QueryAttemptResult,
+                    repair_number: int,
+                ) -> Optional[QuerySqlCandidate]:
+                    return runtime_owner._repair_query_sql_candidate(
+                        runtime.context,
+                        current,
+                        result,
+                        repair_number=repair_number,
+                        contract_override=branch_contract,
+                    )
+
+                return LegacyGroundedQueryBackend(
+                    prepare_contract=lambda current: prepared,
+                    execute_compiled=lambda current: execute_one_batch_branch(
+                        current,
+                        None,
+                    ),
+                    submit_sql=lambda current, candidate, prepared_payload: execute_one_batch_branch(
+                        current, candidate
+                    ),
+                    repair_sql=(repair_sql if runtime_owner.internal_sql_repair_enabled else None),
+                )
+
+            if prepared_requests:
+                executed = runtime_owner.governed_query_service.execute_batch(
+                    prepared_requests,
+                    backend_factory=build_prepared_batch_backend,
+                    caller_id=caller_id,
+                )
+                outcomes_by_id.update({item.query_id: item for item in executed.outcomes})
+            outcomes = [outcomes_by_id[item.query_id] for item in normalized]
+            for item, outcome in zip(normalized, outcomes):
+                _record_governed_query_branch_outcome(
+                    runtime.context.session,
+                    item,
+                    outcome,
+                )
+            with runtime.context.session.lock:
+                runtime.context.session.latest_query_batch_observations = [
+                    outcome.to_core_observation().model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                    for outcome in outcomes
+                    if outcome.status != QueryOutcomeStatus.VERIFIED
+                ]
+            batch_outcome = query_batch_outcome(outcomes)
+            return json.dumps(
+                batch_outcome.to_core_observation().model_dump(
+                    by_alias=True,
+                    mode="json",
+                ),
+                ensure_ascii=False,
+                default=str,
+            )
+
+        @tool("load_skill")
+        def load_skill(
+            skill_name: str,
+            reason: str,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Load one short Skill into the current Core ReAct context."""
+
+            deep_session = runtime.context.session
+            normalized_name = _normalized_skill_name(skill_name)
+            known_header = next(
+                (item for item in runtime_owner.skill_headers if item.get("name") == normalized_name),
+                None,
+            )
+            if (
+                known_header is None
+                or not deep_session.analysis_skill_headers_disclosed
+                or deep_session.skill_input_snapshot_generation <= 0
+            ):
+                return json.dumps(
+                    {
+                        "status": "SKILL_NOT_DISCLOSED",
+                        "skillName": normalized_name,
+                        "nextAction": "FINALIZE_EVIDENCE_COLLECTION",
+                    },
+                    ensure_ascii=False,
+                )
+            skill_dir = runtime_owner._skill_directory(normalized_name)
+            if skill_dir is None:
+                return json.dumps(
+                    {
+                        "status": "SKILL_NOT_FOUND",
+                        "skillName": normalized_name,
+                    },
+                    ensure_ascii=False,
+                )
+            metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
+            execution_mode = str(
+                metadata.get("executionMode") or metadata.get("execution_mode") or "structured_renderer"
+            ).strip()
+            placement_policy = (
+                str(metadata.get("executionPlacement") or metadata.get("execution_placement") or "AUTO").strip().upper()
+            )
+            requires_isolation = str(
+                metadata.get("requiresIsolation") or metadata.get("requires_isolation") or "false"
+            ).strip().lower() in {"true", "1", "yes"}
+            if execution_mode == "python_script" or placement_policy == "SUBAGENT" or requires_isolation:
+                return json.dumps(
+                    {
+                        "status": "SKILL_REQUIRES_SUBAGENT",
+                        "skillName": normalized_name,
+                        "executionMode": execution_mode,
+                        "nextAction": "RUN_SKILL",
+                        "decisionAuthority": "HARNESS_RESOURCE_GUARD",
+                    },
+                    ensure_ascii=False,
+                )
+            procedure = _load_core_skill_procedure(
+                skill_dir / "SKILL.md",
+                max_chars=6000,
+            )
+            if not procedure:
+                return json.dumps(
+                    {
+                        "status": "SKILL_REQUIRES_SUBAGENT",
+                        "skillName": normalized_name,
+                        "nextAction": "RUN_SKILL",
+                        "decisionAuthority": "HARNESS_CONTEXT_GUARD",
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "status": "CORE_SKILL_LOADED",
+                    "skillName": normalized_name,
+                    "reason": str(reason or "")[:500],
+                    "procedure": procedure,
+                    "verifiedInputArtifactIds": (runtime_owner._selected_skill_artifact_ids(deep_session)),
+                    "executionPlacement": "CORE",
+                    "decisionAuthority": "CORE_AGENT_WITH_HARNESS_GUARDS",
+                    "queryMutationAllowed": False,
+                    "countsAsGoalCoverage": False,
+                    "instruction": (
+                        "Apply this bounded procedure in the current ReAct context "
+                        "using only verified artifacts. Use run_skill instead when a "
+                        "formal verified analysis artifact is required."
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
 
         @tool("run_skill")
         def run_skill(
@@ -12374,7 +13536,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 ensure_ascii=False,
             )
 
-        return [
+        built_tools = [
             declare_original_question_goals,
             propose_grounded_execution_graph,
             reopen_grounded_execution_graph_discovery,
@@ -12382,19 +13544,94 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             retrieve_knowledge,
             publish_verified_rule_evidence,
             compose_verified_rule_answer,
-            propose_grounded_contract,
-            prepare_grounded_query_batch,
-            submit_grounded_sql_candidate,
-            execute_grounded_query,
-            execute_grounded_query_batch,
             publish_verified_entity_set,
             delegate_grounded_tasks,
             delegate_grounded_exploration,
             finalize_evidence_collection,
             compose_verified_answer,
+            load_skill,
             run_skill,
             ask_human,
         ]
+        if getattr(self, "governed_query_facade_enabled", True):
+            built_tools.extend([query_data, query_batch])
+        if getattr(self, "legacy_query_tools_visible", True):
+            built_tools.extend(
+                [
+                    propose_grounded_contract,
+                    prepare_grounded_query_batch,
+                    submit_grounded_sql_candidate,
+                    execute_grounded_query,
+                    execute_grounded_query_batch,
+                ]
+            )
+        return built_tools
+
+    def _repair_query_sql_candidate(
+        self,
+        context: GroundedDeepAgentRunContext,
+        request: QueryRequest,
+        result: QueryAttemptResult,
+        *,
+        repair_number: int,
+        contract_override: Optional[GroundedQueryContract] = None,
+    ) -> Optional[QuerySqlCandidate]:
+        current = request.sql_candidate
+        contract = contract_override or context.session.runtime.active_contract
+        if current is None or contract is None:
+            return None
+        repair_payload = {
+            "instruction": (
+                "Repair only the SQL implementation. Preserve the exact Contract semantics, "
+                "tables, outputs, filters, grouping, ordering and limits. Do not add merchant "
+                "or tenant literals; the runtime injects them. Return one JSON object with sql "
+                "and rationale only."
+            ),
+            "repairNumber": repair_number,
+            "currentSql": current.sql,
+            "failure": {
+                "stage": result.stage,
+                "code": result.code,
+                "message": result.message,
+                "gaps": result.gaps,
+                "diagnostics": result.diagnostics,
+            },
+            "sqlObligations": _grounded_contract_sql_obligations(contract),
+            "contract": _compact_json_value(contract.model_dump(by_alias=True, mode="json")),
+        }
+        messages = [
+            SystemMessage(
+                content=(
+                    "You are a bounded Doris SQL repair worker inside a governed query tool. "
+                    "Never change business semantics or access scope. Output strict JSON only."
+                )
+            ),
+            HumanMessage(
+                content=json.dumps(
+                    repair_payload,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            ),
+        ]
+        try:
+            budget = context.budget
+            if budget is None:
+                response = self._model.invoke(messages)
+            else:
+                budget.consume_llm_call(name="query_data.sql_repair.%d" % repair_number)
+                with budget.stage("llm.query_data_sql_repair"):
+                    response = self._model.invoke(messages)
+        except GroundedRuntimeBudgetExceeded:
+            raise
+        except Exception:
+            return None
+        repaired = _parse_query_sql_repair(response)
+        if repaired is None or repaired.sql == current.sql:
+            return None
+        return repaired.model_copy(
+            update={"evidence_ref_ids": (repaired.evidence_ref_ids or current.evidence_ref_ids or request.read_ref_ids)}
+        )
 
     def _dispatch_grounded_subagent_tasks(
         self,
@@ -12402,12 +13639,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         *,
         plan: GroundedSubagentDispatchPlan,
         execute_branch_tool: Any,
+        query_data_tool: Any = None,
     ) -> dict[str, Any]:
         """Issue exact task grants and run optional isolation chosen by Core.
 
         This is intentionally a runtime primitive rather than a business
-        workflow.  Query nodes remain kernel-owned no-LLM branches; the one
-        optional query capability only re-enters an already prepared branch.
+        workflow. Query nodes remain kernel-owned no-LLM branches. A task may
+        also receive the same governed query_data facade in an isolated run.
         """
 
         session = context.session
@@ -12433,12 +13671,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "code": "SUBAGENT_TASK_BATCH_TOO_LARGE",
                 "maxTasks": self.subagent_max_tasks_per_dispatch,
             }
-        sub_goal_ids = [
-            str(item.sub_goal_id or "").strip() for item in normalized_tasks
-        ]
-        if any(not item for item in sub_goal_ids) or len(set(sub_goal_ids)) != len(
-            sub_goal_ids
-        ):
+        sub_goal_ids = [str(item.sub_goal_id or "").strip() for item in normalized_tasks]
+        if any(not item for item in sub_goal_ids) or len(set(sub_goal_ids)) != len(sub_goal_ids):
             return {
                 "status": "REJECTED",
                 "code": "SUBAGENT_SUB_GOAL_ID_INVALID",
@@ -12465,17 +13699,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             }
         parent_goal_ids = set(session.question_goal_contract.goal_map())
         unknown_parent_bindings = {
-            item.sub_goal_id: [
-                goal_id
-                for goal_id in item.parent_goal_ids
-                if goal_id not in parent_goal_ids
-            ]
+            item.sub_goal_id: [goal_id for goal_id in item.parent_goal_ids if goal_id not in parent_goal_ids]
             for item in normalized_tasks
         }
         unknown_parent_bindings = {
-            sub_goal_id: goal_ids
-            for sub_goal_id, goal_ids in unknown_parent_bindings.items()
-            if goal_ids
+            sub_goal_id: goal_ids for sub_goal_id, goal_ids in unknown_parent_bindings.items() if goal_ids
         }
         if unknown_parent_bindings:
             return {
@@ -12485,9 +13713,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             }
         with session.lock:
             already_dispatched = sum(
-                len(item.get("tasks") or [])
-                for item in session.subagent_dispatches
-                if isinstance(item, dict)
+                len(item.get("tasks") or []) for item in session.subagent_dispatches if isinstance(item, dict)
             )
             latest_generations: dict[str, int] = {}
             for dispatch in session.subagent_dispatches:
@@ -12495,15 +13721,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     if not isinstance(outcome, dict):
                         continue
                     sub_goal_id = str(
-                        outcome.get("subGoalId")
-                        or (outcome.get("grant") or {}).get("subGoalId")
-                        or ""
+                        outcome.get("subGoalId") or (outcome.get("grant") or {}).get("subGoalId") or ""
                     ).strip()
-                    generation = int(
-                        outcome.get("generation")
-                        or (outcome.get("grant") or {}).get("generation")
-                        or 0
-                    )
+                    generation = int(outcome.get("generation") or (outcome.get("grant") or {}).get("generation") or 0)
                     if sub_goal_id:
                         latest_generations[sub_goal_id] = max(
                             latest_generations.get(sub_goal_id, 0),
@@ -12541,9 +13761,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         query_tasks = [
             item
             for item in normalized_tasks
-            if "QUERY_BRANCH" in set(item.allowed_capabilities)
+            if set(item.allowed_capabilities).intersection({"QUERY_DATA", "QUERY_BRANCH"})
         ]
-        if plan.parallel and query_tasks and len(normalized_tasks) > 1:
+        if (
+            plan.parallel
+            and any("QUERY_BRANCH" in set(item.allowed_capabilities) for item in query_tasks)
+            and len(normalized_tasks) > 1
+        ):
             return {
                 "status": "REJECTED",
                 "code": "PARALLEL_QUERY_SUBAGENT_DISPATCH_DENIED",
@@ -12563,6 +13787,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         context,
                         task=task,
                         execute_branch_tool=execute_branch_tool,
+                        query_data_tool=query_data_tool,
                     )
                 )
             except (RuntimeError, ValueError) as exc:
@@ -12586,21 +13811,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             parallel=bool(plan.parallel),
             max_workers=self.subagent_max_tasks_per_dispatch,
         )
-        outcome_payloads = [
-            item.model_dump(by_alias=True, mode="json") for item in outcomes
-        ]
+        outcome_payloads = [item.model_dump(by_alias=True, mode="json") for item in outcomes]
         completed_count = sum(item.status == "COMPLETED" for item in outcomes)
         dispatch_record = {
             "dispatchId": "subdispatch_%s" % uuid.uuid4().hex[:16],
             "parallel": bool(plan.parallel),
             "reason": str(plan.reason or "")[:500],
-            "status": (
-                "COMPLETED"
-                if completed_count == len(outcomes)
-                else "PARTIAL"
-                if completed_count
-                else "FAILED"
-            ),
+            "status": ("COMPLETED" if completed_count == len(outcomes) else "PARTIAL" if completed_count else "FAILED"),
             "tasks": outcome_payloads,
         }
         with session.lock:
@@ -12623,19 +13840,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         *,
         task: GroundedSubagentGoalContract,
         execute_branch_tool: Any,
+        query_data_tool: Any = None,
     ) -> PreparedIsolatedSubagentTask:
         session = context.session
         capabilities = list(dict.fromkeys(task.allowed_capabilities))
         capability_set = set(capabilities)
         if not capability_set:
             raise ValueError("SUBAGENT_CAPABILITY_REQUIRED")
-        if any(
-            not str(item or "").strip() for item in task.required_outputs
-        ):
+        if any(not str(item or "").strip() for item in task.required_outputs):
             raise ValueError("SUBAGENT_REQUIRED_OUTPUT_INVALID")
         if any(
-            not str(item.requirement_id or "").strip()
-            or not str(item.description or "").strip()
+            not str(item.requirement_id or "").strip() or not str(item.description or "").strip()
             for item in task.evidence_requirements
         ):
             raise ValueError("SUBAGENT_EVIDENCE_REQUIREMENT_INVALID")
@@ -12643,8 +13858,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             raise ValueError("QUERY_BRANCH_CAPABILITY_MUST_BE_ISOLATED")
         if task.query_branch_ids and "QUERY_BRANCH" not in capability_set:
             raise ValueError("QUERY_BRANCH_IDS_WITHOUT_CAPABILITY")
-        if task.skill_names:
-            raise ValueError("ADVISORY_SKILL_CAPABILITY_DISABLED")
+        if "QUERY_DATA" in capability_set and query_data_tool is None:
+            raise ValueError("QUERY_DATA_TOOL_UNAVAILABLE")
+        if "QUERY_DATA" in capability_set and "READ_CONTEXT" not in capability_set:
+            raise ValueError("QUERY_DATA_REQUIRES_READ_CONTEXT")
+        if len(task.skill_names) > 1:
+            raise ValueError("SUBAGENT_ONE_SKILL_MAXIMUM")
 
         authorized_artifacts = {
             artifact.artifact_id: artifact
@@ -12654,66 +13873,90 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             and verified_query_artifact_integrity_valid(artifact)
         }
         requested_artifact_ids = list(
-            dict.fromkeys(
-                str(item or "").strip()
-                for item in task.artifact_ids
-                if str(item or "").strip()
-            )
+            dict.fromkeys(str(item or "").strip() for item in task.artifact_ids if str(item or "").strip())
         )
         input_artifact_refs = set(
-            str(item or "").strip()
-            for item in task.input_artifact_refs
-            if str(item or "").strip()
+            str(item or "").strip() for item in task.input_artifact_refs if str(item or "").strip()
         )
         undeclared_artifact_inputs = [
-            artifact_id
-            for artifact_id in requested_artifact_ids
-            if artifact_id not in input_artifact_refs
+            artifact_id for artifact_id in requested_artifact_ids if artifact_id not in input_artifact_refs
         ]
         if undeclared_artifact_inputs:
-            raise ValueError(
-                "SUBAGENT_INPUT_ARTIFACT_REF_REQUIRED:%s"
-                % ",".join(undeclared_artifact_inputs)
-            )
+            raise ValueError("SUBAGENT_INPUT_ARTIFACT_REF_REQUIRED:%s" % ",".join(undeclared_artifact_inputs))
         if requested_artifact_ids:
-            missing_artifact_ids = [
-                item for item in requested_artifact_ids if item not in authorized_artifacts
-            ]
+            missing_artifact_ids = [item for item in requested_artifact_ids if item not in authorized_artifacts]
             if missing_artifact_ids:
-                raise ValueError(
-                    "SUBAGENT_ARTIFACT_NOT_AUTHORIZED:%s"
-                    % ",".join(missing_artifact_ids)
-                )
+                raise ValueError("SUBAGENT_ARTIFACT_NOT_AUTHORIZED:%s" % ",".join(missing_artifact_ids))
 
         task_id = str(task.sub_goal_id or "").strip()
-        if (
-            len(task_id) > 96
-            or any(
-                not (
-                    character.isascii()
-                    and (
-                        character.isalnum()
-                        or character in {"_", "-", "."}
-                    )
-                )
-                for character in task_id
-            )
+        if len(task_id) > 96 or any(
+            not (character.isascii() and (character.isalnum() or character in {"_", "-", "."})) for character in task_id
         ):
             raise ValueError("SUBAGENT_SUB_GOAL_ID_INVALID")
         job_id = "task_%s_%s" % (task_id[:48], uuid.uuid4().hex[:12])
         thread_id = "%s__%s" % (context.thread_id, job_id)
+        query_branch_token = "subquery_%s" % uuid.uuid4().hex[:20]
+        if "QUERY_DATA" in capability_set:
+            fork_query_branch = getattr(
+                self.kernel,
+                "fork_query_branch",
+                None,
+            )
+            if callable(fork_query_branch):
+                isolated_runtime = fork_query_branch(
+                    session.runtime,
+                    query_branch_token,
+                    workspace_topics=session.effective_topics(),
+                    objective=task.objective,
+                    inherit_query_artifact_ids=requested_artifact_ids,
+                )
+            else:
+                # Compatibility for injected test kernels. Production kernels
+                # always fork through the governed branch constructor above.
+                isolated_runtime = session.runtime.model_copy(deep=True)
+                isolated_runtime.session_id = "%s__%s" % (
+                    session.runtime.session_id,
+                    query_branch_token,
+                )
+                isolated_runtime.question = str(task.objective or "").strip()
+                isolated_runtime.attempts = []
+                isolated_runtime.active_attempt_id = ""
+                isolated_runtime.active_generation = 0
+                isolated_runtime.active_contract = None
+                isolated_runtime.active_plan = None
+                isolated_runtime.run_result = None
+                isolated_runtime.verified_evidence = None
+                isolated_runtime.verified_query_ledger = []
+                isolated_runtime.defer_artifact_publication = True
+        else:
+            isolated_runtime = session.runtime.model_copy(deep=True)
         isolated_session = GroundedDeepAgentSession(
-            runtime=session.runtime.model_copy(deep=True),
+            runtime=isolated_runtime,
             context_workspace=session.context_workspace,
             opened_topics=list(session.opened_topics),
             data_collection_sealed=session.data_collection_sealed,
-            analysis_skill_headers_disclosed=(
-                session.analysis_skill_headers_disclosed
+            analysis_skill_headers_disclosed=(session.analysis_skill_headers_disclosed),
+            question_goal_contract=(
+                session.question_goal_contract.model_copy(deep=True)
+                if session.question_goal_contract is not None
+                else None
             ),
+            active_goal_ids=list(task.parent_goal_ids),
         )
         semantic_backend = GroundedSemanticBackend(
             self.semantic_catalog,
-            reader_is_core=lambda: False,
+            reader_is_core=lambda: "QUERY_DATA" in capability_set,
+            semantic_activation_refresher=(
+                (
+                    lambda scoped_session: self.kernel.seal_semantic_activation(
+                        scoped_session.runtime,
+                        scoped_session.effective_topics(),
+                        allow_topic_expansion=True,
+                    )
+                )
+                if callable(getattr(self.kernel, "seal_semantic_activation", None))
+                else None
+            ),
         )
         custom_tools: list[Any] = []
         allowed_tool_names: set[str] = set()
@@ -12732,6 +13975,26 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             )
         else:
             default_backend = StateBackend()
+
+        if task.skill_names:
+            skill_name = _normalized_skill_name(task.skill_names[0])
+            skill_dir = self._skill_directory(skill_name)
+            if skill_dir is None:
+                raise ValueError("SUBAGENT_SKILL_NOT_FOUND:%s" % skill_name)
+            metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
+            placement = (
+                str(metadata.get("executionPlacement") or metadata.get("execution_placement") or "SUBAGENT")
+                .strip()
+                .upper()
+            )
+            if placement not in {"AUTO", "SUBAGENT"}:
+                raise ValueError("SUBAGENT_SKILL_PLACEMENT_INVALID:%s" % skill_name)
+            selected_skill_names = [skill_name]
+            backend_routes["/skills/%s/" % skill_name] = FilesystemBackend(
+                root_dir=skill_dir,
+                virtual_mode=True,
+            )
+            allowed_tool_names.update({"ls", "read_file", "grep"})
 
         if "READ_CONTEXT" in capability_set:
             allowed_tool_names.update({"ls", "read_file", "grep"})
@@ -12753,43 +14016,123 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             )
             allowed_tool_names.update({"ls", "read_file", "grep"})
 
+        if "QUERY_DATA" in capability_set:
+            isolated_context = GroundedDeepAgentRunContext(
+                thread_id=thread_id,
+                run_id=job_id,
+                session=isolated_session,
+                budget=context.budget,
+                listener=context.listener,
+            )
+            granted_goal_ids = set(task.parent_goal_ids)
+
+            @tool("query_data")
+            def execute_governed_query_data(
+                request: QueryRequest,
+            ) -> str:
+                """Run the shared governed query facade inside this task grant."""
+
+                normalized = request if isinstance(request, QueryRequest) else QueryRequest.model_validate(request)
+                requested_goals = set(normalized.goal_ids)
+                if not requested_goals or not requested_goals.issubset(granted_goal_ids):
+                    return json.dumps(
+                        {
+                            "status": "DENIED",
+                            "code": "SUBAGENT_QUERY_GOAL_SCOPE_MISMATCH",
+                            "queryId": normalized.query_id,
+                            "requestedGoalIds": sorted(requested_goals),
+                            "grantedGoalIds": sorted(granted_goal_ids),
+                        },
+                        ensure_ascii=False,
+                    )
+                payload = json.loads(
+                    query_data_tool.func(
+                        request=normalized,
+                        runtime=SimpleNamespace(context=isolated_context),
+                    )
+                )
+                if str(payload.get("status") or "").upper() != "VERIFIED":
+                    return json.dumps(payload, ensure_ascii=False, default=str)
+
+                adopt_verified = getattr(
+                    self.kernel,
+                    "adopt_verified_branches",
+                    None,
+                )
+                if not callable(adopt_verified):
+                    return json.dumps(
+                        {
+                            "status": "FAILED",
+                            "code": "SUBAGENT_QUERY_ADOPTION_UNAVAILABLE",
+                            "queryId": normalized.query_id,
+                        },
+                        ensure_ascii=False,
+                    )
+                try:
+                    # Workers may query concurrently. Publication is
+                    # serialized while each query still executes in isolation.
+                    with session.subagent_query_adoption_lock:
+                        adopted = adopt_verified(
+                            session.runtime,
+                            [isolated_session.runtime],
+                        )
+                        adopted_ids = [item.artifact_id for item in adopted]
+                        expected_ids = set(payload.get("artifactIds") or [])
+                        if not adopted_ids or (expected_ids and not expected_ids.issubset(set(adopted_ids))):
+                            raise RuntimeError("SUBAGENT_VERIFIED_QUERY_ADOPTION_MISMATCH")
+                    with session.lock:
+                        for artifact_id in adopted_ids:
+                            session.artifact_goal_ids[artifact_id] = list(normalized.goal_ids)
+                        attach_goals = getattr(
+                            self.kernel,
+                            "attach_verified_artifact_goals",
+                            None,
+                        )
+                        if callable(attach_goals):
+                            for artifact_id in adopted_ids:
+                                attach_goals(
+                                    session.runtime,
+                                    artifact_id,
+                                    session.artifact_goal_ids[artifact_id],
+                                )
+                except Exception as exc:
+                    return json.dumps(
+                        {
+                            "status": "FAILED",
+                            "code": "SUBAGENT_QUERY_ADOPTION_FAILED",
+                            "queryId": normalized.query_id,
+                            "message": "%s:%s" % (type(exc).__name__, str(exc)[:400]),
+                        },
+                        ensure_ascii=False,
+                    )
+                payload["artifactIds"] = adopted_ids
+                payload["coveredGoalIds"] = list(normalized.goal_ids)
+                payload["adoptedIntoRoot"] = True
+                return json.dumps(payload, ensure_ascii=False, default=str)
+
+            custom_tools.append(execute_governed_query_data)
+            allowed_tool_names.add("query_data")
+
         branch_payload: dict[str, Any] = {}
         if "QUERY_BRANCH" in capability_set:
             selected_branch_ids = list(
-                dict.fromkeys(
-                    str(item or "").strip()
-                    for item in task.query_branch_ids
-                    if str(item or "").strip()
-                )
+                dict.fromkeys(str(item or "").strip() for item in task.query_branch_ids if str(item or "").strip())
             )
             if len(selected_branch_ids) != 1:
                 raise ValueError("QUERY_BRANCH_CAPABILITY_REQUIRES_ONE_BRANCH")
             query_id = selected_branch_ids[0]
-            if (
-                query_id not in input_artifact_refs
-                and "query-branch:%s" % query_id not in input_artifact_refs
-            ):
-                raise ValueError(
-                    "SUBAGENT_QUERY_BRANCH_INPUT_REF_REQUIRED:%s" % query_id
-                )
+            if query_id not in input_artifact_refs and "query-branch:%s" % query_id not in input_artifact_refs:
+                raise ValueError("SUBAGENT_QUERY_BRANCH_INPUT_REF_REQUIRED:%s" % query_id)
             with session.lock:
                 branch_context = session.query_branch_contexts.get(query_id)
                 branch_runtime = session.parallel_branches.get(query_id)
             if branch_context is None or branch_runtime is None:
                 raise ValueError("QUERY_BRANCH_NOT_PREPARED:%s" % query_id)
             if branch_context.status != "PREPARED":
-                raise ValueError(
-                    "QUERY_BRANCH_NOT_EXECUTABLE:%s:%s"
-                    % (query_id, branch_context.status)
-                )
-            unbound_parent_goal_ids = sorted(
-                set(task.parent_goal_ids) - set(branch_context.spec.goal_ids)
-            )
+                raise ValueError("QUERY_BRANCH_NOT_EXECUTABLE:%s:%s" % (query_id, branch_context.status))
+            unbound_parent_goal_ids = sorted(set(task.parent_goal_ids) - set(branch_context.spec.goal_ids))
             if unbound_parent_goal_ids:
-                raise ValueError(
-                    "QUERY_SUB_GOAL_PARENT_BINDING_MISMATCH:%s"
-                    % ",".join(unbound_parent_goal_ids)
-                )
+                raise ValueError("QUERY_SUB_GOAL_PARENT_BINDING_MISMATCH:%s" % ",".join(unbound_parent_goal_ids))
             contract = branch_runtime.active_contract
             if contract is None:
                 raise ValueError("QUERY_BRANCH_ACTIVE_CONTRACT_REQUIRED:%s" % query_id)
@@ -12806,9 +14149,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 with session.lock:
                     current_context = session.query_branch_contexts.get(query_id)
                     current_branch = session.parallel_branches.get(query_id)
-                    current_status = (
-                        current_context.status if current_context is not None else ""
-                    )
+                    current_status = current_context.status if current_context is not None else ""
                 if (
                     current_context is not branch_context
                     or current_branch is not branch_runtime
@@ -12831,10 +14172,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             evidence_ref_ids=list(evidence_ref_ids or []),
                         )
                     ],
-                    reason=(
-                        "Task-scoped isolated Core-SQL execution: %s"
-                        % str(task.objective or "")[:500]
-                    ),
+                    reason=("Task-scoped isolated Core-SQL execution: %s" % str(task.objective or "")[:500]),
                     runtime=SimpleNamespace(context=context),
                 )
 
@@ -12858,9 +14196,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "queryShape": contract.query_shape,
                     "primaryTable": contract.primary_table,
                     "evidenceRefs": list(contract.evidence_refs),
-                    "acceptedBindingHints": _core_visible_binding_hints(
-                        contract
-                    ),
+                    "acceptedBindingHints": _core_visible_binding_hints(contract),
                 },
                 "sqlObligations": _grounded_contract_sql_obligations(contract),
                 "instruction": (
@@ -12885,14 +14221,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             {
                 "artifactId": artifact_id,
                 "goalIds": list(session.artifact_goal_ids.get(artifact_id) or []),
-                "contractFingerprint": authorized_artifacts[
-                    artifact_id
-                ].contract_fingerprint,
+                "contractFingerprint": authorized_artifacts[artifact_id].contract_fingerprint,
                 "sqlFingerprint": authorized_artifacts[artifact_id].sql_fingerprint,
                 "resultArtifactRefs": _public_grounded_result_refs(
-                    _public_grounded_result_artifact_receipts(
-                        authorized_artifacts[artifact_id].run_result
-                    )
+                    _public_grounded_result_artifact_receipts(authorized_artifacts[artifact_id].run_result)
                 ),
             }
             for artifact_id in requested_artifact_ids
@@ -12904,12 +14236,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             "input": dict(task.input_payload or {}),
             "capabilityGrant": grant.model_dump(by_alias=True, mode="json"),
             "queryBranch": branch_payload,
-            "verifiedArtifacts": selected_artifact_payload,
-            "mountedSkill": (
-                "/skills/%s/SKILL.md" % selected_skill_names[0]
-                if selected_skill_names
-                else ""
+            "queryData": (
+                {
+                    "tool": "query_data",
+                    "grantedGoalIds": list(task.parent_goal_ids),
+                    "merchantIdentityAuthority": "SERVER_RUNTIME_ONLY",
+                    "resultProtocol": [
+                        "VERIFIED",
+                        "NEEDS_REASONING",
+                        "DENIED",
+                        "FAILED",
+                    ],
+                }
+                if "QUERY_DATA" in capability_set
+                else {}
             ),
+            "verifiedArtifacts": selected_artifact_payload,
+            "mountedSkill": ("/skills/%s/SKILL.md" % selected_skill_names[0] if selected_skill_names else ""),
             "outputContract": {
                 "authority": "ADVISORY",
                 "required": list(
@@ -12952,6 +14295,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 " This task owns no query branch; it may only call execute_assigned_query "
                 "against the exact already-prepared branch in its grant. It may repair and "
                 "retry only while that branch remains PREPARED and within its tool budget."
+            )
+        if "QUERY_DATA" in capability_set:
+            system_prompt += (
+                " Use query_data for governed reads required by this SubGoal. It enforces "
+                "the same Contract, SQL validation, tenant/ACL injection, execution and "
+                "Evidence verification as Root. Handle NEEDS_REASONING Observations and "
+                "their repairReceipt locally; never invent merchant identity or query Goals "
+                "outside grantedGoalIds. Only VERIFIED artifacts are adopted into Root."
             )
         if selected_skill_names:
             system_prompt += (
@@ -13020,10 +14371,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         def runner(job_to_run: IsolatedSubagentJob) -> Any:
             budget = context.budget
             if budget is not None:
-                budget.consume_llm_call(
-                    name="subagent.%s.g%d"
-                    % (task.sub_goal_id, task.generation)
-                )
+                budget.consume_llm_call(name="subagent.%s.g%d" % (task.sub_goal_id, task.generation))
             scope = semantic_backend.scope(isolated_session)
             if budget is None:
                 with scope:
@@ -13031,10 +14379,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         job_to_run,
                         on_progress=progress,
                     )
-            with budget.stage(
-                "llm.subagent.%s.g%d"
-                % (task.sub_goal_id, task.generation)
-            ):
+            with budget.stage("llm.subagent.%s.g%d" % (task.sub_goal_id, task.generation)):
                 with scope:
                     return self.subagent_runtime.run(
                         job_to_run,
@@ -13066,9 +14411,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "nextAction": "DECLARE_ORIGINAL_QUESTION_GOALS",
             }
         known_goal_ids = set(session.question_goal_contract.goal_map())
-        unknown_parent_goal_ids = sorted(
-            set(contract.parent_goal_ids) - known_goal_ids
-        )
+        unknown_parent_goal_ids = sorted(set(contract.parent_goal_ids) - known_goal_ids)
         if not contract.parent_goal_ids or unknown_parent_goal_ids:
             return {
                 "status": "SKILL_PARENT_GOAL_BINDING_INVALID",
@@ -13098,15 +14441,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "skillName": normalized_name,
                 }
             prior_generations = [
-                item.generation
-                for item in session.verified_skill_ledger
-                if item.sub_goal_id == contract.sub_goal_id
+                item.generation for item in session.verified_skill_ledger if item.sub_goal_id == contract.sub_goal_id
             ]
             prior_generations.extend(
                 int(item.get("generation") or 0)
                 for item in session.skill_runs
-                if str(item.get("subGoalId") or "")
-                == contract.sub_goal_id
+                if str(item.get("subGoalId") or "") == contract.sub_goal_id
             )
             expected_generation = max(prior_generations, default=0) + 1
             if contract.generation != expected_generation:
@@ -13124,37 +14464,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "skillName": normalized_name,
                 "message": "Skill must be selected from the disclosed Skill headers.",
             }
-        if (
-            not session.analysis_skill_headers_disclosed
-            or session.skill_input_snapshot_generation <= 0
-        ):
+        if not session.analysis_skill_headers_disclosed or session.skill_input_snapshot_generation <= 0:
             return {
                 "status": "SKILL_INPUT_SNAPSHOT_REQUIRED",
                 "skillName": normalized_name,
                 "nextAction": "FINALIZE_EVIDENCE_COLLECTION",
-                "message": (
-                    "Freeze a verified post-query Skill input snapshot before execution."
-                ),
+                "message": ("Freeze a verified post-query Skill input snapshot before execution."),
             }
-        if (
-            contract.input_snapshot_generation
-            != session.skill_input_snapshot_generation
-        ):
+        if contract.input_snapshot_generation != session.skill_input_snapshot_generation:
             return {
                 "status": "SKILL_INPUT_SNAPSHOT_STALE",
                 "skillName": normalized_name,
-                "submittedSnapshotGeneration": (
-                    contract.input_snapshot_generation
-                ),
-                "activeSnapshotGeneration": (
-                    session.skill_input_snapshot_generation
-                ),
+                "submittedSnapshotGeneration": (contract.input_snapshot_generation),
+                "activeSnapshotGeneration": (session.skill_input_snapshot_generation),
                 "nextAction": "REFRESH_SKILL_INPUT_SNAPSHOT",
             }
         try:
-            frozen_input_artifact_ids = set(
-                self._selected_skill_artifact_ids(session)
-            )
+            frozen_input_artifact_ids = set(self._selected_skill_artifact_ids(session))
         except GroundedSkillArtifactAccessError as exc:
             return {
                 "status": "SKILL_INPUT_SNAPSHOT_INVALID",
@@ -13162,12 +14488,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "code": exc.code,
             }
         submitted_input_artifact_ids = set(contract.input_artifact_ids)
-        if (
-            not submitted_input_artifact_ids
-            or not submitted_input_artifact_ids.issubset(
-                frozen_input_artifact_ids
-            )
-        ):
+        if not submitted_input_artifact_ids or not submitted_input_artifact_ids.issubset(frozen_input_artifact_ids):
             return {
                 "status": "SKILL_INPUT_SNAPSHOT_SCOPE_MISMATCH",
                 "skillName": normalized_name,
@@ -13189,14 +14510,31 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "with the verified result artifact."
                 ),
             }
+        metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
+        execution_placement = (
+            str(metadata.get("executionPlacement") or metadata.get("execution_placement") or "SUBAGENT").strip().upper()
+        )
+        if execution_placement == "CORE":
+            return {
+                "status": "CORE_SKILL_DOES_NOT_REQUIRE_RUN_SKILL",
+                "skillName": normalized_name,
+                "executionPlacement": "CORE",
+                "message": (
+                    "Apply the bounded coreProcedure already disclosed in the "
+                    "Skill header, then continue the Root ReAct loop."
+                ),
+            }
+        if execution_placement not in {"AUTO", "SUBAGENT"}:
+            return {
+                "status": "SKILL_EXECUTION_PLACEMENT_INVALID",
+                "skillName": normalized_name,
+            }
         if self.checkpointer is None:
             return {
                 "status": "SKILL_CHECKPOINT_REQUIRED",
                 "skillName": normalized_name,
                 "message": "Skill isolation requires an independent checkpoint backend.",
             }
-
-        metadata = _load_skill_frontmatter(skill_dir / "SKILL.md")
         lifecycle_phase = str(
             metadata.get("lifecyclePhase") or metadata.get("lifecycle_phase") or "post_query_analysis"
         ).strip()
@@ -13251,9 +14589,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             semantic_seal = state.semantic_activation_seal
             selected_artifact_ids = tuple(
                 dict.fromkeys(
-                    str(item or "").strip()
-                    for item in contract.input_artifact_ids
-                    if str(item or "").strip()
+                    str(item or "").strip() for item in contract.input_artifact_ids if str(item or "").strip()
                 )
             )
             if len(selected_artifact_ids) != len(contract.input_artifact_ids):
@@ -13267,9 +14603,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 artifact_root=session.context_workspace.artifacts_root,
                 sandbox_staging_root=(session.context_workspace.staging_root),
                 owner_fingerprint=(session.context_workspace.owner_fingerprint),
-                verified_query_artifacts=(
-                    _authorized_verified_query_artifacts(session)
-                ),
+                verified_query_artifacts=(_authorized_verified_query_artifacts(session)),
                 selected_artifact_ids=selected_artifact_ids,
                 skill_run_id=skill_run_id,
                 expected_semantic_activation_fingerprint=str(
@@ -13462,9 +14796,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "reason": str(reason or "")[:300],
                     "scope": isolated_session.effective_topics(),
                     "recallCandidates": _thin_recall(bundle, limit=8),
-                    "retrievalTrace": _retrieval_trace_summary(
-                        isolated_session.runtime
-                    ),
+                    "retrievalTrace": _retrieval_trace_summary(isolated_session.runtime),
                 },
                 ensure_ascii=False,
             )
@@ -13651,9 +14983,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             selected_artifact_ids = set(contract.input_artifact_ids)
             permitted_refs = {
                 ref_id
-                for artifact in _authorized_verified_query_artifacts(
-                    session
-                )
+                for artifact in _authorized_verified_query_artifacts(session)
                 if artifact.artifact_id in selected_artifact_ids
                 for ref_id in artifact.contract.evidence_refs
             }
@@ -13854,32 +15184,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         for raw_request in publication_requests:
             request = GroundedRunSkillAnalysisPublicationRequest.model_validate(raw_request)
             if request.analysis_goal_id not in set(contract.parent_goal_ids):
-                raise RuntimeError(
-                    "SKILL_PUBLICATION_PARENT_GOAL_MISMATCH:%s"
-                    % request.analysis_goal_id
-                )
-            if any(
-                artifact_id not in set(contract.input_artifact_ids)
-                for artifact_id in request.input_artifact_ids
-            ):
-                raise RuntimeError(
-                    "SKILL_PUBLICATION_INPUT_ARTIFACT_SCOPE_MISMATCH"
-                )
+                raise RuntimeError("SKILL_PUBLICATION_PARENT_GOAL_MISMATCH:%s" % request.analysis_goal_id)
+            if any(artifact_id not in set(contract.input_artifact_ids) for artifact_id in request.input_artifact_ids):
+                raise RuntimeError("SKILL_PUBLICATION_INPUT_ARTIFACT_SCOPE_MISMATCH")
             artifact = publish_grounded_analysis_from_skill(
                 goal_contract=session.question_goal_contract,
                 publication_request=request,
-                verified_query_artifacts=(
-                    _authorized_verified_query_artifacts(session)
-                ),
+                verified_query_artifacts=(_authorized_verified_query_artifacts(session)),
                 artifact_goal_ids=session.artifact_goal_ids,
             )
             with session.lock:
                 existing = next(
-                    (
-                        item
-                        for item in session.verified_analysis_ledger
-                        if item.artifact_id == artifact.artifact_id
-                    ),
+                    (item for item in session.verified_analysis_ledger if item.artifact_id == artifact.artifact_id),
                     None,
                 )
             if existing is not None:
@@ -13905,42 +15221,27 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         if set(selected) != set(contract.input_artifact_ids):
             raise RuntimeError("SKILL_INPUT_ARTIFACT_AUTHORITY_STALE")
         input_fingerprints = {
-            artifact_id: (
-                artifact.ledger_fingerprint
-                or verified_query_artifact_integrity_fingerprint(artifact)
-            )
+            artifact_id: (artifact.ledger_fingerprint or verified_query_artifact_integrity_fingerprint(artifact))
             for artifact_id, artifact in selected.items()
         }
-        if any(
-            not verified_query_artifact_integrity_valid(artifact)
-            for artifact in selected.values()
-        ):
+        if any(not verified_query_artifact_integrity_valid(artifact) for artifact in selected.values()):
             raise RuntimeError("SKILL_INPUT_ARTIFACT_INTEGRITY_INVALID")
-        skill_definition_sha256 = hashlib.sha256(
-            (skill_dir / "SKILL.md").read_bytes()
-        ).hexdigest()
+        skill_definition_sha256 = hashlib.sha256((skill_dir / "SKILL.md").read_bytes()).hexdigest()
         public_structured = {
-            key: value
-            for key, value in structured_output.items()
-            if not str(key).startswith("_grounded")
+            key: value for key, value in structured_output.items() if not str(key).startswith("_grounded")
         }
-        structured_fingerprint = _stable_json_fingerprint(
-            public_structured
-        )
+        structured_fingerprint = _stable_json_fingerprint(public_structured)
         semantic_seal = session.runtime.semantic_activation_seal
         identity_payload = {
             "skillContractFingerprint": contract.contract_fingerprint(),
             "skillRunId": skill_run_id,
             "skillDefinitionSha256": skill_definition_sha256,
             "inputArtifactFingerprints": input_fingerprints,
-            "derivedAnalysisArtifactIds": [
-                item.artifact_id for item in analysis_artifacts
-            ],
+            "derivedAnalysisArtifactIds": [item.artifact_id for item in analysis_artifacts],
             "structuredOutputFingerprint": structured_fingerprint,
         }
         artifact = GroundedVerifiedSkillArtifact(
-            artifact_id="verified-skill-%s"
-            % _stable_json_fingerprint(identity_payload)[:24],
+            artifact_id="verified-skill-%s" % _stable_json_fingerprint(identity_payload)[:24],
             skill_name=_normalized_skill_name(contract.skill_name),
             skill_run_id=skill_run_id,
             sub_goal_id=contract.sub_goal_id,
@@ -13958,43 +15259,27 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
                 or ""
             ),
-            semantic_activation_seal_fingerprint=str(
-                getattr(semantic_seal, "seal_fingerprint", "") or ""
-            ),
-            derived_analysis_artifact_ids=[
-                item.artifact_id for item in analysis_artifacts
-            ],
+            semantic_activation_seal_fingerprint=str(getattr(semantic_seal, "seal_fingerprint", "") or ""),
+            derived_analysis_artifact_ids=[item.artifact_id for item in analysis_artifacts],
             structured_output_fingerprint=structured_fingerprint,
             observations=list(public_structured.get("observations") or []),
-            semantic_disclosures=list(
-                public_structured.get("semanticDisclosures") or []
-            ),
+            semantic_disclosures=list(public_structured.get("semanticDisclosures") or []),
             derived_facts=list(public_structured.get("derivedFacts") or []),
             hypotheses=list(public_structured.get("hypotheses") or []),
-            recommendations=list(
-                public_structured.get("recommendations") or []
-            ),
-            evidence_refs=[
-                str(item)
-                for item in public_structured.get("evidenceRefs") or []
-            ],
+            recommendations=list(public_structured.get("recommendations") or []),
+            evidence_refs=[str(item) for item in public_structured.get("evidenceRefs") or []],
             gaps=list(public_structured.get("gaps") or []),
-            execution_confidence=float(
-                public_structured.get("executionConfidence") or 0.0
-            ),
+            execution_confidence=float(public_structured.get("executionConfidence") or 0.0),
         ).with_ledger_fingerprint()
         with session.lock:
             if len(session.verified_skill_ledger) >= 4:
                 raise RuntimeError("VERIFIED_SKILL_ARTIFACT_LIMIT_REACHED")
             if any(
-                item.sub_goal_id == artifact.sub_goal_id
-                and item.generation == artifact.generation
+                item.sub_goal_id == artifact.sub_goal_id and item.generation == artifact.generation
                 for item in session.verified_skill_ledger
             ):
                 raise RuntimeError("VERIFIED_SKILL_GENERATION_DUPLICATE")
-            existing_analysis_ids = {
-                item.artifact_id for item in session.verified_analysis_ledger
-            }
+            existing_analysis_ids = {item.artifact_id for item in session.verified_analysis_ledger}
             session.verified_analysis_ledger.extend(
                 item.model_copy(deep=True)
                 for item in analysis_artifacts
@@ -14059,9 +15344,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         verified = state.answer_verified_evidence or state.verified_evidence
         selected_artifact_ids = set(artifact_access.selected_artifact_ids)
         selected_artifacts = [
-            item
-            for item in _authorized_verified_query_artifacts(session)
-            if item.artifact_id in selected_artifact_ids
+            item for item in _authorized_verified_query_artifacts(session) if item.artifact_id in selected_artifact_ids
         ]
         allowed_evidence_refs = list(
             dict.fromkeys(ref_id for artifact in selected_artifacts for ref_id in artifact.contract.evidence_refs)
@@ -14085,20 +15368,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             for artifact_id in (coverage.coverage_by_goal_id.get(input_goal_id, []))
                         )
                     )
-                    if any(
-                        artifact_id not in selected_artifact_ids
-                        for artifact_id in requested_ids
-                    ):
+                    if any(artifact_id not in selected_artifact_ids for artifact_id in requested_ids):
                         continue
                     analysis_input = build_grounded_analysis_skill_input(
                         goal_contract=session.question_goal_contract,
                         analysis_goal_id=goal_id,
                         requested_artifact_ids=requested_ids,
-                        verified_query_artifacts=(
-                            _authorized_verified_query_artifacts(
-                                session
-                            )
-                        ),
+                        verified_query_artifacts=(_authorized_verified_query_artifacts(session)),
                         artifact_goal_ids=session.artifact_goal_ids,
                         include_rows=False,
                     )
@@ -14124,9 +15400,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 by_alias=True,
                 mode="json",
             ),
-            "skillRunContractFingerprint": (
-                skill_contract.contract_fingerprint()
-            ),
+            "skillRunContractFingerprint": (skill_contract.contract_fingerprint()),
             "question": state.question,
             "objective": objective,
             "topics": session.effective_topics(),
@@ -14455,14 +15729,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
                 derived_edges.extend(
                     PopulationDynamicGraphEdge(
-                        source_query_node_id=str(
-                            dependency.get("sourceQueryId") or ""
-                        ),
+                        source_query_node_id=str(dependency.get("sourceQueryId") or ""),
                         target_query_node_id=target_id,
                         dependency_mode="VERIFIED_ARTIFACT",
-                        artifact_kind=str(
-                            dependency.get("artifactKind") or ""
-                        ),
+                        artifact_kind=str(dependency.get("artifactKind") or ""),
                     )
                     for dependency in context.artifact_dependencies
                     if str(dependency.get("artifactKind") or "")
@@ -14530,27 +15800,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = dict(_grounded_artifact_execution_kwargs(session))
         with session.lock:
-            session.population_gate_enforced = bool(
-                self.population_gate_enforced
-            )
+            session.population_gate_enforced = bool(self.population_gate_enforced)
             legacy_goal_gate_active = bool(
-                session.population_goal_gate_result.get("accepted")
-                and session.population_goal_attestation is not None
+                session.population_goal_gate_result.get("accepted") and session.population_goal_attestation is not None
             )
         contract = execution_session.active_contract
         upstream_population_required = bool(
             contract is not None
             and (
                 contract.upstream_entity_bindings
-                or (
-                    contract.reference_scope.enabled
-                    and contract.reference_scope.population_required
-                )
+                or (contract.reference_scope.enabled and contract.reference_scope.population_required)
             )
         )
-        if not self.population_gate_enforced or not (
-            legacy_goal_gate_active or upstream_population_required
-        ):
+        if not self.population_gate_enforced or not (legacy_goal_gate_active or upstream_population_required):
             # Current-turn population authority is carried by the versioned
             # execution graph plus server-issued verified entity/result
             # artifacts.  The legacy population goal gate is retained only
@@ -14642,27 +15904,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         side effect or an in-memory SQL preparation capability.
         """
 
-        parsed = GroundedGraphRevisionBaseSessionCheckpoint.model_validate(
-            checkpoint
-        )
-        goal_contract = OriginalQuestionGoalContract.model_validate(
-            parsed.goal_contract
-        )
-        proposal = GroundedExecutionGraphProposal.model_validate(
-            parsed.execution_proposal
-        )
-        receipt = GroundedExecutionGraphReceipt.model_validate(
-            parsed.execution_receipt
-        )
-        population_receipt = PopulationDynamicGraphReceipt.model_validate(
-            parsed.population_receipt
-        )
-        if str(session.runtime.question or "").strip() != str(
-            parsed.question or ""
-        ).strip():
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_QUESTION_MISMATCH"
-            )
+        parsed = GroundedGraphRevisionBaseSessionCheckpoint.model_validate(checkpoint)
+        goal_contract = OriginalQuestionGoalContract.model_validate(parsed.goal_contract)
+        proposal = GroundedExecutionGraphProposal.model_validate(parsed.execution_proposal)
+        receipt = GroundedExecutionGraphReceipt.model_validate(parsed.execution_receipt)
+        population_receipt = PopulationDynamicGraphReceipt.model_validate(parsed.population_receipt)
+        if str(session.runtime.question or "").strip() != str(parsed.question or "").strip():
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_QUESTION_MISMATCH")
 
         with session.lock:
             active_receipt = session.execution_graph_receipt
@@ -14684,9 +15932,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 or session.population_graph_receipt is not None
             )
         if has_partial_base:
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_PARTIAL_SESSION_CONFLICT"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_PARTIAL_SESSION_CONFLICT")
 
         if runtime_budget is not None:
             runtime_budget.checkpoint()
@@ -14700,54 +15946,29 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             [],
         )
         if not isinstance(raw_subagent_dispatches, list):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_SUBAGENT_DISPATCH_INVALID"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_DISPATCH_INVALID")
         latest_sub_goal_generations: dict[str, int] = {}
         for raw_dispatch in raw_subagent_dispatches[-16:]:
             if not isinstance(raw_dispatch, dict):
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_SUBAGENT_DISPATCH_INVALID"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_DISPATCH_INVALID")
             tasks = raw_dispatch.get("tasks") or []
             if not isinstance(tasks, list):
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_SUBAGENT_TASKS_INVALID"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_TASKS_INVALID")
             for outcome in tasks:
                 if not isinstance(outcome, dict):
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_SUBAGENT_OUTCOME_INVALID"
-                    )
-                grant = GroundedSubagentCapabilityGrant.model_validate(
-                    outcome.get("grant") or {}
-                )
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_OUTCOME_INVALID")
+                grant = GroundedSubagentCapabilityGrant.model_validate(outcome.get("grant") or {})
                 if (
                     not grant.fingerprint_valid()
-                    or not set(grant.parent_goal_ids).issubset(
-                        known_goal_ids
-                    )
-                    or str(outcome.get("subGoalId") or "")
-                    != grant.sub_goal_id
-                    or int(outcome.get("generation") or 0)
-                    != grant.generation
+                    or not set(grant.parent_goal_ids).issubset(known_goal_ids)
+                    or str(outcome.get("subGoalId") or "") != grant.sub_goal_id
+                    or int(outcome.get("generation") or 0) != grant.generation
                 ):
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_SUBAGENT_GRANT_INVALID"
-                    )
-                previous_generation = latest_sub_goal_generations.get(
-                    grant.sub_goal_id
-                )
-                if (
-                    previous_generation is not None
-                    and grant.generation != previous_generation + 1
-                ):
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_SUBAGENT_GENERATION_INVALID"
-                    )
-                latest_sub_goal_generations[grant.sub_goal_id] = (
-                    grant.generation
-                )
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_GRANT_INVALID")
+                previous_generation = latest_sub_goal_generations.get(grant.sub_goal_id)
+                if previous_generation is not None and grant.generation != previous_generation + 1:
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_SUBAGENT_GENERATION_INVALID")
+                latest_sub_goal_generations[grant.sub_goal_id] = grant.generation
             restored_subagent_dispatches.append(
                 json.loads(
                     json.dumps(
@@ -14767,28 +15988,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             )
             or ""
         ).strip()
-        expected_goal_fingerprint = (
-            original_question_goal_contract_fingerprint(goal_contract)
-        )
-        if (
-            active_goal_fingerprint
-            and active_goal_fingerprint != expected_goal_fingerprint
-        ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_GOAL_FINGERPRINT_MISMATCH"
-            )
+        expected_goal_fingerprint = original_question_goal_contract_fingerprint(goal_contract)
+        if active_goal_fingerprint and active_goal_fingerprint != expected_goal_fingerprint:
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_GOAL_FINGERPRINT_MISMATCH")
 
         verified_query_artifacts = [
-            GroundedVerifiedQueryArtifact.model_validate(item)
-            for item in parsed.verified_query_artifacts
+            GroundedVerifiedQueryArtifact.model_validate(item) for item in parsed.verified_query_artifacts
         ]
-        verified_entity_sets = [
-            GroundedVerifiedEntitySet.model_validate(item)
-            for item in parsed.verified_entity_sets
-        ]
+        verified_entity_sets = [GroundedVerifiedEntitySet.model_validate(item) for item in parsed.verified_entity_sets]
         verified_rule_artifacts = [
-            GroundedVerifiedRuleArtifact.model_validate(item)
-            for item in parsed.verified_rule_artifacts
+            GroundedVerifiedRuleArtifact.model_validate(item) for item in parsed.verified_rule_artifacts
         ]
         raw_verified_analysis_artifacts = self._graph_revision_checkpoint_value(
             runtime_state,
@@ -14813,16 +16022,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             or not isinstance(raw_verified_skill_artifacts, list)
             or not isinstance(raw_skill_runs, list)
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_SKILL_LEDGER_INVALID"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_SKILL_LEDGER_INVALID")
         verified_analysis_artifacts = [
-            GroundedDerivedAnalysisArtifact.model_validate(item)
-            for item in raw_verified_analysis_artifacts
+            GroundedDerivedAnalysisArtifact.model_validate(item) for item in raw_verified_analysis_artifacts
         ]
         verified_skill_artifacts = [
-            GroundedVerifiedSkillArtifact.model_validate(item)
-            for item in raw_verified_skill_artifacts
+            GroundedVerifiedSkillArtifact.model_validate(item) for item in raw_verified_skill_artifacts
         ]
         restored_skill_runs = [
             json.loads(
@@ -14836,51 +16041,30 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             for item in raw_skill_runs[-16:]
             if isinstance(item, dict)
         ]
-        query_artifacts_by_id = {
-            item.artifact_id: item for item in verified_query_artifacts
-        }
+        query_artifacts_by_id = {item.artifact_id: item for item in verified_query_artifacts}
         if len(query_artifacts_by_id) != len(verified_query_artifacts):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_QUERY_ARTIFACT_DUPLICATE"
-            )
-        analysis_artifact_ids = {
-            item.artifact_id for item in verified_analysis_artifacts
-        }
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_QUERY_ARTIFACT_DUPLICATE")
+        analysis_artifact_ids = {item.artifact_id for item in verified_analysis_artifacts}
         if len(analysis_artifact_ids) != len(verified_analysis_artifacts):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_ANALYSIS_ARTIFACT_DUPLICATE"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_ANALYSIS_ARTIFACT_DUPLICATE")
         if len(verified_skill_artifacts) > 4 or any(
             not item.integrity_valid()
             or not set(item.parent_goal_ids).issubset(known_goal_ids)
-            or not set(item.input_artifact_ids).issubset(
-                query_artifacts_by_id
-            )
-            or not set(item.derived_analysis_artifact_ids).issubset(
-                analysis_artifact_ids
-            )
+            or not set(item.input_artifact_ids).issubset(query_artifacts_by_id)
+            or not set(item.derived_analysis_artifact_ids).issubset(analysis_artifact_ids)
             for item in verified_skill_artifacts
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_VERIFIED_SKILL_ARTIFACT_INVALID"
-            )
-        if len(
-            {
-                (item.sub_goal_id, item.generation)
-                for item in verified_skill_artifacts
-            }
-        ) != len(verified_skill_artifacts):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_VERIFIED_SKILL_GENERATION_DUPLICATE"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_VERIFIED_SKILL_ARTIFACT_INVALID")
+        if len({(item.sub_goal_id, item.generation) for item in verified_skill_artifacts}) != len(
+            verified_skill_artifacts
+        ):
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_VERIFIED_SKILL_GENERATION_DUPLICATE")
         if any(
             artifact_id not in query_artifacts_by_id
             for branch in parsed.branches
             for artifact_id in branch.verified_artifact_ids
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_BRANCH_ARTIFACT_MISSING"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_BRANCH_ARTIFACT_MISSING")
 
         semantic_activation_payload = self._graph_revision_checkpoint_value(
             runtime_state,
@@ -14889,74 +16073,43 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             {},
         )
         semantic_activation_seal = (
-            GroundedSemanticActivationSeal.model_validate(
-                semantic_activation_payload
-            )
+            GroundedSemanticActivationSeal.model_validate(semantic_activation_payload)
             if semantic_activation_payload
             else None
         )
-        if (
-            semantic_activation_seal is not None
-            and not semantic_activation_seal_valid(
-                semantic_activation_seal
-            )
-        ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_SEMANTIC_ACTIVATION_INVALID"
-            )
+        if semantic_activation_seal is not None and not semantic_activation_seal_valid(semantic_activation_seal):
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_SEMANTIC_ACTIVATION_INVALID")
         if semantic_activation_seal is not None and any(
             (
                 item.semantic_activation_fingerprint
-                and item.semantic_activation_fingerprint
-                != semantic_activation_seal.semantic_activation_fingerprint
+                and item.semantic_activation_fingerprint != semantic_activation_seal.semantic_activation_fingerprint
             )
             or (
                 item.semantic_activation_seal_fingerprint
-                and item.semantic_activation_seal_fingerprint
-                != semantic_activation_seal.seal_fingerprint
+                and item.semantic_activation_seal_fingerprint != semantic_activation_seal.seal_fingerprint
             )
             for item in verified_skill_artifacts
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_SKILL_SEMANTIC_ACTIVATION_MISMATCH"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_SKILL_SEMANTIC_ACTIVATION_MISMATCH")
 
         population_references = {
-            str(query_node_id): PopulationPreExecutionReference.model_validate(
-                value
-            )
-            for query_node_id, value in (
-                parsed.population_pre_execution_references.items()
-            )
+            str(query_node_id): PopulationPreExecutionReference.model_validate(value)
+            for query_node_id, value in (parsed.population_pre_execution_references.items())
         }
-        if any(
-            not population_pre_execution_reference_valid(reference)
-            for reference in population_references.values()
-        ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_POPULATION_REFERENCE_INVALID"
-            )
+        if any(not population_pre_execution_reference_valid(reference) for reference in population_references.values()):
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_POPULATION_REFERENCE_INVALID")
         population_attestation = (
-            PopulationVerificationAttestation.model_validate(
-                parsed.population_goal_attestation
-            )
+            PopulationVerificationAttestation.model_validate(parsed.population_goal_attestation)
             if parsed.population_goal_attestation
             else None
         )
-        if (
-            population_attestation is not None
-            and not self._population_goal_attestation_is_valid(
-                population_attestation,
-                goal_contract_fingerprint=expected_goal_fingerprint,
-            )
+        if population_attestation is not None and not self._population_goal_attestation_is_valid(
+            population_attestation,
+            goal_contract_fingerprint=expected_goal_fingerprint,
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_POPULATION_ATTESTATION_INVALID"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_POPULATION_ATTESTATION_INVALID")
         data_snapshot = (
-            DataSnapshotContract.model_validate(
-                parsed.execution_graph_data_snapshot
-            )
+            DataSnapshotContract.model_validate(parsed.execution_graph_data_snapshot)
             if parsed.execution_graph_data_snapshot
             else None
         )
@@ -14980,9 +16133,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             )
             or 0
         )
-        restored_runtime.active_goal_contract_fingerprint = (
-            active_goal_fingerprint or expected_goal_fingerprint
-        )
+        restored_runtime.active_goal_contract_fingerprint = active_goal_fingerprint or expected_goal_fingerprint
         restored_runtime.workspace_topics = list(
             dict.fromkeys(
                 str(item or "").strip()
@@ -14996,9 +16147,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             )
         )
         restored_runtime.semantic_activation_seal = (
-            semantic_activation_seal.model_copy(deep=True)
-            if semantic_activation_seal is not None
-            else None
+            semantic_activation_seal.model_copy(deep=True) if semantic_activation_seal is not None else None
         )
         restored_runtime.semantic_activation_execution_started = bool(
             self._graph_revision_checkpoint_value(
@@ -15008,18 +16157,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 False,
             )
         )
-        restored_runtime.verified_query_ledger = [
-            item.model_copy(deep=True)
-            for item in verified_query_artifacts
-        ]
-        restored_runtime.verified_entity_sets = [
-            item.model_copy(deep=True)
-            for item in verified_entity_sets
-        ]
-        restored_runtime.verified_rule_ledger = [
-            item.model_copy(deep=True)
-            for item in verified_rule_artifacts
-        ]
+        restored_runtime.verified_query_ledger = [item.model_copy(deep=True) for item in verified_query_artifacts]
+        restored_runtime.verified_entity_sets = [item.model_copy(deep=True) for item in verified_entity_sets]
+        restored_runtime.verified_rule_ledger = [item.model_copy(deep=True) for item in verified_rule_artifacts]
         restored_runtime.phase = "GRAPH_REVISION_BASE_RESTORED"
 
         evidence_by_ref = {
@@ -15027,9 +16167,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             for item in parsed.semantic_evidence
             if str(item.get("refId") or "")
         }
-        node_by_client_key = {
-            item.client_key: item for item in proposal.nodes
-        }
+        node_by_client_key = {item.client_key: item for item in proposal.nodes}
         dependency_goal_ids_by_target_key: dict[str, list[str]] = {}
         for edge in proposal.edges:
             if edge.dependency_mode != "VERIFIED_ARTIFACT":
@@ -15038,23 +16176,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 edge.target_client_key,
                 [],
             )
-            for goal_id in node_by_client_key[
-                edge.source_client_key
-            ].goal_ids:
+            for goal_id in node_by_client_key[edge.source_client_key].goal_ids:
                 if goal_id not in target_goal_ids:
                     target_goal_ids.append(goal_id)
 
-        limits = GroundedBranchBudgetLimits.from_settings(
-            self.settings or object()
-        )
+        limits = GroundedBranchBudgetLimits.from_settings(self.settings or object())
         contexts: dict[str, GroundedQueryBranchContext] = {}
         branch_lifecycle_by_query_id: dict[str, str] = {}
         for branch in parsed.branches:
             if runtime_budget is not None:
                 runtime_budget.checkpoint()
-            branch_lifecycle_by_query_id[branch.query_node_id] = (
-                branch.lifecycle
-            )
+            branch_lifecycle_by_query_id[branch.query_node_id] = branch.lifecycle
             spec = GroundedQueryBranchSpec(
                 query_id=branch.query_node_id,
                 objective=branch.objective,
@@ -15062,14 +16194,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 topic_scope=list(branch.topic_scope),
                 evidence_ref_ids=list(branch.evidence_ref_ids),
             )
-            dependency_query_ids = list(
-                branch.dependency_query_node_ids
-            )
+            dependency_query_ids = list(branch.dependency_query_node_ids)
             branch_runtime: GroundedRuntimeSession | None = None
             should_create_runtime = bool(
-                not dependency_query_ids
-                or branch.lifecycle
-                in {"PUBLISHED", "EXECUTION_FAILED"}
+                not dependency_query_ids or branch.lifecycle in {"PUBLISHED", "EXECUTION_FAILED"}
             )
             if should_create_runtime:
                 try:
@@ -15084,24 +16212,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         restored_runtime,
                         branch.query_node_id,
                     )
-                    branch_runtime.workspace_topics = list(
-                        spec.topic_scope
-                    )
+                    branch_runtime.workspace_topics = list(spec.topic_scope)
                     branch_runtime.question = spec.objective
             if branch.lifecycle == "PRE_AUTHORIZED":
-                restored_status = (
-                    "WAITING_VERIFIED_ARTIFACT"
-                    if dependency_query_ids
-                    else "DECLARED"
-                )
+                restored_status = "WAITING_VERIFIED_ARTIFACT" if dependency_query_ids else "DECLARED"
                 if dependency_query_ids:
                     branch_runtime = None
             elif branch.lifecycle == "UNEXECUTED":
-                restored_status = (
-                    "WAITING_VERIFIED_ARTIFACT"
-                    if dependency_query_ids
-                    else "DECLARED"
-                )
+                restored_status = "WAITING_VERIFIED_ARTIFACT" if dependency_query_ids else "DECLARED"
             else:
                 restored_status = branch.status
             context = GroundedQueryBranchContext(
@@ -15113,9 +16231,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     parent=runtime_budget,
                 ),
                 opened_topics=list(branch.opened_topics),
-                contract_scope_query_ids=list(
-                    branch.contract_scope_query_node_ids
-                ),
+                contract_scope_query_ids=list(branch.contract_scope_query_node_ids),
                 dependency_query_ids=dependency_query_ids,
                 dependency_goal_ids=list(
                     dependency_goal_ids_by_target_key.get(
@@ -15125,9 +16241,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 ),
                 status=restored_status,
                 last_gaps=[dict(item) for item in branch.last_gaps],
-                verified_artifact_ids=list(
-                    branch.verified_artifact_ids
-                ),
+                verified_artifact_ids=list(branch.verified_artifact_ids),
             )
             for ref_id in branch.evidence_ref_ids:
                 evidence = evidence_by_ref.get(ref_id)
@@ -15135,26 +16249,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     context.semantic_ledger.retain(evidence)
             if branch_runtime is not None and branch.verified_artifact_ids:
                 branch_runtime.verified_query_ledger = [
-                    query_artifacts_by_id[artifact_id].model_copy(
-                        deep=True
-                    )
+                    query_artifacts_by_id[artifact_id].model_copy(deep=True)
                     for artifact_id in branch.verified_artifact_ids
                 ]
                 latest_artifact = branch_runtime.verified_query_ledger[-1]
-                branch_runtime.run_result = (
-                    latest_artifact.run_result.model_copy(deep=True)
-                )
-                branch_runtime.verified_evidence = (
-                    latest_artifact.verified_evidence.model_copy(deep=True)
-                )
+                branch_runtime.run_result = latest_artifact.run_result.model_copy(deep=True)
+                branch_runtime.verified_evidence = latest_artifact.verified_evidence.model_copy(deep=True)
                 branch_runtime.phase = "VERIFIED"
             contexts[branch.query_node_id] = context
 
         safe_population_reference_ids = {
             query_node_id
-            for query_node_id, lifecycle in (
-                branch_lifecycle_by_query_id.items()
-            )
+            for query_node_id, lifecycle in (branch_lifecycle_by_query_id.items())
             if lifecycle == "PUBLISHED"
         }
         with session.lock:
@@ -15167,23 +16273,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 or session.verified_skill_ledger
                 or session.population_graph_receipt is not None
             ):
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_SESSION_CHANGED"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_SESSION_CHANGED")
             session.runtime.revision = restored_runtime.revision
-            session.runtime.active_generation = (
-                restored_runtime.active_generation
-            )
-            session.runtime.active_goal_contract_fingerprint = (
-                restored_runtime.active_goal_contract_fingerprint
-            )
-            session.runtime.workspace_topics = list(
-                restored_runtime.workspace_topics
-            )
+            session.runtime.active_generation = restored_runtime.active_generation
+            session.runtime.active_goal_contract_fingerprint = restored_runtime.active_goal_contract_fingerprint
+            session.runtime.workspace_topics = list(restored_runtime.workspace_topics)
             session.runtime.semantic_activation_seal = (
-                restored_runtime.semantic_activation_seal.model_copy(
-                    deep=True
-                )
+                restored_runtime.semantic_activation_seal.model_copy(deep=True)
                 if restored_runtime.semantic_activation_seal is not None
                 else None
             )
@@ -15191,39 +16287,22 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 restored_runtime.semantic_activation_execution_started
             )
             session.runtime.verified_query_ledger = [
-                item.model_copy(deep=True)
-                for item in restored_runtime.verified_query_ledger
+                item.model_copy(deep=True) for item in restored_runtime.verified_query_ledger
             ]
             session.runtime.verified_entity_sets = [
-                item.model_copy(deep=True)
-                for item in restored_runtime.verified_entity_sets
+                item.model_copy(deep=True) for item in restored_runtime.verified_entity_sets
             ]
             session.runtime.verified_rule_ledger = [
-                item.model_copy(deep=True)
-                for item in restored_runtime.verified_rule_ledger
+                item.model_copy(deep=True) for item in restored_runtime.verified_rule_ledger
             ]
             session.runtime.phase = restored_runtime.phase
-            session.core_semantic_evidence = [
-                dict(item) for item in parsed.semantic_evidence
-            ]
+            session.core_semantic_evidence = [dict(item) for item in parsed.semantic_evidence]
             session.opened_topics = list(parsed.opened_topics)
-            session.question_goal_contract = goal_contract.model_copy(
-                deep=True
-            )
-            session.subagent_dispatches = [
-                deepcopy(item) for item in restored_subagent_dispatches
-            ]
-            session.verified_analysis_ledger = [
-                item.model_copy(deep=True)
-                for item in verified_analysis_artifacts
-            ]
-            session.verified_skill_ledger = [
-                item.model_copy(deep=True)
-                for item in verified_skill_artifacts
-            ]
-            session.skill_runs = [
-                deepcopy(item) for item in restored_skill_runs
-            ]
+            session.question_goal_contract = goal_contract.model_copy(deep=True)
+            session.subagent_dispatches = [deepcopy(item) for item in restored_subagent_dispatches]
+            session.verified_analysis_ledger = [item.model_copy(deep=True) for item in verified_analysis_artifacts]
+            session.verified_skill_ledger = [item.model_copy(deep=True) for item in verified_skill_artifacts]
+            session.skill_runs = [deepcopy(item) for item in restored_skill_runs]
             session.skill_input_snapshot_generation = max(
                 0,
                 int(
@@ -15250,78 +16329,39 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             session.query_branch_contexts = contexts
             session.execution_graph_generation = receipt.version
             session.execution_graph_fingerprint = receipt.fingerprint
-            session.execution_graph_proposal = proposal.model_copy(
-                deep=True
-            )
+            session.execution_graph_proposal = proposal.model_copy(deep=True)
             session.execution_graph_receipt = receipt.model_copy(deep=True)
-            session.execution_graph_edges = [
-                item.model_copy(deep=True) for item in proposal.edges
-            ]
+            session.execution_graph_edges = [item.model_copy(deep=True) for item in proposal.edges]
             session.execution_graph_data_snapshot = (
-                data_snapshot.model_copy(deep=True)
-                if data_snapshot is not None
-                else None
+                data_snapshot.model_copy(deep=True) if data_snapshot is not None else None
             )
-            session.execution_graph_revision_count = (
-                parsed.execution_graph_revision_count
-            )
-            session.execution_graph_max_revision_count = (
-                parsed.execution_graph_max_revision_count
-            )
+            session.execution_graph_revision_count = parsed.execution_graph_revision_count
+            session.execution_graph_max_revision_count = parsed.execution_graph_max_revision_count
             session.artifact_goal_ids = {
-                artifact_id: list(goal_ids)
-                for artifact_id, goal_ids in (
-                    parsed.artifact_goal_ids.items()
-                )
+                artifact_id: list(goal_ids) for artifact_id, goal_ids in (parsed.artifact_goal_ids.items())
             }
-            session.population_goal_gate_id = (
-                parsed.population_goal_gate_id
-            )
-            session.population_goal_gate_result = dict(
-                parsed.population_goal_gate_result
-            )
+            session.population_goal_gate_id = parsed.population_goal_gate_id
+            session.population_goal_gate_result = dict(parsed.population_goal_gate_result)
             session.population_goal_attestation = (
-                population_attestation.model_copy(deep=True)
-                if population_attestation is not None
-                else None
+                population_attestation.model_copy(deep=True) if population_attestation is not None else None
             )
-            session.population_graph_receipt = (
-                population_receipt.model_copy(deep=True)
-            )
+            session.population_graph_receipt = population_receipt.model_copy(deep=True)
             session.population_pre_execution_references = {
                 query_node_id: reference.model_copy(deep=True)
-                for query_node_id, reference in (
-                    population_references.items()
-                )
+                for query_node_id, reference in (population_references.items())
                 if query_node_id in safe_population_reference_ids
             }
             session.population_post_gate_results = {
-                query_node_id: dict(result)
-                for query_node_id, result in (
-                    parsed.population_post_gate_results.items()
-                )
+                query_node_id: dict(result) for query_node_id, result in (parsed.population_post_gate_results.items())
             }
-            session.population_artifact_query_node_ids = dict(
-                parsed.population_artifact_query_node_ids
-            )
+            session.population_artifact_query_node_ids = dict(parsed.population_artifact_query_node_ids)
             session.execution_graph_history.append(
                 {
-                    "status": (
-                        "BASE_SESSION_RESTORED_FROM_REVISION_JOURNAL"
-                    ),
-                    "checkpointFingerprint": (
-                        parsed.checkpoint_fingerprint
-                    ),
-                    "baseExecutionReceiptFingerprint": (
-                        receipt.fingerprint
-                    ),
-                    "basePopulationReceiptFingerprint": (
-                        population_receipt.receipt_fingerprint
-                    ),
-                    "verifiedQueryArtifactIds": [
-                        item.artifact_id
-                        for item in verified_query_artifacts
-                    ],
+                    "status": ("BASE_SESSION_RESTORED_FROM_REVISION_JOURNAL"),
+                    "checkpointFingerprint": (parsed.checkpoint_fingerprint),
+                    "baseExecutionReceiptFingerprint": (receipt.fingerprint),
+                    "basePopulationReceiptFingerprint": (population_receipt.receipt_fingerprint),
+                    "verifiedQueryArtifactIds": [item.artifact_id for item in verified_query_artifacts],
                 }
             )
         return True
@@ -15335,42 +16375,26 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         runtime_budget: GroundedRuntimeBudget | None,
     ) -> bool:
         payload = recovery.recovery_payload
-        checkpoint = journal.load_base_session_checkpoint(
-            payload.base_session_checkpoint
-        )
-        base_receipt = GroundedExecutionGraphReceipt.model_validate(
-            checkpoint.execution_receipt
-        )
-        base_population = PopulationDynamicGraphReceipt.model_validate(
-            checkpoint.population_receipt
-        )
+        checkpoint = journal.load_base_session_checkpoint(payload.base_session_checkpoint)
+        base_receipt = GroundedExecutionGraphReceipt.model_validate(checkpoint.execution_receipt)
+        base_population = PopulationDynamicGraphReceipt.model_validate(checkpoint.population_receipt)
         if (
-            base_receipt.fingerprint
-            != recovery.record.base_execution_receipt_fingerprint
-            or base_population.receipt_fingerprint
-            != recovery.record.base_population_receipt_fingerprint
+            base_receipt.fingerprint != recovery.record.base_execution_receipt_fingerprint
+            or base_population.receipt_fingerprint != recovery.record.base_population_receipt_fingerprint
         ):
-            raise RuntimeError(
-                "GRAPH_REVISION_RECOVERY_BASE_CHECKPOINT_MISMATCH"
-            )
+            raise RuntimeError("GRAPH_REVISION_RECOVERY_BASE_CHECKPOINT_MISMATCH")
         with session.lock:
             active_receipt = session.execution_graph_receipt
             goal_contract = session.question_goal_contract
         if active_receipt is not None:
-            revised_receipt = GroundedExecutionGraphReceipt.model_validate(
-                payload.execution_receipt
-            )
+            revised_receipt = GroundedExecutionGraphReceipt.model_validate(payload.execution_receipt)
             if active_receipt.fingerprint not in {
                 base_receipt.fingerprint,
                 revised_receipt.fingerprint,
             }:
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_EXECUTION_BASE_MISMATCH"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_EXECUTION_BASE_MISMATCH")
             if goal_contract is None:
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_GOAL_CONTRACT_MISSING"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_GOAL_CONTRACT_MISSING")
             return False
         return self._restore_graph_revision_base_session(
             session,
@@ -15385,16 +16409,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         *,
         runtime_budget: GroundedRuntimeBudget | None,
     ) -> dict[str, GroundedQueryBranchContext]:
-        proposal = GroundedExecutionGraphProposal.model_validate(
-            payload.execution_proposal
-        )
-        receipt = GroundedExecutionGraphReceipt.model_validate(
-            payload.execution_receipt
-        )
-        declarations = {
-            item.client_key: item
-            for item in payload.candidate_node_declarations
-        }
+        proposal = GroundedExecutionGraphProposal.model_validate(payload.execution_proposal)
+        receipt = GroundedExecutionGraphReceipt.model_validate(payload.execution_receipt)
+        declarations = {item.client_key: item for item in payload.candidate_node_declarations}
         with session.lock:
             old_contexts = dict(session.query_branch_contexts)
             evidence_by_ref = {
@@ -15403,12 +16420,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 if str(item.get("refId") or "")
             }
         carried_query_ids = set(receipt.carried_forward_node_ids)
-        limits = GroundedBranchBudgetLimits.from_settings(
-            self.settings or object()
-        )
-        node_by_client_key = {
-            node.client_key: node for node in proposal.nodes
-        }
+        limits = GroundedBranchBudgetLimits.from_settings(self.settings or object())
+        node_by_client_key = {node.client_key: node for node in proposal.nodes}
         dependency_goal_ids_by_target_key: dict[
             str,
             list[str],
@@ -15416,15 +16429,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         for edge in proposal.edges:
             if edge.dependency_mode != "VERIFIED_ARTIFACT":
                 continue
-            target_goal_ids = (
-                dependency_goal_ids_by_target_key.setdefault(
-                    edge.target_client_key,
-                    [],
-                )
+            target_goal_ids = dependency_goal_ids_by_target_key.setdefault(
+                edge.target_client_key,
+                [],
             )
-            for goal_id in node_by_client_key[
-                edge.source_client_key
-            ].goal_ids:
+            for goal_id in node_by_client_key[edge.source_client_key].goal_ids:
                 if goal_id not in target_goal_ids:
                     target_goal_ids.append(goal_id)
         contexts: dict[str, GroundedQueryBranchContext] = {}
@@ -15434,9 +16443,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             if query_node_id in carried_query_ids:
                 carried = old_contexts.get(query_node_id)
                 if carried is None:
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_BASE_SESSION_REQUIRED"
-                    )
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_BASE_SESSION_REQUIRED")
                 contexts[query_node_id] = carried
                 continue
             spec = GroundedQueryBranchSpec(
@@ -15444,9 +16451,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 objective=declaration.objective,
                 goal_ids=list(declaration.goal_ids),
                 topic_scope=list(declaration.topic_scope),
-                evidence_ref_ids=list(
-                    declaration.evidence_ref_ids
-                ),
+                evidence_ref_ids=list(declaration.evidence_ref_ids),
             )
             branch_runtime: GroundedRuntimeSession | None = None
             if declaration.initial_status == "DECLARED":
@@ -15462,9 +16467,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         session.runtime,
                         query_node_id,
                     )
-                    branch_runtime.workspace_topics = list(
-                        spec.topic_scope
-                    )
+                    branch_runtime.workspace_topics = list(spec.topic_scope)
                     branch_runtime.question = spec.objective
             context = GroundedQueryBranchContext(
                 spec=spec,
@@ -15475,18 +16478,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     parent=runtime_budget,
                 ),
                 status=declaration.initial_status,
-                dependency_query_ids=list(
-                    declaration.dependency_query_node_ids
-                ),
+                dependency_query_ids=list(declaration.dependency_query_node_ids),
                 dependency_goal_ids=list(
                     dependency_goal_ids_by_target_key.get(
                         node.client_key,
                         [],
                     )
                 ),
-                contract_scope_query_ids=list(
-                    declaration.contract_scope_query_node_ids
-                ),
+                contract_scope_query_ids=list(declaration.contract_scope_query_node_ids),
             )
             for ref_id in spec.evidence_ref_ids:
                 evidence = evidence_by_ref.get(ref_id)
@@ -15503,15 +16502,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         expected_base_execution_fingerprint: str,
         runtime_budget: GroundedRuntimeBudget | None,
     ) -> bool:
-        proposal = GroundedExecutionGraphProposal.model_validate(
-            payload.execution_proposal
-        )
-        receipt = GroundedExecutionGraphReceipt.model_validate(
-            payload.execution_receipt
-        )
-        population_receipt = PopulationDynamicGraphReceipt.model_validate(
-            payload.population_receipt
-        )
+        proposal = GroundedExecutionGraphProposal.model_validate(payload.execution_proposal)
+        receipt = GroundedExecutionGraphReceipt.model_validate(payload.execution_receipt)
+        population_receipt = PopulationDynamicGraphReceipt.model_validate(payload.population_receipt)
         with session.lock:
             active_receipt = session.execution_graph_receipt
             if (
@@ -15520,17 +16513,9 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 and active_receipt.version == receipt.version
             ):
                 return False
-            if (
-                active_receipt is None
-                or active_receipt.fingerprint
-                != expected_base_execution_fingerprint
-            ):
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_EXECUTION_BASE_MISMATCH"
-                )
-            old_population_references = dict(
-                session.population_pre_execution_references
-            )
+            if active_receipt is None or active_receipt.fingerprint != expected_base_execution_fingerprint:
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_EXECUTION_BASE_MISMATCH")
+            old_population_references = dict(session.population_pre_execution_references)
         contexts = self._revision_contexts_from_recovery_payload(
             session,
             payload,
@@ -15544,36 +16529,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             gate = self.population_execution_gate
             workspace = session.context_workspace
             goal_contract = session.question_goal_contract
-            if (
-                gate is None
-                or workspace is None
-                or goal_contract is None
-            ):
-                raise RuntimeError(
-                    "POPULATION_ONLINE_GATE_AUTHORITY_REQUIRED"
-                )
-            carried_query_ids = set(
-                receipt.carried_forward_node_ids
-            )
-            for query_node_id, old_reference in (
-                old_population_references.items()
-            ):
+            if gate is None or workspace is None or goal_contract is None:
+                raise RuntimeError("POPULATION_ONLINE_GATE_AUTHORITY_REQUIRED")
+            carried_query_ids = set(receipt.carried_forward_node_ids)
+            for query_node_id, old_reference in old_population_references.items():
                 if query_node_id not in carried_query_ids:
                     continue
-                refreshed_population_references[
-                    query_node_id
-                ] = gate.build_pre_execution_reference(
-                    context_owner_fingerprint=(
-                        workspace.owner_fingerprint
-                    ),
-                    run_authority_fingerprint=(
-                        workspace.request_fingerprint
-                    ),
-                    goal_contract_fingerprint=(
-                        original_question_goal_contract_fingerprint(
-                            goal_contract
-                        )
-                    ),
+                refreshed_population_references[query_node_id] = gate.build_pre_execution_reference(
+                    context_owner_fingerprint=(workspace.owner_fingerprint),
+                    run_authority_fingerprint=(workspace.request_fingerprint),
+                    goal_contract_fingerprint=(original_question_goal_contract_fingerprint(goal_contract)),
                     graph_receipt=population_receipt,
                     node=old_reference.node,
                 )
@@ -15586,14 +16551,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 and current.version == receipt.version
             ):
                 return False
-            if (
-                current is None
-                or current.fingerprint
-                != expected_base_execution_fingerprint
-            ):
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_EXECUTION_CAS_MISMATCH"
-                )
+            if current is None or current.fingerprint != expected_base_execution_fingerprint:
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_EXECUTION_CAS_MISMATCH")
             session.execution_graph_history.append(
                 {
                     "status": "REVISED_RECOVERED",
@@ -15608,22 +16567,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 }
             )
             session.query_branch_contexts = contexts
-            session.execution_graph_proposal = proposal.model_copy(
-                deep=True
-            )
-            session.execution_graph_receipt = receipt.model_copy(
-                deep=True
-            )
-            session.execution_graph_edges = [
-                edge.model_copy(deep=True)
-                for edge in proposal.edges
-            ]
+            session.execution_graph_proposal = proposal.model_copy(deep=True)
+            session.execution_graph_receipt = receipt.model_copy(deep=True)
+            session.execution_graph_edges = [edge.model_copy(deep=True) for edge in proposal.edges]
             session.execution_graph_generation = receipt.version
             session.execution_graph_fingerprint = receipt.fingerprint
             if not any(
-                context.status == "VERIFIED"
-                or bool(context.verified_artifact_ids)
-                for context in contexts.values()
+                context.status == "VERIFIED" or bool(context.verified_artifact_ids) for context in contexts.values()
             ):
                 session.execution_graph_data_snapshot = None
             session.execution_graph_revision_count = max(
@@ -15633,10 +16583,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             session.execution_graph_used_replan_fingerprints.extend(
                 fingerprint
                 for fingerprint in receipt.replan_evidence_fingerprints
-                if fingerprint
-                not in set(
-                    session.execution_graph_used_replan_fingerprints
-                )
+                if fingerprint not in set(session.execution_graph_used_replan_fingerprints)
             )
             session.execution_graph_revision_discovery_evidence_id = ""
             session.execution_graph_revision_discovery_evidence_ids = []
@@ -15647,29 +16594,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             }
             session.parallel_branch_goal_ids = {
                 query_node_id: list(goal_ids)
-                for query_node_id, goal_ids in (
-                    session.parallel_branch_goal_ids.items()
-                )
+                for query_node_id, goal_ids in (session.parallel_branch_goal_ids.items())
                 if query_node_id in contexts
             }
-            session.population_graph_receipt = (
-                population_receipt.model_copy(deep=True)
-            )
-            session.population_pre_execution_references = (
-                refreshed_population_references
-            )
+            session.population_graph_receipt = population_receipt.model_copy(deep=True)
+            session.population_pre_execution_references = refreshed_population_references
             session.population_post_gate_results = {
                 query_node_id: dict(result)
-                for query_node_id, result in (
-                    session.population_post_gate_results.items()
-                )
+                for query_node_id, result in (session.population_post_gate_results.items())
                 if query_node_id in carried_query_ids
             }
             session.population_artifact_query_node_ids = {
                 artifact_id: query_node_id
-                for artifact_id, query_node_id in (
-                    session.population_artifact_query_node_ids.items()
-                )
+                for artifact_id, query_node_id in (session.population_artifact_query_node_ids.items())
                 if query_node_id in carried_query_ids
             }
         return True
@@ -15695,97 +16632,56 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             if runtime_budget is not None:
                 runtime_budget.checkpoint()
             current = recovery
-            base_session_restored = (
-                self._ensure_graph_revision_base_session(
-                    session,
-                    journal,
-                    current,
-                    runtime_budget=runtime_budget,
-                )
+            base_session_restored = self._ensure_graph_revision_base_session(
+                session,
+                journal,
+                current,
+                runtime_budget=runtime_budget,
             )
             goal_contract = session.question_goal_contract
             if goal_contract is None:
-                raise RuntimeError(
-                    "GRAPH_REVISION_RECOVERY_BASE_SESSION_REQUIRED"
-                )
+                raise RuntimeError("GRAPH_REVISION_RECOVERY_BASE_SESSION_REQUIRED")
             payload = current.recovery_payload
-            revised_population_receipt = (
-                PopulationDynamicGraphReceipt.model_validate(
-                    payload.population_receipt
-                )
-            )
+            revised_population_receipt = PopulationDynamicGraphReceipt.model_validate(payload.population_receipt)
             if current.next_action == "COMMIT_POPULATION":
                 gate_result = gate.revise_graph(
-                    context_owner_fingerprint=(
-                        workspace.owner_fingerprint
-                    ),
-                    run_authority_fingerprint=(
-                        workspace.request_fingerprint
-                    ),
-                    goal_contract_fingerprint=(
-                        original_question_goal_contract_fingerprint(
-                            goal_contract
-                        )
-                    ),
-                    previous_graph_receipt_fingerprint=(
-                        current.record.base_population_receipt_fingerprint
-                    ),
-                    revised_graph_receipt=(
-                        revised_population_receipt
-                    ),
-                    revision_evidence_fingerprint=(
-                        current.record.evidence_set_fingerprint
-                    ),
+                    context_owner_fingerprint=(workspace.owner_fingerprint),
+                    run_authority_fingerprint=(workspace.request_fingerprint),
+                    goal_contract_fingerprint=(original_question_goal_contract_fingerprint(goal_contract)),
+                    previous_graph_receipt_fingerprint=(current.record.base_population_receipt_fingerprint),
+                    revised_graph_receipt=(revised_population_receipt),
+                    revision_evidence_fingerprint=(current.record.evidence_set_fingerprint),
                 )
                 if not gate_result.accepted:
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_POPULATION_REJECTED:%s"
-                        % gate_result.code
-                    )
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_POPULATION_REJECTED:%s" % gate_result.code)
                 advanced = journal.advance(
                     current.transaction_id,
                     target_status="POPULATION_COMMITTED",
                     expected_revision=current.record.revision,
-                    expected_record_fingerprint=(
-                        current.record.record_fingerprint
-                    ),
+                    expected_record_fingerprint=(current.record.record_fingerprint),
                 )
-                current = journal.load_recovery(
-                    advanced.record.transaction_id
-                )
+                current = journal.load_recovery(advanced.record.transaction_id)
                 if current is None:
-                    raise RuntimeError(
-                        "GRAPH_REVISION_RECOVERY_JOURNAL_MISSING"
-                    )
+                    raise RuntimeError("GRAPH_REVISION_RECOVERY_JOURNAL_MISSING")
             if current.next_action == "COMMIT_EXECUTION":
                 self._install_recovered_execution_graph_revision(
                     session,
                     current.recovery_payload,
-                    expected_base_execution_fingerprint=(
-                        current.record.base_execution_receipt_fingerprint
-                    ),
+                    expected_base_execution_fingerprint=(current.record.base_execution_receipt_fingerprint),
                     runtime_budget=runtime_budget,
                 )
                 advanced = journal.advance(
                     current.transaction_id,
                     target_status="EXECUTION_COMMITTED",
                     expected_revision=current.record.revision,
-                    expected_record_fingerprint=(
-                        current.record.record_fingerprint
-                    ),
+                    expected_record_fingerprint=(current.record.record_fingerprint),
                 )
                 reports.append(
                     {
-                        "transactionId": (
-                            advanced.record.transaction_id
-                        ),
+                        "transactionId": (advanced.record.transaction_id),
                         "status": advanced.record.status,
-                        "baseSessionRestored": (
-                            base_session_restored
-                        ),
-                        "executionReceipt": (
-                            current.recovery_payload.execution_receipt
-                        ),
+                        "baseSessionRestored": (base_session_restored),
+                        "executionReceipt": (current.recovery_payload.execution_receipt),
                     }
                 )
         return reports
@@ -15888,9 +16784,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     else None
                 )
                 references = tuple(session.population_pre_execution_references.values())
-            legacy_goal_gate_active = bool(
-                goal_gate_id and goal_gate_accepted and goal_attestation is not None
-            )
+            legacy_goal_gate_active = bool(goal_gate_id and goal_gate_accepted and goal_attestation is not None)
             if legacy_goal_gate_active:
                 contract = session.question_goal_contract
                 if contract is None:
@@ -16138,6 +17032,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "access_role": access_role,
                     "user_scope": user_scope,
                 }
+                if conversation_resolution is not None:
+                    session_kwargs["retrieval_question"] = (
+                        conversation_resolution.retrieval_question
+                        or question
+                    )
                 if reference_scope is not None and reference_scope.enabled:
                     session_kwargs["reference_scope"] = reference_scope
                 kernel_session = self.kernel.new_session(
@@ -16153,21 +17052,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     )
                 else:
                     self.kernel.route_topic(kernel_session)
-            if (
-                kernel_session.routing.clarification_required
-                or not kernel_session.workspace_topics
-            ):
-                self.kernel.request_clarification(
-                    kernel_session,
-                    (
-                        "当前问题暂时无法收敛到可靠的业务范围。"
-                        "请补充要分析的业务对象或指标。"
-                    ),
-                    stage="topic_routing",
-                    clarification_type="TOPIC_SCOPE_REQUIRED",
-                    options=[],
+            if kernel_session.routing.clarification_required:
+                kernel_session.routing = kernel_session.routing.model_copy(
+                    update={
+                        "clarification_required": False,
+                        "selection_mode": "automatic",
+                        "scope_disclosure_required": False,
+                        "routing_mode": "open_discovery",
+                        "reason": (
+                            "Topic confidence was insufficient; continue governed "
+                            "open discovery without asking the merchant to route."
+                        ),
+                    }
                 )
-            else:
+            if kernel_session.workspace_topics:
                 try:
                     with budget.stage("recall.initial"):
                         self.kernel.recall_navigation(kernel_session)
@@ -16181,10 +17079,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             sequence=len(kernel_session.events) + 1,
                             stage="recall_navigation",
                             status="DEGRADED",
-                            detail="%s:%s"
-                            % (type(exc).__name__, str(exc)[:500]),
+                            detail="%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         )
                     )
+            else:
+                kernel_session.phase = "TOPIC_OPEN_DISCOVERY"
             session = GroundedDeepAgentSession(
                 runtime=kernel_session,
                 context_workspace=context_workspace,
@@ -16213,7 +17112,11 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 population_gate_enforced=self.population_gate_enforced,
                 conversation_context=(
                     {
-                        "resolution": conversation_resolution.trace(),
+                        "resolution": {
+                            key: value
+                            for key, value in conversation_resolution.trace().items()
+                            if key != "retrievalQuestion"
+                        },
                         "activeScope": dict((previous_conversation_snapshot or {}).get("activeScope") or {}),
                     }
                     if conversation_resolution is not None
@@ -16235,12 +17138,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     run_id=actual_run_id,
                     merchant_id=merchant_id,
                     user_scope=user_scope,
-                    previous_snapshot=(
-                        previous_conversation_snapshot or {}
-                    ),
-                    expected_revision=(
-                        expected_conversation_revision
-                    ),
+                    previous_snapshot=(previous_conversation_snapshot or {}),
+                    expected_revision=(expected_conversation_revision),
                 )
             if self.population_gate_enforced:
                 if self.population_execution_gate is None or context_workspace is None:
@@ -16248,20 +17147,16 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 self.population_execution_gate.register_run(
                     workspace=context_workspace,
                     ledger_provider=(
-                        lambda active=session: tuple(
-                            _authorized_verified_query_artifacts(active)
-                        )
-                        + tuple(
-                            active.population_staged_query_artifacts.values()
+                        lambda active=session: (
+                            tuple(_authorized_verified_query_artifacts(active))
+                            + tuple(active.population_staged_query_artifacts.values())
                         )
                     ),
                 )
                 try:
-                    recovered_graph_revisions = (
-                        self._recover_pending_graph_revisions(
-                            session,
-                            runtime_budget=budget,
-                        )
+                    recovered_graph_revisions = self._recover_pending_graph_revisions(
+                        session,
+                        runtime_budget=budget,
                     )
                 except (
                     GroundedGraphRevisionJournalError,
@@ -16269,11 +17164,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     ValueError,
                 ) as exc:
                     session.operational_failure = {
-                        "code": (
-                            "GRAPH_REVISION_RECOVERY_FAILED"
-                        ),
-                        "message": "%s:%s"
-                        % (type(exc).__name__, str(exc)[:500]),
+                        "code": ("GRAPH_REVISION_RECOVERY_FAILED"),
+                        "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                         "retryable": False,
                     }
                     session.runtime.phase = "OPERATIONAL_FAILURE"
@@ -16281,12 +17173,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     if recovered_graph_revisions:
                         session.execution_graph_history.append(
                             {
-                                "status": (
-                                    "JOURNAL_RECOVERY_COMPLETED_AT_BOOTSTRAP"
-                                ),
-                                "transactions": (
-                                    recovered_graph_revisions
-                                ),
+                                "status": ("JOURNAL_RECOVERY_COMPLETED_AT_BOOTSTRAP"),
+                                "transactions": (recovered_graph_revisions),
                             }
                         )
             context = GroundedDeepAgentRunContext(
@@ -16712,8 +17600,6 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "content": str(result.get("content") or ""),
                 }
             )
-        if not manifests:
-            raise RuntimeError("Grounded bootstrap failed: no routed Topic L0 manifest")
         conversation_context = dict(session.conversation_context or {})
         active_conversation_scope = dict(conversation_context.get("activeScope") or {})
         compact_source_artifacts = [
@@ -16732,10 +17618,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             and session.execution_graph_receipt is not None
             and session.execution_graph_proposal is not None
         ):
-            branch_reports = [
-                context.report()
-                for context in session.query_branch_contexts.values()
-            ]
+            branch_reports = [context.report() for context in session.query_branch_contexts.values()]
             restored_execution_state = {
                 "status": "RESTORED_AND_ROLLED_FORWARD",
                 "goalContract": (
@@ -16757,29 +17640,17 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                             mode="json",
                         )
                     ),
-                    "revisionCount": (
-                        session.execution_graph_revision_count
-                    ),
-                    "maxRevisionCount": (
-                        session.execution_graph_max_revision_count
-                    ),
+                    "revisionCount": (session.execution_graph_revision_count),
+                    "maxRevisionCount": (session.execution_graph_max_revision_count),
                 },
                 "populationAttestation": (
                     {
                         "authority": "ATTACHED_TO_EXECUTION_GRAPH",
                         "derivedFromExecutionGraph": True,
-                        "executionGraphId": (
-                            session.population_graph_receipt.graph_id
-                        ),
-                        "executionGraphVersion": (
-                            session.population_graph_receipt.graph_version
-                        ),
-                        "executionGraphFingerprint": (
-                            session.population_graph_receipt.graph_fingerprint
-                        ),
-                        "attestationReceiptFingerprint": (
-                            session.population_graph_receipt.receipt_fingerprint
-                        ),
+                        "executionGraphId": (session.population_graph_receipt.graph_id),
+                        "executionGraphVersion": (session.population_graph_receipt.graph_version),
+                        "executionGraphFingerprint": (session.population_graph_receipt.graph_fingerprint),
+                        "attestationReceiptFingerprint": (session.population_graph_receipt.receipt_fingerprint),
                     }
                     if session.population_graph_receipt is not None
                     else {}
@@ -16793,35 +17664,19 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "waitingQueryIds": [
                     str(item.get("queryId") or "")
                     for item in branch_reports
-                    if str(item.get("status") or "")
-                    == "WAITING_VERIFIED_ARTIFACT"
+                    if str(item.get("status") or "") == "WAITING_VERIFIED_ARTIFACT"
                 ],
                 "verifiedQueryArtifactIds": [
-                    item.artifact_id
-                    for item in _authorized_verified_query_artifacts(
-                        session
-                    )
+                    item.artifact_id for item in _authorized_verified_query_artifacts(session)
                 ],
-                "verifiedEntitySetArtifactIds": [
-                    item.artifact_id
-                    for item in session.runtime.verified_entity_sets
-                ],
-                "verifiedRuleArtifactIds": [
-                    item.artifact_id
-                    for item in session.runtime.verified_rule_ledger
-                ],
+                "verifiedEntitySetArtifactIds": [item.artifact_id for item in session.runtime.verified_entity_sets],
+                "verifiedRuleArtifactIds": [item.artifact_id for item in session.runtime.verified_rule_ledger],
                 "artifactGoalIds": {
-                    artifact_id: list(goal_ids)
-                    for artifact_id, goal_ids in (
-                        session.artifact_goal_ids.items()
-                    )
+                    artifact_id: list(goal_ids) for artifact_id, goal_ids in (session.artifact_goal_ids.items())
                 },
                 "nextAction": (
                     "PREPARE_READY_GRAPH_NODES"
-                    if any(
-                        str(item.get("status") or "") == "DECLARED"
-                        for item in branch_reports
-                    )
+                    if any(str(item.get("status") or "") == "DECLARED" for item in branch_reports)
                     else "CONTINUE_FROM_RESTORED_VERIFIED_EVIDENCE"
                 ),
                 "authority": (
@@ -16883,18 +17738,14 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             "thinRecallCandidates": _thin_recall(
                 session.runtime.recall,
                 limit=4,
-                metric_slots=_metric_recall_slots(
-                    session.runtime.keywords
-                ),
+                metric_slots=_metric_recall_slots(session.runtime.keywords),
             ),
             "retrievalNavigation": _retrieval_trace_summary(session.runtime),
             "restoredExecutionState": restored_execution_state,
             "originalQuestionGoalPolicy": {
                 "requiredBeforeQuery": True,
                 "immutableAfterQueryStart": True,
-                "alreadyDeclared": bool(
-                    session.question_goal_contract is not None
-                ),
+                "alreadyDeclared": bool(session.question_goal_contract is not None),
                 "goalKinds": [
                     "METRIC",
                     "DIMENSION",
@@ -16909,9 +17760,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 ],
                 "queryAssignmentRequired": True,
                 "coverageOnly": True,
-                "allowedDependencySemantics": (
-                    "Record only the user's logical dependency between answer goals."
-                ),
+                "allowedDependencySemantics": ("Record only the user's logical dependency between answer goals."),
                 "forbiddenAtGoalDeclaration": [
                     "table/field/metric semantic bindings",
                     "population or result-artifact scope",
@@ -16935,6 +17784,12 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "headersDisclosedAfterVerifiedInputSnapshot": True,
                 "queryCollectionClosedBySkill": False,
                 "authoritativeSkillExecution": "SERIAL_ONLY",
+                "placementRule": {
+                    "decisionAuthority": "CORE_AGENT",
+                    "CORE": "choose load_skill for a short bounded invocation",
+                    "SUBAGENT": "choose run_skill for a complex or long invocation",
+                    "harnessOverride": ("scripts, oversized procedures and hard isolation requirements"),
+                },
                 "maxVerifiedSkillArtifacts": 4,
                 "skillProseCountsAsGoalCoverage": False,
                 "retryRule": "SAME_SUB_GOAL_NEXT_GENERATION",
@@ -16950,11 +17805,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "inputArtifactRefs",
                     "evidenceRequirements",
                     "allowedCapabilities",
+                    "skillNames",
                     "budget",
                     "generation",
                 ],
+                "dispatchShape": {
+                    "parallel": (
+                        "Only the typed governed delegation adapter uses this "
+                        "field. Multiple native task calls in one Core model "
+                        "turn may run concurrently through Deep Agents."
+                    ),
+                },
                 "allowedCapabilities": [
                     "READ_CONTEXT",
+                    "QUERY_DATA",
                     "QUERY_BRANCH",
                 ],
                 "firstGeneration": 1,
@@ -16965,11 +17829,18 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "evidenceGaps",
                 ],
                 "coverageRule": (
-                    "A SubGoal must bind frozen parentGoalIds, but worker prose "
-                    "never counts as Goal coverage."
+                    "A SubGoal must bind frozen parentGoalIds, but worker prose never counts as Goal coverage."
                 ),
-                "queryBranchRule": (
-                    "A query branch is a no-LLM execution unit, never a SubAgent."
+                "queryBranchRule": ("A query branch is a no-LLM execution unit, never a SubAgent."),
+                "queryDataRule": (
+                    "A granted SubAgent uses the same query_data request and Observation "
+                    "protocol as Root; tenant and ACL authority remain server-owned."
+                ),
+                "nativeTaskRule": (
+                    "Use Deep Agents native task with subagent_type grounded-researcher "
+                    "only for a JSON grounded_native_task.v1 READ_CONTEXT contract. "
+                    "QUERY_DATA, QUERY_BRANCH and Skill tasks must use their typed "
+                    "governed adapters."
                 ),
             },
             "instructions": (
@@ -16983,18 +17854,22 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 )
                 if restored_execution_state
                 else (
-                    "Use Topic/recall only for initial navigation. trustedExecutionScope is authoritative. "
+                    "Use Topic/recall only for navigation priority. If topicL0Manifests is empty "
+                    "or insufficient, read /knowledge/topics/index.json and then any relevant published "
+                    "Topic manifest without asking the merchant to choose a Topic. trustedExecutionScope "
+                    "is authoritative. "
                     "Declare only the immutable answer obligations and user-explicit logical dependencies first; "
                     "do not attach population scopes, formal semantic refs, query nodes, tables or execution modes. "
                     "Then progressively read formal assets. "
                     "Do not freeze query branches or topology before that evidence is sufficient. Immediately "
-                    "before query preparation, either propose one grounded Contract or freeze a validated graph; "
-                    "the Core may merge, split, parallelize, or serialize nodes only from formal evidence and "
-                    "typed population/artifact dependencies. For a frozen multi-node graph, submit exact "
-                    "semanticPaths through prepare_grounded_query_batch instead of using global filesystem tools. "
+                    "before querying, choose one query_data request or a query_batch of independent requests; "
+                    "the Core may merge, split, parallelize, or serialize work only from formal evidence and "
+                    "typed population/artifact dependencies. Preserve repairReceipt when a structured Observation "
+                    "requires another ReAct turn. "
                     "Only finalize_evidence_collection may freeze a verified Skill-input snapshot "
-                    "and disclose matching headers; this does not close later querying. The parent "
-                    "Core never has access to full SKILL.md bodies, and Skill prose never counts as coverage."
+                    "and disclose matching headers; this does not close later querying. The Core chooses load_skill "
+                    "for a short bounded invocation or run_skill for SubAgent isolation; the Harness may force "
+                    "isolation for scripts and oversized procedures. Skill prose never counts as coverage."
                 )
             ),
         }
@@ -17012,6 +17887,23 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "runtime": "grounded_deepagent",
                 "threadId": thread_id,
                 "runId": run_id,
+                "originalQuestionGoalContract": (
+                    session.question_goal_contract.model_dump(
+                        by_alias=True,
+                        mode="json",
+                    )
+                    if session.question_goal_contract is not None
+                    else {}
+                ),
+                "goalKinds": list(
+                    dict.fromkeys(
+                        str(getattr(goal, "kind", "") or "").upper()
+                        for goal in (
+                            session.question_goal_contract.goals if session.question_goal_contract is not None else []
+                        )
+                        if str(getattr(goal, "kind", "") or "").strip()
+                    )
+                ),
                 "activeAttemptId": state.active_attempt_id,
                 "activeGeneration": state.active_generation,
                 "legacyFallbackUsed": False,
@@ -17020,16 +17912,10 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                 "verifiedRuleArtifactIds": list(state.answer_rule_artifact_ids),
                 "verifiedRuleArtifactCount": len(state.answer_rule_artifact_ids),
                 "verifiedAnalysisArtifactIds": [
-                    item.artifact_id
-                    for item in _latest_verified_analysis_artifacts(session)
+                    item.artifact_id for item in _latest_verified_analysis_artifacts(session)
                 ],
-                "verifiedAnalysisArtifactCount": len(
-                    _latest_verified_analysis_artifacts(session)
-                ),
-                "verifiedAnalysisArtifactAuditIds": [
-                    item.artifact_id
-                    for item in session.verified_analysis_ledger
-                ],
+                "verifiedAnalysisArtifactCount": len(_latest_verified_analysis_artifacts(session)),
+                "verifiedAnalysisArtifactAuditIds": [item.artifact_id for item in session.verified_analysis_ledger],
                 "skillRuns": [
                     {
                         "skillName": item.get("skillName"),
@@ -17049,9 +17935,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                         "generation": item.generation,
                         "parentGoalIds": list(item.parent_goal_ids),
                         "inputArtifactIds": list(item.input_artifact_ids),
-                        "derivedAnalysisArtifactIds": list(
-                            item.derived_analysis_artifact_ids
-                        ),
+                        "derivedAnalysisArtifactIds": list(item.derived_analysis_artifact_ids),
                         "integrityValid": item.integrity_valid(),
                     }
                     for item in session.verified_skill_ledger
@@ -17066,12 +17950,8 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                                 "subGoalId": task.get("subGoalId"),
                                 "generation": task.get("generation"),
                                 "status": task.get("status"),
-                                "grantId": (task.get("grant") or {}).get(
-                                    "grantId"
-                                ),
-                                "goalContractFingerprint": (
-                                    task.get("grant") or {}
-                                ).get("goalContractFingerprint"),
+                                "grantId": (task.get("grant") or {}).get("grantId"),
+                                "goalContractFingerprint": (task.get("grant") or {}).get("goalContractFingerprint"),
                             }
                             for task in item.get("tasks") or []
                             if isinstance(task, dict)
@@ -17098,27 +17978,20 @@ Use the currently visible tools and the server-provided nextAction as the phase-
                     "calls": [dict(item) for item in session.core_context_reports[-16:]],
                 },
                 "trustedSessionContext": {
-                    "modelCallCount": len(
-                        session.trusted_session_context_reports
-                    ),
+                    "modelCallCount": len(session.trusted_session_context_reports),
                     "latest": (
                         dict(session.trusted_session_context_reports[-1])
                         if session.trusted_session_context_reports
                         else {}
                     ),
-                    "calls": [
-                        dict(item)
-                        for item in session.trusted_session_context_reports[-16:]
-                    ],
+                    "calls": [dict(item) for item in session.trusted_session_context_reports[-16:]],
                 },
             }
         }
         if session.operational_failure:
             trace["harness"]["operationalFailure"] = dict(session.operational_failure)
             return ChatResponse(
-                answer=_grounded_operational_failure_answer(
-                    session.operational_failure
-                ),
+                answer=_grounded_operational_failure_answer(session.operational_failure),
                 category_name=state.routing.display_summary(),
                 debug_trace=trace,
             )
@@ -17139,9 +18012,7 @@ Use the currently visible tools and the server-provided nextAction as the phase-
             tables = list(display_run.merged_query_bundle.tables) if display_run is not None else []
             sections: list[dict[str, Any]] = []
             answered_artifact_ids = set(state.answer_artifact_ids)
-            for artifact in _authorized_verified_query_artifacts(
-                session
-            ):
+            for artifact in _authorized_verified_query_artifacts(session):
                 if artifact.artifact_id not in answered_artifact_ids:
                     continue
                 bundle = artifact.run_result.merged_query_bundle
@@ -17196,19 +18067,13 @@ Use the currently visible tools and the server-provided nextAction as the phase-
         if state.answer:
             failure = {
                 "code": "GROUNDED_ANSWER_ATTESTATION_MISSING",
-                "message": (
-                    "Grounded final answer exists without a matching "
-                    "answer-coverage attestation"
-                ),
+                "message": ("Grounded final answer exists without a matching answer-coverage attestation"),
                 "retryable": False,
             }
         else:
             failure = {
                 "code": "GROUNDED_CORE_INCOMPLETE_TERMINAL_STATE",
-                "message": (
-                    "Grounded DeepAgent Core ended without verified answer "
-                    "or typed clarification"
-                ),
+                "message": ("Grounded DeepAgent Core ended without verified answer or typed clarification"),
                 "retryable": False,
             }
         session.operational_failure = dict(failure)
@@ -17278,10 +18143,7 @@ def _grounded_contract_sql_obligations(contract: Any) -> dict[str, Any]:
             }
             for item in contract.internal_metrics
         ],
-        "requestedOutputs": [
-            item.model_dump(by_alias=True, mode="json")
-            for item in contract.requested_outputs
-        ],
+        "requestedOutputs": [item.model_dump(by_alias=True, mode="json") for item in contract.requested_outputs],
         "upstreamTrustedArtifacts": [
             {
                 "artifactId": item.artifact_id,
@@ -17455,15 +18317,9 @@ def _retrieval_trace_summary(session: GroundedRuntimeSession) -> dict[str, Any]:
             ]
             or [0]
         ),
-        "hierarchicalRetrievalApplied": bool(
-            latest.hierarchical_retrieval_applied if latest is not None else False
-        ),
+        "hierarchicalRetrievalApplied": bool(latest.hierarchical_retrieval_applied if latest is not None else False),
         "sourceRefs": list(latest.source_refs or [])[:12] if latest is not None else [],
-        "issueCodes": [
-            str(item.code or "")
-            for item in session.recall_retrieval_issues
-            if str(item.code or "")
-        ][:12],
+        "issueCodes": [str(item.code or "") for item in session.recall_retrieval_issues if str(item.code or "")][:12],
     }
 
 
@@ -17496,12 +18352,8 @@ def _metric_recall_slots(keywords: Any) -> list[dict[str, Any]]:
                 "ownerTables": [],
             },
         )
-        canonical_key = str(
-            getattr(mention, "canonical_key", "") or ""
-        ).strip()
-        owner_table = str(
-            getattr(mention, "owner_table", "") or ""
-        ).strip()
+        canonical_key = str(getattr(mention, "canonical_key", "") or "").strip()
+        owner_table = str(getattr(mention, "owner_table", "") or "").strip()
         if canonical_key and canonical_key not in slot["canonicalKeys"]:
             slot["canonicalKeys"].append(canonical_key)
         if owner_table and owner_table not in slot["ownerTables"]:
@@ -17540,10 +18392,7 @@ def _metric_slot_candidate_score(
         if _normalize_metric_recall_text(value)
     }
     normalized_metric_key = _normalize_metric_recall_text(metric_key)
-    exact_key = bool(
-        normalized_metric_key
-        and normalized_metric_key in canonical_keys
-    )
+    exact_key = bool(normalized_metric_key and normalized_metric_key in canonical_keys)
     aliases = metadata.get("aliases") or []
     if isinstance(aliases, str):
         aliases = [aliases]
@@ -17556,9 +18405,7 @@ def _metric_slot_candidate_score(
         *aliases,
     ]
     normalized_labels = {
-        _normalize_metric_recall_text(value)
-        for value in labels
-        if _normalize_metric_recall_text(value)
+        _normalize_metric_recall_text(value) for value in labels if _normalize_metric_recall_text(value)
     }
     phrase = _normalize_metric_recall_text(slot.get("phrase"))
     exact_phrase = bool(phrase and phrase in normalized_labels)
@@ -17573,22 +18420,12 @@ def _metric_slot_candidate_score(
         phrase
         and (
             phrase in searchable
-            or any(
-                phrase in label or label in phrase
-                for label in normalized_labels
-                if len(label) >= 2
-            )
+            or any(phrase in label or label in phrase for label in normalized_labels if len(label) >= 2)
         )
     )
     match_tier = 3 if exact_key else 2 if exact_phrase else 1 if phrase_related else 0
-    owner_tables = {
-        str(value or "").strip()
-        for value in slot.get("ownerTables") or []
-        if str(value or "").strip()
-    }
-    table_match = int(
-        bool(owner_tables and str(getattr(item, "table", "") or "") in owner_tables)
-    )
+    owner_tables = {str(value or "").strip() for value in slot.get("ownerTables") or [] if str(value or "").strip()}
+    table_match = int(bool(owner_tables and str(getattr(item, "table", "") or "") in owner_tables))
     return (
         match_tier,
         table_match,
@@ -17993,6 +18830,22 @@ def _load_skill_frontmatter(path: Path) -> dict[str, str]:
         key, raw = line.split(":", 1)
         result[key.strip()] = raw.strip().strip('"').strip("'")
     return result
+
+
+def _load_core_skill_procedure(path: Path, *, max_chars: int = 6000) -> str:
+    """Load only an explicitly short Core Skill into trusted Core context."""
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return ""
+    procedure = parts[2].strip()
+    if not procedure or len(procedure) > max_chars:
+        return ""
+    return procedure
 
 
 def _parse_skill_result(raw_output: str) -> dict[str, Any]:

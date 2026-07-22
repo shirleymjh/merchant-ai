@@ -9,6 +9,7 @@ from scripts.acceptance_runner import (
     USER_ACCEPTANCE_CASES,
     AcceptanceCase,
     parse_acceptance_response,
+    performance_violations,
 )
 
 
@@ -250,6 +251,42 @@ def test_catalogue_contains_the_exact_user_15_and_six_supplemental_shapes() -> N
     }
 
 
+def test_single_metric_performance_budget_tracks_calls_not_provider_latency() -> None:
+    case = next(
+        item
+        for item in SUPPLEMENTAL_CASES
+        if item.case_id == "base_single_metric"
+    )
+
+    assert performance_violations(
+        case,
+        {
+            "answer": "最近7天订单量为58单。",
+            "usage": {
+                "dorisQueries": 1,
+                "llmCalls": 3,
+                "toolCalls": 3,
+            },
+            "elapsedMs": 60_000,
+        },
+    ) == []
+    assert performance_violations(
+        case,
+        {
+            "answer": "最近7天订单量为58单。",
+            "usage": {
+                "dorisQueries": 2,
+                "llmCalls": 4,
+                "toolCalls": 5,
+            },
+        },
+    ) == [
+        "SINGLE_METRIC_LLM_CALL_BUDGET_EXCEEDED",
+        "SINGLE_METRIC_TOOL_CALL_BUDGET_EXCEEDED",
+        "SINGLE_METRIC_DORIS_QUERY_COUNT_INVALID",
+    ]
+
+
 def test_parser_summarizes_routing_goals_branches_artifacts_usage_and_coverage() -> None:
     case = USER_ACCEPTANCE_CASES[0]
     summary = parse_acceptance_response(case, _successful_payload(), status_code=200, elapsed_ms=1400.0)
@@ -267,6 +304,7 @@ def test_parser_summarizes_routing_goals_branches_artifacts_usage_and_coverage()
     assert summary["answerCoverage"]["passed"] is True
     assert summary["operationalFailure"] == {}
     assert summary["architecturePassed"] is True
+    assert summary["performancePassed"] is True
 
 
 def test_verified_single_contract_does_not_require_a_declared_execution_graph() -> None:

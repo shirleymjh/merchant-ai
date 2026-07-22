@@ -24,6 +24,7 @@ from merchant_ai.models import (
     RecallItem,
     ResolvedTimeRange,
     SqlValidationResult,
+    SubAgentResultEnvelope,
     TopicRoutingDecision,
     VerifiedEvidence,
 )
@@ -48,6 +49,12 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     _grounded_semantic_read_control,
     _latest_grounded_repair_tool_exchange,
     _metric_recall_slots,
+    _augment_batch_query_request_semantic_refs,
+    _normalize_detail_goal_binding_hints,
+    _normalize_scalar_metric_query_request,
+    _read_exact_core_semantic_path,
+    _record_governed_query_branch_outcome,
+    _simple_scalar_goal_contract,
     _parallel_goal_dependency_issues,
     _phase_visible_tools,
     _skill_output_contract_issues,
@@ -86,6 +93,7 @@ from merchant_ai.services.grounded_goal_contract import (
     OriginalQuestionGoalContract,
     OriginalQuestionGoalDeclaration,
     RankingQuestionGoal,
+    RuleQuestionGoal,
     TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_sql_candidate import (
@@ -99,6 +107,12 @@ from merchant_ai.services.grounded_subagent_runtime import (
     GroundedSubagentEvidenceRequirement,
     GroundedSubagentGoalContract,
     GroundedSkillRunContract,
+)
+from merchant_ai.services.query_request import QueryRequest, QuerySqlCandidate
+from merchant_ai.services.query_request import (
+    QueryOutcome,
+    QueryOutcomeStatus,
+    StructuredQueryObservation,
 )
 
 
@@ -287,9 +301,7 @@ def _verified_skill_contract(
             )
         ],
     )
-    session.artifact_goal_ids = {
-        artifact_id: ["metric.skill.input"] for artifact_id in artifact_ids
-    }
+    session.artifact_goal_ids = {artifact_id: ["metric.skill.input"] for artifact_id in artifact_ids}
     session.analysis_skill_headers_disclosed = True
     session.skill_input_snapshot_generation = snapshot_generation
     session.data_collection_sealed = False
@@ -360,6 +372,136 @@ class FakeSemanticCatalog:
         ]
 
 
+class FakeScalarSemanticCatalog(FakeSemanticCatalog):
+    def read(self, *, path: str, max_chars: int, offset: int) -> dict[str, Any]:
+        del max_chars, offset
+        if path == "topics/经营画像/tables/ads_merchant_profile/detail.json":
+            content = json.dumps(
+                {
+                    "topic": "经营画像",
+                    "tableName": "ads_merchant_profile",
+                    "timeColumn": "pt",
+                    "merchantFilterColumn": "merchant_id",
+                },
+                ensure_ascii=False,
+            )
+            return {
+                "success": True,
+                "refId": "semantic:经营画像:ads_merchant_profile:detail",
+                "path": path,
+                "kind": "TABLE_DETAIL",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "content": content,
+            }
+        if path == ("topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json"):
+            content = json.dumps(
+                {
+                    "metricKey": "order_cnt_1d",
+                    "businessName": "订单量",
+                    "formula": "SUM(order_cnt_1d)",
+                },
+                ensure_ascii=False,
+            )
+            return {
+                "success": True,
+                "refId": ("semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"),
+                "path": path,
+                "kind": "METRIC",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "content": content,
+            }
+        if path == "topics/经营画像/tables/ads_merchant_profile/columns/pt.json":
+            content = json.dumps(
+                {
+                    "topic": "经营画像",
+                    "tableName": "ads_merchant_profile",
+                    "section": "columns",
+                    "key": "pt",
+                    "definition": {
+                        "columnName": "pt",
+                        "businessName": "业务日期",
+                        "role": "TIME",
+                    },
+                },
+                ensure_ascii=False,
+            )
+            return {
+                "success": True,
+                "refId": "semantic:经营画像:ads_merchant_profile:field:pt",
+                "path": path,
+                "kind": "COLUMN",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "content": content,
+            }
+        return {"success": False, "error": "SEMANTIC_REF_NOT_FOUND"}
+
+
+class FakeMultiMetricSemanticCatalog(FakeScalarSemanticCatalog):
+    def read(self, *, path: str, max_chars: int, offset: int) -> dict[str, Any]:
+        del max_chars, offset
+        if path == "topics/电商退货/tables/refunds/detail.json":
+            return {
+                "success": True,
+                "refId": "semantic:电商退货:refunds:detail",
+                "path": path,
+                "kind": "TABLE_DETAIL",
+                "topic": "电商退货",
+                "table": "refunds",
+                "content": json.dumps(
+                    {
+                        "topic": "电商退货",
+                        "tableName": "refunds",
+                        "timeColumn": "pt",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        if path == "topics/电商退货/tables/refunds/metrics/refund_amt.json":
+            return {
+                "success": True,
+                "refId": "semantic:电商退货:refunds:metric:refund_amt",
+                "path": path,
+                "kind": "METRIC",
+                "topic": "电商退货",
+                "table": "refunds",
+                "content": json.dumps(
+                    {
+                        "metric": {
+                            "metricKey": "refund_amt",
+                            "businessName": "退款金额",
+                            "aliases": ["退款金额"],
+                            "timeColumn": "pt",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        if path == "topics/电商退货/tables/refunds/columns/pt.json":
+            return {
+                "success": True,
+                "refId": "semantic:电商退货:refunds:field:pt",
+                "path": path,
+                "kind": "COLUMN",
+                "topic": "电商退货",
+                "table": "refunds",
+                "content": json.dumps(
+                    {
+                        "key": "pt",
+                        "definition": {
+                            "columnName": "pt",
+                            "businessName": "业务日期",
+                            "role": "TIME",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        return super().read(path=path, max_chars=2_000_000, offset=0)
+
+
 class FakeKernel:
     def __init__(self):
         self.route_calls = 0
@@ -371,6 +513,9 @@ class FakeKernel:
         return GroundedRuntimeSession(
             session_id="s1",
             question=question,
+            retrieval_question=(
+                kwargs.get("retrieval_question") or question
+            ),
             merchant_id=merchant_id,
             merchant=kwargs.get("merchant") or MerchantInfo(merchant_id=merchant_id),
         )
@@ -387,7 +532,9 @@ class FakeKernel:
         return session.routing
 
     def recall_navigation(self, session: GroundedRuntimeSession, *, query: str = "", **kwargs: Any) -> RecallBundle:
-        self.recall_queries.append(query or session.question)
+        self.recall_queries.append(
+            query or session.retrieval_question or session.question
+        )
         bundle = RecallBundle(
             items=[
                 RecallItem(
@@ -543,6 +690,24 @@ class ClarifyingConversationAuthority:
         )
 
 
+class ContextualizedConversationAuthority:
+    def resolve(
+        self,
+        question: str,
+        **kwargs: Any,
+    ) -> GroundedConversationResolution:
+        del kwargs
+        normalized = str(question or "").strip()
+        return GroundedConversationResolution(
+            original_question=normalized,
+            effective_question=normalized,
+            retrieval_question="最近7天的退款情况",
+            status="RESOLVED_REFERENCE",
+            reference_detected=True,
+            source="TEST_STRUCTURED_CONVERSATION_REVIEW",
+        )
+
+
 def runtime(factory: CapturingFactory, kernel: FakeKernel | None = None) -> GroundedDeepAgentRuntime:
     return GroundedDeepAgentRuntime(
         kernel or FakeKernel(),
@@ -575,6 +740,647 @@ def declare_single_metric_goal(
         )
     )
     assert result["status"] == "ACCEPTED"
+
+
+def test_query_data_normalizes_only_provably_redundant_scalar_bindings() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="normalize-query-request",
+            question="最近7天订单量是多少",
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="最近7天订单量是多少",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.orders",
+                    label="订单量",
+                ),
+                TimeWindowQuestionGoal(
+                    goal_id="time.recent_7_days",
+                    label="最近7天",
+                    time_expression="最近7天",
+                    days=7,
+                    applies_to_goal_ids=["metric.orders"],
+                ),
+            ],
+        ),
+    )
+    metric_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    request = QueryRequest.model_validate(
+        {
+            "queryId": "orders.recent_7_days",
+            "goalIds": ["metric.orders", "time.recent_7_days"],
+            "bindingHints": {
+                "metricRefs": [metric_ref],
+                "fieldAggregations": [
+                    {
+                        "fieldRef": "semantic:经营画像:ads_merchant_profile:field:order_cnt_1d",
+                        "aggregation": "SUM",
+                    }
+                ],
+                "selectedFields": [
+                    {
+                        "fieldRef": "semantic:经营画像:ads_merchant_profile:field:order_cnt_1d",
+                    }
+                ],
+            },
+        }
+    )
+
+    normalized = _normalize_scalar_metric_query_request(session, request)
+
+    assert normalized.binding_hints.metric_refs == [metric_ref]
+    assert normalized.binding_hints.field_aggregations == []
+    assert normalized.binding_hints.selected_fields == []
+    assert request.binding_hints.field_aggregations
+    assert request.binding_hints.selected_fields
+
+
+def test_query_data_keeps_mixed_bindings_when_metric_refs_do_not_cover_goals() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="keep-ambiguous-query-request",
+            question="订单量和买家数是多少",
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="订单量和买家数是多少",
+            goals=[
+                MetricQuestionGoal(goal_id="metric.orders", label="订单量"),
+                MetricQuestionGoal(goal_id="metric.buyers", label="买家数"),
+            ],
+        ),
+    )
+    request = QueryRequest.model_validate(
+        {
+            "queryId": "orders-and-buyers",
+            "goalIds": ["metric.orders", "metric.buyers"],
+            "bindingHints": {
+                "metricRefs": ["semantic:经营画像:profile:metric:order_cnt_1d"],
+                "fieldAggregations": [
+                    {
+                        "fieldRef": "semantic:电商交易:orders:field:buyer_id",
+                        "aggregation": "COUNT_DISTINCT",
+                    }
+                ],
+            },
+        }
+    )
+
+    normalized = _normalize_scalar_metric_query_request(session, request)
+
+    assert normalized == request
+
+
+def test_query_data_updates_frozen_branch_and_unlocks_verified_dependency() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="query-data-branch-sync",
+            question="先查商品再查工单",
+            merchant_id="m-1",
+        )
+    )
+    source = GroundedQueryBranchContext(
+        spec=GroundedQueryBranchSpec(
+            query_id="source",
+            goal_ids=["goal.source"],
+            topic_scope=["商品"],
+        ),
+        runtime=None,
+        budget=GroundedBranchBudget(
+            "source",
+            GroundedBranchBudgetLimits(),
+        ),
+    )
+    dependent = GroundedQueryBranchContext(
+        spec=GroundedQueryBranchSpec(
+            query_id="dependent",
+            goal_ids=["goal.dependent"],
+            topic_scope=["客服工单"],
+        ),
+        runtime=None,
+        budget=GroundedBranchBudget(
+            "dependent",
+            GroundedBranchBudgetLimits(),
+        ),
+        dependency_query_ids=["source"],
+        status="WAITING_VERIFIED_ARTIFACT",
+    )
+    session.query_branch_contexts = {
+        "source": source,
+        "dependent": dependent,
+    }
+
+    _record_governed_query_branch_outcome(
+        session,
+        QueryRequest(query_id="source", goal_ids=["goal.source"]),
+        QueryOutcome(
+            status=QueryOutcomeStatus.VERIFIED,
+            query_id="source",
+            artifact_ids=["artifact.source"],
+            covered_goal_ids=["goal.source"],
+        ),
+    )
+
+    assert source.status == "VERIFIED"
+    assert source.verified_artifact_ids == ["artifact.source"]
+    assert dependent.status == "DECLARED"
+
+
+def test_query_data_records_reasoning_gap_on_frozen_branch() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="query-data-branch-gap",
+            question="查订单量",
+            merchant_id="m-1",
+        )
+    )
+    branch = GroundedQueryBranchContext(
+        spec=GroundedQueryBranchSpec(
+            query_id="orders",
+            goal_ids=["goal.orders"],
+            topic_scope=["经营画像"],
+        ),
+        runtime=None,
+        budget=GroundedBranchBudget(
+            "orders",
+            GroundedBranchBudgetLimits(),
+        ),
+    )
+    session.query_branch_contexts = {"orders": branch}
+
+    _record_governed_query_branch_outcome(
+        session,
+        QueryRequest(query_id="orders", goal_ids=["goal.orders"]),
+        QueryOutcome(
+            status=QueryOutcomeStatus.NEEDS_REASONING,
+            query_id="orders",
+            observation=StructuredQueryObservation(
+                stage="CONTRACT",
+                code="TIME_FIELD_REF_NOT_READ",
+                retryable=True,
+                gaps=[{"code": "TIME_FIELD_REF_NOT_READ"}],
+            ),
+        ),
+    )
+
+    assert branch.status == "CONTRACT_GAPPED"
+    assert branch.last_gaps == [{"code": "TIME_FIELD_REF_NOT_READ"}]
+
+
+def test_simple_scalar_goal_contract_keeps_query_graph_and_delegation_choices() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="simple-scalar-tools",
+            question="最近7天订单量是多少",
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="最近7天订单量是多少",
+            goals=[
+                MetricQuestionGoal(goal_id="metric.orders", label="订单量"),
+                TimeWindowQuestionGoal(
+                    goal_id="time.recent_7_days",
+                    label="最近7天",
+                    time_expression="最近7天",
+                    days=7,
+                    applies_to_goal_ids=["metric.orders"],
+                ),
+            ],
+        ),
+    )
+
+    visible, _ = _phase_visible_tools(session, outer.tools)
+    visible_names = {item.name for item in visible}
+
+    assert _simple_scalar_goal_contract(session) is True
+    assert "query_data" in visible_names
+    assert "propose_grounded_execution_graph" in visible_names
+    assert "prepare_grounded_query_batch" in visible_names
+    assert "query_batch" in visible_names
+    assert "delegate_grounded_tasks" in visible_names
+
+
+def test_simple_scalar_goal_declaration_prefetches_exact_metric_assets() -> None:
+    factory = CapturingFactory(action="none")
+    outer = GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeScalarSemanticCatalog(),
+        agent_factory=factory,
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+    question = "最近7天订单量是多少"
+    metric_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="simple-scalar-prefetch",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["经营画像"],
+            recall=RecallBundle(
+                items=[
+                    RecallItem(
+                        doc_id=metric_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="经营画像",
+                        table="ads_merchant_profile",
+                        metadata={
+                            "semanticRefId": metric_ref,
+                            "semanticPath": ("topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json"),
+                            "metricResolutionType": "exact_semantic_label",
+                            "metricResolutionConfidence": 0.97,
+                            "metricResolutionAmbiguous": False,
+                        },
+                    )
+                ]
+            ),
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-prefetch",
+        run_id="run-prefetch",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.orders",
+                        label="订单量",
+                    ),
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_7_days",
+                        label="最近7天",
+                        time_expression="最近7天",
+                        days=7,
+                        applies_to_goal_ids=["metric.orders"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert result["simpleScalarPrefetch"]["status"] == "PREFETCHED"
+    assert result["nextAction"] == "QUERY_DATA_WITH_PREFETCHED_ASSETS"
+    assert {item["refId"] for item in session.core_semantic_evidence} == {
+        "semantic:经营画像:ads_merchant_profile:detail",
+        metric_ref,
+        "semantic:经营画像:ads_merchant_profile:field:pt",
+    }
+    assert result["simpleScalarPrefetch"]["timeFieldRef"] == ("semantic:经营画像:ads_merchant_profile:field:pt")
+    visible, _ = _phase_visible_tools(session, outer.tools)
+    visible_names = {item.name for item in visible}
+    assert "query_data" in visible_names
+    assert "read_file" not in visible_names
+    assert "retrieve_knowledge" not in visible_names
+
+
+def test_goal_declaration_removes_presentation_directive_fake_rule() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    question = "最近7天订单明细和工单明细分别给我看一下。"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="presentation-rule-normalization",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["电商交易", "客服工单"],
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-presentation-rule",
+        run_id="run-presentation-rule",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalDeclaration(
+                goals=[
+                    TimeWindowQuestionGoal(
+                        goal_id="time.recent_7_days",
+                        label="最近7天",
+                        source_spans=["最近7天"],
+                        time_expression="最近7天",
+                        days=7,
+                        applies_to_goal_ids=["detail.orders", "detail.tickets"],
+                    ),
+                    DetailQuestionGoal(
+                        goal_id="detail.orders",
+                        label="订单明细",
+                        source_spans=["订单明细"],
+                    ),
+                    DetailQuestionGoal(
+                        goal_id="detail.tickets",
+                        label="工单明细",
+                        source_spans=["工单明细"],
+                    ),
+                    RuleQuestionGoal(
+                        goal_id="rule.separate_views",
+                        label="订单明细和工单明细分别展示",
+                        source_spans=["分别给我看一下"],
+                        requested_action="分别返回两个明细结果",
+                    ),
+                ]
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert result["goalNormalization"] == {
+        "code": "PRESENTATION_DIRECTIVE_RULE_REMOVED",
+        "removedGoalIds": ["rule.separate_views"],
+    }
+    assert session.question_goal_contract is not None
+    assert [goal.kind for goal in session.question_goal_contract.goals] == [
+        "TIME_WINDOW",
+        "DETAIL",
+        "DETAIL",
+    ]
+    assert result["nextAction"] == "DISCOVER_SEMANTIC_EVIDENCE"
+
+
+def test_query_batch_executes_ready_branches_and_repairs_them_independently() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    tools = {item.name: item for item in outer.tools}
+    question = "对比订单量、退款量和工单量"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="batch-independent-repair",
+            question=question,
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=question,
+            goals=[
+                MetricQuestionGoal(goal_id="goal.stable", label="订单量"),
+                MetricQuestionGoal(goal_id="goal.repair", label="退款量"),
+                MetricQuestionGoal(goal_id="goal.gap", label="工单量"),
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-batch",
+        run_id="run-batch",
+        session=session,
+    )
+
+    def fake_prepare(**kwargs: Any) -> str:
+        del kwargs
+        return json.dumps(
+            {
+                "status": "PARTIAL",
+                "queries": [
+                    {
+                        "queryId": "stable",
+                        "status": "PREPARED",
+                        "executionMode": "CORE_SQL_REQUIRED",
+                        "activeGeneration": 1,
+                        "contractFingerprint": "contract-stable",
+                    },
+                    {
+                        "queryId": "repair",
+                        "status": "PREPARED",
+                        "executionMode": "CORE_SQL_REQUIRED",
+                        "activeGeneration": 1,
+                        "contractFingerprint": "contract-repair",
+                    },
+                    {
+                        "queryId": "gap",
+                        "status": "BLOCKED",
+                        "code": "METRIC_REF_NOT_READ",
+                        "readNext": [{"refId": "metric.ticket_count"}],
+                    },
+                ],
+            }
+        )
+
+    execution_calls: dict[str, int] = {}
+
+    def fake_execute(**kwargs: Any) -> str:
+        spec = kwargs["queries"][0]
+        query_id = spec.query_id
+        execution_calls[query_id] = execution_calls.get(query_id, 0) + 1
+        if query_id == "repair" and execution_calls[query_id] == 1:
+            payload = {
+                "queryId": query_id,
+                "status": "REJECTED",
+                "code": "SQL_ALIAS_INVALID",
+                "nextAction": "REPAIR_SQL",
+                "activeGeneration": 1,
+                "contractFingerprint": "contract-repair",
+            }
+        else:
+            payload = {
+                "queryId": query_id,
+                "status": "VERIFIED",
+                "queryArtifactId": "artifact.%s" % query_id,
+                "coveredGoalIds": ["goal.%s" % query_id],
+                "rowCount": 1,
+            }
+        return json.dumps({"status": payload["status"], "queries": [payload]})
+
+    tools["prepare_grounded_query_batch"].func = fake_prepare
+    tools["execute_grounded_query_batch"].func = fake_execute
+    outer._repair_query_sql_candidate = lambda *args, **kwargs: QuerySqlCandidate(
+        sql="SELECT repaired_alias",
+        rationale="repair alias",
+    )
+    requests = [
+        QueryRequest(
+            query_id=query_id,
+            goal_ids=["goal.%s" % query_id],
+            sql_candidate=QuerySqlCandidate(
+                sql="SELECT original_alias",
+                rationale="initial SQL",
+            ),
+        )
+        for query_id in ("stable", "repair", "gap")
+    ]
+
+    outcome = json.loads(
+        tools["query_batch"].func(
+            requests=requests,
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert outcome["status"] == "PARTIAL"
+    assert outcome["verifiedCount"] == 2
+    assert outcome["needsReasoningCount"] == 1
+    by_id = {item["queryId"]: item for item in outcome["outcomes"]}
+    assert by_id["stable"]["attemptCount"] == 1
+    assert by_id["repair"]["attemptCount"] == 2
+    assert by_id["repair"]["internalRepairCount"] == 1
+    assert by_id["gap"]["observation"]["code"] == "METRIC_REF_NOT_READ"
+    assert execution_calls == {"stable": 1, "repair": 2}
+
+
+def test_batch_request_keeps_explicit_time_field_in_semantic_read_set() -> None:
+    request = QueryRequest(
+        query_id="detail.orders",
+        read_ref_ids=["semantic:电商交易:dwm_trade_order_detail_di:detail"],
+        binding_hints=GroundedBindingHints(time_field_ref=("semantic:电商交易:dwm_trade_order_detail_di:column:pt")),
+    )
+
+    normalized = _augment_batch_query_request_semantic_refs(request)
+
+    assert normalized.read_ref_ids == [
+        "semantic:电商交易:dwm_trade_order_detail_di:detail",
+        "semantic:电商交易:dwm_trade_order_detail_di:field:pt",
+    ]
+    assert request.read_ref_ids == ["semantic:电商交易:dwm_trade_order_detail_di:detail"]
+
+
+def test_batch_request_adds_declared_semantic_table_binding_to_read_set() -> None:
+    request = QueryRequest(
+        query_id="detail.orders",
+        binding_hints=GroundedBindingHints(
+            table_refs=["semantic:电商交易:dwm_trade_order_detail_di:detail"],
+            time_field_ref=("semantic:电商交易:dwm_trade_order_detail_di:field:pt"),
+        ),
+    )
+
+    normalized = _augment_batch_query_request_semantic_refs(request)
+
+    assert normalized.read_ref_ids == [
+        "semantic:电商交易:dwm_trade_order_detail_di:detail",
+        "semantic:电商交易:dwm_trade_order_detail_di:field:pt",
+    ]
+
+
+def test_batch_request_does_not_treat_physical_aliases_as_semantic_reads() -> None:
+    request = QueryRequest(
+        query_id="detail.orders",
+        semantic_paths=["semantic:电商交易:dwm_trade_order_detail_di:detail"],
+        binding_hints=GroundedBindingHints(
+            table_refs=["dwm_trade_order_detail_di"],
+            time_field_ref="pt",
+            time_expression="最近7天",
+        ),
+    )
+
+    normalized = _augment_batch_query_request_semantic_refs(request)
+
+    assert normalized.read_ref_ids == []
+    assert normalized.binding_hints.table_refs == ["dwm_trade_order_detail_di"]
+    assert normalized.binding_hints.time_field_ref == "pt"
+
+
+def test_generic_detail_goal_does_not_trust_model_all_fields_flag() -> None:
+    question = "最近7天订单明细和工单明细分别给我看一下。"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="generic-detail-goal",
+            question=question,
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=question,
+            goals=[
+                DetailQuestionGoal(
+                    goal_id="detail.orders",
+                    label="订单明细",
+                    request_all_fields=True,
+                )
+            ],
+        ),
+    )
+
+    normalized = _normalize_detail_goal_binding_hints(
+        session,
+        ["detail.orders"],
+        GroundedBindingHints(),
+    )
+
+    assert normalized.analysis_mode == "DETAIL"
+    assert normalized.detail_projection_mode == "DEFAULT"
+
+
+def test_multi_metric_goal_contract_keeps_graph_and_batch_tools() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory)
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="multi-metric-tools",
+            question="订单量和退款金额是多少",
+            merchant_id="m-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="订单量和退款金额是多少",
+            goals=[
+                MetricQuestionGoal(goal_id="metric.orders", label="订单量"),
+                MetricQuestionGoal(goal_id="metric.refunds", label="退款金额"),
+            ],
+        ),
+    )
+
+    visible, _ = _phase_visible_tools(
+        session,
+        [*outer.tools, SimpleNamespace(name="task")],
+    )
+    visible_names = {item.name for item in visible}
+
+    assert _simple_scalar_goal_contract(session) is False
+    assert "propose_grounded_execution_graph" in visible_names
+    assert "query_batch" in visible_names
+    assert "delegate_grounded_tasks" in visible_names
+    assert "task" in visible_names
+
+
+def test_governed_response_exposes_goal_contract_for_trace_audit() -> None:
+    goal_contract = OriginalQuestionGoalContract(
+        question="最近7天订单量是多少",
+        goals=[
+            MetricQuestionGoal(goal_id="metric.orders", label="订单量"),
+            TimeWindowQuestionGoal(
+                goal_id="time.recent_7_days",
+                label="最近7天",
+                time_expression="最近7天",
+                days=7,
+                applies_to_goal_ids=["metric.orders"],
+            ),
+        ],
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="trace-goal-contract",
+            question=goal_contract.question,
+            merchant_id="m-1",
+        ),
+        question_goal_contract=goal_contract,
+        operational_failure={
+            "code": "TEST_TERMINAL",
+            "message": "test response",
+            "retryable": False,
+        },
+    )
+
+    response = GroundedDeepAgentRuntime._governed_response(
+        session,
+        "thread-trace-goals",
+        "run-trace-goals",
+    )
+    harness = response.debug_trace["harness"]
+
+    assert harness["goalKinds"] == ["METRIC", "TIME_WINDOW"]
+    assert harness["originalQuestionGoalContract"] == goal_contract.model_dump(
+        by_alias=True,
+        mode="json",
+    )
 
 
 def test_goal_declaration_binds_trusted_question_without_model_copy() -> None:
@@ -782,10 +1588,7 @@ def test_goal_declaration_rejects_premature_population_binding() -> None:
 
 
 def test_runtime_source_has_no_legacy_or_action_catalog_dependencies() -> None:
-    source_path = (
-        Path(__file__).resolve().parents[2]
-        / "merchant_ai/services/grounded_deep_agent_runtime.py"
-    )
+    source_path = Path(__file__).resolve().parents[2] / "merchant_ai/services/grounded_deep_agent_runtime.py"
     source = source_path.read_text(encoding="utf-8")
     for forbidden in (
         "MerchantQaWorkflow",
@@ -837,8 +1640,11 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "delegate_grounded_exploration",
         "finalize_evidence_collection",
         "compose_verified_answer",
+        "load_skill",
         "run_skill",
         "ask_human",
+        "query_data",
+        "query_batch",
     }
 
     session = GroundedDeepAgentSession(
@@ -874,11 +1680,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "tableRefs" in contract_schema
     assert "metricRefs" in contract_schema
     assert "timeExpression" in contract_schema
-    goal_tool = next(
-        item
-        for item in factory.kwargs["tools"]
-        if item.name == "declare_original_question_goals"
-    )
+    goal_tool = next(item for item in factory.kwargs["tools"] if item.name == "declare_original_question_goals")
     goal_schema = json.dumps(
         goal_tool.tool_call_schema.model_json_schema(),
         ensure_ascii=False,
@@ -920,18 +1722,172 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         factory.kwargs["middleware"][3],
         GroundedCoreToolBoundaryMiddleware,
     )
-    assert [item["name"] for item in factory.kwargs["subagents"]] == ["general-purpose"]
+    assert [item["name"] for item in factory.kwargs["subagents"]] == [
+        "general-purpose",
+        "grounded-researcher",
+    ]
     assert factory.kwargs["subagents"][0]["tools"] == []
     assert factory.kwargs["subagents"][0]["skills"] is None
+    researcher = factory.kwargs["subagents"][1]
+    assert researcher["tools"] == []
+    assert researcher["response_format"] is SubAgentResultEnvelope
+    # Deep Agents supplies the native task's filesystem middleware from the
+    # raw spec's permissions; the harness must not inject a duplicate.
+    assert researcher.get("middleware") in (None, [])
+    assert "READ_CONTEXT" in researcher["description"]
     assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
-    assert "Execute deterministic modes directly" in factory.kwargs[
-        "system_prompt"
-    ]
-    assert "phase-specific procedure" in factory.kwargs["system_prompt"]
-    assert "not alternate planning authorities" in factory.kwargs[
-        "system_prompt"
-    ]
+    assert "Use query_data for one governed query" in factory.kwargs["system_prompt"]
+    assert "capabilities and constraints, not as a prewritten procedure" in (factory.kwargs["system_prompt"])
+    assert "not alternate planning authorities" in factory.kwargs["system_prompt"]
+
+
+def test_production_settings_hide_legacy_query_tools_by_default(
+    tmp_path: Path,
+) -> None:
+    factory = CapturingFactory(action="none")
+    settings = Settings(
+        harness_workspace_path=str(tmp_path / "runtime"),
+    )
+    GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        agent_factory=factory,
+        settings=settings,
+        skill_run_root=str(tmp_path / "skill-runs"),
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+
+    names = {item.name for item in factory.kwargs["tools"]}
+    assert {"query_data", "query_batch"}.issubset(names)
+    assert names.isdisjoint(
+        {
+            "propose_grounded_contract",
+            "prepare_grounded_query_batch",
+            "submit_grounded_sql_candidate",
+            "execute_grounded_query",
+            "execute_grounded_query_batch",
+        }
+    )
+    query_schema = next(
+        item for item in factory.kwargs["tools"] if item.name == "query_data"
+    ).tool_call_schema.model_json_schema()
+    assert "merchantId" not in json.dumps(query_schema, ensure_ascii=False)
+
+
+def test_core_agent_selects_skill_placement_with_harness_resource_guards(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / "skills"
+    core_skill = skill_root / "short-check"
+    complex_skill = skill_root / "complex-diagnosis"
+    core_skill.mkdir(parents=True)
+    complex_skill.mkdir(parents=True)
+    (core_skill / "SKILL.md").write_text(
+        """---
+name: short-check
+description: Check one bounded verified value.
+executionPlacement: AUTO
+executionMode: structured_renderer
+---
+Compare the verified value with the governed threshold and cite both.
+""",
+        encoding="utf-8",
+    )
+    (complex_skill / "SKILL.md").write_text(
+        """---
+name: complex-diagnosis
+description: Run a long multi-step diagnosis.
+executionPlacement: AUTO
+executionMode: python_script
+script: scripts/diagnose.py
+---
+Run the isolated diagnosis procedure.
+""",
+        encoding="utf-8",
+    )
+    outer = GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeSemanticCatalog(),
+        agent_factory=CapturingFactory(action="none"),
+        skill_root=str(skill_root),
+        skill_run_root=str(tmp_path / "skill-runs"),
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+
+    headers = {item["name"]: item for item in outer.skill_headers}
+    assert headers["short-check"]["executionPlacement"] == "AUTO"
+    assert headers["complex-diagnosis"]["executionPlacement"] == "AUTO"
+    assert "coreProcedure" not in headers["short-check"]
+    assert "coreProcedure" not in headers["complex-diagnosis"]
+
+    deep_session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="complex-skill-isolation",
+            question="诊断复杂指标",
+            merchant_id="merchant-1",
+            workspace_topics=["客服工单"],
+        ),
+        analysis_skill_headers_disclosed=True,
+        skill_input_snapshot_generation=1,
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="诊断复杂指标",
+            goals=[MetricQuestionGoal(goal_id="metric.primary", label="复杂指标")],
+        ),
+    )
+    deep_session.runtime.answer_artifact_ids = ["artifact-skill-input"]
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-complex-skill",
+        run_id="run-complex-skill",
+        session=deep_session,
+    )
+    load_tool = {item.name: item for item in outer.tools}["load_skill"]
+    core_loaded = json.loads(
+        load_tool.func(
+            skill_name="short-check",
+            reason="This invocation is one bounded comparison.",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    forced_isolation = json.loads(
+        load_tool.func(
+            skill_name="complex-diagnosis",
+            reason="This invocation needs the declared script.",
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert core_loaded["status"] == "CORE_SKILL_LOADED"
+    assert "governed threshold" in core_loaded["procedure"]
+    assert core_loaded["decisionAuthority"] == ("CORE_AGENT_WITH_HARNESS_GUARDS")
+    assert forced_isolation["status"] == "SKILL_REQUIRES_SUBAGENT"
+    assert forced_isolation["decisionAuthority"] == "HARNESS_RESOURCE_GUARD"
+
+    prepared = outer._prepare_grounded_subagent_task(
+        context,
+        task=GroundedSubagentGoalContract(
+            sub_goal_id="subgoal.complex.skill",
+            parent_goal_ids=["metric.primary"],
+            objective="隔离执行复杂诊断 Skill",
+            required_outputs=["diagnosis"],
+            input_artifact_refs=[],
+            evidence_requirements=[
+                GroundedSubagentEvidenceRequirement(
+                    requirement_id="diagnosis.refs",
+                    description="Return evidence refs.",
+                )
+            ],
+            allowed_capabilities=["READ_CONTEXT"],
+            budget=GroundedSubagentBudget(max_tool_calls=2, timeout_seconds=15),
+            generation=1,
+            skill_names=["complex-diagnosis"],
+        ),
+        execute_branch_tool=SimpleNamespace(func=lambda **kwargs: "{}"),
+    )
+    assert prepared.grant.skill_names == ["complex-diagnosis"]
+    assert prepared.job.user_payload["mountedSkill"] == ("/skills/complex-diagnosis/SKILL.md")
 
 
 def test_topology_repair_keeps_rebinding_and_execution_graph_tools_visible() -> None:
@@ -951,9 +1907,7 @@ def test_topology_repair_keeps_rebinding_and_execution_graph_tools_visible() -> 
                 code="INDEPENDENT_QUERY_SPLIT_REQUIRED",
                 message="independent metrics must be split",
                 evidence_kind="QUERY_TOPOLOGY",
-                resolution=(
-                    "REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"
-                ),
+                resolution=("REBIND_TO_COMPATIBLE_SINGLE_TABLE_OR_PROPOSE_EXECUTION_GRAPH"),
                 required_capability={
                     "relationshipEvidenceRequired": False,
                     "tableGroups": [
@@ -969,9 +1923,7 @@ def test_topology_repair_keeps_rebinding_and_execution_graph_tools_visible() -> 
             attempt_id="attempt-topology",
             contract=contract,
             status=contract.status,
-            next_action=(
-                "REBIND_COMPATIBLE_CONTRACT_OR_PROPOSE_EXECUTION_GRAPH"
-            ),
+            next_action=("REBIND_COMPATIBLE_CONTRACT_OR_PROPOSE_EXECUTION_GRAPH"),
         )
     ]
     session = GroundedDeepAgentSession(
@@ -1039,16 +1991,54 @@ def test_context_recovery_preserves_latest_repair_tool_call_pair() -> None:
         ),
     )
 
-    exchange = _latest_grounded_repair_tool_exchange(
-        [HumanMessage(content="最近7天订单数"), ai_message, tool_message]
-    )
+    exchange = _latest_grounded_repair_tool_exchange([HumanMessage(content="最近7天订单数"), ai_message, tool_message])
 
     assert len(exchange) == 2
     assert exchange[0].tool_calls[0]["id"] == tool_call_id
     assert exchange[1].tool_call_id == tool_call_id
-    assert json.loads(exchange[1].content)["repairDirective"][
-        "repairType"
-    ] == "BINDING"
+    assert json.loads(exchange[1].content)["repairDirective"]["repairType"] == "BINDING"
+
+
+def test_context_recovery_preserves_query_batch_observation_pair() -> None:
+    tool_call_id = "call_query_batch_observation"
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": tool_call_id,
+                "name": "query_batch",
+                "args": {"requests": []},
+                "type": "tool_call",
+            }
+        ],
+    )
+    tool_message = ToolMessage(
+        name="query_batch",
+        tool_call_id=tool_call_id,
+        content=json.dumps(
+            {
+                "status": "NEEDS_REASONING",
+                "outcomes": [
+                    {
+                        "queryId": "detail.orders",
+                        "status": "NEEDS_REASONING",
+                        "observation": {
+                            "code": "CORE_SQL_REQUIRED",
+                            "repairReceipt": {"receiptId": "receipt-1"},
+                        },
+                    }
+                ],
+            }
+        ),
+    )
+
+    exchange = _latest_grounded_repair_tool_exchange(
+        [HumanMessage(content="最近7天订单明细"), ai_message, tool_message]
+    )
+
+    assert len(exchange) == 2
+    assert exchange[0].tool_calls[0]["name"] == "query_batch"
+    assert json.loads(exchange[1].content)["outcomes"][0]["observation"]["code"] == "CORE_SQL_REQUIRED"
 
 
 def test_verified_query_can_compose_without_analysis_skill_snapshot() -> None:
@@ -1151,6 +2141,732 @@ def test_discovery_read_control_never_uses_fixed_leaf_counts_to_freeze() -> None
     assert control["status"] == "DISCOVERY_OPEN"
     assert control["retrievalClosed"] is False
     assert control["nextAction"] == ("CONTINUE_DISCOVERY_OR_PROPOSE_CONTRACT_OR_GRAPH")
+
+
+def test_goal_evidence_closure_removes_navigation_without_query_shape_rules() -> None:
+    question = "最近7天订单量和 GMV 分别是多少？"
+    table_ref = "semantic:经营画像:ads_merchant_profile:detail"
+    order_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    gmv_ref = "semantic:经营画像:ads_merchant_profile:metric:order_gmv_amt_1d"
+    time_ref = "semantic:经营画像:ads_merchant_profile:field:pt"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="goal-evidence-closure",
+            question=question,
+            merchant_id="merchant-1",
+            workspace_topics=["经营画像"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.orders",
+                    label="订单量",
+                    source_spans=["订单量"],
+                ),
+                MetricQuestionGoal(
+                    goal_id="metric.gmv",
+                    label="GMV",
+                    source_spans=["GMV"],
+                ),
+                TimeWindowQuestionGoal(
+                    goal_id="time.window",
+                    label="最近7天",
+                    source_spans=["最近7天"],
+                    time_expression="最近7天",
+                    applies_to_goal_ids=["metric.orders", "metric.gmv"],
+                ),
+            ],
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": table_ref,
+                "path": "topics/经营画像/tables/ads_merchant_profile/detail.json",
+                "kind": "TABLE_DETAIL",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "contentSnippet": json.dumps(
+                    {
+                        "tableName": "ads_merchant_profile",
+                        "title": "商家经营核心指标日汇总表",
+                        "timeColumn": "pt",
+                    },
+                    ensure_ascii=False,
+                ),
+                "contentComplete": True,
+            },
+            {
+                "refId": order_ref,
+                "path": "topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json",
+                "kind": "METRIC",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "contentSnippet": json.dumps(
+                    {
+                        "metric": {
+                            "metricKey": "order_cnt_1d",
+                            "aliases": ["订单量"],
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                "contentComplete": True,
+            },
+            {
+                "refId": gmv_ref,
+                "path": "topics/经营画像/tables/ads_merchant_profile/metrics/order_gmv_amt_1d.json",
+                "kind": "METRIC",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "contentSnippet": json.dumps(
+                    {
+                        "metric": {
+                            "metricKey": "order_gmv_amt_1d",
+                            "aliases": ["GMV"],
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                "contentComplete": True,
+            },
+            {
+                "refId": time_ref,
+                "path": "topics/经营画像/tables/ads_merchant_profile/columns/pt.json",
+                "kind": "COLUMN",
+                "topic": "经营画像",
+                "table": "ads_merchant_profile",
+                "contentSnippet": json.dumps(
+                    {
+                        "key": "pt",
+                        "definition": {
+                            "columnName": "pt",
+                            "businessName": "业务日期",
+                            "role": "TIME",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                "contentComplete": True,
+            },
+        ],
+    )
+
+    control = _grounded_semantic_read_control(session)
+
+    assert control["status"] == "DECLARED_GOALS_EVIDENCE_BOUND"
+    assert control["retrievalClosed"] is True
+    assert "topologyRequirement" not in control
+    assert control["goalBindings"] == {
+        "metric.orders": [order_ref],
+        "metric.gmv": [gmv_ref],
+    }
+    assert control["bindingSeed"]["bindingHints"] == {
+        "tableRefs": [table_ref],
+        "metricRefs": [order_ref, gmv_ref],
+        "dimensionRefs": [],
+        "timeFieldRefs": [time_ref],
+        "timeFieldRef": time_ref,
+    }
+
+    tools = [
+        SimpleNamespace(name=name)
+        for name in (
+            "grep",
+            "read_file",
+            "retrieve_knowledge",
+            "query_data",
+            "query_batch",
+            "propose_grounded_execution_graph",
+        )
+    ]
+    visible, _ = _phase_visible_tools(session, tools)
+
+    assert {item.name for item in visible} == {
+        "query_data",
+        "query_batch",
+        "propose_grounded_execution_graph",
+    }
+
+
+def test_cross_table_independent_metric_prefetch_keeps_graph_choice() -> None:
+    factory = CapturingFactory(action="none")
+    outer = GroundedDeepAgentRuntime(
+        FakeKernel(),
+        lead_model=object(),
+        semantic_catalog=FakeMultiMetricSemanticCatalog(),
+        agent_factory=factory,
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+    question = "最近7天订单量和退款金额分别是多少？"
+    order_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    refund_ref = "semantic:电商退货:refunds:metric:refund_amt"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="cross-table-prefetch",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["经营画像", "电商退货"],
+            recall=RecallBundle(
+                items=[
+                    RecallItem(
+                        doc_id=order_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="经营画像",
+                        table="ads_merchant_profile",
+                        metadata={
+                            "semanticRefId": order_ref,
+                            "semanticPath": "topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json",
+                            "matchedMetricLabel": "订单量",
+                            "metricResolutionType": "exact_semantic_label",
+                            "metricResolutionConfidence": 0.97,
+                        },
+                    ),
+                    RecallItem(
+                        doc_id=refund_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="电商退货",
+                        table="refunds",
+                        metadata={
+                            "semanticRefId": refund_ref,
+                            "semanticPath": "topics/电商退货/tables/refunds/metrics/refund_amt.json",
+                            "matchedMetricLabel": "退款金额",
+                            "metricResolutionType": "exact_semantic_label",
+                            "metricResolutionConfidence": 0.97,
+                        },
+                    ),
+                ]
+            ),
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-cross-table-prefetch",
+        run_id="run-cross-table-prefetch",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.orders",
+                        label="订单量",
+                        source_spans=["订单量"],
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refunds",
+                        label="退款金额",
+                        source_spans=["退款金额"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "ACCEPTED"
+    assert result["semanticPrefetch"]["status"] == "PREFETCHED"
+    assert len(result["semanticPrefetch"]["items"]) == 2
+    visible, _ = _phase_visible_tools(
+        session,
+        [
+            SimpleNamespace(name=name)
+            for name in (
+                "query_data",
+                "query_batch",
+                "propose_grounded_execution_graph",
+                "prepare_grounded_query_batch",
+                "read_file",
+                "retrieve_knowledge",
+            )
+        ],
+    )
+    assert {item.name for item in visible} == {
+        "query_data",
+        "query_batch",
+        "propose_grounded_execution_graph",
+        "prepare_grounded_query_batch",
+    }
+
+
+def test_goal_declaration_reports_missing_recall_without_side_effects() -> None:
+    class GapTrackingKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gap_calls = 0
+
+        def recall_goal_gaps(
+            self,
+            session: GroundedRuntimeSession,
+            requests: list[dict[str, Any]],
+            *,
+            max_requests: int,
+        ) -> list[dict[str, Any]]:
+            del session, requests, max_requests
+            self.gap_calls += 1
+            return []
+
+    kernel = GapTrackingKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeMultiMetricSemanticCatalog(),
+        agent_factory=CapturingFactory(action="none"),
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+    question = "订单量和退款金额分别是多少？"
+    order_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="goal-recall-no-side-effect",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["经营画像"],
+            recall=RecallBundle(
+                items=[
+                    RecallItem(
+                        doc_id=order_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="经营画像",
+                        table="ads_merchant_profile",
+                        metadata={
+                            "semanticRefId": order_ref,
+                            "semanticPath": ("topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json"),
+                            "matchedMetricLabel": "订单量",
+                        },
+                    )
+                ]
+            ),
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-goal-recall-no-side-effect",
+        run_id="run-goal-recall-no-side-effect",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+
+    result = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.orders",
+                        label="订单量",
+                        source_spans=["订单量"],
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refunds",
+                        label="退款金额",
+                        source_spans=["退款金额"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["goalRecallCoverage"]["missingGoalIds"] == ["metric.refunds"]
+    assert result["semanticPrefetch"] == {
+        "status": "SKIPPED",
+        "mode": "UNIQUE_GOAL_METRIC",
+        "code": "GOAL_RECALL_COVERAGE_INCOMPLETE",
+        "missingGoalIds": ["metric.refunds"],
+    }
+    assert kernel.gap_calls == 0
+    assert session.core_semantic_evidence == []
+
+
+def test_core_can_supplement_only_missing_goal_from_live_receipt() -> None:
+    class SupplementalKernel(FakeKernel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gap_requests: list[dict[str, Any]] = []
+
+        def recall_goal_gaps(
+            self,
+            session: GroundedRuntimeSession,
+            requests: list[dict[str, Any]],
+            *,
+            max_requests: int,
+        ) -> list[dict[str, Any]]:
+            attempted = list(requests)[:max_requests]
+            self.gap_requests.extend(attempted)
+            refund_ref = "semantic:电商退货:refunds:metric:refund_amt"
+            session.recall = RecallBundle(
+                items=[
+                    *session.recall.items,
+                    RecallItem(
+                        doc_id=refund_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="电商退货",
+                        table="refunds",
+                        metadata={
+                            "semanticRefId": refund_ref,
+                            "semanticPath": ("topics/电商退货/tables/refunds/metrics/refund_amt.json"),
+                            "matchedMetricLabel": "退款金额",
+                            "metricResolutionType": "exact_semantic_label",
+                            "metricResolutionConfidence": 0.97,
+                            "metricResolutionAmbiguous": False,
+                            "targetGoalIds": ["metric.refunds"],
+                        },
+                    ),
+                ]
+            )
+            return [
+                {
+                    "requestId": item["requestId"],
+                    "status": "COMPLETED",
+                    "candidateCount": 1,
+                }
+                for item in attempted
+            ]
+
+    kernel = SupplementalKernel()
+    outer = GroundedDeepAgentRuntime(
+        kernel,
+        lead_model=object(),
+        semantic_catalog=FakeMultiMetricSemanticCatalog(),
+        agent_factory=CapturingFactory(action="none"),
+        conversation_online_authority=StandaloneConversationAuthority(),
+    )
+    question = "订单量和退款金额分别是多少？"
+    order_ref = "semantic:经营画像:ads_merchant_profile:metric:order_cnt_1d"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="goal-recall-supplement",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["经营画像", "电商退货"],
+            recall=RecallBundle(
+                items=[
+                    RecallItem(
+                        doc_id=order_ref,
+                        source_type="SEMANTIC_METRIC",
+                        topic="经营画像",
+                        table="ads_merchant_profile",
+                        metadata={
+                            "semanticRefId": order_ref,
+                            "semanticPath": ("topics/经营画像/tables/ads_merchant_profile/metrics/order_cnt_1d.json"),
+                            "matchedMetricLabel": "订单量",
+                            "metricResolutionType": "exact_semantic_label",
+                            "metricResolutionConfidence": 0.97,
+                            "metricResolutionAmbiguous": False,
+                        },
+                    )
+                ]
+            ),
+        )
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-goal-recall-supplement",
+        run_id="run-goal-recall-supplement",
+        session=session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declared = json.loads(
+        tools["declare_original_question_goals"].func(
+            contract=OriginalQuestionGoalContract(
+                question=question,
+                goals=[
+                    MetricQuestionGoal(
+                        goal_id="metric.orders",
+                        label="订单量",
+                        source_spans=["订单量"],
+                    ),
+                    MetricQuestionGoal(
+                        goal_id="metric.refunds",
+                        label="退款金额",
+                        source_spans=["退款金额"],
+                    ),
+                ],
+            ),
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    supplemented = json.loads(
+        tools["retrieve_knowledge"].func(
+            query="退款金额",
+            reason="补齐缺失 Goal 的候选语义资产",
+            coverage_receipt_id=(declared["goalRecallCoverage"]["receiptId"]),
+            goal_ids=["metric.refunds"],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert supplemented["status"] == "COMPLETE"
+    assert supplemented["goalRecallCoverage"]["missingGoalIds"] == []
+    assert supplemented["semanticPrefetch"]["status"] == "PREFETCHED"
+    assert len(supplemented["semanticPrefetch"]["items"]) == 2
+    assert len(kernel.gap_requests) == 1
+    assert kernel.gap_requests[0]["targetGoalIds"] == ["metric.refunds"]
+
+    rejected = json.loads(
+        tools["retrieve_knowledge"].func(
+            query="订单量",
+            reason="不应重复召回已覆盖 Goal",
+            coverage_receipt_id=(supplemented["goalRecallCoverage"]["receiptId"]),
+            goal_ids=["metric.orders"],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+    assert rejected["status"] == "REJECTED"
+    assert rejected["code"] == "GOAL_RECALL_SUPPLEMENT_NOT_REQUIRED"
+
+
+def test_goal_dependency_keeps_graph_capability_after_prefetch_closure() -> None:
+    question = "先找出高退款商品，再统计这些商品的退款金额"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="dependency-graph-capability",
+            question=question,
+            merchant_id="m-1",
+            workspace_topics=["电商退货"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=question,
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.top_products",
+                    label="高退款商品",
+                    source_spans=["高退款商品"],
+                ),
+                MetricQuestionGoal(
+                    goal_id="metric.refund_amount",
+                    label="这些商品的退款金额",
+                    source_spans=["退款金额"],
+                    depends_on_goal_ids=["metric.top_products"],
+                ),
+            ],
+        ),
+    )
+    table_ref = "semantic:电商退货:refunds:detail"
+    session.core_semantic_evidence = [
+        {
+            "refId": table_ref,
+            "kind": "TABLE_DETAIL",
+            "topic": "电商退货",
+            "table": "refunds",
+            "contentSnippet": json.dumps({"tableName": "refunds"}),
+            "contentComplete": True,
+        },
+        {
+            "refId": "semantic:电商退货:refunds:metric:refund_amt",
+            "kind": "METRIC",
+            "topic": "电商退货",
+            "table": "refunds",
+            "contentSnippet": json.dumps(
+                {"metric": {"aliases": ["退款金额"]}},
+                ensure_ascii=False,
+            ),
+            "contentComplete": True,
+        },
+        {
+            "refId": "semantic:电商退货:refunds:metric:high_refund_products",
+            "kind": "METRIC",
+            "topic": "电商退货",
+            "table": "refunds",
+            "contentSnippet": json.dumps(
+                {"metric": {"aliases": ["高退款商品"]}},
+                ensure_ascii=False,
+            ),
+            "contentComplete": True,
+        },
+    ]
+    tools = [
+        SimpleNamespace(name=name)
+        for name in (
+            "query_data",
+            "query_batch",
+            "propose_grounded_execution_graph",
+            "read_file",
+            "retrieve_knowledge",
+        )
+    ]
+
+    visible, _ = _phase_visible_tools(session, tools)
+
+    assert "propose_grounded_execution_graph" in {item.name for item in visible}
+
+
+def test_detail_only_discovery_switches_to_query_batch_after_table_evidence() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="detail-batch-ready",
+            question="最近7天订单明细和最近10天退款明细分别给我看一下。",
+            merchant_id="merchant-1",
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="最近7天订单明细和最近10天退款明细分别给我看一下。",
+            goals=[
+                DetailQuestionGoal(
+                    goal_id="g_order_detail",
+                    label="最近7天订单明细",
+                ),
+                TimeWindowQuestionGoal(
+                    goal_id="g_order_time",
+                    label="最近7天",
+                    time_expression="最近7天",
+                    applies_to_goal_ids=["g_order_detail"],
+                ),
+                DetailQuestionGoal(
+                    goal_id="g_refund_detail",
+                    label="最近10天退款明细",
+                ),
+                TimeWindowQuestionGoal(
+                    goal_id="g_refund_time",
+                    label="最近10天",
+                    time_expression="最近10天",
+                    applies_to_goal_ids=["g_refund_detail"],
+                ),
+            ],
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:电商交易:orders:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "电商交易",
+                "table": "orders",
+                "contentComplete": True,
+            },
+            {
+                "refId": "semantic:电商退货:refunds:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "电商退货",
+                "table": "refunds",
+                "contentComplete": True,
+            },
+        ],
+    )
+
+    control = _grounded_semantic_read_control(session)
+
+    assert control["status"] == "READY_FOR_QUERY_BATCH"
+    assert control["nextAction"] == "CORE_REACT_DECIDES"
+    assert control["decisionMode"] == "CALLER_REACT"
+
+
+def test_query_readiness_and_batch_observations_are_advisory_to_react_caller() -> None:
+    question = "最近7天订单明细和最近10天退款明细分别给我看一下。"
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="batch-read-control",
+            question=question,
+            merchant_id="merchant-1",
+            workspace_topics=["电商交易", "电商退货"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question=question,
+            goals=[
+                DetailQuestionGoal(goal_id="g.orders", label="订单明细"),
+                TimeWindowQuestionGoal(
+                    goal_id="g.orders.time",
+                    label="最近7天",
+                    time_expression="最近7天",
+                    applies_to_goal_ids=["g.orders"],
+                ),
+                DetailQuestionGoal(goal_id="g.refunds", label="退款明细"),
+                TimeWindowQuestionGoal(
+                    goal_id="g.refunds.time",
+                    label="最近10天",
+                    time_expression="最近10天",
+                    applies_to_goal_ids=["g.refunds"],
+                ),
+            ],
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:电商交易:orders:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "电商交易",
+                "table": "orders",
+                "contentComplete": True,
+            },
+            {
+                "refId": "semantic:电商退货:refunds:detail",
+                "kind": "TABLE_DETAIL",
+                "topic": "电商退货",
+                "table": "refunds",
+                "contentComplete": True,
+            },
+        ],
+    )
+    tools = [
+        SimpleNamespace(name=name)
+        for name in (
+            "ls",
+            "grep",
+            "read_file",
+            "retrieve_knowledge",
+            "query_data",
+            "query_batch",
+        )
+    ]
+
+    visible, _ = _phase_visible_tools(session, tools)
+    assert {item.name for item in visible} == set(
+        {
+            "ls",
+            "grep",
+            "read_file",
+            "retrieve_knowledge",
+            "query_data",
+            "query_batch",
+        }
+    )
+
+    session.latest_query_batch_observations = [
+        {
+            "queryId": "orders",
+            "observation": {
+                "stage": "CONTRACT",
+                "code": "SEMANTIC_REF_NOT_READ",
+                "readNext": [
+                    {
+                        "refId": "semantic:电商交易:orders:field:pt",
+                        "path": "topics/电商交易/tables/orders/columns/pt.json",
+                    }
+                ],
+            },
+        }
+    ]
+    visible, _ = _phase_visible_tools(session, tools)
+    assert {item.name for item in visible} == set(
+        {
+            "ls",
+            "grep",
+            "read_file",
+            "retrieve_knowledge",
+            "query_data",
+            "query_batch",
+        }
+    )
+
+    session.latest_query_batch_observations = [
+        {
+            "queryId": "refunds",
+            "observation": {
+                "stage": "CONTRACT",
+                "code": "DEPENDENT_QUERY_REQUIRES_SERIAL_EXECUTION",
+                "nextActions": ["RETRY_QUERY_DATA_SERIAL"],
+            },
+        }
+    ]
+    visible, _ = _phase_visible_tools(session, tools)
+    assert {item.name for item in visible} == set(
+        {
+            "ls",
+            "grep",
+            "read_file",
+            "retrieve_knowledge",
+            "query_data",
+            "query_batch",
+        }
+    )
 
 
 def test_discovery_evidence_is_never_silently_fifo_evicted() -> None:
@@ -1267,18 +2983,40 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
         "lifecyclePhase": "post_query_analysis",
         "requiresGroundedContract": True,
         "requiresExecutedQuery": True,
-            "requiresVerifiedEvidence": True,
-            "mayInfluenceSemanticBindings": False,
-            "mayExecuteSql": False,
-            "headersDisclosedAfterVerifiedInputSnapshot": True,
-            "queryCollectionClosedBySkill": False,
-            "authoritativeSkillExecution": "SERIAL_ONLY",
-            "maxVerifiedSkillArtifacts": 4,
-            "skillProseCountsAsGoalCoverage": False,
-            "retryRule": "SAME_SUB_GOAL_NEXT_GENERATION",
-        }
+        "requiresVerifiedEvidence": True,
+        "mayInfluenceSemanticBindings": False,
+        "mayExecuteSql": False,
+        "headersDisclosedAfterVerifiedInputSnapshot": True,
+        "queryCollectionClosedBySkill": False,
+        "authoritativeSkillExecution": "SERIAL_ONLY",
+        "placementRule": {
+            "decisionAuthority": "CORE_AGENT",
+            "CORE": "choose load_skill for a short bounded invocation",
+            "SUBAGENT": "choose run_skill for a complex or long invocation",
+            "harnessOverride": ("scripts, oversized procedures and hard isolation requirements"),
+        },
+        "maxVerifiedSkillArtifacts": 4,
+        "skillProseCountsAsGoalCoverage": False,
+        "retryRule": "SAME_SUB_GOAL_NEXT_GENERATION",
+    }
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
+
+
+def test_run_uses_retrieval_question_without_mutating_core_question() -> None:
+    factory = CapturingFactory()
+    kernel = FakeKernel()
+    outer = runtime(factory, kernel)
+    outer.conversation_online_authority = ContextualizedConversationAuthority()
+
+    outer.run("那退款呢？", "m-1")
+
+    assert kernel.recall_queries == ["最近7天的退款情况"]
+    first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
+    assert first["question"] == "那退款呢？"
+    assert "retrievalQuestion" not in first["trustedConversationContext"][
+        "resolution"
+    ]
 
 
 def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
@@ -1296,7 +3034,7 @@ def test_conversation_typed_clarification_stops_before_route_and_core() -> None:
     assert response.clarification.type == ("CONVERSATION_SEMANTIC_REVIEW_UNAVAILABLE")
 
 
-def test_unresolved_topic_scope_returns_clarification_before_recall() -> None:
+def test_unresolved_topic_route_opens_discovery_without_merchant_selection() -> None:
     class NoTopicKernel(FakeKernel):
         def route_topic(
             self,
@@ -1327,9 +3065,12 @@ def test_unresolved_topic_scope_returns_clarification_before_recall() -> None:
     response = outer.run("今天天气怎么样？", "m-1")
 
     assert kernel.route_calls == 1
-    assert factory.graph.invocations == []
-    assert response.clarification is not None
-    assert response.clarification.type == "TOPIC_SCOPE_REQUIRED"
+    assert len(factory.graph.invocations) == 1
+    first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
+    assert first["topicRouting"]["routingMode"] == "open_discovery"
+    assert first["topicRouting"]["clarificationRequired"] is False
+    assert first["topicL0Manifests"] == []
+    assert response.clarification is None
 
 
 def test_provider_timeout_is_returned_as_controlled_operational_failure() -> None:
@@ -1390,10 +3131,7 @@ def test_plain_core_answer_cannot_bypass_return_direct_compose_attestation() -> 
     response = outer.run("工单量", "m-1")
 
     assert response.answer != "我直接声称这是最终答案。"
-    assert (
-        response.debug_trace["harness"]["operationalFailure"]["code"]
-        == "GROUNDED_ANSWER_ATTESTATION_MISSING"
-    )
+    assert response.debug_trace["harness"]["operationalFailure"]["code"] == "GROUNDED_ANSWER_ATTESTATION_MISSING"
 
 
 def test_semantic_backend_records_only_complete_exact_reads() -> None:
@@ -1454,7 +3192,7 @@ def test_subagent_semantic_reads_never_enter_core_submission_ledger() -> None:
     assert session.core_semantic_evidence[0]["refId"] == "semantic:客服工单:tickets:detail"
 
 
-def test_topic_expansion_is_driven_by_structured_search_scope_not_gap_code() -> None:
+def test_topic_index_allows_navigation_without_a_structured_gap() -> None:
     relationship_ref = "semantic:alpha:relationship:edge_one"
     runtime_state = GroundedRuntimeSession(
         session_id="s-expand",
@@ -1496,9 +3234,11 @@ def test_topic_expansion_is_driven_by_structured_search_scope_not_gap_code() -> 
         ],
     )
 
+    assert session.can_expand_topic() is False
+    session.topic_index_read = True
     assert session.can_expand_topic() is True
     session.mark_topic_expanded()
-    assert session.can_expand_topic() is False
+    assert session.can_expand_topic() is True
 
 
 def test_root_core_read_middleware_records_exact_complete_file() -> None:
@@ -1661,9 +3401,7 @@ def test_duplicate_complete_semantic_read_returns_receipt_without_backend_call()
 
 
 def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> None:
-    middleware = GroundedCoreToolBoundaryMiddleware(
-        GroundedSemanticBackend(FakeSemanticCatalog())
-    )
+    middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     session = GroundedDeepAgentSession(
         runtime=GroundedRuntimeSession(
             session_id="tool-loop-session",
@@ -1726,9 +3464,7 @@ def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> No
             SimpleNamespace(name="propose_grounded_contract"),
         ],
     )
-    assert {item.name for item in visible} == {
-        "propose_grounded_contract"
-    }
+    assert {item.name for item in visible} == {"propose_grounded_contract"}
 
     session.core_semantic_evidence.append(
         {
@@ -1748,9 +3484,7 @@ def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> No
 
 
 def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
-    middleware = GroundedCoreToolBoundaryMiddleware(
-        GroundedSemanticBackend(FakeSemanticCatalog())
-    )
+    middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     session = GroundedDeepAgentSession(
         runtime=GroundedRuntimeSession(
             session_id="generic-tool-loop-session",
@@ -1794,15 +3528,11 @@ def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
     repeated = invoke("call-contract-2", "paraphrased wording")
 
     assert calls["count"] == 1
-    assert json.loads(str(repeated.content))["code"] == (
-        "TOOL_CALL_NO_PROGRESS"
-    )
+    assert json.loads(str(repeated.content))["code"] == ("TOOL_CALL_NO_PROGRESS")
 
 
 def test_tool_call_exception_is_recovered_with_original_call_id() -> None:
-    middleware = GroundedCoreToolBoundaryMiddleware(
-        GroundedSemanticBackend(FakeSemanticCatalog())
-    )
+    middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     session = GroundedDeepAgentSession(
         runtime=GroundedRuntimeSession(
             session_id="tool-recovery-session",
@@ -1837,7 +3567,7 @@ def test_tool_call_exception_is_recovered_with_original_call_id() -> None:
     assert payload["toolCallId"] == "call-tool-error"
 
 
-def test_ready_contract_closes_semantic_read_boundary() -> None:
+def test_ready_contract_does_not_close_react_semantic_read_boundary() -> None:
     backend = GroundedSemanticBackend(FakeSemanticCatalog())
     middleware = GroundedCoreToolBoundaryMiddleware(backend)
     contract = GroundedQueryContract(
@@ -1878,12 +3608,9 @@ def test_ready_contract_closes_semantic_read_boundary() -> None:
         return ToolMessage(content="unexpected", tool_call_id="call-after-ready")
 
     result = middleware.wrap_tool_call(request, handler)
-    payload = json.loads(str(result.content))
 
-    assert called["handler"] is False
-    assert result.status == "error"
-    assert payload["code"] == "GROUNDED_CONTRACT_READY"
-    assert payload["readControl"]["status"] == "READY_TO_EXECUTE"
+    assert called["handler"] is True
+    assert result.status != "error"
 
 
 def test_large_semantic_read_is_offloaded_but_full_evidence_is_retained() -> None:
@@ -2006,7 +3733,7 @@ def test_catalog_pagination_is_rejected_in_favor_of_targeted_grep() -> None:
     assert "grep" in payload["message"]
 
 
-def test_context_middleware_keeps_messages_below_watermark_and_hides_retrieval_tools_when_ready() -> None:
+def test_context_middleware_keeps_messages_and_tools_available_to_react_caller() -> None:
     contract = GroundedQueryContract(
         question="工单量",
         status="READY",
@@ -2023,7 +3750,11 @@ def test_context_middleware_keeps_messages_below_watermark_and_hides_retrieval_t
             active_attempt_id="attempt-context",
             active_execution_mode=GroundedExecutionMode.DETERMINISTIC_RANKED,
             active_contract=contract,
-        )
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="工单量",
+            goals=[MetricQuestionGoal(goal_id="metric.tickets", label="工单量")],
+        ),
     )
     messages = [
         HumanMessage(content=json.dumps({"question": "工单量", "context": "x" * 2000})),
@@ -2105,16 +3836,17 @@ def test_context_middleware_keeps_messages_below_watermark_and_hides_retrieval_t
     assert result == "ok"
     assert updated.messages == messages
     assert str(updated.messages[4].content) == '{"status":"VERIFIED"}'
-    assert [_tool.name for _tool in updated.tools] == ["execute_grounded_query"]
+    assert [_tool.name for _tool in updated.tools] == [
+        "read_file",
+        "grep",
+        "execute_grounded_query",
+        "submit_grounded_sql_candidate",
+    ]
     report = session.core_context_reports[-1]
     assert report["compactionTriggered"] is False
     assert report["savedChars"] == 0
     assert report["semanticReadMessagesCompacted"] == 0
-    assert report["removedTools"] == [
-        "grep",
-        "read_file",
-        "submit_grounded_sql_candidate",
-    ]
+    assert report["removedTools"] == []
 
 
 def test_context_middleware_exposes_only_goal_transaction_on_first_model_turn() -> None:
@@ -2178,11 +3910,15 @@ def test_context_middleware_exposes_only_goal_transaction_on_first_model_turn() 
     assert session.core_context_reports[-1]["toolCountAfter"] == 2
 
 
-def test_task_dispatch_is_blocked_before_subagent_execution() -> None:
+def test_native_task_rejects_unguarded_dispatch_before_subagent_execution() -> None:
     middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     called = {"handler": False}
     request = SimpleNamespace(
-        tool_call={"id": "call-task", "name": "task", "args": {}},
+        tool_call={
+            "id": "call-task",
+            "name": "task",
+            "args": {"subagent_type": "general-purpose", "description": "{}"},
+        },
         runtime=SimpleNamespace(context=None),
     )
 
@@ -2193,7 +3929,63 @@ def test_task_dispatch_is_blocked_before_subagent_execution() -> None:
     result = middleware.wrap_tool_call(request, handler)
 
     assert result.status == "error"
+    assert json.loads(result.content)["code"] == "NATIVE_TASK_SUBAGENT_TYPE_NOT_ALLOWED"
     assert called["handler"] is False
+
+
+def test_native_task_accepts_only_read_context_contract() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="native-task-boundary",
+            question="主指标是多少",
+            merchant_id="merchant-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="主指标是多少",
+            goals=[MetricQuestionGoal(goal_id="metric.primary", label="主指标")],
+        ),
+    )
+    contract = _subagent_goal()
+    description = json.dumps(
+        {
+            "protocol": "grounded_native_task.v1",
+            "subGoalContract": contract.model_dump(by_alias=True, mode="json"),
+        },
+        ensure_ascii=False,
+    )
+    middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
+    request = SimpleNamespace(
+        tool_call={
+            "id": "call-native-task",
+            "name": "task",
+            "args": {
+                "subagent_type": "grounded-researcher",
+                "description": description,
+            },
+        },
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="native-task-thread",
+                run_id="native-task-run",
+                session=session,
+            )
+        ),
+    )
+
+    called = {"handler": False}
+
+    def handler(_: Any) -> ToolMessage:
+        called["handler"] = True
+        return ToolMessage(
+            content=json.dumps({"status": "COMPLETED"}),
+            tool_call_id="call-native-task",
+        )
+
+    result = middleware.wrap_tool_call(request, handler)
+
+    assert called["handler"] is True
+    assert json.loads(result.content)["status"] == "COMPLETED"
 
 
 def _subagent_goal(
@@ -2367,9 +4159,7 @@ def test_subagent_retry_requires_next_generation_and_parent_goal_binding() -> No
     )
     next_generation = json.loads(
         delegate.func(
-            plan=GroundedSubagentDispatchPlan(
-                tasks=[_subagent_goal(generation=2)]
-            ),
+            plan=GroundedSubagentDispatchPlan(tasks=[_subagent_goal(generation=2)]),
             runtime=SimpleNamespace(context=context),
         )
     )
@@ -2499,6 +4289,155 @@ def test_query_subagent_receives_only_one_prepared_branch_execution_tool() -> No
     assert len(calls) == 1
     assert [item.query_id for item in calls[0]["queries"]] == ["query.complex"]
     assert calls[0]["runtime"].context is context
+
+
+def test_subagent_uses_shared_query_data_with_goal_scope_and_root_adoption() -> None:
+    outer = runtime(CapturingFactory(action="none"))
+    root_runtime = GroundedRuntimeSession(
+        session_id="root-shared-query-data",
+        question="分析复杂指标",
+        merchant_id="merchant-1",
+        workspace_topics=["客服工单"],
+    )
+    deep_session = GroundedDeepAgentSession(
+        runtime=root_runtime,
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="分析复杂指标",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.primary",
+                    label="复杂指标",
+                ),
+                MetricQuestionGoal(
+                    goal_id="metric.outside",
+                    label="未授权指标",
+                ),
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-shared-query-data",
+        run_id="run-shared-query-data",
+        session=deep_session,
+    )
+    calls: list[dict[str, Any]] = []
+
+    def shared_query_data(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        request = kwargs["request"]
+        scoped_context = kwargs["runtime"].context
+        assert scoped_context.session.runtime is not root_runtime
+        assert scoped_context.session.runtime.merchant_id == "merchant-1"
+        if len(calls) == 1:
+            return json.dumps(
+                {
+                    "status": "NEEDS_REASONING",
+                    "queryId": request.query_id,
+                    "observation": {
+                        "stage": "SQL_GENERATION",
+                        "code": "CORE_SQL_CANDIDATE_REQUIRED",
+                        "retryable": True,
+                        "repairReceipt": {
+                            "version": "query_repair_receipt.v1",
+                            "receiptId": "repair-subagent-1",
+                            "queryId": request.query_id,
+                            "callerId": "subagent-bound",
+                            "stage": "SQL_GENERATION",
+                            "code": "CORE_SQL_CANDIDATE_REQUIRED",
+                            "attemptCount": 1,
+                            "contractGeneration": 1,
+                            "contractFingerprint": "c" * 64,
+                            "sqlAstFingerprint": "",
+                            "allowedNextActions": ["SUBMIT_SQL_CANDIDATE"],
+                            "receiptFingerprint": "test",
+                        },
+                    },
+                }
+            )
+        assert request.repair_receipt is not None
+        return json.dumps(
+            {
+                "status": "VERIFIED",
+                "queryId": request.query_id,
+                "artifactIds": ["artifact-subagent-query"],
+            }
+        )
+
+    outer.kernel.adopt_verified_branches = (  # type: ignore[attr-defined]
+        lambda parent, branches: [SimpleNamespace(artifact_id="artifact-subagent-query")]
+    )
+    prepared = outer._prepare_grounded_subagent_task(
+        context,
+        task=GroundedSubagentGoalContract(
+            sub_goal_id="subgoal.shared.query",
+            parent_goal_ids=["metric.primary"],
+            objective="隔离完成复杂查询并自行处理 Observation",
+            required_outputs=["verifiedQueryArtifact"],
+            input_artifact_refs=[],
+            evidence_requirements=[
+                GroundedSubagentEvidenceRequirement(
+                    requirement_id="verified.query",
+                    description="Return one verified query artifact.",
+                    accepted_ref_types=["VERIFIED_QUERY_ARTIFACT"],
+                )
+            ],
+            allowed_capabilities=["READ_CONTEXT", "QUERY_DATA"],
+            budget=GroundedSubagentBudget(
+                max_tool_calls=3,
+                timeout_seconds=20,
+            ),
+            generation=1,
+        ),
+        execute_branch_tool=SimpleNamespace(func=lambda **kwargs: "{}"),
+        query_data_tool=SimpleNamespace(func=shared_query_data),
+    )
+
+    assert prepared.grant.capabilities == ["READ_CONTEXT", "QUERY_DATA"]
+    assert prepared.grant.allowed_tool_names == [
+        "grep",
+        "ls",
+        "query_data",
+        "read_file",
+    ]
+    assert [item.name for item in prepared.job.tools] == ["query_data"]
+    query_tool = prepared.job.tools[0]
+    first = json.loads(
+        query_tool.func(
+            request={
+                "queryId": "query.subagent.complex",
+                "goalIds": ["metric.primary"],
+            }
+        )
+    )
+    assert first["status"] == "NEEDS_REASONING"
+    verified = json.loads(
+        query_tool.func(
+            request={
+                "queryId": "query.subagent.complex",
+                "goalIds": ["metric.primary"],
+                "sqlCandidate": {
+                    "sql": "SELECT COUNT(*) AS metric_value FROM tickets",
+                    "rationale": "Implement the returned Contract.",
+                },
+                "repairReceipt": first["observation"]["repairReceipt"],
+            }
+        )
+    )
+    denied = json.loads(
+        query_tool.func(
+            request={
+                "queryId": "query.outside",
+                "goalIds": ["metric.outside"],
+            }
+        )
+    )
+
+    assert verified["status"] == "VERIFIED"
+    assert verified["adoptedIntoRoot"] is True
+    assert deep_session.artifact_goal_ids["artifact-subagent-query"] == ["metric.primary"]
+    assert denied["status"] == "DENIED"
+    assert denied["code"] == "SUBAGENT_QUERY_GOAL_SCOPE_MISMATCH"
+    assert len(calls) == 2
 
 
 def test_full_table_asset_is_never_exposed_by_grounded_filesystem_or_thin_recall() -> None:
@@ -3092,6 +5031,88 @@ def test_parallel_batch_allows_mutually_independent_goals() -> None:
     assert set(deep_session.parallel_branches) == {"tickets", "refunds"}
 
 
+def test_compat_batch_reads_declared_exact_semantic_paths() -> None:
+    class ParallelKernel(FakeKernel):
+        @staticmethod
+        def fork_query_branch(
+            session: GroundedRuntimeSession,
+            branch_key: str,
+        ) -> GroundedRuntimeSession:
+            return GroundedRuntimeSession(
+                session_id=f"{session.session_id}:{branch_key}",
+                question=session.question,
+                merchant_id=session.merchant_id,
+                merchant=session.merchant,
+                workspace_topics=list(session.workspace_topics),
+            )
+
+    factory = CapturingFactory(action="none")
+    kernel = ParallelKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("查询工单明细", "m-1")
+    kernel_session.workspace_topics = ["客服工单"]
+    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
+    context = GroundedDeepAgentRunContext(
+        thread_id="t-batch-semantic-path",
+        run_id="r-batch-semantic-path",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declare_single_metric_goal(tools, context)
+
+    result = json.loads(
+        tools["prepare_grounded_query_batch"].func(
+            queries=[
+                {
+                    "queryId": "tickets",
+                    "semanticPaths": ["topics/客服工单/tables/tickets/detail.json"],
+                    "goalIds": ["metric.primary"],
+                }
+            ],
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "PREPARED"
+    assert result["queries"][0]["status"] == "PREPARED"
+    assert [item["refId"] for item in deep_session.core_semantic_evidence] == ["semantic:客服工单:tickets:detail"]
+
+
+def test_compat_batch_reuses_core_evidence_when_semantic_ref_is_passed_as_path() -> None:
+    class RejectingCatalog(FakeSemanticCatalog):
+        def read(self, *, path: str, max_chars: int, offset: int) -> dict[str, Any]:
+            raise AssertionError("already-read evidence must be reused")
+
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="batch-evidence-reuse",
+            question="查询工单明细",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        ),
+        core_semantic_evidence=[
+            {
+                "refId": "semantic:客服工单:tickets:detail",
+                "path": "knowledge/topics/客服工单/tables/tickets/detail.json",
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": "{}",
+                "contentHash": "hash",
+                "contentComplete": True,
+            }
+        ],
+    )
+    evidence, newly_read = _read_exact_core_semantic_path(
+        GroundedSemanticBackend(RejectingCatalog()),
+        session,
+        "semantic:客服工单:tickets:detail",
+    )
+
+    assert newly_read is False
+    assert evidence["refId"] == "semantic:客服工单:tickets:detail"
+
+
 def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
     class CoreSqlKernel(FakeKernel):
         def propose_contract(
@@ -3242,6 +5263,104 @@ def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
     assert kernel.verify_calls == 1
 
 
+def test_query_data_collapses_contract_execution_and_evidence() -> None:
+    class QueryDataKernel(FakeKernel):
+        def execute_active(
+            self,
+            session: GroundedRuntimeSession,
+            **kwargs: Any,
+        ) -> AgentRunResult:
+            del kwargs
+            result = AgentRunResult(
+                merged_query_bundle=QueryBundle(
+                    rows=[{"ticket_count": 3}],
+                    tables=["tickets"],
+                )
+            )
+            session.run_result = result
+            return result
+
+        @staticmethod
+        def verify_active(
+            session: GroundedRuntimeSession,
+        ) -> VerifiedEvidence:
+            verified = VerifiedEvidence(passed=True)
+            session.verified_evidence = verified
+            assert session.run_result is not None
+            contract = GroundedQueryContract(
+                question=session.question,
+                topics=["客服工单"],
+                status="READY",
+                query_shape="SCALAR",
+            )
+            session.verified_query_ledger.append(
+                GroundedVerifiedQueryArtifact(
+                    artifact_id="query_artifact_query_data",
+                    generation=1,
+                    contract_fingerprint=(grounded_query_contract_fingerprint(contract)),
+                    sql_fingerprint="a" * 64,
+                    contract=contract,
+                    plan=QueryPlan(),
+                    run_result=session.run_result,
+                    verified_evidence=verified,
+                    output_columns=["ticket_count"],
+                )
+            )
+            return verified
+
+        @staticmethod
+        def latest_verified_query_artifact(
+            session: GroundedRuntimeSession,
+        ) -> GroundedVerifiedQueryArtifact | None:
+            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
+
+    factory = CapturingFactory(action="none")
+    kernel = QueryDataKernel()
+    outer = runtime(factory, kernel)
+    kernel_session = kernel.new_session("工单量是多少", "m-1")
+    detail_ref = "semantic:客服工单:tickets:detail"
+    deep_session = GroundedDeepAgentSession(
+        runtime=kernel_session,
+        core_semantic_evidence=[
+            {
+                "refId": detail_ref,
+                "kind": "TABLE_DETAIL",
+                "topic": "客服工单",
+                "table": "tickets",
+                "contentSnippet": "{}",
+                "contentHash": "hash",
+            }
+        ],
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="thread-query-data",
+        run_id="run-query-data",
+        session=deep_session,
+    )
+    tools = {item.name: item for item in outer.tools}
+    declare_single_metric_goal(tools, context)
+
+    result = json.loads(
+        tools["query_data"].func(
+            request={
+                "queryId": "query.ticket_count",
+                "goalIds": ["metric.primary"],
+                "readRefIds": [detail_ref],
+                "bindingHints": {"tableRefs": [detail_ref]},
+                "reason": "answer the scalar metric goal",
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+    )
+
+    assert result["status"] == "VERIFIED"
+    assert result["queryId"] == "query.ticket_count"
+    assert result["artifactIds"] == ["query_artifact_query_data"]
+    assert result["coveredGoalIds"] == ["metric.primary"]
+    assert result["rowCount"] == 1
+    assert kernel.propose_calls == 1
+
+
 def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies() -> None:
     class RepairingCoreSqlKernel(FakeKernel):
         def __init__(self) -> None:
@@ -3269,9 +5388,7 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
             session.sql_candidate_attempts.append(attempt)
             session.active_sql_candidate = GroundedSqlCandidate(
                 sql=sql,
-                contract_fingerprint=kwargs[
-                    "expected_contract_fingerprint"
-                ],
+                contract_fingerprint=kwargs["expected_contract_fingerprint"],
                 rationale=kwargs["rationale"],
             )
             session.phase = "ACTIVE_CORE_SQL_VALIDATED"
@@ -3285,10 +5402,7 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
             del kwargs
             self.execute_calls += 1
             if self.execute_calls == 1:
-                message = (
-                    "errCode = 2, detailMessage = Table "
-                    "[wrong_catalog.tickets] does not exist"
-                )
+                message = "errCode = 2, detailMessage = Table [wrong_catalog.tickets] does not exist"
                 failed_bundle = QueryBundle(
                     failed=True,
                     error=message,
@@ -3334,14 +5448,8 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
                 GroundedVerifiedQueryArtifact(
                     artifact_id="query_artifact_repaired_sql",
                     generation=session.active_generation,
-                    contract_fingerprint=(
-                        grounded_query_contract_fingerprint(
-                            session.active_contract
-                        )
-                    ),
-                    sql_fingerprint=hashlib.sha256(
-                        str(session.active_sql_candidate.sql).encode("utf-8")
-                    ).hexdigest(),
+                    contract_fingerprint=(grounded_query_contract_fingerprint(session.active_contract)),
+                    sql_fingerprint=hashlib.sha256(str(session.active_sql_candidate.sql).encode("utf-8")).hexdigest(),
                     contract=session.active_contract.model_copy(deep=True),
                     plan=QueryPlan(),
                     run_result=session.run_result,
@@ -3355,11 +5463,7 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
         def latest_verified_query_artifact(
             session: GroundedRuntimeSession,
         ) -> GroundedVerifiedQueryArtifact | None:
-            return (
-                session.verified_query_ledger[-1]
-                if session.verified_query_ledger
-                else None
-            )
+            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
 
     table_ref = "semantic:客服工单:tickets:detail"
     contract = GroundedQueryContract(
@@ -3402,10 +5506,7 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
 
     failed = json.loads(
         tools["submit_grounded_sql_candidate"].func(
-            sql=(
-                "SELECT COUNT(*) AS ticket_count "
-                "FROM wrong_catalog.tickets"
-            ),
+            sql=("SELECT COUNT(*) AS ticket_count FROM wrong_catalog.tickets"),
             expected_generation=1,
             contract_fingerprint=contract_fingerprint,
             rationale="Count tickets from the grounded table",
@@ -3421,23 +5522,18 @@ def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies()
     assert failed["repairReview"]["allowedTables"] == ["tickets"]
     assert failed["repairReview"]["remainingRepairAttempts"] == 2
     assert kernel_session.phase == "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
-    assert kernel_session.sql_execution_repair_context[
-        "failedSql"
-    ].endswith("wrong_catalog.tickets")
+    assert kernel_session.sql_execution_repair_context["failedSql"].endswith("wrong_catalog.tickets")
     visible, _removed = _phase_visible_tools(deep_session, outer.tools)
-    assert {item.name for item in visible} == {
-        "submit_grounded_sql_candidate",
-    }
+    visible_names = {item.name for item in visible}
+    assert "submit_grounded_sql_candidate" in visible_names
+    assert "query_data" in visible_names
 
     repaired = json.loads(
         tools["submit_grounded_sql_candidate"].func(
             sql="SELECT COUNT(*) AS ticket_count FROM tickets",
             expected_generation=1,
             contract_fingerprint=contract_fingerprint,
-            rationale=(
-                "Doris rejected the ungrounded catalog prefix; use the exact "
-                "Contract table identity"
-            ),
+            rationale=("Doris rejected the ungrounded catalog prefix; use the exact Contract table identity"),
             evidence_ref_ids=[table_ref],
             runtime=SimpleNamespace(context=context),
         )
@@ -3607,9 +5703,7 @@ def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None
                 question=session.question,
                 status="READY",
                 query_shape="SCALAR",
-                binding_hints=GroundedBindingHints(
-                    time_expression="最近30天"
-                ),
+                binding_hints=GroundedBindingHints(time_expression="最近30天"),
                 time_range=ResolvedTimeRange(
                     kind="rolling",
                     label="最近30天",
@@ -3885,12 +5979,8 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert kernel_session.answer == ""
     assert len(session.verified_skill_ledger) == 1
     assert session.verified_skill_ledger[0].integrity_valid()
-    assert set(session.goal_coverage_result["artifactIds"]) == set(
-        kernel_session.answer_artifact_ids
-    )
-    assert result["verifiedSkillArtifactId"] not in str(
-        session.goal_coverage_result
-    )
+    assert set(session.goal_coverage_result["artifactIds"]) == set(kernel_session.answer_artifact_ids)
+    assert result["verifiedSkillArtifactId"] not in str(session.goal_coverage_result)
     assert kernel_session.run_result.skill_lifecycle_records[0].matched_by == ("core_llm_skill_header")
 
     base_contract = _verified_skill_contract(session)
@@ -3986,10 +6076,7 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert len(session.verified_skill_ledger) == 4
     assert all(item.integrity_valid() for item in session.verified_skill_ledger)
     assert kernel_session.answer == ""
-    assert all(
-        item.artifact_id not in str(session.goal_coverage_result)
-        for item in session.verified_skill_ledger
-    )
+    assert all(item.artifact_id not in str(session.goal_coverage_result) for item in session.verified_skill_ledger)
 
 
 def test_grounded_exploration_subagent_is_advisory_and_mounts_no_capabilities() -> None:

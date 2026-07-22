@@ -456,6 +456,7 @@ class GroundedQueryContractBuilder:
         now: datetime | None = None,
         default_days: int = 7,
     ) -> GroundedQueryContract:
+        raw_semantic_evidence = list(core_semantic_evidence)
         normalized_topics = _dedupe(str(topic or "").strip() for topic in topics)
         hints = _normalize_binding_hints(binding_hints)
         requested_refs = {
@@ -481,20 +482,70 @@ class GroundedQueryContractBuilder:
             table_detail_ref = _table_detail_ref_candidate(ref_id)
             if table_detail_ref:
                 requested_refs.add(table_detail_ref)
+            else:
+                # Core sometimes submits the physical table name in
+                # ``tableRefs`` while the trusted read ledger contains the
+                # exact semantic ``TABLE_DETAIL`` leaf.  Resolve that alias
+                # only against already-read, hashed evidence for the same
+                # table.  This does not discover a table or manufacture
+                # evidence; it merely keeps the binding and read identities
+                # aligned.
+                bare_table = str(ref_id or "").strip()
+                if bare_table and not bare_table.startswith("semantic:"):
+                    requested_refs.update(
+                        str(raw.get("refId") or raw.get("ref_id") or "").strip()
+                        for raw in raw_semantic_evidence
+                        if isinstance(raw, dict)
+                        and str(raw.get("kind") or "").strip().upper()
+                        == "TABLE_DETAIL"
+                        and str(raw.get("table") or "").strip() == bare_table
+                        and str(raw.get("refId") or raw.get("ref_id") or "")
+                        .strip()
+                    )
         for ref_id in list(requested_refs):
             if ":column:" in ref_id:
                 requested_refs.add(ref_id.replace(":column:", ":field:", 1))
             if ":field:" in ref_id:
                 requested_refs.add(ref_id.replace(":field:", ":column:", 1))
         documents, discovery_gaps = self._trusted_documents(
-            core_semantic_evidence,
+            raw_semantic_evidence,
             normalized_topics,
             requested_refs,
+        )
+        all_trusted_documents, _ = self._trusted_documents(
+            raw_semantic_evidence,
+            normalized_topics,
         )
         document_refs = {document.ref.ref_id for document in documents}
         hints = _canonicalize_binding_hints(hints, document_refs)
         document_kinds = {document.ref.ref_id: document.ref.kind for document in documents}
         discovery_gaps.extend(_missing_binding_ref_gaps(hints, document_kinds))
+        missing_named_metric_refs = [
+            ref_id
+            for ref_id in _governed_named_metric_refs(
+                str(question or ""), all_trusted_documents
+            )
+            if not any(
+                _semantic_refs_equivalent(ref_id, selected_ref)
+                for selected_ref in hints.metric_refs
+            )
+        ]
+        if missing_named_metric_refs:
+            discovery_gaps.append(
+                _gap(
+                    "QUESTION_METRIC_BINDING_INCOMPLETE",
+                    "The question names governed metrics that are absent from the proposed metric bindings",
+                    "METRIC",
+                    required_capability={
+                        "candidateMetricRefs": missing_named_metric_refs,
+                    },
+                    rejected_ref_ids=missing_named_metric_refs,
+                    resolution=(
+                        "Bind every governed metric explicitly named in the question, "
+                        "or return to goal clarification when aliases are ambiguous."
+                    ),
+                )
+            )
         named_time_refs = _governed_named_time_refs(str(question or ""), documents)
         if named_time_refs and not any(
             _semantic_refs_equivalent(hints.time_field_ref, ref_id)
@@ -521,6 +572,25 @@ class GroundedQueryContractBuilder:
             )
         table_details = self._table_details(documents)
         hints = self._apply_detail_projection_policy(hints, table_details)
+        # A model may use the physical partition column name (for example
+        # ``pt``) as a convenience hint.  When the trusted TABLE_DETAIL set
+        # identifies exactly one table with that declared time column, the
+        # table binding already supplies the governed time semantics.  Do not
+        # turn the alias into a fake semantic ref or require a COLUMN leaf
+        # that the caller did not select.  An explicit semantic time ref still
+        # follows the stricter COLUMN-evidence path below.
+        raw_time_ref = str(hints.time_field_ref or "").strip()
+        if raw_time_ref and not raw_time_ref.startswith("semantic:"):
+            matching_time_tables = [
+                detail
+                for detail in table_details.values()
+                if str(detail.time_column or "").strip() == raw_time_ref
+            ]
+            if len(matching_time_tables) == 1:
+                hints = hints.model_copy(
+                    update={"time_field_ref": ""},
+                    deep=True,
+                )
         metrics = self._metric_bindings(
             documents,
             hints.metric_refs,
@@ -889,7 +959,19 @@ class GroundedQueryContractBuilder:
 
         mode = str(hints.detail_projection_mode or "").strip().upper()
         analysis_mode = str(hints.analysis_mode or "").strip().upper()
-        if analysis_mode not in {"DETAIL", "DETAIL_LIST", "LIST", "ENTITY_DETAIL"}:
+        detail_modes = {
+            "DEFAULT",
+            "EXPLICIT",
+            "FIELDS",
+            "ALL",
+            "ALL_ALLOWED",
+            "ALL_VISIBLE",
+        }
+        if (
+            analysis_mode
+            not in {"DETAIL", "DETAIL_LIST", "LIST", "ENTITY_DETAIL"}
+            and mode not in detail_modes
+        ):
             return hints
         if hints.selected_fields and not mode:
             return hints
@@ -4406,8 +4488,6 @@ def _normalize_binding_hints(
         if labels:
             payload["labelRefs"] = labels
     return GroundedBindingHints.model_validate(payload)
-
-
 def _canonicalize_binding_hints(
     hints: GroundedBindingHints,
     available_refs: set[str],
@@ -4436,7 +4516,22 @@ def _canonicalize_binding_hints(
         if value in available_refs:
             return value
         detail_ref = _table_detail_ref_candidate(value)
-        return detail_ref if detail_ref in available_refs else value
+        if detail_ref in available_refs:
+            return detail_ref
+        # A model-authored table binding may be a physical table name.
+        # Match it only to one exact TABLE_DETAIL semantic ref already in
+        # the current trusted evidence set.  Ambiguous or absent matches
+        # remain unresolved and are rejected by the normal validator.
+        bare_table = value.strip()
+        table_matches = [
+            ref
+            for ref in available_refs
+            if ref.startswith("semantic:")
+            and ref.endswith(":detail")
+            and len(ref.split(":")) >= 4
+            and ref.split(":")[-2] == bare_table
+        ]
+        return table_matches[0] if len(table_matches) == 1 else value
 
     return hints.model_copy(
         update={
@@ -4634,6 +4729,33 @@ def _governed_named_time_refs(
                 for alias in aliases
             ):
                 candidates.append(ref_id)
+    return _dedupe(candidates)
+
+
+def _governed_named_metric_refs(
+    question: str,
+    documents: Sequence[_EvidenceDocument],
+) -> list[str]:
+    """Return trusted metric leaves whose published names occur in the question."""
+
+    candidates: list[str] = []
+    for document in documents:
+        if document.ref.kind != "METRIC":
+            continue
+        payload = document.payload if isinstance(document.payload, dict) else {}
+        metric = payload.get("metric") if isinstance(payload.get("metric"), dict) else payload
+        aliases = [
+            metric.get("metricKey"),
+            metric.get("businessName"),
+            metric.get("displayName"),
+            metric.get("naturalName"),
+            *(metric.get("aliases") or []),
+        ]
+        if any(
+            _governed_alias_occurs(question, str(alias or ""))
+            for alias in aliases
+        ):
+            candidates.append(document.ref.ref_id)
     return _dedupe(candidates)
 
 

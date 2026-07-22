@@ -17,6 +17,9 @@ import requests
 from merchant_ai.config import Settings
 from merchant_ai.models import RecallItem
 from merchant_ai.services.cache import build_ttl_cache, stable_cache_key
+from merchant_ai.services.goal_recall_coverage import (
+    attach_goal_recall_capabilities,
+)
 from merchant_ai.services.text_parsing import safe_ascii_component
 
 
@@ -74,16 +77,38 @@ def load_index_manifest(path: Path) -> dict[str, Any]:
 
 def changed_refs(docs: list[dict[str, str]], previous: dict[str, Any], changed_only: bool) -> list[str]:
     previous_docs = {
-        str(item.get("ref") or ""): str(item.get("hash") or "")
+        manifest_document_identity(item): item
         for item in previous.get("docs", [])
         if isinstance(item, dict)
     }
     if not changed_only or not previous_docs:
-        return [doc["ref"] for doc in docs]
-    current_refs = {doc["ref"] for doc in docs}
-    changed = [doc["ref"] for doc in docs if previous_docs.get(doc["ref"]) != doc["hash"]]
-    removed = sorted(set(previous_docs) - current_refs)
-    return changed + ["deleted:%s" % ref for ref in removed]
+        return dedupe_refs(doc["ref"] for doc in docs)
+    current_docs = {manifest_document_identity(doc): doc for doc in docs}
+    changed = [
+        doc["ref"]
+        for identity, doc in current_docs.items()
+        if str((previous_docs.get(identity) or {}).get("hash") or "")
+        != str(doc.get("hash") or "")
+    ]
+    removed = [
+        "deleted:%s" % str(previous_docs[identity].get("ref") or identity)
+        for identity in sorted(set(previous_docs) - set(current_docs))
+    ]
+    return dedupe_refs([*changed, *removed])
+
+
+def manifest_document_identity(doc: dict[str, Any]) -> str:
+    return str(doc.get("docId") or doc.get("ref") or "").strip()
+
+
+def dedupe_refs(refs: Iterable[Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(ref or "").strip()
+            for ref in refs
+            if str(ref or "").strip()
+        )
+    )
 
 
 def build_index_manifest(
@@ -91,13 +116,41 @@ def build_index_manifest(
     previous: dict[str, Any],
     changed_only: bool,
     root: str = "",
+    index_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     docs.sort(key=lambda item: item["ref"])
     semantic_source_hash = source_hash(docs)
+    normalized_index_config = dict(index_config or {})
+    index_config_hash = (
+        hashlib.sha256(
+            json.dumps(
+                normalized_index_config,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        if normalized_index_config
+        else ""
+    )
+    version_source = (
+        "%s:%s" % (semantic_source_hash, index_config_hash)
+        if index_config_hash
+        else semantic_source_hash
+    )
+    index_version = (
+        hashlib.sha256(version_source.encode("utf-8")).hexdigest()[:16]
+        if index_config_hash
+        else semantic_source_hash[:16]
+    )
     updated_refs = changed_refs(docs, previous, changed_only)
     return {
-        "indexVersion": semantic_source_hash[:16],
+        "manifestVersion": "recall_index_manifest.v2",
+        "indexVersion": index_version,
         "semanticSourceHash": semantic_source_hash,
+        "indexConfig": normalized_index_config,
+        "indexConfigHash": index_config_hash,
         "docCount": len(docs),
         "updatedRefs": updated_refs,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -182,7 +235,43 @@ class EsRecallIndexAdapter:
         }
 
     def stage(self, docs: list[RecallItem], manifest: dict[str, Any]) -> dict[str, Any]:
-        """Build and validate an immutable physical index without changing the read alias."""
+        """Build a complete candidate generation for first-build compatibility."""
+        return self._stage_candidate(
+            docs,
+            manifest,
+            previous_manifest={},
+            updated_refs=list(manifest.get("updatedRefs") or []),
+            force_full=True,
+        )
+
+    def stage_incremental(
+        self,
+        docs: list[RecallItem],
+        manifest: dict[str, Any],
+        *,
+        previous_manifest: dict[str, Any],
+        updated_refs: list[str],
+        replace_all: bool = False,
+    ) -> dict[str, Any]:
+        """Copy the active generation and apply a governed delta off-line."""
+        return self._stage_candidate(
+            docs,
+            manifest,
+            previous_manifest=previous_manifest,
+            updated_refs=updated_refs,
+            force_full=replace_all,
+        )
+
+    def _stage_candidate(
+        self,
+        docs: list[RecallItem],
+        manifest: dict[str, Any],
+        *,
+        previous_manifest: dict[str, Any],
+        updated_refs: list[str],
+        force_full: bool,
+    ) -> dict[str, Any]:
+        """Build and validate one immutable candidate without moving the alias."""
         if not self.settings.es_base_url:
             return {"success": False, "mode": "es", "errorCode": "ES_BASE_URL_MISSING"}
         alias = self.settings.es_index
@@ -194,15 +283,78 @@ class EsRecallIndexAdapter:
             previous_state = self._alias_state(alias)
             if previous_state.get("kind") == "concrete":
                 legacy_backup = self._backup_concrete_index(alias, version)
+            base_indices = (
+                [alias]
+                if previous_state.get("kind") == "concrete"
+                else [
+                    str(index_name)
+                    for index_name in previous_state.get("indices") or []
+                    if str(index_name or "").strip()
+                ]
+            )
+            config_compatible = self._incremental_config_compatible(
+                previous_manifest,
+                manifest,
+            )
+            incremental = bool(
+                not force_full
+                and config_compatible
+                and len(base_indices) == 1
+            )
+            base_validation: dict[str, Any] = {}
+            incremental_fallback_reason = ""
+            if incremental:
+                try:
+                    base_validation = self._validate_staged_index(
+                        base_indices[0],
+                        previous_manifest,
+                    )
+                except Exception as exc:
+                    base_validation = {
+                        "success": False,
+                        "errorCode": "ES_ACTIVE_INDEX_VALIDATION_FAILED",
+                        "error": str(exc)[:500],
+                    }
+                if not base_validation.get("success", False):
+                    incremental = False
+                    incremental_fallback_reason = (
+                        "ACTIVE_INDEX_MANIFEST_MISMATCH"
+                    )
             self._create_index(
                 physical_index,
                 {
                     "indexVersion": version,
                     "semanticSourceHash": str(manifest.get("semanticSourceHash") or ""),
+                    "indexConfigHash": str(manifest.get("indexConfigHash") or ""),
                     "docCount": int(manifest.get("docCount") or 0),
                 },
             )
-            upserted = self._bulk_upsert(docs, index_name=physical_index)
+            copied = 0
+            deleted: dict[str, Any] = {"success": True, "count": 0}
+            if incremental:
+                copy_result = self._copy_index(
+                    base_indices[0],
+                    physical_index,
+                )
+                copied = int(copy_result.get("count") or 0)
+                if not copy_result.get("success", False):
+                    raise RuntimeError(
+                        str(copy_result.get("error") or "ES_BASE_INDEX_COPY_FAILED")
+                    )
+                # Delete every affected semantic path before writing its current
+                # documents. This also removes obsolete Markdown chunk IDs.
+                deleted = self._delete_refs(
+                    updated_refs,
+                    index_name=physical_index,
+                )
+                if not deleted.get("success", False):
+                    raise RuntimeError(
+                        str(deleted.get("error") or "ES_INCREMENTAL_DELETE_FAILED")
+                    )
+                write_docs = documents_for_updated_refs(docs, updated_refs)
+            else:
+                write_docs = list(docs)
+            upserted = self._bulk_upsert(write_docs, index_name=physical_index)
             if not upserted.get("success", False):
                 raise RuntimeError(str(upserted.get("error") or "ES_BULK_UPSERT_FAILED"))
             self._refresh_index(physical_index)
@@ -217,7 +369,29 @@ class EsRecallIndexAdapter:
                 "physicalIndex": physical_index,
                 "previousState": previous_state,
                 "legacyBackupIndex": legacy_backup,
+                "candidateBuildMode": (
+                    "incremental_copy_on_write"
+                    if incremental
+                    else "full_rebuild"
+                ),
+                "baseIndex": base_indices[0] if incremental else "",
+                "copied": copied,
+                "baseValidation": base_validation,
                 "upserted": int(upserted.get("count") or 0),
+                "deleted": int(deleted.get("count") or 0),
+                "updatedRefs": dedupe_refs(updated_refs),
+                "fullRebuildReason": (
+                    ""
+                    if incremental
+                    else (
+                        incremental_fallback_reason
+                        or self._full_rebuild_reason(
+                            force_full=force_full,
+                            config_compatible=config_compatible,
+                            base_indices=base_indices,
+                        )
+                    )
+                ),
                 "validatedDocCount": validation.get("docCount", 0),
                 "validatedSemanticSourceHash": validation.get("semanticSourceHash", ""),
                 "committed": False,
@@ -236,6 +410,30 @@ class EsRecallIndexAdapter:
                 "errorCode": "ES_STAGE_FAILED",
                 "error": str(exc)[:500],
             }
+
+    @staticmethod
+    def _incremental_config_compatible(
+        previous_manifest: dict[str, Any],
+        candidate_manifest: dict[str, Any],
+    ) -> bool:
+        previous_hash = str(previous_manifest.get("indexConfigHash") or "")
+        candidate_hash = str(candidate_manifest.get("indexConfigHash") or "")
+        return bool(previous_hash and previous_hash == candidate_hash)
+
+    @staticmethod
+    def _full_rebuild_reason(
+        *,
+        force_full: bool,
+        config_compatible: bool,
+        base_indices: list[str],
+    ) -> str:
+        if force_full:
+            return "EXPLICIT_FULL_REBUILD"
+        if not config_compatible:
+            return "INDEX_CONFIG_CHANGED_OR_UNKNOWN"
+        if not base_indices:
+            return "ACTIVE_INDEX_MISSING"
+        return "ACTIVE_ALIAS_NOT_SINGLETON"
 
     def commit_stage(self, stage: dict[str, Any]) -> dict[str, Any]:
         alias = str(stage.get("alias") or self.settings.es_index)
@@ -495,6 +693,42 @@ class EsRecallIndexAdapter:
         body = response.json()
         return {"success": not bool(body.get("errors")), "count": len(docs), "error": json.dumps(body, ensure_ascii=False)[:500] if body.get("errors") else ""}
 
+    def _copy_index(self, source_index: str, target_index: str) -> dict[str, Any]:
+        response = requests.post(
+            self._url("_reindex?refresh=false&wait_for_completion=true"),
+            headers=self._headers(),
+            auth=self._auth(),
+            json={
+                "source": {"index": source_index},
+                "dest": {"index": target_index, "op_type": "create"},
+            },
+            timeout=120,
+        )
+        if response.status_code >= 400:
+            return {
+                "success": False,
+                "count": 0,
+                "error": response.text[:500],
+            }
+        body = response.json() or {}
+        failures = body.get("failures") or []
+        version_conflicts = int(body.get("version_conflicts") or 0)
+        return {
+            "success": not failures and version_conflicts == 0,
+            "count": int(body.get("created") or 0),
+            "error": (
+                json.dumps(
+                    {
+                        "failures": failures[:5],
+                        "versionConflicts": version_conflicts,
+                    },
+                    ensure_ascii=False,
+                )[:500]
+                if failures or version_conflicts
+                else ""
+            ),
+        }
+
     def _alias_state(self, alias: str) -> dict[str, Any]:
         response = requests.get(self._url("_alias/%s" % alias), headers=self._headers(), auth=self._auth(), timeout=10)
         if response.status_code == 200:
@@ -563,6 +797,12 @@ class EsRecallIndexAdapter:
         expected_hash = str(manifest.get("semanticSourceHash") or "")
         actual_hash = str(metadata.get("semanticSourceHash") or "") if isinstance(metadata, dict) else ""
         actual_version = str(metadata.get("indexVersion") or "") if isinstance(metadata, dict) else ""
+        expected_config_hash = str(manifest.get("indexConfigHash") or "")
+        actual_config_hash = (
+            str(metadata.get("indexConfigHash") or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
         if actual_count != expected_count:
             return {
                 "success": False,
@@ -576,6 +816,13 @@ class EsRecallIndexAdapter:
                 "errorCode": "ES_STAGE_SOURCE_HASH_MISMATCH",
                 "semanticSourceHash": actual_hash,
                 "expectedSemanticSourceHash": expected_hash,
+            }
+        if actual_config_hash != expected_config_hash:
+            return {
+                "success": False,
+                "errorCode": "ES_STAGE_INDEX_CONFIG_MISMATCH",
+                "indexConfigHash": actual_config_hash,
+                "expectedIndexConfigHash": expected_config_hash,
             }
         return {"success": True, "docCount": actual_count, "semanticSourceHash": actual_hash}
 
@@ -682,10 +929,24 @@ class EsRecallIndexAdapter:
         count = 0
         errors: list[str] = []
         target = index_name or self.settings.es_index
-        for ref in deleted_refs:
-            deleted_ref = ref.removeprefix("deleted:")
+        affected_refs = dedupe_refs(
+            str(ref or "").removeprefix("deleted:")
+            for ref in deleted_refs
+        )
+        for deleted_ref in affected_refs:
             semantic_path = deleted_ref if deleted_ref.startswith(("rules/", "topics/")) else "topics/%s" % deleted_ref
-            query = {"query": {"term": {"semantic_path": semantic_path}}}
+            query = {
+                "query": {
+                    "bool": {
+                        "minimum_should_match": 1,
+                        "should": [
+                            {"term": {"semantic_path": semantic_path}},
+                            {"term": {"semantic_ref_id": deleted_ref}},
+                            {"term": {"doc_id": deleted_ref}},
+                        ],
+                    }
+                }
+            }
             response = requests.post(
                 self._url("%s/_delete_by_query" % target),
                 headers=self._headers(),
@@ -779,14 +1040,15 @@ class RecallIndexManager:
         with self._transaction_lock:
             previous = load_index_manifest(self.manifest_path)
             self.clear_caches()
-            # The candidate manifest and every physical ES generation are always
-            # complete. Scope controls only change reporting and legacy adapters.
+            # The candidate manifest remains complete. The ES adapter may copy
+            # the active generation and apply only this Manifest delta.
             manifest_docs = list(documents) if documents is not None else self.scoped_documents()
             manifest = build_index_manifest(
                 recall_documents_for_manifest(manifest_docs),
                 previous,
                 changed_only=changed_only,
                 root=str(self.settings.resolved_topic_path),
+                index_config=self.index_build_config(),
             )
             updated_refs = filter_changed_refs_for_scope(manifest.get("updatedRefs") or [], topic, table_name)
             replace_all = not changed_only and not topic and not table_name
@@ -817,8 +1079,23 @@ class RecallIndexManager:
                 return preparation
 
             try:
+                incremental_stage_method = getattr(
+                    self.es_adapter,
+                    "stage_incremental",
+                    None,
+                )
                 stage_method = getattr(self.es_adapter, "stage", None)
-                if callable(stage_method):
+                if callable(incremental_stage_method):
+                    es_stage = incremental_stage_method(
+                        manifest_docs,
+                        manifest,
+                        previous_manifest=previous,
+                        updated_refs=list(manifest.get("updatedRefs") or []),
+                        replace_all=replace_all,
+                    )
+                    preparation.es_stage = es_stage if isinstance(es_stage, dict) else {}
+                    preparation.es_result = dict(preparation.es_stage)
+                elif callable(stage_method):
                     es_stage = stage_method(manifest_docs, manifest)
                     preparation.es_stage = es_stage if isinstance(es_stage, dict) else {}
                     preparation.es_result = dict(preparation.es_stage)
@@ -1125,18 +1402,41 @@ class RecallIndexManager:
             return [doc for doc in docs if recall_doc_in_scope(doc, topic, table_name)]
         return docs
 
+    def index_build_config(self) -> dict[str, Any]:
+        return {
+            "documentSchemaVersion": "recall_es_document.v2",
+            "vectorEnabled": bool(self.settings.es_vector_enabled),
+            "vectorField": str(self.settings.es_vector_field or ""),
+            "embeddingBaseUrl": str(self.settings.embedding_base_url or ""),
+            "embeddingModel": str(self.settings.embedding_model or ""),
+            "embeddingDims": int(self.settings.embedding_dims or 0),
+            "ruleChunkStrategy": "langchain_markdown_header_recursive.v1",
+            "ruleChunkTargetChars": int(
+                self.settings.rule_chunk_target_chars or 0
+            ),
+            "ruleChunkMaxChars": int(
+                self.settings.rule_chunk_max_chars or 0
+            ),
+            "ruleChunkOverlapChars": int(
+                self.settings.rule_chunk_overlap_chars or 0
+            ),
+        }
+
 
 def recall_item_to_es_doc(item: RecallItem) -> dict[str, Any]:
-    metadata = item.metadata or {}
+    enriched = attach_goal_recall_capabilities(item)
+    metadata = enriched.metadata or {}
     return {
-        "doc_id": item.doc_id,
-        "title": item.title,
-        "content": item.content,
-        "source_type": item.source_type,
-        "topic": item.topic,
-        "table": item.table,
-        "answer_mode": item.answer_mode,
-        "semantic_ref_id": str(metadata.get("semanticRefId") or item.doc_id or ""),
+        "doc_id": enriched.doc_id,
+        "title": enriched.title,
+        "content": enriched.content,
+        "source_type": enriched.source_type,
+        "topic": enriched.topic,
+        "table": enriched.table,
+        "answer_mode": enriched.answer_mode,
+        "semantic_ref_id": str(
+            metadata.get("semanticRefId") or enriched.doc_id or ""
+        ),
         "semantic_path": str(metadata.get("semanticPath") or ""),
         "retrieval_level": str(metadata.get("retrievalLevel") or ""),
         "directory_id": str(metadata.get("directoryId") or ""),
@@ -1175,6 +1475,40 @@ def recall_scopes_for_changed_refs(refs: list[str]) -> set[str]:
         elif len(parts) >= 2 and parts[1] == "relationships.json":
             scopes.add("%s/relationships" % parts[0])
     return scopes
+
+
+def documents_for_updated_refs(
+    docs: Iterable[RecallItem],
+    updated_refs: Iterable[str],
+) -> list[RecallItem]:
+    active_refs = {
+        str(ref or "").removeprefix("deleted:").strip()
+        for ref in updated_refs
+        if str(ref or "").strip()
+        and not str(ref or "").startswith("deleted:")
+    }
+    if not active_refs:
+        return []
+    selected: list[RecallItem] = []
+    for doc in docs:
+        metadata = doc.metadata or {}
+        semantic_path = str(metadata.get("semanticPath") or "").strip()
+        comparable_path = (
+            semantic_path.removeprefix("topics/")
+            if semantic_path.startswith("topics/")
+            else semantic_path
+        )
+        identities = {
+            manifest_ref_for_recall_item(doc),
+            semantic_path,
+            comparable_path,
+            str(metadata.get("semanticRefId") or "").strip(),
+            str(doc.doc_id or "").strip(),
+        }
+        identities.discard("")
+        if identities & active_refs:
+            selected.append(doc)
+    return selected
 
 
 def filter_changed_refs_for_scope(refs: list[str], topic: str = "", table_name: str = "") -> list[str]:

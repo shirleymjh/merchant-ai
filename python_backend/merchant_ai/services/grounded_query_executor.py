@@ -1072,7 +1072,7 @@ class GroundedQueryExecutionKernel:
                 "%s IN (%s)"
                 % (
                     quote_identifier(store_column),
-                    ", ".join(sql_literal(item) for item in store_ids[:200]),
+                    ", ".join(sql_literal(item) for item in store_ids),
                 )
             )
             required_columns.append(store_column)
@@ -1332,7 +1332,7 @@ class GroundedQueryExecutionKernel:
         )
         store_ids = self._dedupe(
             user_scope.get("storeIds") or user_scope.get("store_ids") or []
-        )[:200]
+        )
         region = str(user_scope.get("region") or "").strip()
         access_contracts: list[NodePlanContract] = []
         for table in referenced_tables:
@@ -1544,7 +1544,7 @@ class GroundedQueryExecutionKernel:
         region = str(user_scope.get("region") or "").strip()
         store_ids = self._dedupe(
             user_scope.get("storeIds") or user_scope.get("store_ids") or []
-        )[:200]
+        )
         try:
             scopes = list(traverse_scope(parsed))
         except Exception as exc:
@@ -3116,7 +3116,11 @@ class GroundedQueryExecutionKernel:
         if query_shape == "RANKED":
             coverage = ResultCoverage.TOP_N.value
         elif query_shape not in {"DETAIL", "ENTITY_LOOKUP"}:
-            coverage = ResultCoverage.ALL_ROWS.value
+            coverage = (
+                cls._core_sql_non_ranked_coverage(sql)
+                if core_sql_candidate
+                else ResultCoverage.ALL_ROWS.value
+            )
         elif core_sql_candidate:
             coverage = cls._core_sql_detail_coverage(
                 sql,
@@ -4376,11 +4380,17 @@ class GroundedQueryExecutionKernel:
                 len(raw_rows),
             )
         if query_shape not in {"DETAIL", "ENTITY_LOOKUP"}:
+            coverage = (
+                cls._core_sql_non_ranked_coverage(sql)
+                if core_sql_candidate
+                else ResultCoverage.ALL_ROWS.value
+            )
+            complete = coverage == ResultCoverage.ALL_ROWS.value
             return (
                 list(raw_rows),
-                ResultCoverage.ALL_ROWS.value,
-                False,
-                len(raw_rows),
+                coverage,
+                not complete,
+                len(raw_rows) if complete else 0,
             )
 
         if not core_sql_candidate:
@@ -4430,6 +4440,18 @@ class GroundedQueryExecutionKernel:
         except (TypeError, ValueError):
             return ResultCoverage.PREVIEW.value
         if limit_value <= 0 or returned_row_count >= limit_value:
+            return ResultCoverage.PREVIEW.value
+        return ResultCoverage.ALL_ROWS.value
+
+    @staticmethod
+    def _core_sql_non_ranked_coverage(sql: str) -> str:
+        """A LIMIT on aggregate/grouped Core SQL cannot prove full coverage."""
+
+        try:
+            expression = sqlglot.parse_one(sql, read="mysql")
+        except Exception:
+            return ResultCoverage.PREVIEW.value
+        if any(True for _ in expression.find_all(exp.Limit)):
             return ResultCoverage.PREVIEW.value
         return ResultCoverage.ALL_ROWS.value
 

@@ -1014,8 +1014,8 @@ def test_sql_time_obligation_uses_governed_business_field_not_partition_field() 
         """
         SELECT SUM(f.amount) AS total_amount
         FROM fact_metric f
-        WHERE f.business_event_at >= '2026-06-01'
-          AND f.business_event_at <= '2026-06-30'
+        WHERE f.business_event_at >= '2026-06-01 00:00:00'
+          AND f.business_event_at < '2026-07-01 00:00:00'
         """,
         contract,
     )
@@ -1031,6 +1031,58 @@ def test_sql_time_obligation_uses_governed_business_field_not_partition_field() 
 
     assert valid.valid is True, valid.model_dump(by_alias=True)
     assert "SQL_TIME_PREDICATE_MISSING" in _codes(partition_only)
+
+
+def test_rejects_time_boundaries_with_wrong_operators() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        SELECT SUM(f.amount) AS total_amount
+        FROM fact_metric f
+        WHERE f.event_date > '2026-06-01'
+          AND f.event_date < '2026-06-30'
+        """,
+        _metric_contract(),
+    )
+
+    assert result.valid is False
+    assert "SQL_TIME_PREDICATE_MISSING" in _codes(result)
+    assert "SQL_PREDICATE_NOT_AUTHORIZED" in _codes(result)
+
+
+def test_rejects_filter_not_declared_by_contract() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        SELECT SUM(f.amount) AS total_amount
+        FROM fact_metric f
+        WHERE f.event_date >= '2026-06-01'
+          AND f.event_date <= '2026-06-30'
+          AND f.amount > 999999
+        """,
+        _metric_contract(),
+    )
+
+    assert result.valid is False
+    assert "SQL_PREDICATE_NOT_AUTHORIZED" in _codes(result)
+
+
+def test_cte_cannot_hide_undeclared_aggregate_filter() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH metric_value AS (
+          SELECT SUM(f.amount) AS total_amount
+          FROM fact_metric f
+          WHERE f.event_date >= '2026-06-01'
+            AND f.event_date <= '2026-06-30'
+        )
+        SELECT total_amount
+        FROM metric_value
+        WHERE total_amount > 999999
+        """,
+        _metric_contract(),
+    )
+
+    assert result.valid is False
+    assert "SQL_PREDICATE_NOT_AUTHORIZED" in _codes(result)
 
 
 def test_final_output_set_aliases_and_metric_expression_fail_closed() -> None:
@@ -1187,6 +1239,66 @@ def test_ranked_sql_rejects_unbound_order_keys_offset_and_extra_group_grain() ->
     assert "SQL_RANKING_ORDER_SET_MISMATCH" in _codes(extra_order)
     assert "SQL_RANKING_OFFSET_FORBIDDEN" in _codes(offset)
     assert "SQL_RANKING_GROUP_GRAIN_MISMATCH" in _codes(extra_grain)
+
+
+def test_grouped_sql_requires_exact_grain_and_forbids_unranked_limit() -> None:
+    ranked = _ranked_metric_contract()
+    contract = ranked.model_copy(
+        update={
+            "question": "total amount by category",
+            "query_shape": "GROUPED",
+            "ranking": GroundedRankingBinding(),
+        },
+        deep=True,
+    )
+    validator = GroundedSqlCandidateValidator()
+    valid_sql = """
+        SELECT f.category AS category, SUM(f.amount) AS total_amount
+        FROM fact_metric f
+        WHERE f.event_date >= '2026-06-01'
+          AND f.event_date <= '2026-06-30'
+        GROUP BY f.category
+    """
+
+    valid = validator.validate(valid_sql, contract)
+    extra_grain = validator.validate(
+        valid_sql.replace("GROUP BY f.category", "GROUP BY f.category, f.amount"),
+        contract,
+    )
+    wrong_grain = validator.validate(
+        valid_sql.replace("GROUP BY f.category", "GROUP BY f.amount"),
+        contract,
+    )
+    truncated = validator.validate(valid_sql + " LIMIT 1", contract)
+
+    assert valid.valid is True, valid.model_dump(by_alias=True)
+    assert "SQL_GROUP_GRAIN_MISMATCH" in _codes(extra_grain)
+    assert "SQL_GROUP_GRAIN_MISMATCH" in _codes(wrong_grain)
+    assert "SQL_LIMIT_NOT_AUTHORIZED" in _codes(truncated)
+
+
+def test_trend_sql_rejects_extra_metric_grain() -> None:
+    result = GroundedSqlCandidateValidator().validate(
+        """
+        WITH daily AS (
+          SELECT f.event_date, SUM(f.amount) AS daily_amount
+          FROM fact_metric f
+          WHERE f.event_date >= '2026-06-01'
+            AND f.event_date <= '2026-06-30'
+          GROUP BY f.event_date, f.amount
+        )
+        SELECT event_date,
+               SUM(daily_amount) OVER (
+                 ORDER BY event_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS cumulative_amount
+        FROM daily
+        """,
+        _window_metric_contract(),
+    )
+
+    assert result.valid is False
+    assert "SQL_GROUP_GRAIN_MISMATCH" in _codes(result)
 
 
 def test_ranked_sql_allows_metric_cte_but_requires_final_order_and_limit() -> None:

@@ -51,6 +51,9 @@ class ConversationSemanticIssueCode(str, Enum):
     SELECTED_ARTIFACT_REQUIRED = "SELECTED_ARTIFACT_REQUIRED"
     SELECTED_ARTIFACT_UNKNOWN = "SELECTED_ARTIFACT_UNKNOWN"
     MEMBERSHIP_REQUIREMENT_INVALID = "MEMBERSHIP_REQUIREMENT_INVALID"
+    AMBIGUOUS_RETRIEVAL_QUESTION_PRESENT = (
+        "AMBIGUOUS_RETRIEVAL_QUESTION_PRESENT"
+    )
 
 
 class _StrictFrozenModel(APIModel):
@@ -181,6 +184,7 @@ class ConversationSemanticProviderOutput(_StrictFrozenModel):
     complete_membership_required: bool = False
     current_turn_replaces_time_scope: bool = False
     reference_phrases: tuple[str, ...] = ()
+    retrieval_question: str = ""
 
     @model_validator(mode="after")
     def validate_structure(self) -> "ConversationSemanticProviderOutput":
@@ -192,6 +196,8 @@ class ConversationSemanticProviderOutput(_StrictFrozenModel):
             if not _text(getattr(self, field_name)):
                 raise ValueError("%s must not be empty" % field_name)
         _unique_text(self.reference_phrases, "reference_phrases")
+        if len(_text(self.retrieval_question)) > 1200:
+            raise ValueError("retrieval_question must not exceed 1200 characters")
         return self
 
 
@@ -350,6 +356,7 @@ def _validate_decision(
                 decision.population_required,
                 decision.complete_membership_required,
                 bool(decision.reference_phrases),
+                bool(_text(decision.retrieval_question)),
             )
         ):
             issues.append(
@@ -389,6 +396,13 @@ def _validate_decision(
                 _issue(
                     ConversationSemanticIssueCode.AMBIGUOUS_SELECTION_PRESENT,
                     "An ambiguous reference cannot select an artifact.",
+                )
+            )
+        if _text(decision.retrieval_question):
+            issues.append(
+                _issue(
+                    ConversationSemanticIssueCode.AMBIGUOUS_RETRIEVAL_QUESTION_PRESENT,
+                    "An ambiguous reference cannot produce a standalone retrieval question.",
                 )
             )
         return tuple(issues)

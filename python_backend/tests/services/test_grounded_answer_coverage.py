@@ -788,3 +788,96 @@ def test_derived_analysis_binding_accepts_internal_compose_verified_answer_sourc
     assert "DERIVED_ANALYSIS_RENDERER_SOURCE_REQUIRED" in {
         issue.code for issue in untrusted.issues
     }
+
+
+def test_multi_artifact_detail_renderer_does_not_reuse_another_goal_section() -> None:
+    contract = parse_original_question_goal_contract(
+        {
+            "question": "最近7天订单明细和最近10天退款明细",
+            "goals": [
+                {
+                    "goalId": "detail.orders",
+                    "kind": "detail",
+                    "label": "最近7天订单明细",
+                },
+                {
+                    "goalId": "detail.refunds",
+                    "kind": "detail",
+                    "label": "最近10天退款明细",
+                },
+            ],
+        }
+    )
+    coverage = GoalCoverageResult(
+        passed=True,
+        finalization_allowed=True,
+        required_goal_ids=["detail.orders", "detail.refunds"],
+        covered_goal_ids=["detail.orders", "detail.refunds"],
+        resolved_goal_ids=["detail.orders", "detail.refunds"],
+        resolution_by_goal_id={
+            "detail.orders": "PROVED",
+            "detail.refunds": "PROVED",
+        },
+        resolution_artifact_ids_by_goal_id={
+            "detail.orders": ["artifact-orders"],
+            "detail.refunds": ["artifact-refunds"],
+        },
+        resolution_evidence_refs_by_goal_id={
+            "detail.orders": ["semantic:orders"],
+            "detail.refunds": ["semantic:refunds"],
+        },
+    )
+
+    def artifact(
+        artifact_id: str,
+        evidence_ref: str,
+        row: dict[str, object],
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            artifact_id=artifact_id,
+            output_columns=list(row),
+            contract=SimpleNamespace(
+                query_shape="DETAIL",
+                ranking=SimpleNamespace(enabled=False),
+                evidence_refs=[evidence_ref],
+            ),
+            run_result=SimpleNamespace(
+                merged_query_bundle=SimpleNamespace(
+                    rows=[row],
+                    offloaded_files=[],
+                )
+            ),
+        )
+
+    rendered = render_verified_query_goal_sections(
+        contract,
+        coverage,
+        (
+            "### 最近7天订单明细\n\n"
+            "| order_id | status |\n| --- | --- |\n"
+            "| order_id_shared | paid |"
+        ),
+        [
+            artifact(
+                "artifact-orders",
+                "semantic:orders",
+                {"order_id": "order_id_shared", "status": "paid"},
+            ),
+            artifact(
+                "artifact-refunds",
+                "semantic:refunds",
+                {
+                    "order_id": "order_id_shared",
+                    "refund_status": "success",
+                },
+            ),
+        ],
+    )
+
+    assert rendered.appended_goal_ids == ["detail.refunds"]
+    assert "### 最近10天退款明细" in rendered.answer_markdown
+    assert "| order_id_shared | success |" in rendered.answer_markdown
+    bindings = {item.goal_id: item for item in rendered.bindings}
+    assert bindings["detail.orders"].artifact_ids == ["artifact-orders"]
+    assert bindings["detail.refunds"].artifact_ids == ["artifact-refunds"]
+    assert "最近10天退款明细" not in bindings["detail.orders"].answer_text

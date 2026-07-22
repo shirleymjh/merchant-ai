@@ -218,7 +218,13 @@ def test_business_rerank_prefers_metric_matching_the_question():
             doc_id="gross_revenue",
             source_type="SEMANTIC_METRIC",
             fusion_score=10,
-            metadata={"businessName": "Gross Revenue", "metricKey": "gross_revenue"},
+            metadata={
+                "businessName": "Gross Revenue",
+                "metricKey": "gross_revenue",
+                "metricResolutionType": "exact_business_name",
+                "metricResolutionConfidence": 0.97,
+                "metricResolutionAmbiguous": False,
+            },
         ),
         RecallItem(
             doc_id="net_revenue",
@@ -231,9 +237,44 @@ def test_business_rerank_prefers_metric_matching_the_question():
     reranked = business_rerank_recall_items(items, request.query, request)
 
     assert reranked[0].doc_id == "gross_revenue"
-    assert "exact_business_label" in reranked[0].metadata["businessRerankReasons"]
+    assert "exact_business_label" in reranked[0].metadata["rankingPolicyReasons"]
     assert 0.0 <= reranked[0].fusion_score <= 1.0
-    assert reranked[0].metadata["scoreVersion"] == "recall_v2"
+    assert reranked[0].metadata["scoreVersion"] == "recall_v3"
+    assert "finalScore" not in reranked[0].metadata
+    assert "businessScore" not in reranked[0].metadata
+
+
+def test_business_signals_do_not_override_rrf_within_same_protection_tier():
+    request = KnowledgeRetrievalRequest(
+        query="Gross Revenue",
+        intent_kind="metric_query",
+    )
+    items = [
+        RecallItem(
+            doc_id="strong_rrf",
+            source_type="SEMANTIC_TABLE_ASSET",
+            fusion_score=0.8,
+            metadata={"retrievalScore": 0.8},
+        ),
+        RecallItem(
+            doc_id="business_match",
+            source_type="SEMANTIC_METRIC",
+            fusion_score=0.7,
+            metadata={
+                "businessName": "Gross Revenue",
+                "retrievalScore": 0.7,
+            },
+        ),
+    ]
+
+    reranked = business_rerank_recall_items(items, request.query, request)
+
+    assert [item.doc_id for item in reranked] == [
+        "strong_rrf",
+        "business_match",
+    ]
+    assert reranked[0].fusion_score == 0.8
+    assert reranked[1].fusion_score == 0.7
 
 
 def test_rrf_scores_are_normalized_for_single_and_multiple_channels():
@@ -306,7 +347,9 @@ def test_es_search_uses_active_profile_hybrid_top_k(monkeypatch):
     monkeypatch.setattr(
         service,
         "_text_search",
-        lambda query_text, topics, include_rules=False: [RecallItem(doc_id=f"doc-{index}", fusion_score=100 - index) for index in range(30)],
+        lambda query_text, topics, include_rules=False: [
+            RecallItem(doc_id=f"doc-{index}", fusion_score=100 - index) for index in range(30)
+        ],
     )
 
     items = service._search("复杂分析问题", ["电商交易"])
@@ -329,7 +372,9 @@ def test_exact_unambiguous_metric_uses_protection_tier_instead_of_magic_score():
                 "metricResolverScore": 0.55,
             },
         ),
-        RecallItem(doc_id="strong_es", source_type="SEMANTIC_TABLE_ASSET", fusion_score=1.0, metadata={"retrievalScore": 1.0}),
+        RecallItem(
+            doc_id="strong_es", source_type="SEMANTIC_TABLE_ASSET", fusion_score=1.0, metadata={"retrievalScore": 1.0}
+        ),
     ]
 
     reranked = business_rerank_recall_items(items, request.query, request)
@@ -346,13 +391,29 @@ def test_recall_bundle_strong_match_uses_versioned_normalized_threshold():
         top_score=0.72,
     )
     weak = RecallBundle(
-        items=[RecallItem(doc_id="weak", fusion_score=0.31, metadata={"scoreVersion": "recall_v2", "finalScore": 0.31})],
+        items=[
+            RecallItem(doc_id="weak", fusion_score=0.31, metadata={"scoreVersion": "recall_v2", "finalScore": 0.31})
+        ],
         top_score=0.31,
+    )
+    current = RecallBundle(
+        items=[
+            RecallItem(
+                doc_id="v3",
+                fusion_score=0.68,
+                metadata={
+                    "scoreVersion": "recall_v3",
+                    "retrievalScore": 0.68,
+                },
+            )
+        ],
+        top_score=0.68,
     )
     legacy = RecallBundle(items=[RecallItem(doc_id="legacy", fusion_score=4.2)], top_score=4.2)
 
     assert normalized.has_strong_match() is True
     assert weak.has_strong_match() is False
+    assert current.has_strong_match() is True
     assert legacy.has_strong_match() is True
 
 
