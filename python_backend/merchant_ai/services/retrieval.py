@@ -221,53 +221,55 @@ class EsKnowledgeRetrievalService:
             for item in metric_candidates
             if str(item.get("canonicalMetricKey") or item.get("metricKey") or "")
         ]
-        cache_key = (
-            semantic_request_cache_key(
-                "es_recall",
-                topics=topics,
-                metrics=metric_contracts,
-                dimensions=list(route_slots.get("dimensions") or []),
-                filters=[
-                    *object_filters,
-                    {
-                        "includeRules": include_rules,
-                        "intentKind": request.intent_kind,
-                        "complexity": request.complexity,
-                        "strictTopicScope": request.strict_topic_scope,
-                        "targetGoalIds": sorted(request.target_goal_ids),
-                        "requiredCapabilities": sorted(request.required_capabilities),
-                        "retrievalQueryPlan": retrieval_query_plan,
-                    },
-                    *([knowledge_filter] if knowledge_filter else []),
-                ],
-                time_range=resolve_time_range(query_text, self.settings.business_timezone),
-                asset_version={
-                    "indexVersion": self._index_version(),
-                    "vectorEnabled": self._vector_enabled(),
-                    "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
-                    "retrievalPolicy": {
-                        "version": "hierarchical_v1",
-                        "rrfK": self.settings.es_rrf_k,
-                        "sourceTypeTopK": source_type_top_k,
-                        "multiQueryEnabled": bool(self.settings.es_multi_query_enabled),
-                        "hierarchicalEnabled": bool(self.settings.es_hierarchical_retrieval_enabled),
-                        "hierarchicalMaxDirectories": int(self.settings.es_hierarchical_max_directories or 2),
-                    },
+        normalized_retrieval_question = collapse_whitespace(query_text).casefold()
+        retrieval_question_hash = hashlib.sha256(
+            normalized_retrieval_question.encode("utf-8")
+        ).hexdigest()
+        cache_key = semantic_request_cache_key(
+            "es_recall",
+            topics=topics,
+            metrics=metric_contracts,
+            dimensions=list(route_slots.get("dimensions") or []),
+            filters=[
+                *object_filters,
+                {
+                    "retrievalQuestionHash": retrieval_question_hash,
+                    "includeRules": include_rules,
+                    "intentKind": request.intent_kind,
+                    "complexity": request.complexity,
+                    "strictTopicScope": request.strict_topic_scope,
+                    "targetGoalIds": sorted(request.target_goal_ids),
+                    "requiredCapabilities": sorted(request.required_capabilities),
+                    "coverageReceiptId": request.coverage_receipt_id,
+                    "retrievalQueryPlan": retrieval_query_plan,
                 },
-                scope={
-                    "merchantId": request.merchant_id,
-                    "accessRole": request.access_role,
-                    "permissions": sorted(request.permissions),
+                *([knowledge_filter] if knowledge_filter else []),
+            ],
+            time_range=resolve_time_range(query_text, self.settings.business_timezone),
+            asset_version={
+                "indexVersion": self._index_version(),
+                "vectorEnabled": self._vector_enabled(),
+                "embeddingModel": self.settings.embedding_model if self._vector_enabled() else "",
+                "embeddingDims": int(self.settings.embedding_dims or 0) if self._vector_enabled() else 0,
+                "vectorField": self.settings.es_vector_field if self._vector_enabled() else "",
+                "retrievalPolicy": {
+                    "cacheIdentityVersion": "es_recall_cache_v2",
+                    "profile": retrieval_profile,
+                    "version": "hierarchical_v1",
+                    "rrfK": self.settings.es_rrf_k,
+                    "sourceTypeTopK": source_type_top_k,
+                    "multiQueryEnabled": bool(self.settings.es_multi_query_enabled),
+                    "multiQueryMaxQueries": int(self.settings.es_multi_query_max_queries or 5),
+                    "hierarchicalEnabled": bool(self.settings.es_hierarchical_retrieval_enabled),
+                    "hierarchicalMaxDirectories": int(self.settings.es_hierarchical_max_directories or 2),
+                    "hierarchicalMaxLeafItems": int(self.settings.es_hierarchical_max_leaf_items or 16),
                 },
-            )
-            if (
-                metric_contracts
-                or object_filters
-                or knowledge_filter
-                or request.target_goal_ids
-                or request.required_capabilities
-            )
-            else ""
+            },
+            scope={
+                "merchantId": request.merchant_id,
+                "accessRole": request.access_role,
+                "permissions": sorted(request.permissions),
+            },
         )
         cached = self._recall_cache.get(cache_key)
         if cached is not None:
