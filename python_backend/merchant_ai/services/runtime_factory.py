@@ -533,9 +533,6 @@ class GroundedApplicationRuntime:
                     "route_slots": {"timeWindow": {"days": days}},
                     "user_identity": identity,
                     "persisted": bool(answer_written or pending_written),
-                    "evidence_graph_verified": True,
-                    "evidence_accepted": True,
-                    "verification_status": "verified",
                     "agent_run_result": SimpleNamespace(
                         task_results=[object()],
                         verified_evidence=SimpleNamespace(passed=True),

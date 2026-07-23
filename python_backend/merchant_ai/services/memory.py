@@ -4644,23 +4644,14 @@ def memory_event_from_state(state: AgentState) -> Dict[str, Any]:
     has_task_results = bool(getattr(run_result, "task_results", None))
     evidence_gaps = list(getattr(run_result, "evidence_gaps", []) or []) if run_result is not None else []
     verified_evidence = getattr(run_result, "verified_evidence", None) if run_result is not None else None
-    verification_failed = str(state.get("verification_status") or "") == "failed"
-    evidence_graph_verified = bool(state.get("evidence_graph_verified"))
     evidence_checked = bool(
         has_task_results
-        or evidence_graph_verified
         or evidence_gaps
         or state.get("planner_provider_error")
     )
-    accepted = state.get("evidence_accepted")
-    if accepted is None:
-        accepted = evidence_graph_verified
-    elif accepted is False and evidence_graph_verified and not verification_failed:
-        accepted = True
     answer_verified = bool(
         evidence_checked
         and bool(getattr(verified_evidence, "passed", False))
-        and accepted
         and not evidence_gaps
         and not state.get("planner_provider_error")
     )
@@ -4786,16 +4777,8 @@ def past_case_event_from_state(state: AgentState) -> Dict[str, Any]:
     evidence_gaps = getattr(run_result, "evidence_gaps", []) if run_result is not None else []
     has_task_results = bool(getattr(run_result, "task_results", None))
     completed = bool(state.get("chat_bi_completed")) or has_task_results
-    verification_failed = str(state.get("verification_status") or "") == "failed"
-    evidence_graph_verified = bool(state.get("evidence_graph_verified"))
-    accepted = state.get("evidence_accepted")
-    if accepted is None:
-        accepted = evidence_graph_verified
-    elif accepted is False and evidence_graph_verified and not verification_failed:
-        accepted = True
     verified = bool(
-        accepted
-        and run_result is not None
+        run_result is not None
         and bool(getattr(getattr(run_result, "verified_evidence", None), "passed", False))
     )
     has_unverified_execution = bool(has_task_results and not verified)

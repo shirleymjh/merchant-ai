@@ -57,11 +57,11 @@ flowchart TB
 
 ## 并行查询
 
-Core 先把相互独立的查询描述交给 `prepare_grounded_query_batch`。Runtime 为每个查询创建独立的 `GroundedRuntimeSession`：
+Core 将相互独立的查询一次性交给统一入口 `query_batch`。Runtime 在入口内部为每个查询创建独立的 `GroundedRuntimeSession`：
 
 - branch 拥有独立 session id、active generation、Contract、SQL candidate 和验证状态；
-- Contract 准备目前由同一个 Core/工具串行完成；
-- `execute_grounded_query_batch` 使用线程池并发进行 SQL candidate 校验、Doris 执行和 Evidence 校验；
+- Contract 准备由 `query_batch` 的内部阶段完成，不再暴露为独立工具；
+- `query_batch` 使用线程池并发进行 SQL candidate 校验、Doris 执行和 Evidence 校验；
 - 所有 branch 共享线程安全的总时长、工具次数和 Doris 次数预算；
 - 失败或未验证 branch 不修改主 session；
 - 只有验证通过的 immutable query artifacts 才在锁内合并进主 ledger。

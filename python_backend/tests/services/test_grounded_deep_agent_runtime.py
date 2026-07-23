@@ -14,7 +14,6 @@ from langgraph.types import Command
 from merchant_ai.config import Settings
 from merchant_ai.models import (
     AgentRunResult,
-    AgentTaskResult,
     ClarificationRequest,
     DataSnapshotContract,
     ExtractedKeywords,
@@ -24,8 +23,6 @@ from merchant_ai.models import (
     QuestionIntent,
     RecallBundle,
     RecallItem,
-    ResolvedTimeRange,
-    SqlValidationResult,
     SubAgentResultEnvelope,
     TopicRoutingDecision,
     VerifiedEvidence,
@@ -69,7 +66,6 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedEntityFilterBinding,
     GroundedEntityFilterHint,
     GroundedQueryContract,
-    GroundedTableBinding,
     GroundedUpstreamEntityBinding,
     GroundedUpstreamEntityHint,
 )
@@ -99,7 +95,6 @@ from merchant_ai.services.grounded_goal_contract import (
     TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_sql_candidate import (
-    GroundedSqlCandidate,
     grounded_query_contract_fingerprint,
 )
 from merchant_ai.services.grounded_subagent_runtime import IsolatedSubagentResult
@@ -110,7 +105,7 @@ from merchant_ai.services.grounded_subagent_runtime import (
     GroundedSubagentGoalContract,
     GroundedSkillRunContract,
 )
-from merchant_ai.services.query_request import QueryRequest, QuerySqlCandidate
+from merchant_ai.services.query_request import QueryRequest
 from merchant_ai.services.query_request import (
     QueryOutcome,
     QueryOutcomeStatus,

@@ -162,7 +162,10 @@ def test_verified_answer_is_written_to_pending_mysql_and_memory() -> None:
         "m-1",
     )
     assert answer_repository.answer.id == response.id
-    assert memory_store.state["evidence_graph_verified"] is True
+    assert (
+        memory_store.state["agent_run_result"].verified_evidence.passed
+        is True
+    )
     assert response.debug_trace["harness"]["persistence"] == {
         "pendingAnswerWritten": True,
         "answerRepositoryWritten": True,

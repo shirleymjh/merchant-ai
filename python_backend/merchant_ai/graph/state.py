@@ -314,16 +314,8 @@ class AgentState(TypedDict, total=False):
     rule_recall_ready: bool
     rule_recall_refs: List[str]
     rule_recall_context: str
-    query_graph_validated: bool
-    query_graph_validation_attempted: bool
-    query_graph_validation_passed: bool
-    query_graph_validation_status: str
-    validated_query_graph_fingerprint: str
     query_graph_reflected: bool
     sql_repair_reviewed: bool
-    evidence_graph_verified: bool
-    verification_status: str
-    evidence_accepted: bool
 
     supervised: bool
     scope_clarified: bool

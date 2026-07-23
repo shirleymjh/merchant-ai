@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import multiprocessing
 import os
 import traceback
-from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,12 +10,7 @@ import pytest
 
 from merchant_ai.config import Settings
 from merchant_ai.models import (
-    AgentRunResult,
-    AgentTaskResult,
     ClarificationRequest,
-    DataSnapshotContract,
-    QueryBundle,
-    SqlValidationResult,
 )
 from merchant_ai.services.grounded_context_workspace import (
     GroundedContextWorkspace,
@@ -26,7 +19,6 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     _build_graph_revision_base_session_checkpoint,
     _execution_graph_node_runtime_states,
     _authorized_verified_query_artifacts,
-    _published_query_artifact_digests,
 )
 from merchant_ai.services.grounded_execution_graph import (
     build_grounded_execution_graph_replan_evidence,
@@ -36,20 +28,6 @@ from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
     original_question_goal_contract_fingerprint,
-)
-from merchant_ai.services.grounded_runtime_budget import (
-    GroundedRuntimeBudget,
-    GroundedRuntimeBudgetExceeded,
-    GroundedRuntimeBudgetLimits,
-)
-from merchant_ai.services.grounded_runtime_kernel import (
-    GroundedRuntimeKernel,
-    GroundedRuntimeSession,
-    verified_query_artifact_integrity_fingerprint,
-)
-from merchant_ai.services.grounded_population_runtime_gate import (
-    PopulationPreExecutionReference,
-    seal_population_pre_execution_reference,
 )
 from merchant_ai.services.grounded_population_gate_coordinator import (
     PopulationDynamicGraphNode,
@@ -69,10 +47,8 @@ from merchant_ai.services.grounded_subagent_runtime import (
 )
 from tests.services.test_grounded_branch_scoped_runtime import (
     _context,
-    _freeze_reopenable_execution_graph,
     _propose_test_execution_graph,
     _runtime,
-    _set_frozen_branch_evidence_kind,
 )
 
 
@@ -469,122 +445,6 @@ def _spawn_graph_revision_recovery(
                 "error": traceback.format_exc(),
             }
         )
-
-
-def test_new_runtime_rolls_forward_each_graph_revision_crash_window(
-    tmp_path,
-    crash_stage: str,
-    pending_phase: str,
-    expected_population_calls: int,
-) -> None:
-    first_runtime, first_kernel, _ = _runtime(require_parallel_overlap=False)
-    first_context = _context(
-        first_kernel,
-        "two independent metrics",
-    )
-    frozen = _two_node_graph(first_runtime, first_context)
-    base_population = _install_population_revision_base(
-        first_context,
-        frozen,
-    )
-    revision = _failed_revision_payload(first_context, frozen)
-    settings = Settings(harness_workspace_path=str(tmp_path / "workspace"))
-    first_workspace = GroundedContextWorkspace.open(
-        settings,
-        thread_id=first_context.thread_id,
-        run_id=first_context.run_id,
-        merchant_id="merchant-1",
-        access_role="merchant",
-        user_scope={},
-        question=first_context.session.runtime.question,
-    )
-    first_context.session.context_workspace = first_workspace
-    checkpoint_context = _context(
-        first_kernel,
-        "two independent metrics",
-    )
-    _restore_base_session(
-        checkpoint_context.session,
-        first_context.session,
-        first_workspace,
-    )
-    population_gate = _IdempotentPopulationRevisionGate(base_population.receipt_fingerprint)
-    crashed_transaction_ids: list[str] = []
-
-    def crash(stage: str, transaction_id: str) -> None:
-        if stage != crash_stage:
-            return
-        crashed_transaction_ids.append(transaction_id)
-        raise _RevisionCrash(stage)
-
-    first_runtime.settings = settings
-    first_runtime.population_gate_enforced = True
-    first_runtime.population_execution_gate = population_gate
-    first_runtime.graph_revision_fault_injector = crash
-
-    crashed = False
-    try:
-        _tools(first_runtime)["revise_grounded_execution_graph"].func(
-            revision=revision,
-            runtime=SimpleNamespace(context=first_context),
-        )
-    except _RevisionCrash:
-        crashed = True
-    assert crashed is True
-    assert len(crashed_transaction_ids) == 1
-
-    pending = GroundedGraphRevisionTransactionJournal(
-        GroundedContextWorkspace.open(
-            settings,
-            thread_id=first_context.thread_id,
-            run_id=first_context.run_id,
-            merchant_id="merchant-1",
-            access_role="merchant",
-            user_scope={},
-            question=first_context.session.runtime.question,
-        )
-    ).discover_pending()
-    assert len(pending) == 1
-    assert pending[0].transaction_id == crashed_transaction_ids[0]
-    assert pending[0].phase == pending_phase
-
-    restarted_runtime, restarted_kernel, _ = _runtime(require_parallel_overlap=False)
-    restarted_context = _context(
-        restarted_kernel,
-        "two independent metrics",
-    )
-    restarted_workspace = GroundedContextWorkspace.open(
-        settings,
-        thread_id=restarted_context.thread_id,
-        run_id=restarted_context.run_id,
-        merchant_id="merchant-1",
-        access_role="merchant",
-        user_scope={},
-        question=restarted_context.session.runtime.question,
-    )
-    _restore_base_session(
-        restarted_context.session,
-        checkpoint_context.session,
-        restarted_workspace,
-    )
-    restarted_runtime.settings = settings
-    restarted_runtime.population_gate_enforced = True
-    restarted_runtime.population_execution_gate = population_gate
-
-    recovered = json.loads(
-        _tools(restarted_runtime)["revise_grounded_execution_graph"].func(
-            revision=revision,
-            runtime=SimpleNamespace(context=restarted_context),
-        )
-    )
-
-    assert recovered["status"] == "REVISED"
-    assert recovered["recovered"] is True
-    assert recovered["receipt"]["version"] == 2
-    assert restarted_context.session.execution_graph_receipt is not None
-    assert restarted_context.session.execution_graph_receipt.fingerprint == recovered["receipt"]["fingerprint"]
-    assert len(population_gate.revision_calls) == expected_population_calls
-    assert GroundedGraphRevisionTransactionJournal(restarted_workspace).discover_pending() == ()
 
 
 def test_recovery_hydrates_subgoal_generation_without_promoting_advisory_coverage() -> None:

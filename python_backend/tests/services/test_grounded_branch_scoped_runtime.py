@@ -8,13 +8,10 @@ from typing import Any
 
 from merchant_ai.models import (
     AgentRunResult,
-    AgentTaskResult,
     DataSnapshotContract,
-    FreshnessCheckResult,
     MerchantInfo,
     QueryBundle,
     QueryPlan,
-    SqlValidationResult,
     VerifiedEvidence,
 )
 from merchant_ai.services.grounded_deep_agent_runtime import (
@@ -44,7 +41,6 @@ from merchant_ai.services.grounded_query_contract import (
     GroundedContractGap,
     GroundedQueryContract,
 )
-from merchant_ai.services.grounded_query_branches import GroundedSemanticReadLedger
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeAttempt,
     GroundedRuntimeSession,

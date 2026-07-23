@@ -237,8 +237,6 @@ class SkillDraftService:
         }
 
     def _eligible(self, state: Dict[str, Any]) -> bool:
-        if not bool(state.get("evidence_graph_verified")):
-            return False
         run_result = state.get("agent_run_result") or AgentRunResult()
         if not getattr(getattr(run_result, "verified_evidence", None), "passed", False):
             return False

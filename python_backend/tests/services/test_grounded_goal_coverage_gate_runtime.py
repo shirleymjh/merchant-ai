@@ -28,7 +28,6 @@ from merchant_ai.services.grounded_goal_contract import (
     MetricQuestionGoal,
     OriginalQuestionGoalContract,
     RankingQuestionGoal,
-    TimeWindowQuestionGoal,
 )
 from merchant_ai.services.grounded_query_contract import (
     GroundedBindingHints,
