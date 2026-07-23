@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import hashlib
+
 from typing import Any, Dict, List, Set
 
 import sqlglot
 from sqlglot import exp
 
-from merchant_ai.models import AgentRunResult, AnswerMode, EvidenceGap, QueryPlan, VerifiedEvidence
+from merchant_ai.models import (
+    AgentRunResult,
+    AnswerMode,
+    EvidenceGap,
+    QueryPlan,
+    ResultCoverage,
+    VerifiedEvidence,
+)
 from merchant_ai.services.entity_contracts import (
     entity_filter_contract_hash,
     entity_filter_sql_hash,
 )
 from merchant_ai.services.memory_constraints import memory_constraint_evidence_gaps
+from merchant_ai.services.grounded_query_proof import (
+    GroundedQueryProofBundle,
+    grounded_query_proof_integrity_errors,
+)
 from merchant_ai.services.query import (
     semantic_filter_contract_hash,
     semantic_filter_execution_hash,
@@ -45,6 +58,68 @@ def _verification_input_is_empty(
 
 
 class EvidenceVerifier:
+    def verify_proof(
+        self,
+        proof: GroundedQueryProofBundle,
+        *,
+        memory_constraints: List[Dict[str, Any]] | None = None,
+        allowed_knowledge_refs: Set[str] | None = None,
+    ) -> VerifiedEvidence:
+        """Verify one sealed grounded query without trusting caller prose."""
+
+        verified = self.verify(
+            proof.question,
+            proof.execution_plan,
+            proof.run_result,
+            memory_constraints=memory_constraints,
+            allowed_knowledge_refs=allowed_knowledge_refs,
+        )
+        proof_gaps = [
+            EvidenceGap(
+                code=code,
+                reason=reason,
+                severity="blocking",
+                source="query_proof",
+                answer_instruction=(
+                    "不能使用身份、语义版本、SQL 或结果证明不一致的查询结果。"
+                ),
+            )
+            for code, reason in grounded_query_proof_integrity_errors(proof)
+        ]
+        proof_gaps.extend(
+            grounded_result_shape_evidence_gaps(
+                proof.contract,
+                proof.run_result,
+                sql_validation=proof.sql_validation,
+            )
+        )
+        if not proof_gaps:
+            return verified
+        gaps = dedupe_evidence_gaps(
+            [
+                *verified.gaps,
+                *[classify_evidence_gap(gap) for gap in proof_gaps],
+            ]
+        )
+        blocking = [gap for gap in gaps if gap.severity == "blocking"]
+        warnings = [gap for gap in gaps if gap.severity == "warning"]
+        return verified.model_copy(
+            update={
+                "passed": not blocking,
+                "gaps": gaps,
+                "blocking_gaps": blocking,
+                "warning_gaps": warnings,
+                "answer_guard_required": bool(
+                    blocking
+                    or warnings
+                    or verified.required_disclosures
+                ),
+                "partial_answer_reason": "；".join(
+                    gap.reason for gap in blocking[:3]
+                ),
+            }
+        )
+
     def verify(
         self,
         question: str,
@@ -494,12 +569,17 @@ class EvidenceVerifier:
             if not task_result.query_bundle.rows:
                 if task_result.task_id in zero_filled_component_tasks:
                     continue
+                if authoritative_empty_result(task_result.query_bundle):
+                    continue
                 gaps.append(
                     EvidenceGap(
-                        code="ZERO_ROWS",
+                        code="EMPTY_RESULT_COVERAGE_UNPROVEN",
                         task_id=task_result.task_id,
                         evidence=semantic_label,
-                        reason="%s 执行成功但返回 0 行" % (task_result.task_id or semantic_label),
+                        reason=(
+                            "%s 返回 0 行，但执行结果没有证明已完整覆盖请求范围"
+                            % (task_result.task_id or semantic_label)
+                        ),
                     )
                 )
                 continue
@@ -578,7 +658,13 @@ class EvidenceVerifier:
                         labels.add(label)
                 continue
             task_result = self._matching_task_result(str(contract.get("taskId") or contract.get("task_id") or ""), str(contract.get("table") or ""), run_result)
-            if not task_result or task_result.query_bundle.failed or not task_result.query_bundle.rows:
+            if not task_result or task_result.query_bundle.failed:
+                continue
+            if not task_result.query_bundle.rows:
+                if authoritative_empty_result(task_result.query_bundle):
+                    label = str(contract.get("semanticLabel") or contract.get("semantic_label") or "")
+                    if label:
+                        labels.add(label)
                 continue
             columns = [str(item) for item in contract.get("columns", []) if item]
             columns_any_of = normalize_any_of(contract.get("columnsAnyOf") or contract.get("columns_any_of") or [])
@@ -1232,6 +1318,204 @@ def semantic_filter_evidence_gaps(run_result: AgentRunResult) -> List[EvidenceGa
     return gaps
 
 
+def authoritative_empty_result(bundle: Any) -> bool:
+    """A complete empty population is evidence; an unknown preview is not."""
+
+    return bool(
+        bundle is not None
+        and not bundle.failed
+        and not bundle.rows
+        and not bundle.is_truncated
+        and str(bundle.result_coverage or "")
+        in {
+            ResultCoverage.ALL_ROWS.value,
+            ResultCoverage.TOP_N.value,
+        }
+    )
+
+
+def grounded_result_shape_evidence_gaps(
+    contract: Any,
+    run_result: AgentRunResult,
+    *,
+    sql_validation: Any = None,
+) -> List[EvidenceGap]:
+    """Check result completeness against the sealed grounded query shape."""
+
+    gaps: List[EvidenceGap] = []
+    bundle = run_result.merged_query_bundle
+    if bundle.failed:
+        return gaps
+
+    shape = str(getattr(contract, "query_shape", "") or "").upper()
+    coverage = str(bundle.result_coverage or ResultCoverage.UNKNOWN.value)
+    complete = coverage in {
+        ResultCoverage.ALL_ROWS.value,
+        ResultCoverage.TOP_N.value,
+    }
+    if bundle.is_truncated or not complete:
+        if shape in {"DETAIL", "ENTITY_LOOKUP"}:
+            gaps.append(
+                EvidenceGap(
+                    code="RESULT_PREVIEW_ONLY",
+                    evidence=coverage,
+                    reason=(
+                        "明细结果只覆盖预览行，不能表述为全部匹配记录"
+                    ),
+                    severity="warning",
+                    disclosure_required=True,
+                    source="result_coverage",
+                    answer_instruction=(
+                        "明确说明当前展示的是预览结果，不要声称已经列出全部明细。"
+                    ),
+                    suggested_action="publish_complete_detail_artifact_or_disclose_preview",
+                )
+            )
+        else:
+            gaps.append(
+                EvidenceGap(
+                    code="RESULT_SET_COVERAGE_INCOMPLETE",
+                    evidence=coverage,
+                    reason=(
+                        "聚合、分组、趋势或排名结果没有证明完整覆盖请求范围"
+                    ),
+                    severity="blocking",
+                    source="result_coverage",
+                    answer_instruction=(
+                        "不能用只覆盖部分结果集的数据生成完整业务结论。"
+                    ),
+                    suggested_action="execute_complete_result_query",
+                )
+            )
+
+    expected_outputs = {
+        str(item.output_alias or "").strip()
+        for item in getattr(contract, "requested_outputs", []) or []
+        if str(item.output_alias or "").strip()
+    }
+    observed_outputs = {
+        str(key)
+        for row in bundle.rows[:20]
+        for key in row.keys()
+        if not str(key).startswith("__")
+    }
+    if not observed_outputs and sql_validation is not None:
+        observed_outputs = {
+            str(item)
+            for item in getattr(sql_validation, "output_columns", []) or []
+            if str(item or "").strip()
+        }
+    if not observed_outputs:
+        observed_outputs = {
+            str(item)
+            for node_contract in run_result.node_plan_contracts
+            for item in node_contract.output_keys
+            if str(item or "").strip()
+        }
+    if not observed_outputs:
+        observed_outputs = {
+            str(item)
+            for task_result in run_result.task_results
+            for item in task_result.node_plan_contract.output_keys
+            if str(item or "").strip()
+        }
+    missing_outputs = sorted(expected_outputs - observed_outputs)
+    if missing_outputs:
+        gaps.append(
+            EvidenceGap(
+                code="RESULT_OUTPUT_CONTRACT_MISMATCH",
+                evidence=",".join(missing_outputs),
+                reason="查询结果缺少 Grounded Contract 声明的输出字段",
+                severity="blocking",
+                source="result_shape",
+                answer_instruction="不能使用缺少必需输出字段的查询结果。",
+                details={"missingOutputs": missing_outputs},
+            )
+        )
+
+    ranking = getattr(contract, "ranking", None)
+    if shape == "RANKED" or bool(getattr(ranking, "enabled", False)):
+        limit = max(0, int(getattr(ranking, "limit", 0) or 0))
+        if coverage != ResultCoverage.TOP_N.value:
+            gaps.append(
+                EvidenceGap(
+                    code="RANKING_RESULT_COVERAGE_MISMATCH",
+                    evidence=coverage,
+                    reason="排名查询结果没有 TOP_N 覆盖证明",
+                    severity="blocking",
+                    source="result_shape",
+                    answer_instruction="不能把未验证排序范围的结果表述为 TopN。",
+                )
+            )
+        if limit and bundle.effective_row_count() > limit:
+            gaps.append(
+                EvidenceGap(
+                    code="RANKING_RESULT_LIMIT_MISMATCH",
+                    evidence=str(bundle.effective_row_count()),
+                    reason="排名结果行数超过 Grounded Contract 声明的 N",
+                    severity="blocking",
+                    source="result_shape",
+                    details={
+                        "expectedLimit": limit,
+                        "actualRowCount": bundle.effective_row_count(),
+                    },
+                )
+            )
+
+    physical = dict(run_result.physical_plan_assessment or {})
+    if physical:
+        executed_sql_hash = hashlib.sha256(
+            str(bundle.sql or "").strip().encode("utf-8")
+        ).hexdigest()
+        declared_sql_hash = str(
+            physical.get("sqlFingerprint")
+            or physical.get("sql_fingerprint")
+            or ""
+        )
+        if not declared_sql_hash or declared_sql_hash != executed_sql_hash:
+            gaps.append(
+                EvidenceGap(
+                    code="PHYSICAL_PLAN_SQL_FINGERPRINT_MISMATCH",
+                    evidence=declared_sql_hash,
+                    reason="物理计划证明没有绑定到最终执行 SQL",
+                    severity="blocking",
+                    source="physical_plan",
+                )
+            )
+        status = str(physical.get("status") or "").upper()
+        executable = bool(physical.get("executable"))
+        for item in physical.get("gaps") or []:
+            if not isinstance(item, dict):
+                continue
+            blocking = bool(item.get("blocking"))
+            gaps.append(
+                EvidenceGap(
+                    code=str(item.get("code") or "PHYSICAL_PLAN_GAP"),
+                    evidence=",".join(
+                        str(value) for value in item.get("tables") or []
+                    ),
+                    reason=str(item.get("message") or "Doris 物理计划证明存在缺口"),
+                    severity="blocking" if blocking else "warning",
+                    source="physical_plan",
+                    details=dict(item.get("details") or {}),
+                )
+            )
+        if status in {"INVALID", "GAPPED"} and not executable and not any(
+            gap.severity == "blocking" and gap.source == "physical_plan"
+            for gap in gaps
+        ):
+            gaps.append(
+                EvidenceGap(
+                    code="PHYSICAL_PLAN_NOT_EXECUTABLE",
+                    evidence=status,
+                    reason="Doris 物理计划治理未授权本次 SQL 执行",
+                    severity="blocking",
+                    source="physical_plan",
+                )
+            )
+    return gaps
+
+
 def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
     warning_codes = {
         "FIELD_AMBIGUOUS",
@@ -1240,6 +1524,7 @@ def classify_evidence_gap(gap: EvidenceGap) -> EvidenceGap:
         "RESOURCE_DEGRADED_QUERY",
         "MEMORY_METRIC_DISPUTE_REQUIRES_CLARIFICATION",
         "ENTITY_FILTER_VALUE_NOT_FOUND",
+        "RESULT_PREVIEW_ONLY",
     }
     info_codes: Set[str] = set()
     default_severity = "warning" if gap.code in warning_codes else "info" if gap.code in info_codes else "blocking"

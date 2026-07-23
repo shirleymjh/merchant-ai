@@ -342,6 +342,17 @@ class FakeExecutor:
 
 
 class FakeVerifier:
+    def __init__(self) -> None:
+        self.last_proof = None
+
+    def verify_proof(self, proof, **kwargs: Any) -> VerifiedEvidence:
+        del kwargs
+        self.last_proof = proof
+        return VerifiedEvidence(
+            passed=True,
+            covered_evidence=[proof.question],
+        )
+
     @staticmethod
     def verify(question: str, plan: QueryPlan, run_result: AgentRunResult) -> VerifiedEvidence:
         return VerifiedEvidence(passed=True, covered_evidence=[question])
@@ -803,6 +814,15 @@ def test_valid_candidate_executes_verifies_and_answers_through_contract_executor
     assert executor.execute_calls == 1
     assert "runtime_budget" not in executor.last_kwargs
     assert session.phase == "ANSWERED"
+    assert runtime.verifier.last_proof is not None
+    artifact = runtime.latest_verified_query_artifact(session)
+    assert artifact is not None
+    assert artifact.query_proof_fingerprint == (
+        runtime.verifier.last_proof.proof_fingerprint
+    )
+    assert artifact.executed_sql_ast_fingerprint == (
+        runtime.verifier.last_proof.sql_ast_fingerprint
+    )
 
 
 def test_serial_verified_artifact_requires_pre_ledger_authorization() -> None:

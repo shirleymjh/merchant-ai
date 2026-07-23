@@ -1336,6 +1336,17 @@ def test_ranking_bindings_are_part_of_sql_contract_fingerprint() -> None:
     )
 
 
+def test_equivalent_question_wording_shares_sql_contract_fingerprint() -> None:
+    contract = _ranked_metric_contract()
+    equivalent = contract.model_copy(
+        update={"question": "换一种说法但保持相同的正式查询语义"}
+    )
+
+    assert grounded_query_contract_fingerprint(contract) == grounded_query_contract_fingerprint(
+        equivalent
+    )
+
+
 def test_cross_turn_rank_is_bound_to_prior_predicate_population() -> None:
     contract = _cross_turn_population_contract()
     result = GroundedSqlCandidateValidator().validate(

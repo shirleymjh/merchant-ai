@@ -18,6 +18,12 @@ from typing import Any, Dict, List, Optional
 
 from merchant_ai.config import Settings, get_settings
 from merchant_ai.graph.action_contract import action_state_flag_ready, state_path_ready
+from merchant_ai.graph.evidence_verification_contract import (
+    EvidenceVerificationStatus,
+    evidence_verification_passed,
+    invalidate_evidence_verification,
+    record_evidence_verification,
+)
 from merchant_ai.graph.policy import REPAIRABLE_QUERY_GRAPH_GAP_CODES, V2AgentPolicy
 from merchant_ai.graph.query_graph_contract import (
     graph_validation_attempted,
@@ -759,9 +765,7 @@ class MerchantQaWorkflow:
         )
         state["sql_generated"] = False
         state["sql_repair_reviewed"] = False
-        state["evidence_graph_verified"] = False
-        state["verification_status"] = "not_run"
-        state["evidence_accepted"] = False
+        invalidate_evidence_verification(state)
         state["result_generation"] = -1
         state["evidence_generation"] = -1
         state["analysis_generation"] = -1
@@ -835,7 +839,7 @@ class MerchantQaWorkflow:
             partial_answer_reason=run_result.partial_answer_reason,
         )
         state["agent_run_result"] = run_result
-        state["evidence_accepted"] = False
+        record_evidence_verification(state, run_result.verified_evidence)
 
     def route_after_retrieve_knowledge(self, state: AgentState) -> str:
         terminal = self.terminal_or_human_node(state)
@@ -3240,9 +3244,11 @@ class MerchantQaWorkflow:
             verified_evidence=VerifiedEvidence(passed=False, summary="semantic definition only; no Doris evidence required"),
         )
         state["sql_generated"] = False
-        state["evidence_graph_verified"] = False
-        state["verification_status"] = "semantic_definition"
-        state["evidence_accepted"] = False
+        record_evidence_verification(
+            state,
+            state["agent_run_result"].verified_evidence,
+            status=EvidenceVerificationStatus.SEMANTIC_DEFINITION,
+        )
 
     def attach_fast_metric_evidence_state(self, state: AgentState, response: ChatResponse, semantic_identity: Dict[str, Any]) -> None:
         debug_trace = response.debug_trace or {}
@@ -3302,9 +3308,10 @@ class MerchantQaWorkflow:
             verified_evidence=VerifiedEvidence(passed=True),
         )
         state["sql_generated"] = True
-        state["evidence_graph_verified"] = True
-        state["verification_status"] = "passed"
-        state["evidence_accepted"] = True
+        record_evidence_verification(
+            state,
+            state["agent_run_result"].verified_evidence,
+        )
         state["result_generation"] = int(state.get("execution_generation") or 0)
         state["evidence_generation"] = int(state.get("execution_generation") or 0)
 
@@ -6306,9 +6313,7 @@ class MerchantQaWorkflow:
                 ),
             )
         add_step(state, "Main Agent Tool verify_evidence_graph：" + ("证据门禁通过" if verified.passed else "证据存在缺口 %d 个" % len(verified.gaps)))
-        state["evidence_graph_verified"] = True
-        state["verification_status"] = "passed" if verified.passed else "failed"
-        state["evidence_accepted"] = bool(verified.passed)
+        record_evidence_verification(state, verified)
         state["evidence_generation"] = int(state.get("execution_generation") or 0) if verified.passed else -1
         if not verified.passed and self.latency_optimizer.blocks_expensive_agents(state.get("latency_optimization") or {}):
             self.escalate_fast_request(state, "evidence verification failed on the fast path")
@@ -7490,9 +7495,10 @@ class MerchantQaWorkflow:
         state["sql_generated"] = True
         state["result_generation"] = int(state.get("execution_generation") or 0)
         state["sql_repair_reviewed"] = True
-        state["evidence_graph_verified"] = True
-        state["verification_status"] = "passed"
-        state["evidence_accepted"] = True
+        record_evidence_verification(
+            state,
+            run_result.verified_evidence,
+        )
         state["evidence_generation"] = int(state.get("execution_generation") or 0)
         if state.get("analysis_summary"):
             state["analysis_generation"] = int(state.get("execution_generation") or 0)
@@ -11494,21 +11500,10 @@ def archive_execution_attempt(
 
 
 def evidence_accepted_for_state(state: AgentState) -> bool:
-    run_result = state.get("agent_run_result") or AgentRunResult()
-    if "execution_generation" in state:
-        current_generation = int(state.get("execution_generation") or 0)
-        result_generation = int(state.get("result_generation") if state.get("result_generation") is not None else -1)
-        evidence_generation = int(state.get("evidence_generation") if state.get("evidence_generation") is not None else -1)
-        if (result_generation >= 0 or evidence_generation >= 0) and (
-            result_generation != current_generation or evidence_generation != current_generation
-        ):
-            return False
-    accepted = state.get("evidence_accepted")
-    if accepted is None:
-        accepted = state.get("evidence_graph_verified")
-    elif accepted is False and state.get("evidence_graph_verified") and str(state.get("verification_status") or "") != "failed":
-        accepted = True
-    return bool(accepted and run_result.verified_evidence.passed)
+    return evidence_verification_passed(
+        state,
+        require_current_generation=True,
+    )
 
 
 def current_analysis_summary_for_state(state: AgentState) -> str:

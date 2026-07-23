@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from merchant_ai.services.governed_query_service import (
+    CallbackGroundedQueryBackend,
     GovernedQueryService,
-    LegacyGroundedQueryBackend,
 )
 from merchant_ai.services.query_request import (
     QueryAttemptResult,
@@ -303,7 +303,7 @@ def test_batch_contains_one_branch_backend_exception() -> None:
 
 def test_legacy_backend_collapses_prepare_and_deterministic_execution() -> None:
     calls: list[str] = []
-    backend = LegacyGroundedQueryBackend(
+    backend = CallbackGroundedQueryBackend(
         prepare_contract=lambda request: {
             "status": "READY",
             "activated": True,
@@ -333,7 +333,7 @@ def test_legacy_backend_collapses_prepare_and_deterministic_execution() -> None:
 
 
 def test_legacy_backend_requests_sql_for_complex_contract() -> None:
-    backend = LegacyGroundedQueryBackend(
+    backend = CallbackGroundedQueryBackend(
         prepare_contract=lambda request: {
             "status": "READY",
             "activated": True,
@@ -379,7 +379,7 @@ def test_legacy_backend_repairs_rejected_sql_inside_query_data() -> None:
             "coveredGoalIds": ["goal-2"],
         }
 
-    backend = LegacyGroundedQueryBackend(
+    backend = CallbackGroundedQueryBackend(
         prepare_contract=lambda request: {
             "status": "READY",
             "activated": True,

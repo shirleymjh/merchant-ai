@@ -93,6 +93,12 @@ from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
+from merchant_ai.services.doris_physical_plan_governance import (
+    DorisPhysicalPlanGovernor,
+    PartitionPruningRequirement,
+    PhysicalPlanAssessment,
+    PhysicalPlanGap,
+)
 from merchant_ai.services.query_sql_binding import quote_identifier, sql_literal
 from merchant_ai.services.query_security import apply_column_masks
 from merchant_ai.services.tool_runtime import ExecutionIdentity
@@ -498,6 +504,64 @@ class GroundedQueryExecutionKernel:
                 ),
             )
 
+        physical_plan_assessment = self._assess_physical_plan(
+            contract,
+            compilation,
+            asset_pack,
+            timeout_seconds=query_timeout_seconds,
+        )
+        if physical_plan_assessment and not bool(
+            physical_plan_assessment.get("executable")
+        ):
+            blocking = next(
+                (
+                    item
+                    for item in physical_plan_assessment.get("gaps") or []
+                    if isinstance(item, dict) and item.get("blocking")
+                ),
+                {},
+            )
+            code = str(
+                blocking.get("code")
+                or "PHYSICAL_PLAN_NOT_EXECUTABLE"
+            )
+            message = str(
+                blocking.get("message")
+                or "Doris physical-plan governance rejected the query"
+            )
+            physical_failure = SqlValidationResult(
+                valid=False,
+                error_code=code,
+                message=message,
+                base_tables=list(compilation.tables),
+            )
+            for decision in decisions:
+                self.access_control.record_query_audit(
+                    decision,
+                    row_count=0,
+                    status="physical_plan_rejected",
+                )
+            return self._failed_result(
+                plan,
+                compilation,
+                physical_failure,
+                code,
+                message,
+                data_snapshot=active_data_snapshot,
+                physical_plan_assessment=physical_plan_assessment,
+            )
+        if runtime_budget is not None:
+            query_timeout_seconds = max(
+                1,
+                int(
+                    runtime_budget.clamp_timeout_seconds(
+                        query_timeout_seconds,
+                        minimum_seconds=1.0,
+                        operation="doris_query_timeout_after_explain",
+                    )
+                ),
+            )
+
         masked_columns = {
             key: value
             for decision in decisions
@@ -609,6 +673,19 @@ class GroundedQueryExecutionKernel:
                 if "data_snapshot_contract" in query_signature.parameters:
                     query_kwargs["data_snapshot_contract"] = (
                         active_data_snapshot
+                    )
+                if "semantic_request_fingerprint" in query_signature.parameters:
+                    query_kwargs["semantic_request_fingerprint"] = (
+                        grounded_query_contract_fingerprint(contract)
+                    )
+                if "scope_fingerprint" in query_signature.parameters:
+                    query_kwargs["scope_fingerprint"] = (
+                        str(context_owner_fingerprint or "").strip()
+                        or grounded_context_owner_fingerprint(
+                            merchant_id,
+                            access_role,
+                            normalized_user_scope,
+                        )
                     )
                 raw_rows = [
                     dict(row)
@@ -820,6 +897,19 @@ class GroundedQueryExecutionKernel:
                         if isinstance(candidate_validation, GroundedSqlValidationResult)
                         else 0
                     ),
+                    **(
+                        {
+                            "physicalPlanAssessmentId": str(
+                                physical_plan_assessment.get("assessmentId")
+                                or ""
+                            ),
+                            "physicalPlanStatus": str(
+                                physical_plan_assessment.get("status") or ""
+                            ),
+                        }
+                        if physical_plan_assessment
+                        else {}
+                    ),
                 }
             ],
         )
@@ -929,6 +1019,7 @@ class GroundedQueryExecutionKernel:
                     or (compilation.node_contract,)
                 )
             ],
+            physical_plan_assessment=physical_plan_assessment,
         )
 
     def compile_sql(
@@ -2476,6 +2567,79 @@ class GroundedQueryExecutionKernel:
                     )
         return sorted(unknown)
 
+    def _assess_physical_plan(
+        self,
+        contract: GroundedQueryContract,
+        compilation: GroundedSqlCompilation,
+        asset_pack: Any,
+        *,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        explain = getattr(self.doris_repository, "explain_verbose", None)
+        if not callable(explain):
+            return {}
+        formal_assets = [
+            dict(getattr(item, "metadata", {}) or {})
+            for item in getattr(asset_pack, "tables", []) or []
+            if str(getattr(item, "table", "") or "")
+            in set(compilation.tables)
+        ]
+        time_field = contract.time_field
+        partition_requirements: list[PartitionPruningRequirement] = []
+        if (
+            time_field.table
+            and time_field.partition_pruning_column
+            and time_field.semantic_ref_id
+            and time_field.partition_pruning_policy
+            in {"EXACT_EQUIVALENT", "SAFE_SUPERSET"}
+        ):
+            partition_requirements.append(
+                PartitionPruningRequirement(
+                    table=time_field.table,
+                    partition_column=time_field.partition_pruning_column,
+                    semantic_evidence_ref=time_field.semantic_ref_id,
+                )
+            )
+        if not partition_requirements and len(set(compilation.tables)) < 2:
+            return {}
+        try:
+            explain_kwargs: dict[str, Any] = {}
+            if "timeout_seconds" in inspect.signature(explain).parameters:
+                explain_kwargs["timeout_seconds"] = max(
+                    1,
+                    int(timeout_seconds),
+                )
+            explain_payload = explain(compilation.sql, **explain_kwargs)
+            assessment = DorisPhysicalPlanGovernor().assess(
+                sql=compilation.sql,
+                formal_assets=formal_assets,
+                explain_payload=explain_payload,
+                partition_requirements=partition_requirements,
+            )
+        except Exception as exc:
+            blocking = bool(partition_requirements)
+            sql_fingerprint = hashlib.sha256(
+                str(compilation.sql or "").strip().encode("utf-8")
+            ).hexdigest()
+            assessment = PhysicalPlanAssessment(
+                assessment_id="physical_plan_%s" % sql_fingerprint[:16],
+                status="INVALID" if blocking else "GAPPED",
+                executable=not blocking,
+                sql_fingerprint=sql_fingerprint,
+                gaps=[
+                    PhysicalPlanGap(
+                        code="PHYSICAL_PLAN_EXPLAIN_FAILED",
+                        message=(
+                            "Doris EXPLAIN VERBOSE failed: %s"
+                            % str(exc)[:400]
+                        ),
+                        blocking=blocking,
+                        expected_evidence="Doris EXPLAIN VERBOSE receipt",
+                    )
+                ],
+            )
+        return assessment.model_dump(by_alias=True, mode="json")
+
     def _failed_result(
         self,
         plan: QueryPlan,
@@ -2486,6 +2650,7 @@ class GroundedQueryExecutionKernel:
         *,
         duration_ms: int = 0,
         data_snapshot: DataSnapshotContract | None = None,
+        physical_plan_assessment: dict[str, Any] | None = None,
     ) -> AgentRunResult:
         intent = plan.intents[0]
         bundle = QueryBundle(
@@ -2549,6 +2714,7 @@ class GroundedQueryExecutionKernel:
                 )
             ],
             node_plan_contracts=[compilation.node_contract.model_copy(deep=True)],
+            physical_plan_assessment=dict(physical_plan_assessment or {}),
         )
 
     def _prepare_data_snapshot(

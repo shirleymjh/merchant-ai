@@ -2389,6 +2389,7 @@ class AgentRunResult(APIModel):
     verified_facts: List[VerifiedFact] = Field(default_factory=list)
     answer_claim_verification: AnswerClaimVerification = Field(default_factory=AnswerClaimVerification)
     execution_attempt_artifacts: List[ExecutionAttemptArtifact] = Field(default_factory=list)
+    physical_plan_assessment: Dict[str, Any] = Field(default_factory=dict)
 
 
 class HypothesisEvidenceRecord(APIModel):

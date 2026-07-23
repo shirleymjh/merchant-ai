@@ -4,6 +4,10 @@ from typing import Dict, List, Optional
 
 from merchant_ai.config import Settings
 from merchant_ai.graph.action_contract import action_prerequisite_gaps, contract_block_observation
+from merchant_ai.graph.evidence_verification_contract import (
+    evidence_verification_attempted,
+    evidence_verification_passed,
+)
 from merchant_ai.graph.state import AgentState
 from merchant_ai.graph.query_graph_contract import graph_validation_attempted, graph_validation_passed
 from merchant_ai.models import AgentAction, AgentDecision, AnswerMode, IntentType, PlannerReflectionResult, QuestionRoute, SkillMatchState
@@ -466,7 +470,7 @@ class V2AgentPolicy:
         if state.get("chat_bi_completed"):
             return ["cache_answer"], "answer action completed; close the run through the terminal cache contract", False
         if state.get("run_budget_exhausted"):
-            if self.has_task_results(state) and not state.get("evidence_graph_verified"):
+            if self.has_task_results(state) and not self.evidence_verification_attempted(state):
                 return ["verify_evidence"], "run budget exhausted after SQL execution; evidence verification is still mandatory", True
             return ["answer_data"], "run budget exhausted; answer with collected results", True
         plan = state.get("plan")
@@ -484,7 +488,7 @@ class V2AgentPolicy:
         if route and route.route == QuestionRoute.INVALID:
             return ["ask_human"], "question is outside supported business scope", False
         if int(state.get("react_round") or 0) >= self.max_main_actions:
-            if self.has_task_results(state) and not state.get("evidence_graph_verified"):
+            if self.has_task_results(state) and not self.evidence_verification_attempted(state):
                 return ["verify_evidence"], "evidence must be verified after execution before answer", True
             if self.has_executable_plan(state) and not state.get("sql_generated"):
                 if self.has_blocking_reflection_issues(state):
@@ -1071,18 +1075,10 @@ class V2AgentPolicy:
         return bool(degraded.get("active") and degraded.get("stopExpensivePostProcessing", True))
 
     def evidence_verification_passed(self, state: AgentState) -> bool:
-        run_result = state.get("agent_run_result")
-        verified = getattr(run_result, "verified_evidence", None) if run_result else None
-        accepted = state.get("evidence_accepted")
-        if accepted is None:
-            accepted = state.get("evidence_graph_verified")
-        elif accepted is False and state.get("evidence_graph_verified") and str(state.get("verification_status") or "") != "failed":
-            accepted = True
-        return bool(accepted and verified and getattr(verified, "passed", False))
+        return evidence_verification_passed(state)
 
     def evidence_verification_attempted(self, state: AgentState) -> bool:
-        status = str(state.get("verification_status") or "")
-        return status in {"passed", "failed"} or bool(state.get("evidence_graph_verified"))
+        return evidence_verification_attempted(state)
 
     def fast_path_verified_graph(self, state: AgentState) -> bool:
         latency = state.get("latency_optimization") or {}

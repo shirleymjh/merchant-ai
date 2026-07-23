@@ -146,13 +146,6 @@ class _BudgetGraph:
             self.budget_middleware.wrap_tool_call(request, lambda _: object())
             self.budget_middleware.wrap_tool_call(request, lambda _: object())
             return
-        if self.action == "doris":
-            context.budget.consume_doris_query(name="already_reserved")
-            self.tools["execute_grounded_query"].func(
-                reason="must fail before Doris",
-                runtime=runtime,
-            )
-            return
         raise AssertionError("unknown graph action: %s" % self.action)
 
 
@@ -216,7 +209,6 @@ def _runtime(action: str, kernel: _BudgetKernel) -> GroundedDeepAgentRuntime:
     [
         ("model", "llm_calls"),
         ("tool", "tool_calls"),
-        ("doris", "doris_queries"),
     ],
 )
 def test_run_converts_count_budget_exhaustion_to_operational_failure(
@@ -240,55 +232,6 @@ def test_run_converts_count_budget_exhaustion_to_operational_failure(
         runtime.deep_agent_graph.last_context.session.execution_graph_replan_evidence
         == {}
     )
-    if action == "doris":
-        assert kernel.execute_calls == 0
-
-
-def test_serial_query_tool_does_not_translate_budget_exhaustion_to_revise() -> None:
-    kernel = _BudgetKernel()
-    runtime = _runtime("doris", kernel)
-    budget = GroundedRuntimeBudget(_limits(max_doris_queries=1))
-    budget.consume_doris_query(name="already_reserved")
-    session = kernel.new_session("query orders", "merchant-1")
-    context = GroundedDeepAgentRunContext(
-        thread_id="budget-thread",
-        run_id="budget-run",
-        session=GroundedDeepAgentSession(runtime=session),
-        budget=budget,
-    )
-    tool = next(item for item in runtime.tools if item.name == "execute_grounded_query")
-
-    with pytest.raises(GroundedRuntimeBudgetExceeded) as raised:
-        tool.func(
-            reason="must not become EXECUTION_REVISE_REQUIRED",
-            runtime=SimpleNamespace(context=context),
-        )
-
-    assert raised.value.breaches == ("doris_queries",)
-    assert kernel.execute_calls == 0
-
-
-def test_serial_query_tool_passes_shared_budget_to_grounded_execution_only_when_present() -> None:
-    kernel = _CapturingTimeoutKernel()
-    runtime = _runtime("doris", kernel)
-    tool = next(item for item in runtime.tools if item.name == "execute_grounded_query")
-    budget = GroundedRuntimeBudget(_limits())
-
-    for index, active_budget in enumerate((budget, None), start=1):
-        session = kernel.new_session("query orders", "merchant-1")
-        context = GroundedDeepAgentRunContext(
-            thread_id="budget-thread-%s" % index,
-            run_id="budget-run-%s" % index,
-            session=GroundedDeepAgentSession(runtime=session),
-            budget=active_budget,
-        )
-        tool.func(
-            reason="capture grounded execution budget",
-            runtime=SimpleNamespace(context=context),
-        )
-
-    assert kernel.received_runtime_budgets == [budget, None]
-    assert budget.report()["usage"]["dorisQueries"] == 1
 
 
 def test_core_model_request_timeout_is_clamped_to_remaining_run_budget() -> None:

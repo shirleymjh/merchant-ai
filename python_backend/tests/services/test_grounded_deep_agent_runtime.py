@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.graph import END
+from langgraph.types import Command
 
 from merchant_ai.config import Settings
 from merchant_ai.models import (
@@ -959,7 +961,6 @@ def test_simple_scalar_goal_contract_keeps_query_graph_and_delegation_choices() 
     assert _simple_scalar_goal_contract(session) is True
     assert "query_data" in visible_names
     assert "propose_grounded_execution_graph" in visible_names
-    assert "prepare_grounded_query_batch" in visible_names
     assert "query_batch" in visible_names
     assert "delegate_grounded_tasks" in visible_names
 
@@ -1110,123 +1111,6 @@ def test_goal_declaration_removes_presentation_directive_fake_rule() -> None:
         "DETAIL",
     ]
     assert result["nextAction"] == "DISCOVER_SEMANTIC_EVIDENCE"
-
-
-def test_query_batch_executes_ready_branches_and_repairs_them_independently() -> None:
-    factory = CapturingFactory(action="none")
-    outer = runtime(factory)
-    tools = {item.name: item for item in outer.tools}
-    question = "对比订单量、退款量和工单量"
-    session = GroundedDeepAgentSession(
-        runtime=GroundedRuntimeSession(
-            session_id="batch-independent-repair",
-            question=question,
-            merchant_id="m-1",
-        ),
-        question_goal_contract=OriginalQuestionGoalContract(
-            question=question,
-            goals=[
-                MetricQuestionGoal(goal_id="goal.stable", label="订单量"),
-                MetricQuestionGoal(goal_id="goal.repair", label="退款量"),
-                MetricQuestionGoal(goal_id="goal.gap", label="工单量"),
-            ],
-        ),
-    )
-    context = GroundedDeepAgentRunContext(
-        thread_id="thread-batch",
-        run_id="run-batch",
-        session=session,
-    )
-
-    def fake_prepare(**kwargs: Any) -> str:
-        del kwargs
-        return json.dumps(
-            {
-                "status": "PARTIAL",
-                "queries": [
-                    {
-                        "queryId": "stable",
-                        "status": "PREPARED",
-                        "executionMode": "CORE_SQL_REQUIRED",
-                        "activeGeneration": 1,
-                        "contractFingerprint": "contract-stable",
-                    },
-                    {
-                        "queryId": "repair",
-                        "status": "PREPARED",
-                        "executionMode": "CORE_SQL_REQUIRED",
-                        "activeGeneration": 1,
-                        "contractFingerprint": "contract-repair",
-                    },
-                    {
-                        "queryId": "gap",
-                        "status": "BLOCKED",
-                        "code": "METRIC_REF_NOT_READ",
-                        "readNext": [{"refId": "metric.ticket_count"}],
-                    },
-                ],
-            }
-        )
-
-    execution_calls: dict[str, int] = {}
-
-    def fake_execute(**kwargs: Any) -> str:
-        spec = kwargs["queries"][0]
-        query_id = spec.query_id
-        execution_calls[query_id] = execution_calls.get(query_id, 0) + 1
-        if query_id == "repair" and execution_calls[query_id] == 1:
-            payload = {
-                "queryId": query_id,
-                "status": "REJECTED",
-                "code": "SQL_ALIAS_INVALID",
-                "nextAction": "REPAIR_SQL",
-                "activeGeneration": 1,
-                "contractFingerprint": "contract-repair",
-            }
-        else:
-            payload = {
-                "queryId": query_id,
-                "status": "VERIFIED",
-                "queryArtifactId": "artifact.%s" % query_id,
-                "coveredGoalIds": ["goal.%s" % query_id],
-                "rowCount": 1,
-            }
-        return json.dumps({"status": payload["status"], "queries": [payload]})
-
-    tools["prepare_grounded_query_batch"].func = fake_prepare
-    tools["execute_grounded_query_batch"].func = fake_execute
-    outer._repair_query_sql_candidate = lambda *args, **kwargs: QuerySqlCandidate(
-        sql="SELECT repaired_alias",
-        rationale="repair alias",
-    )
-    requests = [
-        QueryRequest(
-            query_id=query_id,
-            goal_ids=["goal.%s" % query_id],
-            sql_candidate=QuerySqlCandidate(
-                sql="SELECT original_alias",
-                rationale="initial SQL",
-            ),
-        )
-        for query_id in ("stable", "repair", "gap")
-    ]
-
-    outcome = json.loads(
-        tools["query_batch"].func(
-            requests=requests,
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert outcome["status"] == "PARTIAL"
-    assert outcome["verifiedCount"] == 2
-    assert outcome["needsReasoningCount"] == 1
-    by_id = {item["queryId"]: item for item in outcome["outcomes"]}
-    assert by_id["stable"]["attemptCount"] == 1
-    assert by_id["repair"]["attemptCount"] == 2
-    assert by_id["repair"]["internalRepairCount"] == 1
-    assert by_id["gap"]["observation"]["code"] == "METRIC_REF_NOT_READ"
-    assert execution_calls == {"stable": 1, "repair": 2}
 
 
 def test_batch_request_keeps_explicit_time_field_in_semantic_read_set() -> None:
@@ -1464,85 +1348,6 @@ def test_goal_declaration_does_not_invoke_population_gate() -> None:
     assert deep_session.population_goal_attestation is None
 
 
-def test_generic_detail_goal_forces_detail_analysis_mode_before_contract_build() -> None:
-    class CapturingHintsKernel(FakeKernel):
-        def __init__(self) -> None:
-            super().__init__()
-            self.last_hints: GroundedBindingHints | None = None
-
-        def propose_contract(
-            self,
-            session: GroundedRuntimeSession,
-            evidence: list[dict[str, Any]],
-            hints: dict[str, Any] | GroundedBindingHints,
-            **kwargs: Any,
-        ) -> GroundedRuntimeAttempt:
-            self.last_hints = GroundedBindingHints.model_validate(hints)
-            return super().propose_contract(session, evidence, hints, **kwargs)
-
-    factory = CapturingFactory(action="none")
-    kernel = CapturingHintsKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("给我最近10天的订单明细", "m-1")
-    detail_ref = "semantic:客服工单:tickets:detail"
-    deep_session = GroundedDeepAgentSession(
-        runtime=kernel_session,
-        core_semantic_evidence=[
-            {
-                "refId": detail_ref,
-                "kind": "TABLE_DETAIL",
-                "topic": "客服工单",
-                "table": "tickets",
-                "contentSnippet": "{}",
-                "contentHash": "hash",
-            }
-        ],
-    )
-    context = GroundedDeepAgentRunContext(
-        thread_id="thread-generic-detail",
-        run_id="run-generic-detail",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declared = json.loads(
-        tools["declare_original_question_goals"].func(
-            contract=OriginalQuestionGoalContract(
-                question=kernel_session.question,
-                goals=[
-                    DetailQuestionGoal(
-                        goal_id="detail.orders",
-                        label="订单明细",
-                    ),
-                    TimeWindowQuestionGoal(
-                        goal_id="time.recent_10_days",
-                        label="最近10天",
-                        time_expression="最近10天",
-                        days=10,
-                        applies_to_goal_ids=["detail.orders"],
-                    ),
-                ],
-            ),
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-    assert declared["status"] == "ACCEPTED"
-
-    tools["propose_grounded_contract"].func(
-        read_ref_ids=[detail_ref],
-        binding_hints={
-            "tableRefs": [detail_ref],
-            "timeExpression": "最近10天",
-        },
-        goal_ids=["detail.orders", "time.recent_10_days"],
-        runtime=SimpleNamespace(context=context),
-    )
-
-    assert kernel.last_hints is not None
-    assert kernel.last_hints.analysis_mode == "DETAIL"
-    assert kernel.last_hints.detail_projection_mode == "DEFAULT"
-    assert kernel.last_hints.selected_fields == []
-
-
 def test_goal_declaration_rejects_premature_population_binding() -> None:
     factory = CapturingFactory(action="none")
     outer = runtime(factory)
@@ -1630,11 +1435,6 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
         "retrieve_knowledge",
         "publish_verified_rule_evidence",
         "compose_verified_rule_answer",
-        "propose_grounded_contract",
-        "prepare_grounded_query_batch",
-        "submit_grounded_sql_candidate",
-        "execute_grounded_query",
-        "execute_grounded_query_batch",
         "publish_verified_entity_set",
         "delegate_grounded_tasks",
         "delegate_grounded_exploration",
@@ -1672,14 +1472,14 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "propose_grounded_execution_graph" in visible_names
     assert "declare_grounded_query_branches" not in visible_names
     assert "declare_grounded_query_branches" not in {item.name for item in factory.kwargs["tools"]}
-    contract_tool = next(item for item in factory.kwargs["tools"] if item.name == "propose_grounded_contract")
-    contract_schema = json.dumps(
-        contract_tool.tool_call_schema.model_json_schema(),
+    query_tool = next(item for item in factory.kwargs["tools"] if item.name == "query_data")
+    query_schema = json.dumps(
+        query_tool.tool_call_schema.model_json_schema(),
         ensure_ascii=False,
     )
-    assert "tableRefs" in contract_schema
-    assert "metricRefs" in contract_schema
-    assert "timeExpression" in contract_schema
+    assert "tableRefs" in query_schema
+    assert "metricRefs" in query_schema
+    assert "timeExpression" in query_schema
     goal_tool = next(item for item in factory.kwargs["tools"] if item.name == "declare_original_question_goals")
     goal_schema = json.dumps(
         goal_tool.tool_call_schema.model_json_schema(),
@@ -1696,7 +1496,9 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     ):
         assert execution_field not in goal_schema
     compose_tool = next(item for item in factory.kwargs["tools"] if item.name == "compose_verified_answer")
-    assert compose_tool.return_direct is True
+    # Completion gaps are ordinary ReAct observations so Core can decide
+    # whether to query, clarify, or disclose an accepted partial result.
+    assert compose_tool.return_direct is False
     ask_human_tool = next(item for item in factory.kwargs["tools"] if item.name == "ask_human")
     assert ask_human_tool.return_direct is False
     assert factory.kwargs["backend"] is not None
@@ -1738,11 +1540,94 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
     assert "Use query_data for one governed query" in factory.kwargs["system_prompt"]
-    assert "capabilities and constraints, not as a prewritten procedure" in (factory.kwargs["system_prompt"])
-    assert "not alternate planning authorities" in factory.kwargs["system_prompt"]
+    assert "capabilities and constraints, not as a prewritten procedure" in (
+        factory.kwargs["system_prompt"]
+    )
+    assert "not alternate planning authorities" in factory.kwargs[
+        "system_prompt"
+    ]
 
 
-def test_production_settings_hide_legacy_query_tools_by_default(
+def test_compose_tool_ends_only_after_answer_attestation() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(SimpleNamespace())
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="compose-command",
+            question="return revenue",
+            merchant_id="merchant-1",
+            answer="verified answer",
+        ),
+        answer_coverage_result={
+            "passed": True,
+            "source": "compose_verified_answer",
+            "answerFingerprint": answer_fingerprint("verified answer"),
+        },
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "name": "compose_verified_answer",
+            "id": "compose-call",
+            "args": {"allow_llm": False},
+        },
+        runtime=SimpleNamespace(
+            context=SimpleNamespace(session=session)
+        ),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _: ToolMessage(
+            content=json.dumps(
+                {"status": "ANSWERED", "answer": "verified answer"}
+            ),
+            name="compose_verified_answer",
+            tool_call_id="compose-call",
+        ),
+    )
+
+    assert isinstance(result, Command)
+    assert result.goto == END
+    assert result.update["messages"][0].tool_call_id == "compose-call"
+
+
+def test_compose_gap_remains_a_react_observation() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(SimpleNamespace())
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="compose-observation",
+            question="return revenue and orders",
+            merchant_id="merchant-1",
+        )
+    )
+    request = SimpleNamespace(
+        tool_call={
+            "name": "compose_verified_answer",
+            "id": "compose-gap-call",
+            "args": {"allow_llm": False},
+        },
+        runtime=SimpleNamespace(
+            context=SimpleNamespace(session=session)
+        ),
+    )
+
+    result = middleware.wrap_tool_call(
+        request,
+        lambda _: ToolMessage(
+            content=json.dumps(
+                {"status": "OUTCOME_COMPLETION_INCOMPLETE"}
+            ),
+            name="compose_verified_answer",
+            tool_call_id="compose-gap-call",
+        ),
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert json.loads(result.content)["status"] == (
+        "OUTCOME_COMPLETION_INCOMPLETE"
+    )
+
+
+def test_production_settings_expose_governed_query_facade(
     tmp_path: Path,
 ) -> None:
     factory = CapturingFactory(action="none")
@@ -1761,15 +1646,6 @@ def test_production_settings_hide_legacy_query_tools_by_default(
 
     names = {item.name for item in factory.kwargs["tools"]}
     assert {"query_data", "query_batch"}.issubset(names)
-    assert names.isdisjoint(
-        {
-            "propose_grounded_contract",
-            "prepare_grounded_query_batch",
-            "submit_grounded_sql_candidate",
-            "execute_grounded_query",
-            "execute_grounded_query_batch",
-        }
-    )
     query_schema = next(
         item for item in factory.kwargs["tools"] if item.name == "query_data"
     ).tool_call_schema.model_json_schema()
@@ -1884,7 +1760,7 @@ Run the isolated diagnosis procedure.
             generation=1,
             skill_names=["complex-diagnosis"],
         ),
-        execute_branch_tool=SimpleNamespace(func=lambda **kwargs: "{}"),
+        execute_branch=lambda **kwargs: "{}",
     )
     assert prepared.grant.skill_names == ["complex-diagnosis"]
     assert prepared.job.user_payload["mountedSkill"] == ("/skills/complex-diagnosis/SKILL.md")
@@ -1953,7 +1829,8 @@ def test_topology_repair_keeps_rebinding_and_execution_graph_tools_visible() -> 
     assert control["status"] == "REPAIR_REQUIRED"
     assert control["repairType"] == "TOPOLOGY"
     assert control["relationshipEvidenceRequired"] is False
-    assert "propose_grounded_contract" in visible_names
+    assert "query_data" in visible_names
+    assert "query_batch" in visible_names
     assert "propose_grounded_execution_graph" in visible_names
     assert "retrieve_knowledge" in visible_names
     assert "read_file" in visible_names
@@ -1967,18 +1844,20 @@ def test_context_recovery_preserves_latest_repair_tool_call_pair() -> None:
         tool_calls=[
             {
                 "id": tool_call_id,
-                "name": "propose_grounded_contract",
+                "name": "query_data",
                 "args": {
-                    "read_ref_ids": ["semantic:topic:table:metric:orders"],
-                    "binding_hints": {},
-                    "goal_ids": ["metric.orders"],
+                    "request": {
+                        "queryId": "metric.orders",
+                        "readRefIds": ["semantic:topic:table:metric:orders"],
+                        "goalIds": ["metric.orders"],
+                    },
                 },
                 "type": "tool_call",
             }
         ],
     )
     tool_message = ToolMessage(
-        name="propose_grounded_contract",
+        name="query_data",
         tool_call_id=tool_call_id,
         content=json.dumps(
             {
@@ -2377,7 +2256,6 @@ def test_cross_table_independent_metric_prefetch_keeps_graph_choice() -> None:
                 "query_data",
                 "query_batch",
                 "propose_grounded_execution_graph",
-                "prepare_grounded_query_batch",
                 "read_file",
                 "retrieve_knowledge",
             )
@@ -2387,7 +2265,6 @@ def test_cross_table_independent_metric_prefetch_keeps_graph_choice() -> None:
         "query_data",
         "query_batch",
         "propose_grounded_execution_graph",
-        "prepare_grounded_query_batch",
     }
 
 
@@ -3115,7 +2992,7 @@ def test_post_answer_tail_timeout_cannot_overwrite_verified_answer() -> None:
     assert "operationalFailure" not in response.debug_trace["harness"]
 
 
-def test_plain_core_answer_cannot_bypass_return_direct_compose_attestation() -> None:
+def test_plain_core_answer_cannot_bypass_compose_attestation() -> None:
     factory = CapturingFactory(action="none")
     outer = runtime(factory, FakeKernel())
 
@@ -3461,10 +3338,10 @@ def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> No
         session,
         [
             SimpleNamespace(name="ls"),
-            SimpleNamespace(name="propose_grounded_contract"),
+            SimpleNamespace(name="query_data"),
         ],
     )
-    assert {item.name for item in visible} == {"propose_grounded_contract"}
+    assert {item.name for item in visible} == {"query_data"}
 
     session.core_semantic_evidence.append(
         {
@@ -3477,7 +3354,7 @@ def test_tool_loop_guard_fuses_duplicate_call_and_unlocks_after_progress() -> No
         session,
         [
             SimpleNamespace(name="ls"),
-            SimpleNamespace(name="propose_grounded_contract"),
+            SimpleNamespace(name="query_data"),
         ],
     )
     assert "ls" in {item.name for item in visible_after_progress}
@@ -3503,7 +3380,7 @@ def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
         request = SimpleNamespace(
             tool_call={
                 "id": call_id,
-                "name": "propose_grounded_contract",
+                "name": "query_data",
                 "args": {
                     "read_ref_ids": ["semantic:metric:tickets"],
                     "binding_hints": {"metricRefs": ["semantic:metric:tickets"]},
@@ -3518,7 +3395,7 @@ def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
             calls["count"] += 1
             return ToolMessage(
                 content='{"status":"REJECTED"}',
-                name="propose_grounded_contract",
+                name="query_data",
                 tool_call_id=call_id,
             )
 
@@ -3779,8 +3656,8 @@ def test_context_middleware_keeps_messages_and_tools_available_to_react_caller()
             tool_calls=[
                 {
                     "id": "call-execute",
-                    "name": "execute_grounded_query",
-                    "args": {"reason": "ready"},
+                    "name": "query_data",
+                    "args": {"request": {"queryId": "tickets"}},
                     "type": "tool_call",
                 }
             ],
@@ -3788,19 +3665,19 @@ def test_context_middleware_keeps_messages_and_tools_available_to_react_caller()
         ToolMessage(
             content='{"status":"VERIFIED"}',
             tool_call_id="call-execute",
-            name="execute_grounded_query",
+            name="query_data",
         ),
     ]
     tools = [
         SimpleNamespace(name="read_file", description="read", args_schema=None),
         SimpleNamespace(name="grep", description="grep", args_schema=None),
         SimpleNamespace(
-            name="execute_grounded_query",
+            name="query_data",
             description="execute",
             args_schema=None,
         ),
         SimpleNamespace(
-            name="submit_grounded_sql_candidate",
+            name="query_batch",
             description="submit",
             args_schema=None,
         ),
@@ -3839,8 +3716,8 @@ def test_context_middleware_keeps_messages_and_tools_available_to_react_caller()
     assert [_tool.name for _tool in updated.tools] == [
         "read_file",
         "grep",
-        "execute_grounded_query",
-        "submit_grounded_sql_candidate",
+        "query_data",
+        "query_batch",
     ]
     report = session.core_context_reports[-1]
     assert report["compactionTriggered"] is False
@@ -3868,8 +3745,8 @@ def test_context_middleware_exposes_only_goal_transaction_on_first_model_turn() 
             "declare_original_question_goals",
             "read_file",
             "grep",
-            "propose_grounded_contract",
-            "execute_grounded_query",
+            "query_data",
+            "query_batch",
             "compose_verified_answer",
             "ask_human",
             "task",
@@ -4268,7 +4145,7 @@ def test_query_subagent_receives_only_one_prepared_branch_execution_tool() -> No
             generation=1,
             query_branch_ids=["query.complex"],
         ),
-        execute_branch_tool=SimpleNamespace(func=execute_branch),
+        execute_branch=execute_branch,
     )
 
     assert branch_context.runtime is branch_runtime
@@ -4388,8 +4265,8 @@ def test_subagent_uses_shared_query_data_with_goal_scope_and_root_adoption() -> 
             ),
             generation=1,
         ),
-        execute_branch_tool=SimpleNamespace(func=lambda **kwargs: "{}"),
-        query_data_tool=SimpleNamespace(func=shared_query_data),
+        execute_branch=lambda **kwargs: "{}",
+        query_data_call=shared_query_data,
     )
 
     assert prepared.grant.capabilities == ["READ_CONTEXT", "QUERY_DATA"]
@@ -4665,67 +4542,6 @@ def test_multi_metric_thin_recall_retains_candidates_for_each_metric_phrase() ->
     assert thin[0]["metricSlotPhrases"] == ["订单总数"]
 
 
-def test_typed_retrieve_and_contract_tools_use_kernel_without_action_dispatch() -> None:
-    factory = CapturingFactory(action="none")
-    kernel = FakeKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("工单量", "m-1")
-    kernel.route_topic(kernel_session)
-    session = GroundedDeepAgentSession(
-        runtime=kernel_session,
-        core_semantic_evidence=[
-            {
-                "refId": "semantic:客服工单:tickets:detail",
-                "kind": "TABLE_DETAIL",
-                "topic": "客服工单",
-                "table": "tickets",
-                "contentSnippet": "{}",
-                "contentHash": "hash",
-            }
-        ],
-    )
-    context = GroundedDeepAgentRunContext(thread_id="t1", run_id="r1", session=session)
-    tools = {item.name: item for item in outer.tools}
-    declare_single_metric_goal(tools, context)
-
-    recall_result = json.loads(
-        tools["retrieve_knowledge"].func(
-            query="商品字段",
-            reason="need product dimension",
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-    contract_result = json.loads(
-        tools["propose_grounded_contract"].func(
-            read_ref_ids=["semantic:客服工单:tickets:detail"],
-            binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
-            goal_ids=["metric.primary"],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert recall_result["status"] == "OK"
-    assert kernel.recall_queries[-1] == "商品字段"
-    assert contract_result["activated"] is True
-    assert contract_result["activationStatus"] == "ACTIVATED"
-    assert contract_result["executionMode"] == "DETERMINISTIC_METRIC"
-    assert contract_result["executionReasonCodes"] == ["SINGLE_METRIC_FAST_PATH_ELIGIBLE"]
-    assert contract_result["fastPathEligible"] is True
-    assert contract_result["fastPathReasonCodes"] == []
-    assert contract_result["nextAction"] == "EXECUTE_GROUNDED_QUERY"
-    assert contract_result["semanticCoverage"] == {
-        "status": "READY_TO_EXECUTE",
-        "retrievalClosed": True,
-        "blockingGapCount": 0,
-        "nextAction": "EXECUTE_GROUNDED_QUERY",
-    }
-    assert contract_result["activeGeneration"] == 1
-    assert len(contract_result["contractFingerprint"]) == 64
-    assert "requiredFinalOutputAliases" in contract_result["sqlObligations"]
-    assert kernel.propose_calls == 1
-    assert kernel.compile_calls == 1
-
-
 def test_semantic_goal_dependency_does_not_force_query_serialization() -> None:
     factory = CapturingFactory(action="none")
     kernel = FakeKernel()
@@ -4770,84 +4586,6 @@ def test_semantic_goal_dependency_does_not_force_query_serialization() -> None:
         )
         == []
     )
-
-
-def test_parallel_batch_rejects_dependency_goal_endpoints() -> None:
-    factory = CapturingFactory(action="none")
-    kernel = FakeKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("查询商品退款链路", "m-1")
-    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-batch-dependency-goal",
-        run_id="r-batch-dependency-goal",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declared = json.loads(
-        tools["declare_original_question_goals"].func(
-            contract=OriginalQuestionGoalContract(
-                question=kernel_session.question,
-                goals=[
-                    MetricQuestionGoal(
-                        goal_id="metric.top_products",
-                        label="TopN 商品",
-                    ),
-                    MetricQuestionGoal(
-                        goal_id="metric.refunds",
-                        label="这些商品的退款",
-                    ),
-                    DependencyQuestionGoal(
-                        goal_id="dependency.product_refunds",
-                        label="TopN 商品到退款的实体依赖",
-                        upstream_goal_ids=["metric.top_products"],
-                        downstream_goal_ids=["metric.refunds"],
-                        artifact_kind="entity_set",
-                    ),
-                ],
-            ),
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-    assert declared["status"] == "ACCEPTED"
-
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {"queryId": "top-products", "goalIds": ["metric.top_products"]},
-                {"queryId": "refunds", "goalIds": ["metric.refunds"]},
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "REJECTED"
-    assert result["code"] == "PARALLEL_GOAL_DEPENDENCY_DETECTED"
-    assert result["issues"] == [
-        {
-            "code": "BATCH_DEPENDENCY_GOAL_EDGE",
-            "upstreamGoalId": "metric.top_products",
-            "downstreamGoalId": "metric.refunds",
-            "upstreamQueryIds": ["top-products"],
-            "downstreamQueryIds": ["refunds"],
-            "requiredExecution": "SERIAL",
-            "direct": True,
-            "pathGoalIds": ["metric.top_products", "metric.refunds"],
-            "pathEdges": [
-                {
-                    "relationType": "DEPENDENCY_GOAL",
-                    "upstreamGoalId": "metric.top_products",
-                    "downstreamGoalId": "metric.refunds",
-                    "declaredByGoalId": "dependency.product_refunds",
-                    "dependencyGoalId": "dependency.product_refunds",
-                }
-            ],
-            "dependencyGoalIds": ["dependency.product_refunds"],
-            "dependencyGoalId": "dependency.product_refunds",
-            "dependencyGoalQueryIds": [],
-        }
-    ]
-    assert deep_session.parallel_branches == {}
 
 
 def test_transitive_semantic_goal_dependencies_do_not_create_artifact_waits() -> None:
@@ -4950,134 +4688,6 @@ def test_artifact_dependency_does_not_spread_through_semantic_only_edges() -> No
     assert deep_session.parallel_branches == {}
 
 
-def test_parallel_batch_allows_mutually_independent_goals() -> None:
-    class ParallelKernel(FakeKernel):
-        @staticmethod
-        def fork_query_branch(
-            session: GroundedRuntimeSession,
-            branch_key: str,
-        ) -> GroundedRuntimeSession:
-            return GroundedRuntimeSession(
-                session_id=f"{session.session_id}:{branch_key}",
-                question=session.question,
-                merchant_id=session.merchant_id,
-                merchant=session.merchant,
-                workspace_topics=list(session.workspace_topics),
-            )
-
-    factory = CapturingFactory(action="none")
-    kernel = ParallelKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("查询工单量和退款量", "m-1")
-    evidence_ref = "semantic:客服工单:tickets:detail"
-    deep_session = GroundedDeepAgentSession(
-        runtime=kernel_session,
-        core_semantic_evidence=[
-            {
-                "refId": evidence_ref,
-                "kind": "TABLE_DETAIL",
-                "topic": "客服工单",
-                "table": "tickets",
-                "contentSnippet": "{}",
-                "contentHash": "hash",
-            }
-        ],
-    )
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-batch-independent",
-        run_id="r-batch-independent",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declared = json.loads(
-        tools["declare_original_question_goals"].func(
-            contract=OriginalQuestionGoalContract(
-                question=kernel_session.question,
-                goals=[
-                    MetricQuestionGoal(goal_id="metric.tickets", label="工单量"),
-                    MetricQuestionGoal(goal_id="metric.refunds", label="退款量"),
-                ],
-            ),
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-    assert declared["status"] == "ACCEPTED"
-
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {
-                    "queryId": "tickets",
-                    "readRefIds": [evidence_ref],
-                    "goalIds": ["metric.tickets"],
-                },
-                {
-                    "queryId": "refunds",
-                    "readRefIds": [evidence_ref],
-                    "goalIds": ["metric.refunds"],
-                },
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "PREPARED"
-    assert result["preparedCount"] == 2
-    assert {item["queryId"] for item in result["queries"]} == {
-        "tickets",
-        "refunds",
-    }
-    assert all(item["status"] == "PREPARED" for item in result["queries"])
-    assert set(deep_session.parallel_branches) == {"tickets", "refunds"}
-
-
-def test_compat_batch_reads_declared_exact_semantic_paths() -> None:
-    class ParallelKernel(FakeKernel):
-        @staticmethod
-        def fork_query_branch(
-            session: GroundedRuntimeSession,
-            branch_key: str,
-        ) -> GroundedRuntimeSession:
-            return GroundedRuntimeSession(
-                session_id=f"{session.session_id}:{branch_key}",
-                question=session.question,
-                merchant_id=session.merchant_id,
-                merchant=session.merchant,
-                workspace_topics=list(session.workspace_topics),
-            )
-
-    factory = CapturingFactory(action="none")
-    kernel = ParallelKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("查询工单明细", "m-1")
-    kernel_session.workspace_topics = ["客服工单"]
-    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-batch-semantic-path",
-        run_id="r-batch-semantic-path",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declare_single_metric_goal(tools, context)
-
-    result = json.loads(
-        tools["prepare_grounded_query_batch"].func(
-            queries=[
-                {
-                    "queryId": "tickets",
-                    "semanticPaths": ["topics/客服工单/tables/tickets/detail.json"],
-                    "goalIds": ["metric.primary"],
-                }
-            ],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "PREPARED"
-    assert result["queries"][0]["status"] == "PREPARED"
-    assert [item["refId"] for item in deep_session.core_semantic_evidence] == ["semantic:客服工单:tickets:detail"]
-
-
 def test_compat_batch_reuses_core_evidence_when_semantic_ref_is_passed_as_path() -> None:
     class RejectingCatalog(FakeSemanticCatalog):
         def read(self, *, path: str, max_chars: int, offset: int) -> dict[str, Any]:
@@ -5111,156 +4721,6 @@ def test_compat_batch_reuses_core_evidence_when_semantic_ref_is_passed_as_path()
 
     assert newly_read is False
     assert evidence["refId"] == "semantic:客服工单:tickets:detail"
-
-
-def test_ready_core_sql_contract_is_activated_without_template_switch() -> None:
-    class CoreSqlKernel(FakeKernel):
-        def propose_contract(
-            self,
-            session: GroundedRuntimeSession,
-            evidence: list[dict[str, Any]],
-            hints: dict[str, Any],
-            **kwargs: Any,
-        ) -> GroundedRuntimeAttempt:
-            attempt = super().propose_contract(session, evidence, hints, **kwargs)
-            attempt.execution_mode = "CORE_SQL_REQUIRED"
-            attempt.execution_reason_codes = [
-                "COMPLEX_QUERY_REQUIRES_CORE_SQL",
-                "QUERY_SHAPE_NOT_SCALAR",
-            ]
-            attempt.fast_path_reason_codes = ["QUERY_SHAPE_NOT_SCALAR"]
-            attempt.next_action = "SUBMIT_GROUNDED_SQL_CANDIDATE"
-            return attempt
-
-    factory = CapturingFactory(action="none")
-    kernel = CoreSqlKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = kernel.new_session("按商品统计工单量", "m-1")
-    session = GroundedDeepAgentSession(
-        runtime=kernel_session,
-        core_semantic_evidence=[
-            {
-                "refId": "semantic:客服工单:tickets:detail",
-                "kind": "TABLE_DETAIL",
-                "topic": "客服工单",
-                "table": "tickets",
-                "contentSnippet": "{}",
-                "contentHash": "hash",
-            }
-        ],
-    )
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-core-sql",
-        run_id="r-core-sql",
-        session=session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declare_single_metric_goal(tools, context)
-
-    result = json.loads(
-        tools["propose_grounded_contract"].func(
-            read_ref_ids=["semantic:客服工单:tickets:detail"],
-            binding_hints={"tableRefs": ["semantic:客服工单:tickets:detail"]},
-            goal_ids=["metric.primary"],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert kernel.compile_calls == 1
-    assert result["activated"] is True
-    assert result["executionMode"] == "CORE_SQL_REQUIRED"
-    assert result["compileStatus"] == "NOT_APPLICABLE_CORE_SQL_REQUIRED"
-    assert result["fastPathReasonCodes"] == ["QUERY_SHAPE_NOT_SCALAR"]
-    assert result["nextAction"] == "SUBMIT_GROUNDED_SQL_CANDIDATE"
-
-
-def test_core_sql_tool_submits_complete_sql_without_template_dispatch() -> None:
-    class TransactionalCoreSqlKernel(FakeKernel):
-        def __init__(self) -> None:
-            super().__init__()
-            self.execute_calls = 0
-            self.verify_calls = 0
-
-        def execute_active(
-            self,
-            session: GroundedRuntimeSession,
-            **kwargs: Any,
-        ) -> AgentRunResult:
-            del kwargs
-            self.execute_calls += 1
-            result = AgentRunResult(
-                merged_query_bundle=QueryBundle(
-                    rows=[{"ticket_count": 3}],
-                    tables=["tickets"],
-                )
-            )
-            session.run_result = result
-            return result
-
-        def verify_active(
-            self,
-            session: GroundedRuntimeSession,
-        ) -> VerifiedEvidence:
-            self.verify_calls += 1
-            verified = VerifiedEvidence(passed=True)
-            session.verified_evidence = verified
-            assert session.run_result is not None
-            contract = GroundedQueryContract(
-                question=session.question,
-                status="READY",
-                query_shape="GROUPED",
-            )
-            session.verified_query_ledger.append(
-                GroundedVerifiedQueryArtifact(
-                    artifact_id="query_artifact_core_sql",
-                    generation=1,
-                    contract_fingerprint=grounded_query_contract_fingerprint(contract),
-                    sql_fingerprint="a" * 64,
-                    contract=contract,
-                    plan=QueryPlan(),
-                    run_result=session.run_result,
-                    verified_evidence=verified,
-                    output_columns=["ticket_count"],
-                )
-            )
-            return verified
-
-        @staticmethod
-        def latest_verified_query_artifact(
-            session: GroundedRuntimeSession,
-        ) -> GroundedVerifiedQueryArtifact | None:
-            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
-
-    factory = CapturingFactory(action="none")
-    kernel = TransactionalCoreSqlKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = outer.kernel.new_session("按商品统计工单量", "m-1")
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-submit-core-sql",
-        run_id="r-submit-core-sql",
-        session=GroundedDeepAgentSession(runtime=kernel_session),
-    )
-    tools = {item.name: item for item in outer.tools}
-
-    result = json.loads(
-        tools["submit_grounded_sql_candidate"].func(
-            sql="SELECT spu_id, COUNT(*) AS ticket_count FROM tickets GROUP BY spu_id",
-            expected_generation=1,
-            contract_fingerprint="c" * 64,
-            rationale="Contract requires grouped Core SQL",
-            evidence_ref_ids=["semantic:客服工单:tickets:detail"],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "VERIFIED"
-    assert result["sqlCandidateStatus"] == "ACCEPTED"
-    assert result["submittedAndExecuted"] is True
-    assert result["nextAction"] == "PUBLISH_ENTITY_SET_OR_CONTINUE_QUERYING_OR_FINALIZE"
-    assert result["outputColumns"] == ["ticket_count"]
-    assert result["rowCount"] == 1
-    assert kernel.execute_calls == 1
-    assert kernel.verify_calls == 1
 
 
 def test_query_data_collapses_contract_execution_and_evidence() -> None:
@@ -5359,194 +4819,6 @@ def test_query_data_collapses_contract_execution_and_evidence() -> None:
     assert result["coveredGoalIds"] == ["metric.primary"]
     assert result["rowCount"] == 1
     assert kernel.propose_calls == 1
-
-
-def test_core_sql_doris_table_error_reopens_real_repair_turn_and_then_verifies() -> None:
-    class RepairingCoreSqlKernel(FakeKernel):
-        def __init__(self) -> None:
-            super().__init__()
-            self.submitted_sql: list[str] = []
-            self.execute_calls = 0
-
-        def submit_sql_candidate(
-            self,
-            session: GroundedRuntimeSession,
-            sql: str,
-            **kwargs: Any,
-        ) -> GroundedRuntimeSqlCandidateAttempt:
-            self.submitted_sql.append(sql)
-            fingerprint = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-            attempt = GroundedRuntimeSqlCandidateAttempt(
-                candidate_id="sql-%d" % len(self.submitted_sql),
-                active_generation=session.active_generation,
-                status="ACCEPTED",
-                next_action="EXECUTE_GROUNDED_QUERY",
-                ast_fingerprint=fingerprint,
-                contract_fingerprint=kwargs["expected_contract_fingerprint"],
-                output_columns=["ticket_count"],
-            )
-            session.sql_candidate_attempts.append(attempt)
-            session.active_sql_candidate = GroundedSqlCandidate(
-                sql=sql,
-                contract_fingerprint=kwargs["expected_contract_fingerprint"],
-                rationale=kwargs["rationale"],
-            )
-            session.phase = "ACTIVE_CORE_SQL_VALIDATED"
-            return attempt
-
-        def execute_active(
-            self,
-            session: GroundedRuntimeSession,
-            **kwargs: Any,
-        ) -> AgentRunResult:
-            del kwargs
-            self.execute_calls += 1
-            if self.execute_calls == 1:
-                message = "errCode = 2, detailMessage = Table [wrong_catalog.tickets] does not exist"
-                failed_bundle = QueryBundle(
-                    failed=True,
-                    error=message,
-                    tables=["tickets"],
-                )
-                result = AgentRunResult(
-                    task_results=[
-                        AgentTaskResult(
-                            task_id="tickets",
-                            success=False,
-                            query_bundle=failed_bundle,
-                            validation_results=[
-                                SqlValidationResult(
-                                    valid=False,
-                                    error_code="DORIS_ERROR",
-                                    message=message,
-                                )
-                            ],
-                        )
-                    ],
-                    merged_query_bundle=failed_bundle,
-                )
-                session.run_result = result
-                return result
-            result = AgentRunResult(
-                merged_query_bundle=QueryBundle(
-                    rows=[{"ticket_count": 3}],
-                    tables=["tickets"],
-                )
-            )
-            session.run_result = result
-            return result
-
-        @staticmethod
-        def verify_active(
-            session: GroundedRuntimeSession,
-        ) -> VerifiedEvidence:
-            verified = VerifiedEvidence(passed=True)
-            session.verified_evidence = verified
-            assert session.active_contract is not None
-            assert session.run_result is not None
-            session.verified_query_ledger.append(
-                GroundedVerifiedQueryArtifact(
-                    artifact_id="query_artifact_repaired_sql",
-                    generation=session.active_generation,
-                    contract_fingerprint=(grounded_query_contract_fingerprint(session.active_contract)),
-                    sql_fingerprint=hashlib.sha256(str(session.active_sql_candidate.sql).encode("utf-8")).hexdigest(),
-                    contract=session.active_contract.model_copy(deep=True),
-                    plan=QueryPlan(),
-                    run_result=session.run_result,
-                    verified_evidence=verified,
-                    output_columns=["ticket_count"],
-                )
-            )
-            return verified
-
-        @staticmethod
-        def latest_verified_query_artifact(
-            session: GroundedRuntimeSession,
-        ) -> GroundedVerifiedQueryArtifact | None:
-            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
-
-    table_ref = "semantic:客服工单:tickets:detail"
-    contract = GroundedQueryContract(
-        question="统计工单量",
-        status="READY",
-        query_shape="GROUPED",
-        topics=["客服工单"],
-        primary_table="tickets",
-        tables=[
-            GroundedTableBinding(
-                topic="客服工单",
-                table="tickets",
-                detail_ref_id=table_ref,
-            )
-        ],
-        evidence_refs=[table_ref],
-    )
-    contract_fingerprint = grounded_query_contract_fingerprint(contract)
-    factory = CapturingFactory(action="none")
-    kernel = RepairingCoreSqlKernel()
-    outer = runtime(factory, kernel)
-    kernel_session = GroundedRuntimeSession(
-        session_id="repair-table-prefix",
-        question=contract.question,
-        merchant_id="m-1",
-        workspace_topics=["客服工单"],
-        phase="ACTIVE_CORE_SQL_REQUIRED",
-        active_generation=1,
-        active_attempt_id="attempt-repair",
-        active_execution_mode=GroundedExecutionMode.CORE_SQL_REQUIRED,
-        active_contract=contract,
-    )
-    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
-    context = GroundedDeepAgentRunContext(
-        thread_id="t-repair-table-prefix",
-        run_id="r-repair-table-prefix",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-
-    failed = json.loads(
-        tools["submit_grounded_sql_candidate"].func(
-            sql=("SELECT COUNT(*) AS ticket_count FROM wrong_catalog.tickets"),
-            expected_generation=1,
-            contract_fingerprint=contract_fingerprint,
-            rationale="Count tickets from the grounded table",
-            evidence_ref_ids=[table_ref],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert failed["status"] == "SQL_EXECUTION_REPAIR_REQUIRED"
-    assert failed["nextAction"] == "SUBMIT_GROUNDED_SQL_CANDIDATE"
-    assert failed["repairReview"]["decision"] == "REPAIR_SQL"
-    assert failed["repairReview"]["category"] == "TABLE_RESOLUTION"
-    assert failed["repairReview"]["allowedTables"] == ["tickets"]
-    assert failed["repairReview"]["remainingRepairAttempts"] == 2
-    assert kernel_session.phase == "CORE_SQL_EXECUTION_REPAIR_REQUIRED"
-    assert kernel_session.sql_execution_repair_context["failedSql"].endswith("wrong_catalog.tickets")
-    visible, _removed = _phase_visible_tools(deep_session, outer.tools)
-    visible_names = {item.name for item in visible}
-    assert "submit_grounded_sql_candidate" in visible_names
-    assert "query_data" in visible_names
-
-    repaired = json.loads(
-        tools["submit_grounded_sql_candidate"].func(
-            sql="SELECT COUNT(*) AS ticket_count FROM tickets",
-            expected_generation=1,
-            contract_fingerprint=contract_fingerprint,
-            rationale=("Doris rejected the ungrounded catalog prefix; use the exact Contract table identity"),
-            evidence_ref_ids=[table_ref],
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert repaired["status"] == "VERIFIED"
-    assert repaired["submittedAndExecuted"] is True
-    assert kernel.execute_calls == 2
-    assert kernel.submitted_sql == [
-        "SELECT COUNT(*) AS ticket_count FROM wrong_catalog.tickets",
-        "SELECT COUNT(*) AS ticket_count FROM tickets",
-    ]
-    assert kernel_session.sql_execution_repair_context == {}
 
 
 def test_internal_runtime_failure_cannot_be_disguised_as_user_clarification() -> None:
@@ -5651,170 +4923,6 @@ def test_run_skill_is_rejected_before_query_execution_and_verification() -> None
     assert result["status"] == "SKILL_RUN_CONTRACT_REQUIRED"
     assert kernel_session.run_result is None
     assert context.session.skill_runs == []
-
-
-def test_execute_tool_returns_revise_instruction_instead_of_crashing_core() -> None:
-    class CompatibilityBlockedKernel(FakeKernel):
-        @staticmethod
-        def execute_active(session: GroundedRuntimeSession, **kwargs: Any) -> AgentRunResult:
-            raise RuntimeError("grounded metrics have incompatible time selection policies")
-
-    factory = CapturingFactory(action="none")
-    outer = runtime(factory, CompatibilityBlockedKernel())
-    kernel_session = outer.kernel.new_session("最近30天退款率", "m-1")
-    context = GroundedDeepAgentRunContext(
-        thread_id="thread-execution-blocked",
-        run_id="run-execution-blocked",
-        session=GroundedDeepAgentSession(runtime=kernel_session),
-    )
-    tools = {item.name: item for item in outer.tools}
-
-    result = json.loads(
-        tools["execute_grounded_query"].func(
-            reason="执行退款率查询",
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "EXECUTION_REVISE_REQUIRED"
-    assert result["nextAction"] == "REVISE_BINDINGS"
-    assert "Do not retry the same bindings" in result["instruction"]
-
-
-def test_skill_headers_are_disclosed_only_after_portfolio_finalization() -> None:
-    class VerifiedKernel(FakeKernel):
-        @staticmethod
-        def execute_active(session: GroundedRuntimeSession, **kwargs: Any) -> AgentRunResult:
-            result = AgentRunResult(
-                merged_query_bundle=QueryBundle(
-                    rows=[{"refund_rate": 0.2}],
-                    tables=["merchant_profile"],
-                )
-            )
-            session.run_result = result
-            return result
-
-        @staticmethod
-        def verify_active(session: GroundedRuntimeSession) -> VerifiedEvidence:
-            verified = VerifiedEvidence(passed=True)
-            session.verified_evidence = verified
-            assert session.run_result is not None
-            contract = GroundedQueryContract(
-                question=session.question,
-                status="READY",
-                query_shape="SCALAR",
-                binding_hints=GroundedBindingHints(time_expression="最近30天"),
-                time_range=ResolvedTimeRange(
-                    kind="rolling",
-                    label="最近30天",
-                    days=30,
-                    start_date="2026-06-21",
-                    end_date="2026-07-20",
-                    timezone="Asia/Shanghai",
-                    calendar_anchor_policy="runtime_current_date",
-                    window_role="primary",
-                    explicit=True,
-                ),
-            )
-            session.verified_query_ledger.append(
-                GroundedVerifiedQueryArtifact(
-                    artifact_id="query_artifact_1",
-                    generation=1,
-                    contract_fingerprint=grounded_query_contract_fingerprint(contract),
-                    sql_fingerprint="f" * 64,
-                    contract=contract,
-                    plan=QueryPlan(),
-                    run_result=session.run_result,
-                    verified_evidence=verified,
-                )
-            )
-            return verified
-
-        @staticmethod
-        def latest_verified_query_artifact(
-            session: GroundedRuntimeSession,
-        ) -> GroundedVerifiedQueryArtifact | None:
-            return session.verified_query_ledger[-1] if session.verified_query_ledger else None
-
-        @staticmethod
-        def verify_portfolio(
-            session: GroundedRuntimeSession,
-        ) -> tuple[QueryPlan, AgentRunResult, VerifiedEvidence, list[str]]:
-            assert session.run_result is not None
-            assert session.verified_evidence is not None
-            return (
-                QueryPlan(),
-                session.run_result,
-                session.verified_evidence,
-                ["query_artifact_1"],
-            )
-
-    factory = CapturingFactory(action="none")
-    outer = GroundedDeepAgentRuntime(
-        VerifiedKernel(),
-        lead_model=object(),
-        semantic_catalog=FakeSemanticCatalog(),
-        skill_root="python_backend/resources/runtime/agent_skills",
-        agent_factory=factory,
-    )
-    kernel_session = outer.kernel.new_session("最近30天退款率", "m-1")
-    deep_session = GroundedDeepAgentSession(runtime=kernel_session)
-    context = GroundedDeepAgentRunContext(
-        thread_id="thread-skill-headers",
-        run_id="run-skill-headers",
-        session=deep_session,
-    )
-    tools = {item.name: item for item in outer.tools}
-    declared = json.loads(
-        tools["declare_original_question_goals"].func(
-            contract=OriginalQuestionGoalContract(
-                question=kernel_session.question,
-                goals=[
-                    MetricQuestionGoal(
-                        goal_id="metric.refund_rate",
-                        label="退款率",
-                    ),
-                    TimeWindowQuestionGoal(
-                        goal_id="time.recent_30_days",
-                        label="最近30天",
-                        time_expression="最近30天",
-                        applies_to_goal_ids=["metric.refund_rate"],
-                    ),
-                ],
-            ),
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-    assert declared["status"] == "ACCEPTED"
-    deep_session.active_goal_ids = [
-        "metric.refund_rate",
-        "time.recent_30_days",
-    ]
-
-    result = json.loads(
-        tools["execute_grounded_query"].func(
-            reason="执行已激活查询",
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert result["status"] == "VERIFIED"
-    assert deep_session.analysis_skill_headers_disclosed is False
-    assert "availableAnalysisSkillHeaders" not in result
-
-    finalized = json.loads(
-        tools["finalize_evidence_collection"].func(
-            reason="原问题所需数据已经齐全",
-            runtime=SimpleNamespace(context=context),
-        )
-    )
-
-    assert finalized["status"] == "SKILL_INPUT_SNAPSHOT_READY"
-    assert deep_session.analysis_skill_headers_disclosed is True
-    assert deep_session.data_collection_sealed is False
-    assert deep_session.skill_input_snapshot_generation == 1
-    assert any(item["name"] == "refund-rate-diagnosis" for item in finalized["availableAnalysisSkillHeaders"])
-    assert all(item["lifecyclePhase"] == "post_query_analysis" for item in finalized["availableAnalysisSkillHeaders"])
 
 
 def test_skill_output_contract_rejects_governed_formula_drift() -> None:

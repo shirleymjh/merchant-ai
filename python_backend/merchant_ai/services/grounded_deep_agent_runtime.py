@@ -27,6 +27,8 @@ from typing import (
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END
+from langgraph.types import Command
 from pydantic import Field as PydanticField
 
 try:
@@ -172,6 +174,13 @@ from merchant_ai.services.grounded_answer_coverage import (
     answer_attestation_matches,
     render_verified_query_goal_sections,
     render_verified_rule_goal_bindings,
+)
+from merchant_ai.services.grounded_outcome_completion import (
+    OutcomeCompletionResult,
+    OutcomeCompletionVerifier,
+    StructuredOutcomeCompletionProvider,
+    outcome_attestation_matches,
+    render_partial_outcome_gaps,
 )
 from merchant_ai.services.grounded_analysis_artifact import (
     GroundedDerivedAnalysisArtifact,
@@ -332,9 +341,9 @@ from merchant_ai.services.goal_recall_coverage import (
     GoalRecallCoverageService,
 )
 from merchant_ai.services.governed_query_service import (
+    CallbackGroundedQueryBackend,
     GovernedQueryService,
-    LegacyGroundedQueryBackend,
-    classify_legacy_query_payload,
+    classify_query_stage_payload,
 )
 from merchant_ai.services.query_request import (
     QueryAttemptResult,
@@ -1529,6 +1538,7 @@ class GroundedDeepAgentSession:
     population_artifact_query_node_ids: dict[str, str] = field(default_factory=dict)
     goal_coverage_result: dict[str, Any] = field(default_factory=dict)
     answer_coverage_result: dict[str, Any] = field(default_factory=dict)
+    outcome_completion_result: dict[str, Any] = field(default_factory=dict)
     operational_failure: dict[str, Any] = field(default_factory=dict)
     runtime_budget_report: dict[str, Any] = field(default_factory=dict)
     core_context_reports: list[dict[str, Any]] = field(default_factory=list)
@@ -2056,6 +2066,108 @@ def _authorized_verified_query_artifacts(
                 and verified_query_artifact_integrity_valid(artifact)
             )
         )
+    ]
+
+
+def _outcome_required_goal_summaries(
+    session: GroundedDeepAgentSession,
+) -> list[dict[str, Any]]:
+    contract = session.question_goal_contract
+    if contract is None:
+        return []
+    required = set(required_goal_ids(contract))
+    return [
+        {
+            "goalId": goal.goal_id,
+            "kind": str(getattr(goal, "kind", "") or ""),
+            "label": str(getattr(goal, "label", "") or ""),
+            "sourceSpans": list(getattr(goal, "source_spans", ()) or ()),
+            "dependsOnGoalIds": list(
+                getattr(goal, "depends_on_goal_ids", ()) or ()
+            ),
+        }
+        for goal in contract.goals
+        if goal.goal_id in required
+    ]
+
+
+def _outcome_query_artifact_summaries(
+    session: GroundedDeepAgentSession,
+    artifacts: Sequence[GroundedVerifiedQueryArtifact],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        contract = artifact.contract
+        bundle = artifact.run_result.merged_query_bundle
+        time_range = getattr(contract, "time_range", None)
+        summaries.append(
+            {
+                "artifactId": artifact.artifact_id,
+                "goalIds": list(
+                    session.artifact_goal_ids.get(artifact.artifact_id, ())
+                ),
+                "queryQuestion": str(contract.question or ""),
+                "queryShape": str(contract.query_shape or ""),
+                "metricKeys": [
+                    str(getattr(item, "metric_key", "") or "")
+                    for item in contract.metrics
+                    if str(getattr(item, "metric_key", "") or "")
+                ],
+                "dimensions": [
+                    str(getattr(item, "column", "") or "")
+                    for item in contract.dimensions
+                    if str(getattr(item, "column", "") or "")
+                ],
+                "selectedFields": [
+                    str(
+                        getattr(item, "output_alias", "")
+                        or getattr(item, "column", "")
+                        or ""
+                    )
+                    for item in contract.selected_fields
+                    if str(
+                        getattr(item, "output_alias", "")
+                        or getattr(item, "column", "")
+                        or ""
+                    )
+                ],
+                "timeRange": (
+                    time_range.model_dump(by_alias=True, mode="json")
+                    if callable(getattr(time_range, "model_dump", None))
+                    else {}
+                ),
+                "outputColumns": list(artifact.output_columns),
+                "rowCount": bundle.effective_row_count(),
+                "resultCoverage": str(bundle.result_coverage or "UNKNOWN"),
+                "evidenceRefs": list(contract.evidence_refs),
+            }
+        )
+    return summaries
+
+
+def _outcome_rule_artifact_summaries(
+    session: GroundedDeepAgentSession,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "artifactId": artifact.artifact_id,
+            "goalIds": list(artifact.goal_ids),
+            "evidenceRefs": [item.ref_id for item in artifact.evidence_refs],
+        }
+        for artifact in session.runtime.verified_rule_ledger
+        if artifact.verification_passed
+    ]
+
+
+def _outcome_known_gaps(goal_coverage: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "code": str(getattr(issue, "code", "") or ""),
+            "goalId": str(getattr(issue, "goal_id", "") or ""),
+            "message": str(getattr(issue, "message", "") or ""),
+        }
+        for issue in getattr(goal_coverage, "issues", ()) or ()
+        if bool(getattr(issue, "blocking", False))
     ]
 
 
@@ -5053,16 +5165,11 @@ _GROUNDED_CAPABILITY_TOOLS: dict[str, set[str]] = {
     "CLARIFICATION": {"ask_human"},
     "FILESYSTEM_READ": {"ls", "read_file", "grep"},
     "SEMANTIC_RECALL": {"retrieve_knowledge"},
-    "CONTRACT_VERSION": {"propose_grounded_contract"},
     "GRAPH_CREATE": {"propose_grounded_execution_graph"},
-    "GRAPH_PREPARE": {"prepare_grounded_query_batch"},
     "GRAPH_REVISION": {
         "reopen_grounded_execution_graph_discovery",
         "revise_grounded_execution_graph",
     },
-    "SQL_VERSION": {"submit_grounded_sql_candidate"},
-    "QUERY_EXECUTION": {"execute_grounded_query"},
-    "QUERY_BATCH_EXECUTION": {"execute_grounded_query_batch"},
     "RULE_PUBLICATION": {"publish_verified_rule_evidence"},
     "RULE_ANSWER": {"compose_verified_rule_answer"},
     "ENTITY_SET_PUBLICATION": {"publish_verified_entity_set"},
@@ -5095,6 +5202,17 @@ def _grounded_runtime_tool_capabilities(
 
     if session.runtime.clarification is not None or session.operational_failure or session.skill_execution_in_progress:
         return set()
+    if session.runtime.answer and (
+        outcome_attestation_matches(
+            session.runtime.answer,
+            session.outcome_completion_result,
+        )
+        or answer_attestation_matches(
+            session.runtime.answer,
+            session.answer_coverage_result,
+        )
+    ):
+        return set()
     if finalization_ready:
         return {"ANSWER_COMPOSITION"}
     if session.runtime.verified_rule_ledger and _required_goals_are_rule_only(session):
@@ -5112,9 +5230,7 @@ def _grounded_runtime_tool_capabilities(
         "FILESYSTEM_READ",
         "SEMANTIC_RECALL",
         "CLARIFICATION",
-        "CONTRACT_VERSION",
         "GRAPH_CREATE",
-        "GRAPH_PREPARE",
         "DELEGATION",
     }
     if bool(read_control.get("retrievalClosed")):
@@ -5124,8 +5240,6 @@ def _grounded_runtime_tool_capabilities(
         capabilities.difference_update({"FILESYSTEM_READ", "SEMANTIC_RECALL"})
     if session.execution_graph_receipt is not None:
         capabilities.add("GRAPH_REVISION")
-    if session.runtime.active_contract is not None:
-        capabilities.update({"SQL_VERSION", "QUERY_EXECUTION"})
     if session.runtime.phase in {
         "EXECUTED",
         "VERIFICATION_GAPPED",
@@ -5134,8 +5248,6 @@ def _grounded_runtime_tool_capabilities(
         capabilities.add("FILESYSTEM_READ")
     if session.runtime.verified_rule_ledger:
         capabilities.add("RULE_PUBLICATION")
-    if session.parallel_branches:
-        capabilities.add("QUERY_BATCH_EXECUTION")
     if _authorized_verified_query_artifacts(session):
         capabilities.update(
             {
@@ -5179,7 +5291,13 @@ def _phase_visible_tools(
                 GroundedDeepAgentRuntime._goal_coverage_declarations(session),
             )
             session.goal_coverage_result = coverage.model_dump(by_alias=True)
-            finalization_ready = bool(coverage.finalization_allowed)
+            # The deterministic fast path may close immediately. Complex
+            # questions keep the full ReAct capability set until the
+            # user-outcome evaluator has accepted the candidate answer.
+            finalization_ready = bool(
+                _simple_scalar_goal_contract(session)
+                and coverage.finalization_allowed
+            )
         except (RuntimeError, TypeError, ValueError):
             finalization_ready = False
     read_control = _grounded_semantic_read_control(session)
@@ -5234,11 +5352,11 @@ def _historical_tool_call_receipt(call: dict[str, Any]) -> dict[str, Any]:
                 "limit": int(args.get("limit") or 0),
             }
         )
-    elif name in {"propose_grounded_contract", "prepare_grounded_query_batch"}:
+    elif name in {"query_data", "query_batch"}:
         receipt.update(
             {
-                "readRefCount": len(args.get("read_ref_ids") or []),
-                "goalIds": list(args.get("goal_ids") or [])[:12],
+                "queryId": str((args.get("request") or {}).get("queryId") or ""),
+                "requestCount": len(args.get("requests") or []),
             }
         )
     return receipt
@@ -5310,25 +5428,21 @@ def _compact_tool_result_message(
         payload["path"] = path
     if evidence:
         payload["semanticReceipt"] = _core_visible_semantic_receipt(evidence)
-    if name == "propose_grounded_contract":
+    if name == "query_data":
         try:
             parsed = json.loads(content)
         except (TypeError, ValueError):
             parsed = {}
         if isinstance(parsed, dict):
-            payload["contractReceipt"] = {
+            payload["queryReceipt"] = {
                 key: parsed.get(key)
                 for key in (
-                    "attemptId",
                     "status",
-                    "queryShape",
-                    "compileStatus",
-                    "activationStatus",
-                    "executionMode",
-                    "nextAction",
-                    "activeGeneration",
-                    "contractFingerprint",
-                    "assignedGoalIds",
+                    "queryId",
+                    "summary",
+                    "decisionMode",
+                    "artifactIds",
+                    "code",
                 )
                 if parsed.get(key) not in (None, "", [], {})
             }
@@ -5344,8 +5458,6 @@ def _compact_tool_result_message(
 
 
 _GROUNDED_REPAIR_TOOL_NAMES = {
-    "propose_grounded_contract",
-    "prepare_grounded_query_batch",
     "query_data",
     "query_batch",
     "propose_grounded_execution_graph",
@@ -5466,12 +5578,12 @@ def _compact_grounded_model_messages(
         ),
         default=latest_human_index,
     )
-    latest_contract_index = max(
+    latest_query_index = max(
         (
             index
             for index, item in enumerate(messages)
             if getattr(item, "type", "") == "tool"
-            and str(getattr(item, "name", "") or "") == "propose_grounded_contract"
+            and str(getattr(item, "name", "") or "") == "query_data"
         ),
         default=-1,
     )
@@ -5523,7 +5635,7 @@ def _compact_grounded_model_messages(
             if name == "read_file" and index < latest_ai_index:
                 should_compact = True
                 read_compacted += 1
-            elif name == "propose_grounded_contract" and index != latest_contract_index:
+            elif name == "query_data" and index != latest_query_index:
                 should_compact = True
             elif index < latest_ai_index and len(_message_content_text(item)) > 8_000:
                 should_compact = True
@@ -5828,6 +5940,21 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
                 args=args,
                 tool_call_id=tool_call_id,
             )
+        if (
+            tool_name == "compose_verified_answer"
+            and isinstance(session, GroundedDeepAgentSession)
+            and isinstance(result, ToolMessage)
+            and GroundedDeepAgentRuntime._answer_is_attested(session)
+        ):
+            try:
+                compose_result = json.loads(_message_content_text(result))
+            except (TypeError, ValueError):
+                compose_result = {}
+            if str(compose_result.get("status") or "").upper() == "ANSWERED":
+                return Command(
+                    update={"messages": [result]},
+                    goto=END,
+                )
         if (
             workspace_recovery_signature
             and getattr(result, "status", "success") != "error"
@@ -6168,6 +6295,31 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
                 "sqlExecutionRepair": dict(state.sql_execution_repair_context or {}),
                 "semanticReadControl": semantic_read_control,
                 "queryBatchObservations": [dict(item) for item in session.latest_query_batch_observations],
+                "outcomeCompletion": {
+                    "overallStatus": str(
+                        session.outcome_completion_result.get(
+                            "overallStatus", ""
+                        )
+                    ),
+                    "completionAllowed": bool(
+                        session.outcome_completion_result.get(
+                            "completionAllowed", False
+                        )
+                    ),
+                    "missingRequirements": list(
+                        session.outcome_completion_result.get(
+                            "missingRequirements", []
+                        )
+                    )[:6],
+                    "issueCodes": [
+                        str(item.get("code") or "")
+                        for item in session.outcome_completion_result.get(
+                            "issues", []
+                        )
+                        if isinstance(item, dict)
+                        and str(item.get("code") or "")
+                    ][:6],
+                },
                 "nextAction": str(semantic_read_control.get("nextAction") or ""),
             },
             "goal": {
@@ -6614,7 +6766,7 @@ Authority and scope
 
 Decision ownership
 - You own business understanding, progressive asset exploration, table/metric/field selection, query count and topology, complex SQL, and genuine user clarification.
-- The Harness owns deterministic schema/evidence/relationship checks, SQL safety and ACL, tenant injection, execution, result verification and final Goal coverage.
+- The Harness owns deterministic schema/evidence/relationship checks, SQL safety and ACL, tenant injection, execution, result verification and final artifact authority checks. A zero-tool evaluator judges whether the candidate answer covers the user's visible outcomes; it does not plan or execute work.
 - Subagents and complex Skills are isolation boundaries, not alternate planning authorities. You decide per invocation: load_skill keeps a short bounded procedure in this Core loop; run_skill isolates a long or complex procedure in a SubAgent. The Harness may force isolation for scripts, oversized procedures or hard resource requirements. Both Core and a granted SubAgent use the same query_data protocol. Query branches are execution units, not agents.
 - Deep Agents native task is available as the grounded-researcher isolation primitive for long read-only semantic investigations. Call it only with a JSON grounded_native_task.v1 contract and READ_CONTEXT capability. Governed query or Skill work must use the typed governed delegation boundary, which issues the required grant before execution.
 
@@ -6624,8 +6776,8 @@ Required lifecycle
 3. After evidence is sufficient, bind every requested metric to its formal owner table, grain and time semantics before choosing topology. Merge Goals into one Contract only when those bindings form one coherent query; metrics on different tables that are independently aggregatable belong in parallel graph nodes, while a JOIN is valid only when one requested result truly requires governed cross-table combination.
 4. Treat trustedSessionContext.runtime.semanticReadControl and every ToolMessage Observation as advisory runtime context, not a workflow. Inspect repairOptions, readNext and repairReceipt, then choose the next ReAct action that can make progress: read an exact semantic leaf, revise a binding or topology, call query_data, call query_batch, delegate for isolation, or ask the merchant only when the business question is genuinely ambiguous. The Harness validates the chosen action at the tool boundary; it does not prescribe a fixed transition. Never replace newer typed evidence with historical recovery text or repeat an unchanged action.
 5. Use query_data for one governed query and query_batch when the caller's reasoning identifies mutually independent requests. Both tools own Contract construction, SQL validation, execution, ACL/tenant injection and Evidence verification. For CORE_SQL_REQUIRED, submit the QueryRequest with one complete Doris SELECT/WITH sqlCandidate implementing the returned Contract obligations, without tenant literals or invented tables/columns. The facade repairs bounded mechanical SQL/execution errors internally. When a tool returns NEEDS_REASONING, inspect the structured Observation, preserve its repairReceipt, and decide whether to read, replan, retry the same tool, choose the other query tool, or delegate. DENIED is terminal for that request and must never be bypassed.
-6. Treat verified results as immutable evidence. Continue querying until every required Goal and dependency is covered by actual artifact semantics. Do not turn partial or preview results into a complete answer.
-7. Finish only through compose_verified_rule_answer, compose_verified_answer, or ask_human. Never answer from ordinary assistant prose or invent formulas, rows, evidence or provenance.
+6. Treat verified results as immutable evidence. The Goal ledger supports recall, contracts and evidence accounting; internal helper Goals do not each need a separate visible answer span. Before claiming completion, call compose_verified_answer. Its isolated evaluator checks the candidate against the user's visible outcomes, while deterministic code checks every cited Artifact and claim. If it returns an incomplete Observation, decide in the same ReAct loop whether to query, clarify a genuine business ambiguity, or explicitly accept an evidence-backed partial answer with disclosed gaps.
+7. Finish only through compose_verified_rule_answer, an accepted compose_verified_answer result, or ask_human. After compose_verified_answer returns ANSWERED, stop without another tool call. Never answer from ordinary assistant prose or invent formulas, rows, evidence or provenance.
 
 Use the currently visible tools and server-owned evidence as capabilities and constraints, not as a prewritten procedure. Delegate only when isolation or real parallel reasoning is useful. Ask the user only for genuine business ambiguity, never for Topic selection, internal failures, merchant identity already bound by runtime, or information available in governed assets.
 """
@@ -6649,6 +6801,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         backend: Any = None,
         conversation_state_store: Any = None,
         conversation_online_authority: Optional[GroundedConversationOnlineAuthorityFacade] = None,
+        outcome_completion_provider: Any = None,
         population_execution_gate: GroundedPopulationExecutionGate | None = None,
         population_gate_enforced: bool = False,
         graph_revision_fault_injector: Optional[Callable[[str, str], None]] = None,
@@ -6659,6 +6812,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         self.memory_store = memory_store
         self.conversation_state_store = conversation_state_store
         self.conversation_online_authority = conversation_online_authority
+        self.outcome_completion_provider = outcome_completion_provider
         self.population_execution_gate = population_execution_gate
         self.population_gate_enforced = bool(population_gate_enforced)
         self.graph_revision_fault_injector = graph_revision_fault_injector
@@ -6734,7 +6888,6 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         )
         self.budget_middleware = GroundedRuntimeBudgetMiddleware(settings)
         self.governed_query_facade_enabled = bool(getattr(settings, "governed_query_facade_enabled", True))
-        self.legacy_query_tools_visible = bool(getattr(settings, "grounded_legacy_query_tools_visible", True))
         self.internal_sql_repair_enabled = bool(
             getattr(
                 settings,
@@ -6764,6 +6917,12 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 )
             agent_factory = create_deep_agent
         self._model = model
+        if self.outcome_completion_provider is None and callable(
+            getattr(model, "with_structured_output", None)
+        ):
+            self.outcome_completion_provider = StructuredOutcomeCompletionProvider(
+                model
+            )
         self.context_middleware.bind_model(model)
         self._agent_factory = agent_factory
         subagent_model = self._resolve_model(isolated_subagent_model) or model
@@ -9577,8 +9736,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 ensure_ascii=False,
             )
 
-        @tool("propose_grounded_contract")
-        def propose_grounded_contract(
+        def prepare_query_contract(
             read_ref_ids: list[str],
             binding_hints: GroundedBindingHints,
             goal_ids: list[str],
@@ -9801,8 +9959,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 default=str,
             )
 
-        @tool("prepare_grounded_query_batch")
-        def prepare_grounded_query_batch(
+        def prepare_query_batch(
             queries: list[GroundedParallelQuerySpec],
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
@@ -10709,8 +10866,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 default=str,
             )
 
-        @tool("execute_grounded_query_batch")
-        def execute_grounded_query_batch(
+        def execute_query_batch(
             queries: list[GroundedParallelExecutionSpec],
             reason: str,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
@@ -11665,8 +11821,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 default=str,
             )
 
-        @tool("submit_grounded_sql_candidate")
-        def submit_grounded_sql_candidate(
+        def submit_query_sql_candidate(
             sql: str,
             expected_generation: int,
             contract_fingerprint: str,
@@ -11761,7 +11916,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             # verify inside this same governed tool call so a second LLM turn
             # is not required merely to dispatch the accepted candidate.
             execution_payload = json.loads(
-                execute_grounded_query.func(
+                execute_query_contract(
                     reason="Core SQL candidate accepted; execute and verify atomically",
                     runtime=runtime,
                 )
@@ -11785,8 +11940,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 default=str,
             )
 
-        @tool("execute_grounded_query")
-        def execute_grounded_query(
+        def execute_query_contract(
             reason: str,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
@@ -12681,10 +12835,11 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 default=str,
             )
 
-        @tool("compose_verified_answer", return_direct=True)
+        @tool("compose_verified_answer")
         def compose_verified_answer(
             allow_llm: bool,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
+            accept_partial: bool = False,
         ) -> str:
             """Compose and attest the final answer from verified evidence only.
 
@@ -12694,16 +12849,29 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             retain a narrow compatibility binding from the verified renderer.
             """
 
+            deep_session = runtime.context.session
+            use_outcome_evaluator = bool(
+                not _simple_scalar_goal_contract(deep_session)
+                and runtime_owner.outcome_completion_provider is not None
+            )
             try:
-                goal_coverage = runtime_owner._require_complete_goal_coverage(runtime.context.session)
+                goal_coverage = (
+                    runtime_owner._goal_coverage_snapshot(deep_session)
+                    if use_outcome_evaluator
+                    else runtime_owner._require_complete_goal_coverage(
+                        deep_session
+                    )
+                )
             except GoalCoverageBlocked as exc:
                 result = exc.result.model_dump(by_alias=True)
-                runtime.context.session.goal_coverage_result = result
+                deep_session.goal_coverage_result = result
                 return json.dumps(
                     {
                         "status": "GOAL_COVERAGE_INCOMPLETE",
                         "code": "ORIGINAL_QUESTION_GOALS_UNCOVERED",
-                        "missingRequiredGoalIds": result.get("missingRequiredGoalIds", []),
+                        "missingRequiredGoalIds": result.get(
+                            "missingRequiredGoalIds", []
+                        ),
                         "issues": result.get("issues", []),
                         "nextAction": "CONTINUE_PROGRESSIVE_QUERYING",
                     },
@@ -12720,9 +12888,16 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     ensure_ascii=False,
                 )
             required_rule_goal_ids = _required_goal_ids_for_kind(
-                runtime.context.session,
+                deep_session,
                 "RULE",
             )
+            if use_outcome_evaluator:
+                resolved_goal_ids = set(goal_coverage.resolved_goal_ids)
+                required_rule_goal_ids = [
+                    goal_id
+                    for goal_id in required_rule_goal_ids
+                    if goal_id in resolved_goal_ids
+                ]
             verified_rule_artifacts: list[Any] = []
             verified_rule_artifact_ids: list[str] = []
             rule_answer_span = ""
@@ -12826,35 +13001,217 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         rule_answer_span,
                     )
                 )
-            try:
-                answer_coverage = AnswerCoverageVerifier().require_complete(
-                    runtime.context.session.question_goal_contract,
+            answer_coverage_verifier = AnswerCoverageVerifier()
+            if use_outcome_evaluator:
+                # Keep fine-grained Goal coverage as an audit and retrieval
+                # ledger. It is no longer the semantic definition of whether
+                # a complex user-visible answer is complete.
+                answer_coverage = answer_coverage_verifier.verify(
+                    deep_session.question_goal_contract,
                     goal_coverage,
                     answer,
                     bindings,
                     source="compose_verified_answer",
                     auto_bind_verified_primitives=True,
                 )
-            except AnswerCoverageBlocked as exc:
-                result = exc.result.model_dump(by_alias=True)
-                runtime.context.session.answer_coverage_result = result
-                runtime_owner._clear_rejected_answer(runtime.context.session)
-                return json.dumps(
-                    {
-                        "status": "ANSWER_COVERAGE_INCOMPLETE",
-                        "code": "FINAL_ANSWER_GOALS_NOT_RENDERED",
-                        "missingGoalIds": result.get("missingGoalIds", []),
-                        "issues": result.get("issues", []),
-                        "nextAction": "RECOMPOSE_WITH_TYPED_GOAL_BINDINGS",
-                    },
-                    ensure_ascii=False,
-                    default=str,
+                deep_session.answer_coverage_result = (
+                    answer_coverage.model_dump(by_alias=True)
                 )
-            runtime.context.session.answer_coverage_result = answer_coverage.model_dump(by_alias=True)
+                try:
+                    answer, outcome_completion = (
+                        runtime_owner._evaluate_user_outcome_completion(
+                            deep_session,
+                            candidate_answer=answer,
+                            goal_coverage=goal_coverage,
+                            allow_partial=bool(accept_partial),
+                            budget=runtime.context.budget,
+                        )
+                    )
+                except GroundedRuntimeBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    if goal_coverage.finalization_allowed:
+                        # A fully proved Goal ledger remains a fail-closed
+                        # availability fallback when the semantic evaluator is
+                        # temporarily unavailable.
+                        try:
+                            answer_coverage = (
+                                answer_coverage_verifier.require_complete(
+                                    deep_session.question_goal_contract,
+                                    goal_coverage,
+                                    answer,
+                                    bindings,
+                                    source="compose_verified_answer",
+                                    auto_bind_verified_primitives=True,
+                                )
+                            )
+                        except AnswerCoverageBlocked as coverage_exc:
+                            result = coverage_exc.result.model_dump(
+                                by_alias=True
+                            )
+                            deep_session.answer_coverage_result = result
+                            runtime_owner._clear_rejected_answer(deep_session)
+                            return json.dumps(
+                                {
+                                    "status": "ANSWER_COVERAGE_INCOMPLETE",
+                                    "code": "FINAL_ANSWER_GOALS_NOT_RENDERED",
+                                    "missingGoalIds": result.get(
+                                        "missingGoalIds", []
+                                    ),
+                                    "issues": result.get("issues", []),
+                                    "nextAction": (
+                                        "RECOMPOSE_FROM_VERIFIED_ARTIFACTS"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            )
+                        deep_session.answer_coverage_result = (
+                            answer_coverage.model_dump(by_alias=True)
+                        )
+                    else:
+                        deep_session.outcome_completion_result = {
+                            "passed": False,
+                            "completionAllowed": False,
+                            "source": "compose_verified_answer",
+                            "overallStatus": "INSUFFICIENT_EVIDENCE",
+                            "issues": [
+                                {
+                                    "code": (
+                                        "OUTCOME_COMPLETION_EVALUATION_FAILED"
+                                    ),
+                                    "message": "%s:%s"
+                                    % (
+                                        type(exc).__name__,
+                                        str(exc)[:400],
+                                    ),
+                                    "blocking": True,
+                                }
+                            ],
+                        }
+                        runtime_owner._clear_rejected_answer(deep_session)
+                        deep_session.runtime.phase = (
+                            "OUTCOME_COMPLETION_UNAVAILABLE"
+                        )
+                        return json.dumps(
+                            {
+                                "status": "OUTCOME_EVALUATION_UNAVAILABLE",
+                                "code": (
+                                    "OUTCOME_COMPLETION_EVALUATION_FAILED"
+                                ),
+                                "message": "%s:%s"
+                                % (type(exc).__name__, str(exc)[:300]),
+                                "nextAction": (
+                                    "RETRY_FINALIZATION_OR_CONTINUE_REASONING"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                else:
+                    deep_session.outcome_completion_result = (
+                        outcome_completion.model_dump(by_alias=True)
+                    )
+                    if not outcome_completion.completion_allowed:
+                        runtime_owner._clear_rejected_answer(deep_session)
+                        deep_session.runtime.phase = (
+                            "OUTCOME_COMPLETION_INCOMPLETE"
+                        )
+                        return json.dumps(
+                            {
+                                "status": (
+                                    "USER_INPUT_REQUIRED"
+                                    if outcome_completion.needs_user_input
+                                    else "OUTCOME_COMPLETION_INCOMPLETE"
+                                ),
+                                "code": (
+                                    "USER_OUTCOME_NEEDS_CLARIFICATION"
+                                    if outcome_completion.needs_user_input
+                                    else "USER_VISIBLE_OUTCOME_MISSING"
+                                ),
+                                "overallStatus": (
+                                    outcome_completion.overall_status
+                                ),
+                                "missingRequirements": (
+                                    outcome_completion.missing_requirements
+                                ),
+                                "issues": [
+                                    item.model_dump(by_alias=True)
+                                    for item in outcome_completion.issues
+                                ],
+                                "nextAction": (
+                                    "ASK_HUMAN_FOR_BUSINESS_AMBIGUITY"
+                                    if outcome_completion.needs_user_input
+                                    else (
+                                        "CONTINUE_REASONING_OR_ACCEPT_PARTIAL"
+                                    )
+                                ),
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                    state.answer = answer
+                    if outcome_completion.query_artifact_ids:
+                        state.answer_artifact_ids = list(
+                            outcome_completion.query_artifact_ids
+                        )
+                    if outcome_completion.rule_artifact_ids:
+                        state.answer_rule_artifact_ids = list(
+                            outcome_completion.rule_artifact_ids
+                        )
+                    answer_coverage = answer_coverage_verifier.verify(
+                        deep_session.question_goal_contract,
+                        goal_coverage,
+                        answer,
+                        bindings,
+                        source="compose_verified_answer",
+                        auto_bind_verified_primitives=True,
+                    )
+                    deep_session.answer_coverage_result = (
+                        answer_coverage.model_dump(by_alias=True)
+                    )
+            else:
+                try:
+                    answer_coverage = (
+                        answer_coverage_verifier.require_complete(
+                            deep_session.question_goal_contract,
+                            goal_coverage,
+                            answer,
+                            bindings,
+                            source="compose_verified_answer",
+                            auto_bind_verified_primitives=True,
+                        )
+                    )
+                except AnswerCoverageBlocked as exc:
+                    result = exc.result.model_dump(by_alias=True)
+                    deep_session.answer_coverage_result = result
+                    runtime_owner._clear_rejected_answer(deep_session)
+                    return json.dumps(
+                        {
+                            "status": "ANSWER_COVERAGE_INCOMPLETE",
+                            "code": "FINAL_ANSWER_GOALS_NOT_RENDERED",
+                            "missingGoalIds": result.get(
+                                "missingGoalIds", []
+                            ),
+                            "issues": result.get("issues", []),
+                            "nextAction": (
+                                "RECOMPOSE_WITH_TYPED_GOAL_BINDINGS"
+                            ),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                deep_session.answer_coverage_result = (
+                    answer_coverage.model_dump(by_alias=True)
+                )
             return json.dumps(
                 {
                     "status": "ANSWERED",
                     "answer": answer,
+                    "partial": bool(
+                        deep_session.outcome_completion_result.get(
+                            "partialAnswer", False
+                        )
+                    ),
                     "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
                     "verifiedRuleArtifactIds": list(state.answer_rule_artifact_ids),
                     "verifiedSkillArtifactIds": [
@@ -12862,7 +13219,12 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         for item in runtime.context.session.verified_skill_ledger
                         if item.integrity_valid()
                     ],
-                    "goalAnswerCoverage": dict(runtime.context.session.answer_coverage_result),
+                    "goalAnswerCoverage": dict(
+                        deep_session.answer_coverage_result
+                    ),
+                    "outcomeCompletion": dict(
+                        deep_session.outcome_completion_result
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -12996,8 +13358,8 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     if isinstance(plan, GroundedSubagentDispatchPlan)
                     else GroundedSubagentDispatchPlan.model_validate(plan)
                 ),
-                execute_branch_tool=execute_grounded_query_batch,
-                query_data_tool=query_data,
+                execute_branch=execute_query_batch,
+                query_data_call=_query_data_impl,
             )
             return json.dumps(result, ensure_ascii=False, default=str)
 
@@ -13041,7 +13403,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         def build_serial_query_backend(
             request: QueryRequest,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
-        ) -> LegacyGroundedQueryBackend:
+        ) -> CallbackGroundedQueryBackend:
             def prepare_contract(
                 current: QueryRequest,
             ) -> Mapping[str, Any]:
@@ -13049,7 +13411,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 if resumed is not None:
                     return resumed
                 return json.loads(
-                    propose_grounded_contract.func(
+                    prepare_query_contract(
                         read_ref_ids=current.read_ref_ids,
                         binding_hints=current.binding_hints,
                         goal_ids=current.goal_ids,
@@ -13061,7 +13423,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 current: QueryRequest,
             ) -> Mapping[str, Any]:
                 return json.loads(
-                    execute_grounded_query.func(
+                    execute_query_contract(
                         reason=(current.reason or "query_data executes the validated Contract"),
                         runtime=runtime,
                     )
@@ -13073,7 +13435,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 prepared: Mapping[str, Any],
             ) -> Mapping[str, Any]:
                 return json.loads(
-                    submit_grounded_sql_candidate.func(
+                    submit_query_sql_candidate(
                         sql=candidate.sql,
                         expected_generation=int(prepared.get("activeGeneration") or 0),
                         contract_fingerprint=str(prepared.get("contractFingerprint") or ""),
@@ -13095,19 +13457,18 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     repair_number=repair_number,
                 )
 
-            return LegacyGroundedQueryBackend(
+            return CallbackGroundedQueryBackend(
                 prepare_contract=prepare_contract,
                 execute_compiled=execute_compiled,
                 submit_sql=submit_sql,
                 repair_sql=(repair_sql if runtime_owner.internal_sql_repair_enabled else None),
             )
 
-        @tool("query_data")
-        def query_data(
+        def _query_data_impl(
             request: QueryRequest,
             runtime: ToolRuntime[GroundedDeepAgentRunContext],
         ) -> str:
-            """Execute one governed query and return a verified artifact or Observation."""
+            """Internal implementation of the governed serial query facade."""
 
             normalized = request if isinstance(request, QueryRequest) else QueryRequest.model_validate(request)
             normalized = _normalize_goal_prefetched_query_request(
@@ -13138,6 +13499,15 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 ensure_ascii=False,
                 default=str,
             )
+
+        @tool("query_data")
+        def query_data(
+            request: QueryRequest,
+            runtime: ToolRuntime[GroundedDeepAgentRunContext],
+        ) -> str:
+            """Execute one governed query and return a verified artifact or Observation."""
+
+            return _query_data_impl(request=request, runtime=runtime)
 
         def query_batch_outcome(
             outcomes: Sequence[QueryOutcome],
@@ -13212,7 +13582,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     ensure_ascii=False,
                 )
             prepared_payload = json.loads(
-                prepare_grounded_query_batch.func(
+                prepare_query_batch(
                     queries=[
                         GroundedParallelQuerySpec(
                             query_id=item.query_id,
@@ -13242,7 +13612,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 if str(payload.get("status") or "").upper() == "PREPARED":
                     prepared_requests.append(item)
                     continue
-                attempt = classify_legacy_query_payload(
+                attempt = classify_query_stage_payload(
                     item,
                     payload,
                     stage="CONTRACT",
@@ -13258,7 +13628,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 candidate: Optional[QuerySqlCandidate],
             ) -> Mapping[str, Any]:
                 execution_payload = json.loads(
-                    execute_grounded_query_batch.func(
+                    execute_query_batch(
                         queries=[
                             GroundedParallelExecutionSpec(
                                 query_id=current.query_id,
@@ -13292,7 +13662,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
 
             def build_prepared_batch_backend(
                 item: QueryRequest,
-            ) -> LegacyGroundedQueryBackend:
+            ) -> CallbackGroundedQueryBackend:
                 prepared = {
                     **prepared_items[item.query_id],
                     "activated": True,
@@ -13317,7 +13687,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         contract_override=branch_contract,
                     )
 
-                return LegacyGroundedQueryBackend(
+                return CallbackGroundedQueryBackend(
                     prepare_contract=lambda current: prepared,
                     execute_compiled=lambda current: execute_one_batch_branch(
                         current,
@@ -13555,16 +13925,6 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         ]
         if getattr(self, "governed_query_facade_enabled", True):
             built_tools.extend([query_data, query_batch])
-        if getattr(self, "legacy_query_tools_visible", True):
-            built_tools.extend(
-                [
-                    propose_grounded_contract,
-                    prepare_grounded_query_batch,
-                    submit_grounded_sql_candidate,
-                    execute_grounded_query,
-                    execute_grounded_query_batch,
-                ]
-            )
         return built_tools
 
     def _repair_query_sql_candidate(
@@ -13638,8 +13998,8 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         context: GroundedDeepAgentRunContext,
         *,
         plan: GroundedSubagentDispatchPlan,
-        execute_branch_tool: Any,
-        query_data_tool: Any = None,
+        execute_branch: Any,
+        query_data_call: Any = None,
     ) -> dict[str, Any]:
         """Issue exact task grants and run optional isolation chosen by Core.
 
@@ -13773,7 +14133,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 "code": "PARALLEL_QUERY_SUBAGENT_DISPATCH_DENIED",
                 "message": (
                     "Query branches already have a no-LLM parallel execution path. "
-                    "Use execute_grounded_query_batch, or isolate exactly one long "
+                    "Use query_batch, or isolate exactly one long "
                     "Core-SQL branch."
                 ),
             }
@@ -13786,8 +14146,8 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     self._prepare_grounded_subagent_task(
                         context,
                         task=task,
-                        execute_branch_tool=execute_branch_tool,
-                        query_data_tool=query_data_tool,
+                        execute_branch=execute_branch,
+                        query_data_call=query_data_call,
                     )
                 )
             except (RuntimeError, ValueError) as exc:
@@ -13839,8 +14199,8 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         context: GroundedDeepAgentRunContext,
         *,
         task: GroundedSubagentGoalContract,
-        execute_branch_tool: Any,
-        query_data_tool: Any = None,
+        execute_branch: Any,
+        query_data_call: Any = None,
     ) -> PreparedIsolatedSubagentTask:
         session = context.session
         capabilities = list(dict.fromkeys(task.allowed_capabilities))
@@ -13858,7 +14218,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             raise ValueError("QUERY_BRANCH_CAPABILITY_MUST_BE_ISOLATED")
         if task.query_branch_ids and "QUERY_BRANCH" not in capability_set:
             raise ValueError("QUERY_BRANCH_IDS_WITHOUT_CAPABILITY")
-        if "QUERY_DATA" in capability_set and query_data_tool is None:
+        if "QUERY_DATA" in capability_set and query_data_call is None:
             raise ValueError("QUERY_DATA_TOOL_UNAVAILABLE")
         if "QUERY_DATA" in capability_set and "READ_CONTEXT" not in capability_set:
             raise ValueError("QUERY_DATA_REQUIRES_READ_CONTEXT")
@@ -14046,7 +14406,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         ensure_ascii=False,
                     )
                 payload = json.loads(
-                    query_data_tool.func(
+                    query_data_call(
                         request=normalized,
                         runtime=SimpleNamespace(context=isolated_context),
                     )
@@ -14163,7 +14523,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         },
                         ensure_ascii=False,
                     )
-                return execute_branch_tool.func(
+                return execute_branch(
                     queries=[
                         GroundedParallelExecutionSpec(
                             query_id=query_id,
@@ -15575,7 +15935,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
 
     @staticmethod
     def _clear_rejected_answer(session: GroundedDeepAgentSession) -> None:
-        """Remove an answer snapshot that failed final answer-goal coverage."""
+        """Remove an answer snapshot that failed final answer attestation."""
 
         state = session.runtime
         with session.lock:
@@ -15590,9 +15950,15 @@ Use the currently visible tools and server-owned evidence as capabilities and co
 
     @staticmethod
     def _answer_is_attested(session: GroundedDeepAgentSession) -> bool:
-        return answer_attestation_matches(
-            session.runtime.answer,
-            session.answer_coverage_result,
+        return bool(
+            outcome_attestation_matches(
+                session.runtime.answer,
+                session.outcome_completion_result,
+            )
+            or answer_attestation_matches(
+                session.runtime.answer,
+                session.answer_coverage_result,
+            )
         )
 
     @staticmethod
@@ -16769,6 +17135,115 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         session.goal_coverage_result = result.model_dump(by_alias=True)
         return result
 
+    def _evaluate_user_outcome_completion(
+        self,
+        session: GroundedDeepAgentSession,
+        *,
+        candidate_answer: str,
+        goal_coverage: Any,
+        allow_partial: bool,
+        budget: GroundedRuntimeBudget | None,
+    ) -> tuple[str, OutcomeCompletionResult]:
+        provider = self.outcome_completion_provider
+        if provider is None:
+            raise RuntimeError("OUTCOME_COMPLETION_EVALUATOR_UNAVAILABLE")
+        query_artifacts = [
+            artifact
+            for artifact in _authorized_verified_query_artifacts(session)
+            if artifact.verified_evidence.passed
+        ]
+        query_artifact_evidence = {
+            artifact.artifact_id: tuple(artifact.contract.evidence_refs)
+            for artifact in query_artifacts
+        }
+        rule_artifact_evidence = {
+            artifact.artifact_id: tuple(
+                item.ref_id for item in artifact.evidence_refs
+            )
+            for artifact in session.runtime.verified_rule_ledger
+            if artifact.verification_passed
+        }
+        timeout_seconds = max(
+            1.0,
+            float(
+                getattr(
+                    self.settings,
+                    "llm_request_timeout_seconds",
+                    60,
+                )
+                or 60
+            ),
+        )
+        if budget is not None:
+            budget.consume_llm_call(name="outcome_completion_evaluator")
+            timeout_seconds = budget.clamp_timeout_seconds(
+                timeout_seconds,
+                minimum_seconds=0.001,
+                operation="outcome_completion_evaluator",
+            )
+        stage = (
+            budget.stage("answer.outcome_completion")
+            if budget is not None
+            else nullcontext()
+        )
+        with stage:
+            decision = provider.evaluate(
+                question=session.runtime.question,
+                required_goals=_outcome_required_goal_summaries(session),
+                candidate_answer=candidate_answer,
+                verified_query_artifacts=_outcome_query_artifact_summaries(
+                    session,
+                    query_artifacts,
+                ),
+                verified_rule_artifacts=_outcome_rule_artifact_summaries(
+                    session
+                ),
+                known_gaps=_outcome_known_gaps(goal_coverage),
+                timeout_seconds=timeout_seconds,
+            )
+        contract = session.question_goal_contract
+        required_ids = set(
+            required_goal_ids(contract) if contract is not None else ()
+        )
+        required_kinds = {
+            str(getattr(goal, "kind", "") or "").upper()
+            for goal in (contract.goals if contract is not None else ())
+            if goal.goal_id in required_ids
+        }
+        answer_run_result = session.runtime.answer_run_result
+        claim_verification_passed = bool(
+            answer_run_result is not None
+            and answer_run_result.answer_claim_verification.passed
+        )
+        verifier = OutcomeCompletionVerifier()
+        result = verifier.verify(
+            decision,
+            answer_markdown=candidate_answer,
+            query_artifact_evidence=query_artifact_evidence,
+            rule_artifact_evidence=rule_artifact_evidence,
+            data_outcome_required=bool(required_kinds - {"RULE"}),
+            rule_outcome_required="RULE" in required_kinds,
+            claim_verification_passed=claim_verification_passed,
+            allow_partial=allow_partial,
+        )
+        answer = str(candidate_answer or "").strip()
+        if result.partial_answer:
+            answer = render_partial_outcome_gaps(
+                answer,
+                result.missing_requirements,
+            )
+            result = verifier.verify(
+                decision,
+                answer_markdown=answer,
+                query_artifact_evidence=query_artifact_evidence,
+                rule_artifact_evidence=rule_artifact_evidence,
+                data_outcome_required=bool(required_kinds - {"RULE"}),
+                rule_outcome_required="RULE" in required_kinds,
+                claim_verification_passed=claim_verification_passed,
+                allow_partial=True,
+            )
+        return answer, result
+
     def _require_complete_goal_coverage(
         self,
         session: GroundedDeepAgentSession,
@@ -17771,7 +18246,11 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 "executionGraphFreezePoint": "IMMEDIATELY_BEFORE_QUERY_PREPARATION",
                 "topologyAuthority": "CORE_LLM_WITHIN_KERNEL_VALIDATED_EVIDENCE",
                 "branchTopicScopeAuthority": "CORE_LLM_WITHIN_ROUTED_TOPICS",
-                "finalizationRequiresVerifiedCoverage": True,
+                "finalizationPolicy": (
+                    "User-visible completion is judged by an isolated "
+                    "evaluator; every cited Artifact and answer claim remains "
+                    "deterministically verified."
+                ),
                 "parallelRule": ("Only goals without dependency/upstream entity bindings may share a batch."),
             },
             "analysisSkillPolicy": {
@@ -17971,6 +18450,9 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 "queryBranches": [context.report() for context in session.query_branch_contexts.values()],
                 "goalCoverage": dict(session.goal_coverage_result),
                 "answerCoverage": dict(session.answer_coverage_result),
+                "outcomeCompletion": dict(
+                    session.outcome_completion_result
+                ),
                 "analysisDataInputGate": dict(session.analysis_data_input_gate_result),
                 "contextManagement": {
                     "modelCallCount": len(session.core_context_reports),

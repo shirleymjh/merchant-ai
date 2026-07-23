@@ -299,10 +299,6 @@ class Settings(BaseSettings):
         True,
         validation_alias="YSHOPPING_GOVERNED_QUERY_FACADE_ENABLED",
     )
-    grounded_legacy_query_tools_visible: bool = Field(
-        False,
-        validation_alias="YSHOPPING_GROUNDED_LEGACY_QUERY_TOOLS_VISIBLE",
-    )
     governed_query_internal_sql_repair_enabled: bool = Field(
         True,
         validation_alias=(

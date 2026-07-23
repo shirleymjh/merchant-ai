@@ -105,6 +105,43 @@ def test_doris_cache_key_is_bound_to_data_and_semantic_generations(tmp_path):
     assert repository.last_cache_key not in {"", first_key, epoch_key}
 
 
+def test_doris_cache_reuses_verified_semantic_request_across_equivalent_sql(tmp_path):
+    repository = DorisRepository(_settings(tmp_path))
+    database = EpochAwareDb()
+    repository.db = database
+    snapshot = repository.capture_data_snapshot("semantic-v1")
+    semantic_fingerprint = "a" * 64
+    scope_fingerprint = "b" * 64
+
+    first = repository.query(
+        "SELECT SUM(amount) AS total_amount FROM facts",
+        data_snapshot_contract=snapshot,
+        semantic_request_fingerprint=semantic_fingerprint,
+        scope_fingerprint=scope_fingerprint,
+    )
+    second = repository.query(
+        "SELECT SUM(amount) total_amount FROM facts",
+        data_snapshot_contract=snapshot,
+        semantic_request_fingerprint=semantic_fingerprint,
+        scope_fingerprint=scope_fingerprint,
+    )
+
+    assert second == first
+    assert database.data_calls == 1
+    assert repository.last_cache_hit
+    assert repository.cache_trace()["lastCacheIdentityKind"] == "SEMANTIC_REQUEST"
+
+    repository.query(
+        "SELECT SUM(amount) total_amount FROM facts",
+        data_snapshot_contract=snapshot,
+        semantic_request_fingerprint=semantic_fingerprint,
+        scope_fingerprint="c" * 64,
+    )
+
+    assert database.data_calls == 2
+    assert not repository.last_cache_hit
+
+
 def test_multi_query_snapshot_validation_rejects_mixed_or_non_atomic_reads():
     observed = DataSnapshotContract(
         datasource_fingerprint="datasource",

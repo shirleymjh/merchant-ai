@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from merchant_ai.graph.evidence_verification_contract import (
+    evidence_verification_attempted,
+)
 from merchant_ai.graph.query_graph_contract import graph_validation_passed
 from merchant_ai.graph.state import AgentState
 from merchant_ai.models import AgentAction
@@ -21,6 +24,8 @@ def action_prerequisite_gaps(
 def action_state_flag_ready(state: AgentState, flag: str) -> bool:
     if flag == "query_graph_validation_passed":
         return graph_validation_passed(state)
+    if flag == "evidence_graph_verified":
+        return evidence_verification_attempted(state)
     return bool(state.get(flag))
 
 

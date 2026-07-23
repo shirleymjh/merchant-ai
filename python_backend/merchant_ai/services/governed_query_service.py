@@ -451,8 +451,13 @@ class GovernedQueryService:
         )
 
 
-class LegacyGroundedQueryBackend:
-    """Compatibility adapter that collapses the existing serial tool chain."""
+class CallbackGroundedQueryBackend:
+    """Internal adapter that collapses governed query stages behind callbacks.
+
+    The callbacks are runtime services rather than caller-visible tools. This
+    keeps ``query_data`` as the public facade while preserving independently
+    testable deterministic stages.
+    """
 
     def __init__(
         self,
@@ -626,14 +631,14 @@ class LegacyGroundedQueryBackend:
         )
 
 
-def classify_legacy_query_payload(
+def classify_query_stage_payload(
     request: QueryRequest,
     payload: Mapping[str, Any],
     *,
     stage: str,
 ) -> QueryAttemptResult:
     if str(stage or "").upper() == "CONTRACT":
-        result = LegacyGroundedQueryBackend._prepared_result(request, payload)
+        result = CallbackGroundedQueryBackend._prepared_result(request, payload)
         if result is not None:
             return result
         return QueryAttemptResult(
@@ -643,7 +648,7 @@ def classify_legacy_query_payload(
             code="QUERY_BATCH_PREPARED_NOT_EXECUTED",
             next_actions=["EXECUTE_QUERY_BATCH"],
         )
-    return LegacyGroundedQueryBackend._terminal_result(
+    return CallbackGroundedQueryBackend._terminal_result(
         request,
         payload,
         stage=stage,

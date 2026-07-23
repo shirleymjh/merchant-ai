@@ -341,8 +341,10 @@ def test_legacy_population_fields_on_detail_are_discarded() -> None:
     assert result.valid is True
     assert result.contract is not None
     detail = result.contract.goal_map()["detail.orders"]
-    assert not hasattr(detail, "population_scope")
-    assert not hasattr(detail, "population_goal_ids")
+    # Compatibility fields remain on trusted checkpoint models, but model
+    # declarations cannot set them. The normalizer restores safe defaults.
+    assert detail.population_scope == "ALL_MATCHING_ROWS"
+    assert detail.population_goal_ids == []
 
 
 def test_explicit_all_matching_rows_population_is_accepted() -> None:

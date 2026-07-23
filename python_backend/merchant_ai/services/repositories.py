@@ -272,6 +272,9 @@ class DorisRepository:
         self.query_cache = build_ttl_cache("doris_select", settings, settings.cache_doris_select_ttl_seconds)
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self.last_cache_identity_kind = ""
+        self.last_semantic_request_fingerprint = ""
+        self.last_scope_fingerprint = ""
         self.last_data_snapshot = DataSnapshotContract()
         self.last_degraded_reason: Dict[str, Any] = {}
 
@@ -282,9 +285,14 @@ class DorisRepository:
         cancel_events: Optional[Iterable[Any]] = None,
         timeout_seconds: Optional[int] = None,
         data_snapshot_contract: Optional[DataSnapshotContract] = None,
+        semantic_request_fingerprint: str = "",
+        scope_fingerprint: str = "",
     ) -> List[Dict[str, Any]]:
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self.last_cache_identity_kind = ""
+        self.last_semantic_request_fingerprint = ""
+        self.last_scope_fingerprint = ""
         params_list = list(params or [])
         snapshot = data_snapshot_contract or DataSnapshotContract(
             unsupported_reason="DATA_SNAPSHOT_CONTRACT_NOT_SUPPLIED"
@@ -292,11 +300,25 @@ class DorisRepository:
         self.last_data_snapshot = snapshot.model_copy(deep=True)
         snapshot_current = self._snapshot_is_current(snapshot)
         cacheable = self._cacheable_query(sql) and snapshot_current
+        semantic_fingerprint = str(semantic_request_fingerprint or "").strip().lower()
+        governed_scope_fingerprint = str(scope_fingerprint or "").strip().lower()
+        semantic_identity_available = (
+            self._valid_sha256(semantic_fingerprint)
+            and self._valid_sha256(governed_scope_fingerprint)
+        )
+        query_identity = (
+            {
+                "semanticRequestFingerprint": semantic_fingerprint,
+                "scopeFingerprint": governed_scope_fingerprint,
+            }
+            if semantic_identity_available
+            else {"sql": normalize_sql_for_cache(sql)}
+        )
         cache_key = (
             stable_cache_key(
                 "doris",
                 {
-                    "sql": normalize_sql_for_cache(sql),
+                    "queryIdentity": query_identity,
                     "params": params_list,
                     "snapshot": snapshot.cache_identity(),
                 },
@@ -304,6 +326,16 @@ class DorisRepository:
             if cacheable
             else ""
         )
+        if cache_key:
+            self.last_cache_identity_kind = (
+                "SEMANTIC_REQUEST" if semantic_identity_available else "SQL"
+            )
+            self.last_semantic_request_fingerprint = (
+                semantic_fingerprint if semantic_identity_available else ""
+            )
+            self.last_scope_fingerprint = (
+                governed_scope_fingerprint if semantic_identity_available else ""
+            )
         if cache_key:
             cached = self.query_cache.get(cache_key)
             if cached is not None:
@@ -345,6 +377,9 @@ class DorisRepository:
 
         self.last_cache_hit = False
         self.last_cache_key = ""
+        self.last_cache_identity_kind = ""
+        self.last_semantic_request_fingerprint = ""
+        self.last_scope_fingerprint = ""
         snapshot = data_snapshot_contract or DataSnapshotContract(
             unsupported_reason="DATA_SNAPSHOT_CONTRACT_NOT_SUPPLIED"
         )
@@ -546,11 +581,19 @@ class DorisRepository:
         safe_table = safe_identifier(table_name)
         return self.query("SHOW PARTITIONS FROM `%s`" % safe_table)
 
-    def explain_verbose(self, sql: str) -> List[Dict[str, Any]]:
+    def explain_verbose(
+        self,
+        sql: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> List[Dict[str, Any]]:
         statement = str(sql or "").strip()
         if not statement:
             raise ValueError("sql is required for EXPLAIN VERBOSE")
-        return self.query("EXPLAIN VERBOSE %s" % statement)
+        kwargs: Dict[str, Any] = {}
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = max(1, int(timeout_seconds))
+        return self.query("EXPLAIN VERBOSE %s" % statement, **kwargs)
 
     def sample_rows(
         self,
@@ -647,6 +690,11 @@ class DorisRepository:
         trace = self.query_cache.trace()
         trace["lastCacheHit"] = self.last_cache_hit
         trace["lastCacheKey"] = self.last_cache_key
+        trace["lastCacheIdentityKind"] = self.last_cache_identity_kind
+        trace["lastSemanticRequestFingerprint"] = (
+            self.last_semantic_request_fingerprint
+        )
+        trace["lastScopeFingerprint"] = self.last_scope_fingerprint
         trace["lastDataSnapshot"] = self.last_data_snapshot.model_dump(
             by_alias=True,
             exclude={"captured_at"},
@@ -665,6 +713,13 @@ class DorisRepository:
             return False
         volatile = [" rand(", " random(", " now(", " current_timestamp", " uuid("]
         return not any(token in " " + text for token in volatile)
+
+    @staticmethod
+    def _valid_sha256(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        return len(text) == 64 and all(
+            character in "0123456789abcdef" for character in text
+        )
 
 
 def normalize_sql_for_cache(sql: str) -> str:

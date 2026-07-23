@@ -229,7 +229,8 @@ def test_published_rule_does_not_close_data_tools_for_mixed_goals() -> None:
         "detail.records",
     ]
     assert "propose_grounded_execution_graph" in visible_names
-    assert "propose_grounded_contract" in visible_names
+    assert "query_data" in visible_names
+    assert "query_batch" in visible_names
     assert "compose_verified_rule_answer" not in visible_names
 
 
@@ -326,4 +327,3 @@ def test_mixed_finalizer_binds_rule_and_query_artifacts_once() -> None:
     )
     assert composed["goalAnswerCoverage"]["passed"] is True
     assert kernel.compose_calls == 1
-

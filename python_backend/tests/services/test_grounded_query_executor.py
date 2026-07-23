@@ -35,6 +35,7 @@ from merchant_ai.services.grounded_query_contract import (
     materialize_grounded_asset_pack,
 )
 from merchant_ai.services.grounded_query_executor import GroundedQueryExecutionKernel
+from merchant_ai.services.grounded_query_proof import build_grounded_query_proof
 from merchant_ai.services.grounded_population_runtime_gate import (
     GroundedPopulationExecutionGate,
     PopulationPreExecutionNodeReference,
@@ -49,7 +50,10 @@ from merchant_ai.services.grounded_population_gate_coordinator import (
 from merchant_ai.services.grounded_result_streaming import (
     grounded_canonical_json_sha256,
 )
-from merchant_ai.services.grounded_context_workspace import GroundedContextWorkspace
+from merchant_ai.services.grounded_context_workspace import (
+    GroundedContextWorkspace,
+    grounded_context_owner_fingerprint,
+)
 from merchant_ai.services.grounded_runtime_budget import (
     GroundedRuntimeBudget,
     GroundedRuntimeBudgetExceeded,
@@ -63,12 +67,53 @@ from merchant_ai.services.grounded_sql_candidate import (
 class FakeDoris:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.semantic_cache_identities: list[tuple[str, str]] = []
         self.last_cache_hit = False
         self.last_cache_key = ""
 
-    def query(self, sql: str, *, timeout_seconds: int) -> list[dict[str, object]]:
+    def query(
+        self,
+        sql: str,
+        *,
+        timeout_seconds: int,
+        semantic_request_fingerprint: str = "",
+        scope_fingerprint: str = "",
+    ) -> list[dict[str, object]]:
         self.calls.append((sql, timeout_seconds))
+        self.semantic_cache_identities.append(
+            (semantic_request_fingerprint, scope_fingerprint)
+        )
         return [{"order_cnt_1d": 129, "refund_amt_1d": 4437.15}]
+
+
+class FakePhysicalPlanDoris(FakeDoris):
+    def __init__(self) -> None:
+        super().__init__()
+        self.explain_calls: list[str] = []
+
+    def explain_verbose(self, sql: str) -> list[dict[str, object]]:
+        self.explain_calls.append(sql)
+        return [
+            {
+                "plan": (
+                    "TABLE: ads_merchant_profile\n"
+                    "tabletRatio=1/1\npartitions=1/1"
+                )
+            }
+        ]
+
+
+class FakeUnprunedPhysicalPlanDoris(FakePhysicalPlanDoris):
+    def explain_verbose(self, sql: str) -> list[dict[str, object]]:
+        self.explain_calls.append(sql)
+        return [
+            {
+                "plan": (
+                    "TABLE: ads_merchant_profile\n"
+                    "tabletRatio=1/1\npartitions=30/30"
+                )
+            }
+        ]
 
 
 class FakeDetailDoris(FakeDoris):
@@ -392,6 +437,16 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
     )
 
     assert len(repository.calls) == 1
+    assert repository.semantic_cache_identities == [
+        (
+            grounded_query_contract_fingerprint(contract),
+            grounded_context_owner_fingerprint(
+                "99999999999999999999999999999999",
+                "merchant_admin",
+                {},
+            ),
+        )
+    ]
     sql = repository.calls[0][0]
     assert "SUM(`order_cnt_1d`) AS `order_cnt_1d`" in sql
     assert "SUM(`refund_amt_1d`) AS `refund_amt_1d`" in sql
@@ -415,6 +470,154 @@ def test_direct_executor_has_no_node_agent_and_preserves_metric_labels(tmp_path)
 
     verified = EvidenceVerifier().verify(contract.question, preparation.plan, result)
     assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_direct_executor_seals_doris_physical_plan_before_business_query(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    contract.time_field = GroundedTimeFieldBinding(
+        semantic_ref_id="semantic:经营画像:ads_merchant_profile:column:pt",
+        topic="经营画像",
+        table="ads_merchant_profile",
+        column="pt",
+        time_role="BUSINESS_EVENT",
+        partition_pruning_column="pt",
+        partition_pruning_policy="EXACT_EQUIVALENT",
+    )
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    physical = pack.tables[0].metadata["physicalMetadata"]
+    physical["partitionColumns"] = ["pt"]
+    physical["partitionCount"] = 1
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakePhysicalPlanDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
+    )
+
+    result = executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-physical-plan",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    assert repository.explain_calls == [result.merged_query_bundle.sql]
+    assert result.merged_query_bundle.failed is False
+    assert result.physical_plan_assessment["status"] == "VERIFIED"
+    assert result.physical_plan_assessment["executable"] is True
+    proof = build_grounded_query_proof(
+        question=contract.question,
+        contract=contract,
+        execution_plan=preparation.plan,
+        run_result=result,
+        merchant_scope_fingerprint=grounded_context_owner_fingerprint(
+            "99999999999999999999999999999999",
+            "merchant_admin",
+            {},
+        ),
+    )
+    verified = EvidenceVerifier().verify_proof(proof)
+    assert verified.passed, [gap.model_dump() for gap in verified.blocking_gaps]
+
+
+def test_simple_query_without_physical_obligation_skips_explain(tmp_path) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakePhysicalPlanDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
+    )
+
+    result = executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-no-physical-obligation",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    assert result.merged_query_bundle.failed is False
+    assert repository.explain_calls == []
+    assert result.physical_plan_assessment == {}
+
+
+def test_partition_pruning_gap_blocks_business_query_before_execution(
+    tmp_path,
+) -> None:
+    settings = get_settings()
+    contract = scalar_contract()
+    contract.time_field = GroundedTimeFieldBinding(
+        semantic_ref_id="semantic:经营画像:ads_merchant_profile:column:pt",
+        topic="经营画像",
+        table="ads_merchant_profile",
+        column="pt",
+        time_role="BUSINESS_EVENT",
+        partition_pruning_column="pt",
+        partition_pruning_policy="EXACT_EQUIVALENT",
+    )
+    pack = materialize_grounded_asset_pack(contract, TopicAssetService(settings))
+    physical = pack.tables[0].metadata["physicalMetadata"]
+    physical["partitionColumns"] = ["pt"]
+    physical["partitionCount"] = 30
+    preparation = compile_grounded_query(contract, pack)
+    repository = FakeUnprunedPhysicalPlanDoris()
+    executor = GroundedQueryExecutionKernel(
+        repository,
+        settings,
+        access_control=explicit_test_access_control(
+            settings,
+            tmp_path,
+            contract,
+            merchant_id="99999999999999999999999999999999",
+            role="merchant_admin",
+        ),
+    )
+
+    result = executor.execute_contract(
+        "99999999999999999999999999999999",
+        contract,
+        preparation.plan,
+        pack,
+        contract.question,
+        run_id="run-physical-plan-blocked",
+        access_role="merchant_admin",
+        execution_preparation=preparation,
+    )
+
+    assert len(repository.explain_calls) == 1
+    assert repository.calls == []
+    assert result.merged_query_bundle.failed is True
+    assert result.physical_plan_assessment["executable"] is False
+    assert "PARTITION_SCAN_NOT_REDUCED" in {
+        gap.code for gap in result.evidence_gaps
+    }
 
 
 def test_grounded_query_stages_before_verified_manifest_publication(

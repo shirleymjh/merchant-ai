@@ -73,6 +73,9 @@ from merchant_ai.services.grounded_sql_candidate import (
     GroundedSqlValidationResult,
     grounded_query_contract_fingerprint,
 )
+from merchant_ai.services.grounded_query_proof import (
+    build_grounded_query_proof,
+)
 from merchant_ai.services.routing import (
     KeywordExtractService,
     RouteSlotExtractor,
@@ -179,6 +182,9 @@ class GroundedVerifiedQueryArtifact(APIModel):
     semantic_activation_fingerprint: str = ""
     semantic_activation_seal_fingerprint: str = ""
     semantic_activation_topics: list[str] = Field(default_factory=list)
+    query_proof_version: str = "grounded_query_proof.v1"
+    query_proof_fingerprint: str = ""
+    executed_sql_ast_fingerprint: str = ""
     ledger_fingerprint: str = ""
     trusted_descriptor: Optional[GroundedTrustedArtifactDescriptor] = None
     created_at: str = ""
@@ -2837,11 +2843,37 @@ class GroundedRuntimeKernel:
         verifier_kwargs: dict[str, Any] = {}
         if _plan_has_knowledge_evidence_contract(plan):
             verifier_kwargs["allowed_knowledge_refs"] = allowed_knowledge_refs
-        verified = self.verifier.verify(
-            session.question,
-            plan,
-            verifier_run_result,
-            **verifier_kwargs,
+        semantic_activation_fingerprint = str(
+            (
+                session.semantic_activation_seal.semantic_activation_fingerprint
+                if session.semantic_activation_seal is not None
+                else ""
+            )
+            or ""
+        )
+        query_proof = build_grounded_query_proof(
+            question=session.question,
+            contract=session.active_contract,
+            execution_plan=plan,
+            run_result=verifier_run_result,
+            merchant_scope_fingerprint=grounded_context_owner_fingerprint(
+                session.merchant_id,
+                session.access_role,
+                session.user_scope,
+            ),
+            semantic_activation_fingerprint=semantic_activation_fingerprint,
+            sql_validation=session.active_sql_validation,
+        )
+        verify_proof = getattr(self.verifier, "verify_proof", None)
+        verified = (
+            verify_proof(query_proof, **verifier_kwargs)
+            if callable(verify_proof)
+            else self.verifier.verify(
+                session.question,
+                plan,
+                verifier_run_result,
+                **verifier_kwargs,
+            )
         )
         if not isinstance(verified, VerifiedEvidence):
             verified = VerifiedEvidence.model_validate(verified)
@@ -2954,6 +2986,10 @@ class GroundedRuntimeKernel:
                         else "VERIFIED_IN_MEMORY"
                     ),
                     result_artifact_receipts=published_receipts,
+                    query_proof_fingerprint=query_proof.proof_fingerprint,
+                    executed_sql_ast_fingerprint=(
+                        query_proof.sql_ast_fingerprint
+                    ),
                     append_to_ledger=(
                         pre_ledger_authorizer is None
                     ),
@@ -3835,6 +3871,8 @@ class GroundedRuntimeKernel:
         verified: VerifiedEvidence,
         publication_status: str = "VERIFIED_IN_MEMORY",
         result_artifact_receipts: Sequence[dict[str, Any]] = (),
+        query_proof_fingerprint: str = "",
+        executed_sql_ast_fingerprint: str = "",
         append_to_ledger: bool = True,
     ) -> GroundedVerifiedQueryArtifact:
         if session.active_contract is None:
@@ -3978,6 +4016,12 @@ class GroundedRuntimeKernel:
                 list(semantic_seal.exact_topics)
                 if semantic_seal is not None
                 else []
+            ),
+            query_proof_fingerprint=str(
+                query_proof_fingerprint or ""
+            ),
+            executed_sql_ast_fingerprint=str(
+                executed_sql_ast_fingerprint or ""
             ),
             created_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -4705,6 +4749,11 @@ def verified_query_artifact_integrity_fingerprint(
             ),
             "semanticActivationTopics": list(
                 artifact.semantic_activation_topics
+            ),
+            "queryProofVersion": artifact.query_proof_version,
+            "queryProofFingerprint": artifact.query_proof_fingerprint,
+            "executedSqlAstFingerprint": (
+                artifact.executed_sql_ast_fingerprint
             ),
             "verifiedEvidenceFingerprint": _stable_json_hash(
                 artifact.verified_evidence.model_dump(
