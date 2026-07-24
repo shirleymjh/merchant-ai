@@ -208,7 +208,7 @@ def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
             )
         )
     )
-    memory = app_main.workflow.memory_store.load("100")
+    memory = app_main.runtime.services.memory_store.load("100")
     memory["knowledgeSuggestions"] = [
         {
             "suggestionId": "ks_store_rule",
@@ -218,7 +218,7 @@ def test_merchant_can_confirm_chat_knowledge_suggestion_through_api(tmp_path):
             "payload": {"memoryType": "correction", "correctionText": "本店退款率超过8%时提醒"},
         }
     ]
-    app_main.workflow.memory_store.save("100", memory)
+    app_main.runtime.services.memory_store.save("100", memory)
 
     unauthorized = client.post(
         "/api/merchant/knowledge-suggestions/ks_store_rule/action",

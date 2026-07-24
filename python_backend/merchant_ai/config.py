@@ -244,6 +244,8 @@ class Settings(BaseSettings):
         5, validation_alias="YSHOPPING_MEMORY_QUERY_UNDERSTANDING_MAX_TIMEOUT_SECONDS"
     )
     memory_curator_enabled: bool = Field(True, validation_alias="YSHOPPING_MEMORY_CURATOR_ENABLED")
+    memory_curator_async: bool = Field(True, validation_alias="YSHOPPING_MEMORY_CURATOR_ASYNC")
+    memory_curator_workers: int = Field(1, validation_alias="YSHOPPING_MEMORY_CURATOR_WORKERS")
     memory_curator_timeout_seconds: int = Field(8, validation_alias="YSHOPPING_MEMORY_CURATOR_TIMEOUT_SECONDS")
     memory_curator_min_confidence: float = Field(0.72, validation_alias="YSHOPPING_MEMORY_CURATOR_MIN_CONFIDENCE")
     memory_curator_max_candidates: int = Field(3, validation_alias="YSHOPPING_MEMORY_CURATOR_MAX_CANDIDATES")
@@ -428,6 +430,14 @@ class Settings(BaseSettings):
     grounded_core_model_retry_attempts: int = Field(
         2,
         validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_RETRY_ATTEMPTS",
+    )
+    grounded_core_model_retry_base_delay_ms: int = Field(
+        500,
+        validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_RETRY_BASE_DELAY_MS",
+    )
+    grounded_core_model_retry_max_delay_ms: int = Field(
+        4000,
+        validation_alias="YSHOPPING_GROUNDED_CORE_MODEL_RETRY_MAX_DELAY_MS",
     )
     grounded_execution_graph_max_revisions: int = Field(
         2,

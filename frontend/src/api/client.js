@@ -2,6 +2,17 @@ function configuredMerchantId() {
   return String(globalThis.__MERCHANT_AI_RUNTIME__?.merchantId || '').trim()
 }
 
+function configuredDevOpsActor() {
+  const runtime = globalThis.__MERCHANT_AI_RUNTIME__ || {}
+  if (runtime.internalMode !== true) return ''
+  return String(
+    runtime.opsActor
+    || runtime.identity?.userId
+    || runtime.identity?.displayName
+    || ''
+  ).trim()
+}
+
 function merchantIdFrom(context = {}, options = {}) {
   return String(
     options.merchantId
@@ -23,17 +34,30 @@ function merchantQuery(merchantId) {
 }
 
 async function request(path, options = {}) {
+  const { headers: optionHeaders = {}, ...requestOptions } = options
   const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...requestOptions,
     headers: {
       'Content-Type': 'application/json',
-      ...(options.headers || {})
-    },
-    ...options
+      ...optionHeaders
+    }
   })
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`)
   }
   return response.json()
+}
+
+async function opsRequest(path, options = {}) {
+  const actor = configuredDevOpsActor()
+  return request(path, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...(actor ? { 'X-Dev-Ops-Actor': actor } : {})
+    }
+  })
 }
 
 export async function sendMessage(message, context, messageHistory = []) {
@@ -177,34 +201,48 @@ export async function getDailyReport(merchantId = '') {
 }
 
 export async function getTopics() {
-  return request('/api/topics')
+  return opsRequest('/api/topics')
 }
 
 export async function buildTopicAsset(payload) {
-  return request('/api/topics/build', { method: 'POST', body: JSON.stringify(payload) })
+  return opsRequest('/api/topics/build', { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export async function getTopicAssets(topic) {
-  return request(`/api/topics/${encodeURIComponent(topic)}/assets`)
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/assets`)
 }
 
 export async function getTopicTableGovernance(topic, tableName) {
-  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/governance`)
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/governance`)
 }
 
 export async function saveTopicTableDraft(topic, tableName, payload) {
-  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/draft`, { method: 'POST', body: JSON.stringify(payload) })
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/draft`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function submitTopicTableReview(topic, tableName, payload = {}) {
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/submit-review`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function reviewTopicTable(topic, tableName, payload) {
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/review`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
 }
 
 export async function publishTopicTable(topic, tableName, payload) {
-  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/publish`, { method: 'POST', body: JSON.stringify(payload) })
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/publish`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export async function rollbackTopicTable(topic, tableName, version = '', payload = {}) {
   const params = new URLSearchParams({ version })
   if (payload.reviewer) params.set('reviewer', payload.reviewer)
   if (payload.reason) params.set('reason', payload.reason)
-  return request(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/rollback?${params}`, { method: 'POST' })
+  return opsRequest(`/api/topics/${encodeURIComponent(topic)}/tables/${encodeURIComponent(tableName)}/rollback?${params}`, { method: 'POST' })
 }
 
 export async function getKnowledgeSuggestions(status = '', merchantId = '') {
@@ -213,27 +251,33 @@ export async function getKnowledgeSuggestions(status = '', merchantId = '') {
   const effectiveMerchantId = String(merchantId || configuredMerchantId()).trim()
   if (effectiveMerchantId) params.set('merchantId', effectiveMerchantId)
   const suffix = params.toString() ? `?${params}` : ''
-  return request(`/api/ops/knowledge-suggestions${suffix}`)
+  return opsRequest(`/api/ops/knowledge-suggestions${suffix}`)
+}
+
+export async function checkKnowledgeSuggestionConflicts(id, merchantId = '') {
+  return opsRequest(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/conflict-check${merchantQuery(merchantId || configuredMerchantId())}`, {
+    method: 'POST'
+  })
 }
 
 export async function reviewKnowledgeSuggestion(id, payload) {
-  return request(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/review${merchantQuery(payload?.merchantId || configuredMerchantId())}`, {
+  return opsRequest(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/review${merchantQuery(payload?.merchantId || configuredMerchantId())}`, {
     method: 'POST', body: JSON.stringify(payload)
   })
 }
 
 export async function publishKnowledgeSuggestion(id, payload) {
-  return request(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/publish${merchantQuery(payload?.merchantId || configuredMerchantId())}`, {
+  return opsRequest(`/api/ops/knowledge-suggestions/${encodeURIComponent(id)}/publish${merchantQuery(payload?.merchantId || configuredMerchantId())}`, {
     method: 'POST', body: JSON.stringify(payload)
   })
 }
 
 export async function getAnalysisCatalog() {
-  return request('/api/ops/skill-market')
+  return opsRequest('/api/ops/skill-market')
 }
 
 export async function installAnalysisPlan(name, payload = {}) {
-  return request(`/api/ops/skill-market/${encodeURIComponent(name)}/install`, {
+  return opsRequest(`/api/ops/skill-market/${encodeURIComponent(name)}/install`, {
     method: 'POST', body: JSON.stringify(payload)
   })
 }

@@ -223,6 +223,18 @@ def test_new_thread_receives_personal_memory_and_dynamic_session_coordinates(tmp
     store = StructuredMemoryStore(settings)
     _seed(store)
     session = _session("user_a", "新会话看交易趋势")
+    session.trusted_bootstrap_context = {
+        "trustedExecutionScope": {
+            "merchantId": "seller_100",
+            "authorizedStoreIds": ["S1"],
+        },
+        "topicL0Manifests": [
+            {
+                "topic": "电商交易",
+                "refId": "semantic:topic:电商交易",
+            }
+        ],
+    }
 
     envelope = _invoke(
         GroundedTrustedSessionContextMiddleware(settings, store),
@@ -232,6 +244,10 @@ def test_new_thread_receives_personal_memory_and_dynamic_session_coordinates(tmp
     )
 
     assert _preference_values(envelope) == ["默认关注新加坡"]
+    assert envelope["trustedExecutionScope"]["merchantId"] == "seller_100"
+    assert envelope["trustedBootstrapContext"]["topicL0Manifests"][0][
+        "topic"
+    ] == "电商交易"
     runtime_state = envelope["trustedRuntimeState"]
     assert runtime_state["threadId"] == "thread_new"
     assert runtime_state["effectiveTopics"] == ["电商交易"]

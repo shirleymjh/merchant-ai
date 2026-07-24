@@ -11,9 +11,7 @@ from merchant_ai.services.memory import (
     default_memory_status,
     filter_memory_items,
     is_metric_definition_dispute,
-    knowledge_suggestion_from_event,
     knowledge_suggestion_proposed_scope,
-    memory_event_from_state,
     memory_item_counts,
 )
 
@@ -42,8 +40,8 @@ class _CuratorLlm:
                     "kind": "personal_preference",
                     "scope": "personal",
                     "title": "区域关注偏好",
-                    "content": "我只关注新加坡和印尼的指标。",
-                    "evidenceQuote": "我只关注新加坡和印尼的指标",
+                    "content": "我平时更关注新加坡和印尼的指标。",
+                    "evidenceQuote": "我平时更关注新加坡和印尼的指标",
                     "topic": "",
                     "metricName": "",
                     "aliases": [],
@@ -90,6 +88,17 @@ class _MixedCuratorLlm:
         }
 
 
+class _NoPersonalMemoryLlm:
+    configured = True
+
+    def tool_json_chat(self, *args, **kwargs):
+        return {
+            "shouldExtract": False,
+            "reason": "one-off question without a durable personal preference",
+            "candidates": [],
+        }
+
+
 def _governance_service(payload):
     service = object.__new__(KnowledgeSuggestionGovernanceService)
     service.memory_store = _Store(payload)
@@ -120,13 +129,13 @@ def test_personal_memory_uses_automatic_quarantine_not_human_review():
     assert stored["reviewStatus"] == "evidence_gap"
 
 
-def test_metric_corrections_are_knowledge_sources_not_active_personal_memory():
+def test_metric_corrections_are_private_quarantined_traces():
     assert default_memory_status("correction", source="answer_run") == "quarantined"
     assert default_memory_status("metric_dispute", source="answer_run") == "quarantined"
     assert default_memory_status("business_focus", source="answer_run") == "active"
 
 
-def test_curator_routes_personal_preference_directly_to_memory(tmp_path):
+def test_curator_extracts_natural_personal_preference_without_memory_keywords(tmp_path):
     settings = get_settings().model_copy(
         update={
             "harness_workspace_path": str(tmp_path),
@@ -138,7 +147,7 @@ def test_curator_routes_personal_preference_directly_to_memory(tmp_path):
     event = {
         "eventId": "preference_turn",
         "memoryType": "business_focus",
-        "question": "请记住，我只关注新加坡和印尼的指标。",
+        "question": "我平时更关注新加坡和印尼的指标。",
         "topics": [],
         "metrics": [],
         "confidence": 0.8,
@@ -160,6 +169,77 @@ def test_curator_routes_personal_preference_directly_to_memory(tmp_path):
     assert preference["scope"]["userId"] == "user_1"
 
 
+def test_interaction_hook_persists_natural_preference_without_keywords(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "memory_curator_enabled": True,
+            "memory_curator_min_confidence": 0.7,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(
+        settings,
+        curator=KnowledgeCuratorService(settings, llm=_CuratorLlm()),
+    )
+
+    memory = store.update_from_state(
+        {
+            "question": "我平时更关注新加坡和印尼的指标。",
+            "answer": "好的。",
+            "requested_merchant_id": "seller_1",
+            "user_identity": {
+                "userId": "user_1",
+                "merchantId": "seller_1",
+                "permissions": ["memory.read", "memory.write"],
+            },
+            "memory_hook": {"type": "interaction_completed"},
+        }
+    )
+
+    assert [item["value"] for item in memory["preferences"]] == [
+        "我平时更关注新加坡和印尼的指标。"
+    ]
+    assert memory["memoryIngestionTrace"]["preferenceUpdates"] == 1
+
+
+def test_interaction_hook_does_not_store_chat_when_model_finds_no_preference(tmp_path):
+    settings = get_settings().model_copy(
+        update={
+            "harness_workspace_path": str(tmp_path),
+            "memory_backend": "file",
+            "memory_curator_enabled": True,
+        }
+    )
+    store = StructuredMemoryStore(settings)
+    store.ingestion_service = MemoryIngestionService(
+        settings,
+        curator=KnowledgeCuratorService(settings, llm=_NoPersonalMemoryLlm()),
+    )
+
+    memory = store.update_from_state(
+        {
+            "question": "你好",
+            "answer": "你好，有什么可以帮你？",
+            "requested_merchant_id": "seller_1",
+            "user_identity": {
+                "userId": "user_1",
+                "merchantId": "seller_1",
+            },
+            "memory_hook": {"type": "interaction_completed"},
+        }
+    )
+
+    assert memory["events"] == []
+    assert memory["preferences"] == []
+    assert memory["memoryIngestionTrace"]["written"] is False
+    assert (
+        memory["memoryIngestionTrace"]["reason"]
+        == "no_durable_personal_signal"
+    )
+
+
 def test_derived_metric_selection_is_not_itself_a_definition_dispute() -> None:
     plan = QueryPlan(intents=[QuestionIntent(answer_mode=AnswerMode.DERIVED)])
 
@@ -173,40 +253,6 @@ def test_derived_metric_selection_is_not_itself_a_definition_dispute() -> None:
         ["refund_rate"],
         plan=plan,
     )
-
-
-def test_correction_proposal_keeps_its_intent_bound_semantic_publish_target() -> None:
-    plan = QueryPlan(
-        intents=[
-            QuestionIntent(
-                answer_mode=AnswerMode.DERIVED,
-                metric_resolution={
-                    "metricKey": "refund_rate",
-                    "semanticRefId": (
-                        "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate"
-                    ),
-                },
-            )
-        ]
-    )
-    event = memory_event_from_state(
-        {
-            "question": "不对，退款率应该用退款单数 / 订单数。",
-            "requested_merchant_id": "seller_1",
-            "plan": plan,
-            "answer": "已生成待审核口径建议。",
-        }
-    )
-
-    suggestion = knowledge_suggestion_from_event(event)
-
-    assert event["knowledgePublishTarget"] == {
-        "topic": "电商退货",
-        "tableName": "dwm_trade_refund_detail_di",
-        "semanticRefId": "semantic:电商退货:dwm_trade_refund_detail_di:metric:refund_rate",
-    }
-    assert suggestion["topic"] == "电商退货"
-    assert suggestion["sourceTable"] == "dwm_trade_refund_detail_di"
 
 
 def test_mixed_correction_keeps_independent_curated_personal_preference(tmp_path) -> None:
@@ -241,7 +287,12 @@ def test_mixed_correction_keeps_independent_curated_personal_preference(tmp_path
 
     assert memory["events"][-1]["memoryType"] == "correction"
     assert memory["events"][-1]["status"] == "quarantined"
-    assert memory["knowledgeSuggestions"]
+    assert memory["knowledgeSuggestions"] == []
+    assert memory["memoryIngestionTrace"]["knowledgeSuggestionWritten"] is False
+    assert (
+        memory["memoryIngestionTrace"]["knowledgeSuggestionPolicy"]
+        == "evidence_gap_only"
+    )
     preference = next(
         item
         for item in memory["preferences"]

@@ -296,11 +296,16 @@ def test_core_model_request_without_timeout_uses_per_attempt_hard_cap() -> None:
 
 def test_core_model_timeout_retries_once_and_counts_each_provider_call() -> None:
     budget = GroundedRuntimeBudget(_limits(max_duration_seconds=90))
+    retry_delays: list[float] = []
     middleware = GroundedRuntimeBudgetMiddleware(
         SimpleNamespace(
             grounded_core_model_call_timeout_seconds=20,
             grounded_core_model_retry_attempts=2,
-        )
+            grounded_core_model_retry_base_delay_ms=500,
+            grounded_core_model_retry_max_delay_ms=4000,
+        ),
+        sleeper=retry_delays.append,
+        jitter=lambda lower, upper: upper,
     )
     runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
     original = SimpleNamespace(runtime=runtime, model_settings={})
@@ -325,14 +330,177 @@ def test_core_model_timeout_retries_once_and_counts_each_provider_call() -> None
 
     assert result is not None
     assert len(attempts) == 2
+    assert retry_delays == [0.5]
     assert all(0 < timeout <= 20 for timeout in attempts)
     report = budget.report()
+    assert report["usage"]["actionsByName"] == {
+        "grounded_core": 1
+    }
     assert report["usage"]["llmCallsByName"] == {"grounded_core": 2}
     assert report["stages"]["llm.grounded_core"]["calls"] == 2
     assert report["stages"]["llm.grounded_core"]["errors"] == 1
     assert report["stages"]["llm.grounded_core"]["successes"] == 1
     assert report["stages"]["llm.grounded_core.attempt_1"]["errors"] == 1
     assert report["stages"]["llm.grounded_core.attempt_2"]["successes"] == 1
+    assert report["stages"]["llm.grounded_core.retry_backoff"]["calls"] == 1
+
+
+def test_core_model_token_budget_counts_each_retry_input_and_output_usage() -> None:
+    budget = GroundedRuntimeBudget(
+        _limits(
+            max_llm_calls=2,
+            max_estimated_tokens=100,
+        )
+    )
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_retry_attempts=2,
+            grounded_core_model_retry_base_delay_ms=0,
+        ),
+        provider_token_counter=lambda messages, system, tools: 11,
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(
+        runtime=runtime,
+        model_settings={},
+        messages=[SimpleNamespace(content="question")],
+        tools=[],
+        system_message=None,
+    )
+    calls = 0
+
+    def handler(_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("provider timed out")
+        return SimpleNamespace(
+            result=[
+                SimpleNamespace(
+                    content="answer",
+                    usage_metadata={"output_tokens": 7},
+                )
+            ]
+        )
+
+    middleware.wrap_model_call(request, handler)
+
+    report = budget.report()
+    assert report["usage"]["actions"] == 1
+    assert report["usage"]["llmCalls"] == 2
+    assert report["usage"]["estimatedTokens"] == 29
+    assert report["usage"]["estimatedTokensByName"] == {
+        "grounded_core.input.injected_provider_counter": 22,
+        "grounded_core.output.provider_usage": 7,
+    }
+
+
+def test_core_model_circuit_fast_fails_until_cooldown_elapses() -> None:
+    now = {"value": 1_000.0}
+    budget = GroundedRuntimeBudget(
+        _limits(
+            max_actions=6,
+            max_llm_calls=6,
+        )
+    )
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_retry_attempts=1,
+            llm_circuit_threshold=2,
+            llm_circuit_cooldown_seconds=30,
+        ),
+        wall_clock=lambda: now["value"],
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(runtime=runtime, model_settings={})
+    provider_calls = 0
+
+    def failing_handler(_: Any) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise TimeoutError("provider timed out")
+
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            middleware.wrap_model_call(request, failing_handler)
+
+    with pytest.raises(RuntimeError) as circuit_open:
+        middleware.wrap_model_call(request, failing_handler)
+    assert "circuit is open" in str(circuit_open.value)
+    assert provider_calls == 2
+    assert middleware._circuit_report()["open"] is True
+
+    now["value"] += 31
+    result = middleware.wrap_model_call(request, lambda _: object())
+
+    assert result is not None
+    assert middleware._circuit_report()["open"] is False
+
+
+def test_core_model_rate_limit_uses_bounded_backoff_then_retries() -> None:
+    class RateLimitError(RuntimeError):
+        status_code = 429
+
+    budget = GroundedRuntimeBudget(
+        _limits(max_duration_seconds=90, max_llm_calls=3)
+    )
+    retry_delays: list[float] = []
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_call_timeout_seconds=20,
+            grounded_core_model_retry_attempts=3,
+            grounded_core_model_retry_base_delay_ms=200,
+            grounded_core_model_retry_max_delay_ms=1000,
+        ),
+        sleeper=retry_delays.append,
+        jitter=lambda lower, upper: upper,
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(runtime=runtime, model_settings={})
+    calls = 0
+
+    def handler(_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RateLimitError("too many requests")
+        return object()
+
+    result = middleware.wrap_model_call(request, handler)
+
+    assert result is not None
+    assert calls == 3
+    assert retry_delays == [0.2, 0.4]
+    assert budget.report()["usage"]["llmCalls"] == 3
+
+
+def test_core_model_retry_backoff_cannot_escape_run_deadline() -> None:
+    budget = GroundedRuntimeBudget(_limits(max_duration_seconds=0.1))
+    retry_delays: list[float] = []
+    middleware = GroundedRuntimeBudgetMiddleware(
+        SimpleNamespace(
+            grounded_core_model_retry_attempts=2,
+            grounded_core_model_retry_base_delay_ms=500,
+            grounded_core_model_retry_max_delay_ms=4000,
+        ),
+        sleeper=retry_delays.append,
+        jitter=lambda lower, upper: upper,
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(budget=budget))
+    request = SimpleNamespace(runtime=runtime, model_settings={})
+    calls = 0
+
+    def handler(_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("provider timed out")
+
+    with pytest.raises(GroundedRuntimeBudgetExceeded) as raised:
+        middleware.wrap_model_call(request, handler)
+
+    assert raised.value.breaches == ("duration",)
+    assert calls == 1
+    assert retry_delays == []
 
 
 def test_core_model_does_not_retry_non_timeout_provider_error() -> None:

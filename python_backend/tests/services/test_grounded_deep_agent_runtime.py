@@ -42,6 +42,7 @@ from merchant_ai.services.grounded_deep_agent_runtime import (
     GroundedCoreToolBoundaryMiddleware,
     GroundedRuntimeBudgetMiddleware,
     GroundedSemanticBackend,
+    GroundedToolCallRepairMiddleware,
     GroundedTrustedSessionContextMiddleware,
     _core_visible_binding_hints,
     _grounded_contract_sql_obligations,
@@ -624,10 +625,12 @@ class FakeGraph:
         self.action = action
         self.invocations: list[dict[str, Any]] = []
         self.configs: list[Any] = []
+        self.contexts: list[Any] = []
 
     def invoke(self, payload: dict[str, Any], *, config: Any, context: Any) -> None:
         self.invocations.append(payload)
         self.configs.append(config)
+        self.contexts.append(context)
         if self.action == "clarify":
             self.tools["ask_human"].func(
                 question="请问要查询最近多少天？",
@@ -713,6 +716,33 @@ def runtime(factory: CapturingFactory, kernel: FakeKernel | None = None) -> Grou
         agent_factory=factory,
         conversation_online_authority=StandaloneConversationAuthority(),
     )
+
+
+def model_call_request(
+    messages: list[Any],
+    *,
+    session: GroundedDeepAgentSession,
+) -> Any:
+    request = SimpleNamespace(
+        messages=messages,
+        tools=[],
+        system_message=HumanMessage(content="system"),
+        runtime=SimpleNamespace(
+            context=GroundedDeepAgentRunContext(
+                thread_id="tool-repair-thread",
+                run_id="tool-repair-run",
+                session=session,
+            )
+        ),
+    )
+
+    def override(**updates: Any) -> Any:
+        values = dict(request.__dict__)
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    request.override = override
+    return request
 
 
 def declare_single_metric_goal(
@@ -1499,6 +1529,7 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert factory.kwargs["backend"] is not None
     assert [item.name for item in factory.kwargs["middleware"]] == [
         "GroundedTrustedSessionContextMiddleware",
+        "GroundedToolCallRepairMiddleware",
         "GroundedContextManagementMiddleware",
         "GroundedRuntimeBudgetMiddleware",
         "GroundedCoreToolBoundaryMiddleware",
@@ -1509,14 +1540,18 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     )
     assert isinstance(
         factory.kwargs["middleware"][1],
-        GroundedContextManagementMiddleware,
+        GroundedToolCallRepairMiddleware,
     )
     assert isinstance(
         factory.kwargs["middleware"][2],
-        GroundedRuntimeBudgetMiddleware,
+        GroundedContextManagementMiddleware,
     )
     assert isinstance(
         factory.kwargs["middleware"][3],
+        GroundedRuntimeBudgetMiddleware,
+    )
+    assert isinstance(
+        factory.kwargs["middleware"][4],
         GroundedCoreToolBoundaryMiddleware,
     )
     assert [item["name"] for item in factory.kwargs["subagents"]] == [
@@ -1534,6 +1569,15 @@ def test_initialization_keeps_skill_bodies_out_of_parent_core() -> None:
     assert "READ_CONTEXT" in researcher["description"]
     assert factory.kwargs["skills"] is None
     assert "execute SQL" in factory.kwargs["subagents"][0]["system_prompt"]
+    assert '<prompt id="grounded.native.general_purpose"' in (
+        factory.kwargs["subagents"][0]["system_prompt"]
+    )
+    assert '<prompt id="grounded.native.researcher"' in (
+        factory.kwargs["subagents"][1]["system_prompt"]
+    )
+    assert '<prompt id="grounded.core.system"' in factory.kwargs[
+        "system_prompt"
+    ]
     assert "Use query_data for one governed query" in factory.kwargs["system_prompt"]
     assert "capabilities and constraints, not as a prewritten procedure" in (
         factory.kwargs["system_prompt"]
@@ -2838,7 +2882,11 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
 
     assert kernel.route_calls == 1
     assert kernel.recall_queries == ["工单量最多的商品"]
-    first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
+    assert factory.graph.invocations[0]["messages"][0]["content"] == (
+        "工单量最多的商品"
+    )
+    first = factory.graph.contexts[0].session.trusted_bootstrap_context
+    assert "question" not in first
     assert first["userInputRequirements"]["explicitTimeExpression"] is False
     assert first["trustedExecutionScope"]["merchantScopeBound"] is True
     assert first["trustedExecutionScope"]["merchantId"] == "m-1"
@@ -2871,6 +2919,13 @@ def test_run_bootstraps_topic_and_scoped_recall_into_first_core_context() -> Non
         "skillProseCountsAsGoalCoverage": False,
         "retryRule": "SAME_SUB_GOAL_NEXT_GENERATION",
     }
+    root_prompt_trace = response.debug_trace["harness"]["promptManagement"][
+        "root"
+    ]
+    assert root_prompt_trace["promptId"] == "grounded.core.system"
+    assert root_prompt_trace["version"] == "v1"
+    assert root_prompt_trace["templateFingerprint"]
+    assert root_prompt_trace["renderFingerprint"]
     assert response.clarification is not None
     assert response.debug_trace["harness"]["legacyFallbackUsed"] is False
 
@@ -2884,8 +2939,9 @@ def test_run_uses_retrieval_question_without_mutating_core_question() -> None:
     outer.run("那退款呢？", "m-1")
 
     assert kernel.recall_queries == ["最近7天的退款情况"]
-    first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
-    assert first["question"] == "那退款呢？"
+    assert factory.graph.invocations[0]["messages"][0]["content"] == "那退款呢？"
+    first = factory.graph.contexts[0].session.trusted_bootstrap_context
+    assert "question" not in first
     assert "retrievalQuestion" not in first["trustedConversationContext"][
         "resolution"
     ]
@@ -2938,7 +2994,10 @@ def test_unresolved_topic_route_opens_discovery_without_merchant_selection() -> 
 
     assert kernel.route_calls == 1
     assert len(factory.graph.invocations) == 1
-    first = json.loads(factory.graph.invocations[0]["messages"][0]["content"])
+    assert factory.graph.invocations[0]["messages"][0]["content"] == (
+        "今天天气怎么样？"
+    )
+    first = factory.graph.contexts[0].session.trusted_bootstrap_context
     assert first["topicRouting"]["routingMode"] == "open_discovery"
     assert first["topicRouting"]["clarificationRequired"] is False
     assert first["topicL0Manifests"] == []
@@ -2962,6 +3021,29 @@ def test_provider_timeout_is_returned_as_controlled_operational_failure() -> Non
     assert failure["code"] == "GROUNDED_PROVIDER_TIMEOUT"
     assert failure["retryable"] is True
     assert "模型调用时限" in response.answer
+
+
+def test_transient_provider_failure_is_returned_as_controlled_operational_failure() -> None:
+    factory = CapturingFactory(action="none")
+    outer = runtime(factory, FakeKernel())
+
+    class RateLimitError(RuntimeError):
+        status_code = 429
+
+    class RateLimitedGraph:
+        @staticmethod
+        def invoke(payload: dict[str, Any], *, config: Any, context: Any) -> None:
+            del payload, config, context
+            raise RateLimitError("too many requests")
+
+    outer.deep_agent_graph = RateLimitedGraph()
+    response = outer.run("工单量", "m-1")
+    failure = response.debug_trace["harness"]["operationalFailure"]
+
+    assert failure["code"] == "GROUNDED_PROVIDER_TRANSIENT_FAILURE"
+    assert failure["reason"] == "rate_limit"
+    assert failure["retryable"] is True
+    assert "模型服务暂时不可用" in response.answer
 
 
 def test_post_answer_tail_timeout_cannot_overwrite_verified_answer() -> None:
@@ -3403,6 +3485,92 @@ def test_tool_loop_guard_is_not_limited_to_filesystem_tools() -> None:
     assert json.loads(str(repeated.content))["code"] == ("TOOL_CALL_NO_PROGRESS")
 
 
+def test_tool_loop_guard_warns_then_hard_blocks_repeated_tool_type() -> None:
+    middleware = GroundedCoreToolBoundaryMiddleware(
+        GroundedSemanticBackend(FakeSemanticCatalog()),
+        settings=SimpleNamespace(
+            middleware_loop_guard_threshold=3,
+            middleware_tool_repeat_warning_threshold=5,
+            middleware_tool_repeat_hard_stop_threshold=6,
+            middleware_tool_type_warning_threshold=3,
+            middleware_tool_type_hard_stop_threshold=4,
+            middleware_tool_loop_window_size=6,
+        ),
+    )
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="tool-type-loop-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        ),
+        question_goal_contract=OriginalQuestionGoalContract(
+            question="工单量",
+            goals=[
+                MetricQuestionGoal(
+                    goal_id="metric.tickets",
+                    label="工单量",
+                )
+            ],
+        ),
+    )
+    context = GroundedDeepAgentRunContext(
+        thread_id="tool-type-loop-thread",
+        run_id="tool-type-loop-run",
+        session=session,
+    )
+    handler_calls = 0
+
+    def invoke(call_number: int) -> ToolMessage:
+        request = SimpleNamespace(
+            tool_call={
+                "id": "call-ls-%s" % call_number,
+                "name": "ls",
+                "args": {
+                    "path": (
+                        "/knowledge/topics/客服工单/%s"
+                        % call_number
+                    )
+                },
+            },
+            runtime=SimpleNamespace(context=context),
+        )
+
+        def handler(_: Any) -> ToolMessage:
+            nonlocal handler_calls
+            handler_calls += 1
+            return ToolMessage(
+                content="ok",
+                name="ls",
+                tool_call_id="call-ls-%s" % call_number,
+            )
+
+        return middleware.wrap_tool_call(request, handler)
+
+    assert invoke(1).status == "success"
+    assert invoke(2).status == "success"
+    warning = invoke(3)
+    hard_stop = invoke(4)
+
+    assert handler_calls == 2
+    assert json.loads(str(warning.content))["code"] == (
+        "TOOL_LOOP_WARNING"
+    )
+    assert json.loads(str(hard_stop.content))["code"] == (
+        "TOOL_LOOP_HARD_STOP"
+    )
+    assert session.tool_loop_blocked == {"ls"}
+
+    visible, _ = _phase_visible_tools(
+        session,
+        [
+            SimpleNamespace(name="ls"),
+            SimpleNamespace(name="query_data"),
+        ],
+    )
+    assert {item.name for item in visible} == {"query_data"}
+
+
 def test_tool_call_exception_is_recovered_with_original_call_id() -> None:
     middleware = GroundedCoreToolBoundaryMiddleware(GroundedSemanticBackend(FakeSemanticCatalog()))
     session = GroundedDeepAgentSession(
@@ -3603,6 +3771,241 @@ def test_catalog_pagination_is_rejected_in_favor_of_targeted_grep() -> None:
     assert result.status == "error"
     assert payload["code"] == "PAGINATED_CATALOG_SCAN_DENIED"
     assert "grep" in payload["message"]
+
+
+def test_tool_call_repair_injects_interrupted_result_without_mutating_checkpoint() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="tool-repair-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    messages = [
+        HumanMessage(content="查询工单量"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-query",
+                    "name": "query_data",
+                    "args": {"request": {"queryId": "tickets"}},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        HumanMessage(content="继续"),
+    ]
+    request = model_call_request(messages, session=session)
+    captured: dict[str, Any] = {}
+
+    def handler(updated: Any) -> str:
+        captured["request"] = updated
+        return "ok"
+
+    result = GroundedToolCallRepairMiddleware().wrap_model_call(
+        request,
+        handler,
+    )
+
+    assert result == "ok"
+    assert request.messages is messages
+    assert len(messages) == 3
+    repaired = captured["request"].messages
+    assert [item.type for item in repaired] == ["human", "ai", "tool", "human"]
+    assert repaired[2].tool_call_id == "call-query"
+    assert repaired[2].name == "query_data"
+    assert repaired[2].status == "error"
+    assert "interrupted" in str(repaired[2].content)
+    report = session.tool_call_recovery_reports[-1]
+    assert report["status"] == "REPAIRED"
+    assert report["injectedToolResultCount"] == 1
+    assert report["isolatedToolResultCount"] == 0
+    assert report["checkpointMutated"] is False
+
+
+def test_tool_call_repair_preserves_valid_parallel_result_and_fills_only_missing_one() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="parallel-tool-repair-session",
+            question="同时读取两个结果",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    existing_result = ToolMessage(
+        content='{"status":"VERIFIED"}',
+        tool_call_id="call-query",
+        name="query_data",
+    )
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-query",
+                    "name": "query_data",
+                    "args": {"request": {"queryId": "tickets"}},
+                    "type": "tool_call",
+                },
+                {
+                    "id": "call-read",
+                    "name": "read_file",
+                    "args": {"file_path": "/knowledge/topic.json"},
+                    "type": "tool_call",
+                },
+            ],
+        ),
+        existing_result,
+    ]
+    request = model_call_request(messages, session=session)
+    captured: dict[str, Any] = {}
+
+    GroundedToolCallRepairMiddleware().wrap_model_call(
+        request,
+        lambda updated: captured.setdefault("request", updated),
+    )
+
+    repaired = captured["request"].messages
+    assert [item.type for item in repaired] == ["ai", "tool", "tool"]
+    assert repaired[1].tool_call_id == "call-read"
+    assert repaired[1].status == "error"
+    assert repaired[2] is existing_result
+    report = session.tool_call_recovery_reports[-1]
+    assert [
+        item["toolCallId"]
+        for item in report["injectedToolResults"]
+    ] == ["call-read"]
+
+
+def test_tool_call_repair_isolates_orphan_duplicate_and_out_of_order_results() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="orphan-tool-repair-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    valid_result = ToolMessage(
+        content='{"status":"VERIFIED"}',
+        tool_call_id="call-query",
+        name="query_data",
+    )
+    messages = [
+        HumanMessage(content="查询工单量"),
+        ToolMessage(
+            content="orphan",
+            tool_call_id="call-orphan",
+            name="read_file",
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-query",
+                    "name": "query_data",
+                    "args": {"request": {"queryId": "tickets"}},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        valid_result,
+        ToolMessage(
+            content="duplicate",
+            tool_call_id="call-query",
+            name="query_data",
+        ),
+        HumanMessage(content="下一步"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-late",
+                    "name": "read_file",
+                    "args": {"file_path": "/knowledge/topic.json"},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        HumanMessage(content="工具还没完成"),
+        ToolMessage(
+            content="late",
+            tool_call_id="call-late",
+            name="read_file",
+        ),
+    ]
+    request = model_call_request(messages, session=session)
+    captured: dict[str, Any] = {}
+
+    GroundedToolCallRepairMiddleware().wrap_model_call(
+        request,
+        lambda updated: captured.setdefault("request", updated),
+    )
+
+    repaired = captured["request"].messages
+    assert repaired[:5] == [
+        messages[0],
+        messages[2],
+        valid_result,
+        messages[5],
+        messages[6],
+    ]
+    assert repaired[5].type == "tool"
+    assert repaired[5].tool_call_id == "call-late"
+    assert repaired[5].status == "error"
+    assert repaired[6] is messages[7]
+    report = session.tool_call_recovery_reports[-1]
+    assert report["injectedToolResultCount"] == 1
+    assert report["isolatedToolResultCount"] == 3
+    assert {
+        item["reason"]
+        for item in report["isolatedToolResults"]
+    } == {
+        "ORPHAN_TOOL_RESULT",
+        "DUPLICATE_TOOL_RESULT",
+        "OUT_OF_ORDER_TOOL_RESULT",
+    }
+
+
+def test_tool_call_repair_leaves_well_formed_history_unchanged() -> None:
+    session = GroundedDeepAgentSession(
+        runtime=GroundedRuntimeSession(
+            session_id="valid-tool-history-session",
+            question="工单量",
+            merchant_id="m-1",
+            workspace_topics=["客服工单"],
+        )
+    )
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call-query",
+                    "name": "query_data",
+                    "args": {"request": {"queryId": "tickets"}},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content='{"status":"VERIFIED"}',
+            tool_call_id="call-query",
+            name="query_data",
+        ),
+    ]
+    request = model_call_request(messages, session=session)
+    captured: dict[str, Any] = {}
+
+    GroundedToolCallRepairMiddleware().wrap_model_call(
+        request,
+        lambda updated: captured.setdefault("request", updated),
+    )
+
+    assert captured["request"] is request
+    assert session.tool_call_recovery_reports == []
 
 
 def test_context_middleware_keeps_messages_and_tools_available_to_react_caller() -> None:
@@ -3970,6 +4373,9 @@ def test_core_dynamically_dispatches_goal_bound_task_with_exact_capability_grant
     assert job.capability_grant.max_tool_calls == 3
     assert job.model_timeout_seconds == 9
     assert job.tools == []
+    assert job.user_payload["promptTrace"]["promptId"] == (
+        "grounded.subagent.system"
+    )
     assert deep_session.core_semantic_evidence == []
 
 
@@ -5076,6 +5482,9 @@ def test_run_skill_uses_generic_isolated_subagent_checkpoint_progress_and_artifa
     assert result["checkpoint"]["threadId"].startswith("thread-skill__skill_")
     assert isolated.job.skills == []
     assert isolated.job.user_payload["mountedSkill"] == "/skills/risk-analysis/SKILL.md"
+    assert isolated.job.user_payload["promptTrace"]["promptId"] == (
+        "grounded.skill_subagent.system"
+    )
     assert "generic isolated subagent" in isolated.job.system_prompt
     assert [item[0] for item in events] == ["skill.progress"] * len(events)
     assert any(item[2]["stage"] == "subagent_step" for item in events)

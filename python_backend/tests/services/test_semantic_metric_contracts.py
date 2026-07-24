@@ -20,7 +20,7 @@ from merchant_ai.services.answer import (
     merchant_friendly_data_answer,
     metric_value_column_for_rows,
 )
-from merchant_ai.services.memory import reusable_knowledge_assertion_present
+from merchant_ai.services.memory import memory_interaction_present
 from merchant_ai.services.planning import (
     PlannerReflectionAgent,
     QuestionUnderstandingCompiler,
@@ -394,16 +394,16 @@ def test_merged_rows_record_field_owner_conflicts_instead_of_hiding_them():
     assert {item["taskId"] for item in row["__fieldConflicts"]["pay_amt"]} == {"order_lookup", "refund_lookup"}
 
 
-def test_knowledge_curator_hot_path_skips_ordinary_one_shot_query():
+def test_memory_curator_hook_inspects_ordinary_interaction_without_keywords():
     state = {"question": "最近7天订单量是多少？", "message_history": []}
 
-    assert not reusable_knowledge_assertion_present(state, {"memoryType": "query_event"})
+    assert memory_interaction_present(state, {"memoryType": "query_event"})
 
 
-def test_knowledge_curator_keeps_explicit_reusable_user_assertion():
-    state = {"question": "请记住，以后默认使用支付口径。", "message_history": []}
+def test_memory_curator_hook_skips_only_when_no_user_text_exists():
+    state = {"question": "", "message_history": []}
 
-    assert reusable_knowledge_assertion_present(state, {"memoryType": "query_event"})
+    assert not memory_interaction_present(state, {"memoryType": "query_event"})
 
 
 def test_cross_task_detail_answer_keeps_each_tasks_owned_fields():

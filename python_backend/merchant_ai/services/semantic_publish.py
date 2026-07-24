@@ -164,14 +164,19 @@ class SemanticPublishCoordinator:
                     "state": "PREPARING_INDEX",
                     "candidatePublish": candidate_publish,
                     "candidateDocCount": len(documents),
+                    "recallScope": {
+                        "topic": topic,
+                        "table": self._recall_scope_table(topic, table_name),
+                    },
                     "updatedAt": self._now(),
                 }
             )
             self._write_state(record_path, state)
+            recall_scope_table = self._recall_scope_table(topic, table_name)
             preparation = self.recall_index_manager.prepare_rebuild(
                 changed_only=True,
                 topic=topic,
-                table_name=table_name,
+                table_name=recall_scope_table,
                 documents=documents,
             )
             if not preparation.success:
@@ -219,11 +224,16 @@ class SemanticPublishCoordinator:
             target_dir = self.topic_assets.table_asset_dir(topic, table_name)
             governance_dir = self.settings.resolved_workspace_path / "semantic_governance" / topic / table_name
             topic_manifest_path = self.topic_assets.root / topic / "manifest.json"
+            topic_relationships_path = self.topic_assets.root / topic / "relationships.json"
             target_existed = self._snapshot_directory(target_dir, work_dir / "backup" / "target")
             governance_existed = self._snapshot_directory(governance_dir, work_dir / "backup" / "governance")
             topic_manifest_existed = self._snapshot_file(
                 topic_manifest_path,
                 work_dir / "backup" / "topic_manifest.json",
+            )
+            topic_relationships_existed = self._snapshot_file(
+                topic_relationships_path,
+                work_dir / "backup" / "topic_relationships.json",
             )
             state.update(
                 {
@@ -308,6 +318,9 @@ class SemanticPublishCoordinator:
                     topic_manifest_path,
                     work_dir / "backup" / "topic_manifest.json",
                     topic_manifest_existed,
+                    topic_relationships_path,
+                    work_dir / "backup" / "topic_relationships.json",
+                    topic_relationships_existed,
                 )
                 state.update(
                     {
@@ -367,6 +380,9 @@ class SemanticPublishCoordinator:
                     topic_manifest_path,
                     work_dir / "backup" / "topic_manifest.json",
                     topic_manifest_existed,
+                    topic_relationships_path,
+                    work_dir / "backup" / "topic_relationships.json",
+                    topic_relationships_existed,
                 )
                 state.update(
                     {
@@ -593,11 +609,19 @@ class SemanticPublishCoordinator:
         topic_manifest_path: Path,
         topic_manifest_backup: Path,
         topic_manifest_existed: bool,
+        topic_relationships_path: Path,
+        topic_relationships_backup: Path,
+        topic_relationships_existed: bool,
     ) -> dict[str, Any]:
         try:
             self._restore_directory(target_dir, target_backup, target_existed)
             self._restore_directory(governance_dir, governance_backup, governance_existed)
             self._restore_file(topic_manifest_path, topic_manifest_backup, topic_manifest_existed)
+            self._restore_file(
+                topic_relationships_path,
+                topic_relationships_backup,
+                topic_relationships_existed,
+            )
             self._clear_topic_asset_caches()
             self.recall_index_manager.clear_caches()
             return {"success": True, "status": "OLD_ACTIVE_RESTORED"}
@@ -616,6 +640,16 @@ class SemanticPublishCoordinator:
         self.topic_assets._topic_names_cache = None
         self.topic_assets._topic_contract_cache.clear()
         self.topic_assets._semantic_source_hash_cache.clear()
+
+    def _recall_scope_table(self, topic: str, table_name: str) -> str:
+        pending_relationships = (
+            self.topic_assets.root
+            / topic
+            / "pending"
+            / table_name
+            / TopicAssetService.PENDING_RELATIONSHIPS_FILE
+        )
+        return "" if pending_relationships.exists() else table_name
 
     @staticmethod
     def _restore_directory(target: Path, backup: Path, existed: bool) -> None:

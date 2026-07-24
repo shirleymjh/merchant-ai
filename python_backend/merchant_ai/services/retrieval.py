@@ -36,6 +36,7 @@ from merchant_ai.services.language_policy import load_language_policy
 from merchant_ai.services.semantic_request import semantic_request_cache_key
 from merchant_ai.services.text_parsing import collapse_whitespace, safe_ascii_component
 from merchant_ai.services.time_semantics import resolve_time_range
+from merchant_ai.services.tool_runtime import ToolFailureRegistry
 
 
 class KnowledgeRetrievalService(Protocol):
@@ -2529,6 +2530,179 @@ def merge_knowledge_fallback(primary: KnowledgeBundle, fallback: KnowledgeBundle
         retrieval_status=status,
         retrieval_issues=issues,
     )
+
+
+class ResilientKnowledgeRetrievalService:
+    """Use local governed recall when Elasticsearch is unavailable.
+
+    Empty ES recall is a valid result and does not trigger fallback. Only an
+    operationally failed primary bundle (or an exception/circuit-open state)
+    switches to the local hybrid backend.
+    """
+
+    backend_name = "es_with_hybrid_fallback"
+
+    def __init__(
+        self,
+        primary: KnowledgeRetrievalService,
+        fallback: KnowledgeRetrievalService,
+        *,
+        settings: Any = None,
+        failure_registry: ToolFailureRegistry | None = None,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        effective_settings = settings or getattr(primary, "settings", None)
+        self.failure_registry = failure_registry or ToolFailureRegistry(
+            # The retrieval adapter is shared across runs, so an identical
+            # query failure must not become a permanent process-wide block.
+            # Per-run duplicate blocking remains in ToolRuntime; this layer
+            # uses the service circuit and its cooldown/half-open probe.
+            repeat_threshold=2**31 - 1,
+            circuit_threshold=max(
+                1,
+                int(
+                    getattr(
+                        effective_settings,
+                        "tool_circuit_threshold",
+                        5,
+                    )
+                    or 5
+                ),
+            ),
+            cooldown_seconds=max(
+                1,
+                int(
+                    getattr(
+                        effective_settings,
+                        "tool_circuit_cooldown_seconds",
+                        60,
+                    )
+                    or 60
+                ),
+            ),
+        )
+        base_url = str(
+            getattr(effective_settings, "es_base_url", "") or ""
+        ).rstrip("/")
+        index = str(
+            getattr(effective_settings, "es_index", "") or ""
+        ).strip("/")
+        self.target = "%s/%s" % (base_url, index)
+        self.target = self.target.strip("/") or "elasticsearch"
+
+    @staticmethod
+    def _request_identity(
+        request: KnowledgeRetrievalRequest,
+    ) -> dict[str, Any]:
+        knowledge_request = request.knowledge_request
+        return {
+            "query": collapse_whitespace(request.query).casefold(),
+            "merchantId": request.merchant_id,
+            "topics": sorted(
+                str(item.value if hasattr(item, "value") else item)
+                for item in request.topic_categories
+            ),
+            "requestKey": (
+                str(knowledge_request.request_key or "")
+                if knowledge_request is not None
+                else ""
+            ),
+            "round": request.round,
+            "requiredCapabilities": sorted(
+                request.required_capabilities
+            ),
+        }
+
+    def _fallback_bundle(
+        self,
+        request: KnowledgeRetrievalRequest,
+        primary: KnowledgeBundle,
+    ) -> KnowledgeBundle:
+        try:
+            fallback = self.fallback.retrieve(request)
+        except Exception as exc:
+            fallback = failed_knowledge_bundle(
+                request,
+                getattr(self.fallback, "backend_name", "hybrid"),
+                "KNOWLEDGE_FALLBACK_FAILED",
+                "%s:%s" % (type(exc).__name__, str(exc)[:400]),
+                stage="fallback",
+            )
+        return merge_knowledge_fallback(primary, fallback)
+
+    def retrieve(
+        self,
+        request: KnowledgeRetrievalRequest,
+    ) -> KnowledgeBundle:
+        args = self._request_identity(request)
+        blocked = self.failure_registry.should_block(
+            "retrieve_knowledge",
+            args,
+            service_name="elasticsearch",
+            target=self.target,
+        )
+        if blocked is not None:
+            primary = failed_knowledge_bundle(
+                request,
+                getattr(self.primary, "backend_name", "es"),
+                "ES_RETRIEVAL_CIRCUIT_OPEN",
+                str(blocked.reason or "Elasticsearch circuit is open"),
+                stage="circuit",
+            )
+            return self._fallback_bundle(request, primary)
+
+        try:
+            primary = normalize_knowledge_bundle_status(
+                self.primary.retrieve(request)
+            )
+        except Exception as exc:
+            primary = failed_knowledge_bundle(
+                request,
+                getattr(self.primary, "backend_name", "es"),
+                "ES_RETRIEVAL_FAILED",
+                "%s:%s" % (type(exc).__name__, str(exc)[:400]),
+            )
+
+        if primary.retrieval_status != "failed":
+            self.failure_registry.record_success(
+                "retrieve_knowledge",
+                args,
+                service_name="elasticsearch",
+                target=self.target,
+            )
+            return primary
+
+        issue = next(iter(primary.retrieval_issues), None)
+        self.failure_registry.record_failure(
+            "retrieve_knowledge",
+            args,
+            str(getattr(issue, "code", "") or "ES_RETRIEVAL_FAILED"),
+            str(
+                getattr(issue, "message", "")
+                or "Elasticsearch retrieval failed"
+            ),
+            service_name="elasticsearch",
+            target=self.target,
+        )
+        return self._fallback_bundle(request, primary)
+
+    def cache_trace(self) -> dict[str, Any]:
+        primary_trace = (
+            self.primary.cache_trace()
+            if callable(getattr(self.primary, "cache_trace", None))
+            else {}
+        )
+        fallback_trace = (
+            self.fallback.cache_trace()
+            if callable(getattr(self.fallback, "cache_trace", None))
+            else {}
+        )
+        return {
+            "primary": primary_trace,
+            "fallback": fallback_trace,
+            "failureRegistry": self.failure_registry.trace(),
+        }
 
 
 def merge_recall_items(primary: list[RecallItem], secondary: list[RecallItem]) -> list[RecallItem]:

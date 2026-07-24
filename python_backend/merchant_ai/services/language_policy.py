@@ -54,7 +54,6 @@ class RoutingLanguagePolicy:
     correction_markers: tuple[str, ...]
     entity_assignment_operators: tuple[str, ...]
     time_clarification_options: tuple[str, ...]
-    memory_authoring_markers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -234,10 +233,6 @@ def load_language_policy(path: str = "") -> LanguagePolicy:
             time_clarification_options=_text_tuple(
                 routing.get("timeClarificationOptions"),
                 "routing.timeClarificationOptions",
-            ),
-            memory_authoring_markers=_text_tuple(
-                routing.get("memoryAuthoringMarkers"),
-                "routing.memoryAuthoringMarkers",
             ),
         ),
         answer=AnswerLanguagePolicy(

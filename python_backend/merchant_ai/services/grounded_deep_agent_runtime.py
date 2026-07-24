@@ -3,6 +3,8 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import random
+import time
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +17,7 @@ from threading import RLock
 from types import SimpleNamespace
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Generic,
     Iterator,
@@ -141,6 +144,8 @@ from merchant_ai.models import (
 from merchant_ai.services.answer_claims import AnswerClaimVerifier
 from merchant_ai.services.assets import normalize_semantic_path
 from merchant_ai.services.artifacts import WorkspaceArtifactStore
+from merchant_ai.services.grounded_prompt_text import GROUNDED_SKILL_REPAIR_RULES
+from merchant_ai.services.prompts import PromptAssembler
 from merchant_ai.services.grounded_runtime_kernel import (
     GroundedRuntimeKernel,
     GroundedRuntimeEvent,
@@ -1541,14 +1546,23 @@ class GroundedDeepAgentSession:
     outcome_completion_result: dict[str, Any] = field(default_factory=dict)
     operational_failure: dict[str, Any] = field(default_factory=dict)
     runtime_budget_report: dict[str, Any] = field(default_factory=dict)
+    provider_circuit_report: dict[str, Any] = field(default_factory=dict)
     core_context_reports: list[dict[str, Any]] = field(default_factory=list)
     trusted_session_context_reports: list[dict[str, Any]] = field(default_factory=list)
+    tool_call_recovery_reports: list[dict[str, Any]] = field(default_factory=list)
     workspace_read_signatures: set[str] = field(default_factory=set)
     tool_action_receipts: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_no_progress_blocked: dict[str, str] = field(default_factory=dict)
     tool_no_progress_events: list[dict[str, Any]] = field(default_factory=list)
+    tool_loop_history: list[dict[str, Any]] = field(default_factory=list)
+    tool_loop_type_counts: dict[str, int] = field(default_factory=dict)
+    tool_loop_warning_keys: set[str] = field(default_factory=set)
+    tool_loop_blocked: set[str] = field(default_factory=set)
+    tool_loop_events: list[dict[str, Any]] = field(default_factory=list)
     latest_graph_rejection: dict[str, Any] = field(default_factory=dict)
     conversation_context: dict[str, Any] = field(default_factory=dict)
+    trusted_bootstrap_context: dict[str, Any] = field(default_factory=dict)
+    prompt_traces: dict[str, dict[str, Any]] = field(default_factory=dict)
     subagent_query_adoption_lock: Any = field(
         default_factory=RLock,
         repr=False,
@@ -1984,6 +1998,8 @@ def _grounded_operational_failure_answer(
     code = str(payload.get("code") or "GROUNDED_OPERATIONAL_FAILURE").strip()
     if code == "GROUNDED_PROVIDER_TIMEOUT":
         return "本次查数未能在模型调用时限内完成。系统没有把未完成或未验证的结果当作最终答案；请稍后重试。"
+    if code == "GROUNDED_PROVIDER_TRANSIENT_FAILURE":
+        return "本次查数因模型服务暂时不可用而未能完成。系统没有把未完成或未验证的结果当作最终答案；请稍后重试。"
     if code == "GROUNDED_RUNTIME_BUDGET_EXHAUSTED":
         return "本次查数未能在运行预算内完成。系统没有把未完成或未验证的结果当作最终答案；请缩小查询范围，或稍后重试。"
 
@@ -5089,7 +5105,19 @@ def _record_grounded_tool_post_state(
         }
 
 
-def _is_provider_timeout_error(exc: BaseException) -> bool:
+_RETRIABLE_PROVIDER_STATUS_CODES = {
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
+
+
+def _provider_retry_reason(exc: BaseException) -> Optional[str]:
     current: Optional[BaseException] = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
@@ -5097,9 +5125,42 @@ def _is_provider_timeout_error(exc: BaseException) -> bool:
         name = type(current).__name__.lower()
         message = str(current).lower()
         if "timeout" in name or "timed out" in message or "read operation timed out" in message:
-            return True
+            return "timeout"
+        status_code = getattr(current, "status_code", None)
+        response = getattr(current, "response", None)
+        if status_code is None and response is not None:
+            status_code = getattr(response, "status_code", None)
+        try:
+            normalized_status = int(status_code)
+        except (TypeError, ValueError):
+            normalized_status = 0
+        if normalized_status in _RETRIABLE_PROVIDER_STATUS_CODES:
+            return "rate_limit" if normalized_status == 429 else "service_unavailable"
+        if "ratelimit" in name or "rate limit" in message or "too many requests" in message:
+            return "rate_limit"
+        if (
+            "connection" in name
+            or "remoteprotocol" in name
+            or "connection reset" in message
+            or "connection aborted" in message
+            or "connection refused" in message
+        ):
+            return "connection"
+        if (
+            "serviceunavailable" in name
+            or "internalserver" in name
+            or "temporarily unavailable" in message
+            or "service unavailable" in message
+            or "server busy" in message
+            or "provider overloaded" in message
+        ):
+            return "service_unavailable"
         current = current.__cause__ or current.__context__
-    return False
+    return None
+
+
+def _is_provider_timeout_error(exc: BaseException) -> bool:
+    return _provider_retry_reason(exc) == "timeout"
 
 
 def _tool_name(item: Any) -> str:
@@ -5318,8 +5379,11 @@ def _phase_visible_tools(
             for name, fingerprint in session.tool_no_progress_blocked.items()
             if fingerprint == progress_fingerprint
         }
-        no_progress_blocked_tools = set(session.tool_no_progress_blocked)
-    allowed.difference_update(no_progress_blocked_tools)
+        loop_blocked_tools = {
+            *session.tool_no_progress_blocked,
+            *session.tool_loop_blocked,
+        }
+    allowed.difference_update(loop_blocked_tools)
     blocked = (all_names - allowed) | always_hidden
     visible = [item for item in tools if _tool_name(item) not in blocked]
     removed = sorted({_tool_name(item) for item in tools if _tool_name(item) in blocked})
@@ -5694,8 +5758,222 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
     name = "GroundedCoreToolBoundaryMiddleware"
     MAX_INLINE_READ_CHARS = 8_000
 
-    def __init__(self, semantic_backend: GroundedSemanticBackend):
+    def __init__(
+        self,
+        semantic_backend: GroundedSemanticBackend,
+        settings: Any = None,
+    ):
         self.semantic_backend = semantic_backend
+        self.loop_guard_threshold = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "middleware_loop_guard_threshold",
+                    3,
+                )
+                or 3
+            ),
+        )
+        self.tool_repeat_warning_threshold = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "middleware_tool_repeat_warning_threshold",
+                    3,
+                )
+                or 3
+            ),
+        )
+        self.tool_repeat_hard_stop_threshold = max(
+            self.tool_repeat_warning_threshold + 1,
+            int(
+                getattr(
+                    settings,
+                    "middleware_tool_repeat_hard_stop_threshold",
+                    5,
+                )
+                or 5
+            ),
+        )
+        self.tool_type_warning_threshold = max(
+            1,
+            int(
+                getattr(
+                    settings,
+                    "middleware_tool_type_warning_threshold",
+                    30,
+                )
+                or 30
+            ),
+        )
+        self.tool_type_hard_stop_threshold = max(
+            self.tool_type_warning_threshold + 1,
+            int(
+                getattr(
+                    settings,
+                    "middleware_tool_type_hard_stop_threshold",
+                    50,
+                )
+                or 50
+            ),
+        )
+        self.tool_loop_window_size = max(
+            self.tool_repeat_hard_stop_threshold,
+            int(
+                getattr(
+                    settings,
+                    "middleware_tool_loop_window_size",
+                    20,
+                )
+                or 20
+            ),
+        )
+
+    def _tool_loop_guard_result(
+        self,
+        session: GroundedDeepAgentSession,
+        *,
+        tool_name: str,
+        args: Mapping[str, Any],
+        tool_call_id: str,
+        state_fingerprint: str,
+    ) -> Optional[ToolMessage]:
+        action_signature = _stable_json_fingerprint(
+            {
+                "tool": tool_name,
+                "args": _grounded_tool_key_args(tool_name, args),
+            }
+        )
+        with session.lock:
+            type_count = (
+                int(session.tool_loop_type_counts.get(tool_name, 0))
+                + 1
+            )
+            session.tool_loop_type_counts[tool_name] = type_count
+            session.tool_loop_history.append(
+                {
+                    "toolName": tool_name,
+                    "actionSignature": action_signature,
+                    "stateFingerprint": state_fingerprint,
+                    "toolCallId": tool_call_id,
+                }
+            )
+            session.tool_loop_history = session.tool_loop_history[
+                -self.tool_loop_window_size :
+            ]
+            repeat_count = sum(
+                1
+                for item in session.tool_loop_history
+                if item.get("actionSignature") == action_signature
+            )
+            unchanged_state_count = sum(
+                1
+                for item in session.tool_loop_history
+                if item.get("toolName") == tool_name
+                and item.get("stateFingerprint") == state_fingerprint
+            )
+
+            hard_reason = ""
+            if tool_name in session.tool_loop_blocked:
+                hard_reason = "TOOL_ALREADY_BLOCKED"
+            elif (
+                repeat_count
+                >= self.tool_repeat_hard_stop_threshold
+            ):
+                hard_reason = "REPEATED_ACTION_HARD_STOP"
+            elif type_count >= self.tool_type_hard_stop_threshold:
+                hard_reason = "TOOL_TYPE_HARD_STOP"
+            if hard_reason:
+                session.tool_loop_blocked.add(tool_name)
+                event = {
+                    "code": "TOOL_LOOP_HARD_STOP",
+                    "reason": hard_reason,
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "repeatCount": repeat_count,
+                    "unchangedStateCount": unchanged_state_count,
+                    "toolTypeCount": type_count,
+                    "stateFingerprint": state_fingerprint,
+                }
+                session.tool_loop_events.append(event)
+                session.tool_loop_events = session.tool_loop_events[-64:]
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "BLOCKED",
+                            **event,
+                            "message": (
+                                "The loop guard blocked this tool after repeated "
+                                "calls. Use a different grounded action or finish "
+                                "from already verified evidence."
+                            ),
+                            "nextAction": (
+                                "CHANGE_TOOL_OR_FINALIZE_WITH_VERIFIED_EVIDENCE"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+
+            warning_key = ""
+            warning_reason = ""
+            if (
+                repeat_count
+                >= self.tool_repeat_warning_threshold
+            ):
+                warning_key = "repeat:%s" % action_signature
+                warning_reason = "REPEATED_ACTION_WARNING"
+            elif unchanged_state_count >= self.loop_guard_threshold:
+                warning_key = "state:%s:%s" % (
+                    tool_name,
+                    state_fingerprint,
+                )
+                warning_reason = "UNCHANGED_STATE_WARNING"
+            elif type_count >= self.tool_type_warning_threshold:
+                warning_key = "type:%s" % tool_name
+                warning_reason = "TOOL_TYPE_WARNING"
+            if (
+                warning_key
+                and warning_key not in session.tool_loop_warning_keys
+            ):
+                session.tool_loop_warning_keys.add(warning_key)
+                event = {
+                    "code": "TOOL_LOOP_WARNING",
+                    "reason": warning_reason,
+                    "toolName": tool_name,
+                    "toolCallId": tool_call_id,
+                    "repeatCount": repeat_count,
+                    "unchangedStateCount": unchanged_state_count,
+                    "toolTypeCount": type_count,
+                    "stateFingerprint": state_fingerprint,
+                }
+                session.tool_loop_events.append(event)
+                session.tool_loop_events = session.tool_loop_events[-64:]
+                return ToolMessage(
+                    content=json.dumps(
+                        {
+                            "status": "WARNING",
+                            **event,
+                            "message": (
+                                "This call was not executed because the same "
+                                "tool pattern is making no observable progress."
+                            ),
+                            "nextAction": (
+                                "SUMMARIZE_PROGRESS_OR_CHANGE_TOOL_OR_ARGUMENTS"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="error",
+                )
+        return None
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         tool_call = dict(getattr(request, "tool_call", None) or {})
@@ -5739,6 +6017,15 @@ class GroundedCoreToolBoundaryMiddleware(AgentMiddleware):
         tool_action_signature = ""
         if isinstance(session, GroundedDeepAgentSession) and bool(tool_name):
             tool_state_fingerprint = _grounded_tool_progress_fingerprint(session)
+            loop_guard_result = self._tool_loop_guard_result(
+                session,
+                tool_name=tool_name,
+                args=args,
+                tool_call_id=tool_call_id,
+                state_fingerprint=tool_state_fingerprint,
+            )
+            if loop_guard_result is not None:
+                return loop_guard_result
             tool_action_signature = _grounded_tool_action_signature(
                 tool_name,
                 args,
@@ -6359,9 +6646,15 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
         if session is None:
             return handler(request)
         personal_context, memory_trace = self._recall_personal_context(session)
+        bootstrap_context = deepcopy(session.trusted_bootstrap_context)
+        trusted_execution_scope = dict(
+            bootstrap_context.pop("trustedExecutionScope", {}) or {}
+        )
         envelope = {
             "authority": "SERVER_GENERATED_CURRENT_MODEL_CALL",
             "refreshPolicy": "EVERY_MODEL_CALL",
+            "trustedExecutionScope": trusted_execution_scope,
+            "trustedBootstrapContext": bootstrap_context,
             "trustedRuntimeState": self._trusted_runtime_state(session, context),
             "trustedPersonalContext": {
                 "status": memory_trace.get("status"),
@@ -6418,6 +6711,212 @@ class GroundedTrustedSessionContextMiddleware(AgentMiddleware):
         if callable(override):
             request = override(system_message=updated_system)
         return handler(request)
+
+
+class GroundedToolCallRepairMiddleware(AgentMiddleware):
+    """Repair malformed tool-call history in the ephemeral model request.
+
+    A process interruption can leave an assistant tool call without the
+    protocol-required ToolMessage.  Before every model invocation, this
+    middleware injects an explicit interrupted/error result with the original
+    tool-call id.  Tool results that cannot be paired with the immediately
+    preceding assistant tool-call block are omitted from the model-facing
+    request instead of inventing a historical assistant action.
+
+    The durable checkpoint is never mutated.  Repairs are request-local and
+    recorded on the current grounded session for observability.
+    """
+
+    name = "GroundedToolCallRepairMiddleware"
+    INTERRUPTED_MESSAGE = "[Tool call was interrupted and did not return a result.]"
+
+    @staticmethod
+    def _tool_calls(message: Any) -> list[dict[str, Any]]:
+        if str(getattr(message, "type", "") or "") != "ai":
+            return []
+        return [
+            dict(call)
+            for call in list(getattr(message, "tool_calls", None) or [])
+            if isinstance(call, Mapping)
+        ]
+
+    @staticmethod
+    def _tool_call_id(message: Any) -> str:
+        return str(getattr(message, "tool_call_id", "") or "").strip()
+
+    @classmethod
+    def _repair_messages(
+        cls,
+        messages: Sequence[Any],
+    ) -> tuple[Optional[list[Any]], dict[str, Any]]:
+        original = list(messages)
+        valid_tool_result_indexes: set[int] = set()
+        missing_calls_by_ai_index: dict[int, list[dict[str, Any]]] = {}
+        declared_call_indexes: dict[str, list[int]] = {}
+        malformed_call_count = 0
+
+        for index, message in enumerate(original):
+            calls = cls._tool_calls(message)
+            if not calls:
+                continue
+            calls_by_id: dict[str, dict[str, Any]] = {}
+            for call in calls:
+                call_id = str(call.get("id") or "").strip()
+                if not call_id:
+                    malformed_call_count += 1
+                    continue
+                calls_by_id.setdefault(call_id, call)
+                declared_call_indexes.setdefault(call_id, []).append(index)
+
+            matched_ids: set[str] = set()
+            next_index = index + 1
+            while (
+                next_index < len(original)
+                and str(getattr(original[next_index], "type", "") or "") == "tool"
+            ):
+                result_id = cls._tool_call_id(original[next_index])
+                if result_id in calls_by_id and result_id not in matched_ids:
+                    valid_tool_result_indexes.add(next_index)
+                    matched_ids.add(result_id)
+                next_index += 1
+
+            missing = [
+                call
+                for call_id, call in calls_by_id.items()
+                if call_id not in matched_ids
+            ]
+            if missing:
+                missing_calls_by_ai_index[index] = missing
+
+        isolated_results: list[dict[str, Any]] = []
+        for index, message in enumerate(original):
+            if str(getattr(message, "type", "") or "") != "tool":
+                continue
+            if index in valid_tool_result_indexes:
+                continue
+            tool_call_id = cls._tool_call_id(message)
+            owners = declared_call_indexes.get(tool_call_id, [])
+            if not tool_call_id or not owners:
+                reason = "ORPHAN_TOOL_RESULT"
+            elif any(owner >= index for owner in owners):
+                reason = "RESULT_PRECEDES_TOOL_CALL"
+            elif any(
+                cls._tool_call_id(original[candidate]) == tool_call_id
+                for candidate in valid_tool_result_indexes
+            ):
+                reason = "DUPLICATE_TOOL_RESULT"
+            else:
+                reason = "OUT_OF_ORDER_TOOL_RESULT"
+            isolated_results.append(
+                {
+                    "messageIndex": index,
+                    "toolCallId": tool_call_id,
+                    "toolName": str(getattr(message, "name", "") or ""),
+                    "reason": reason,
+                }
+            )
+
+        injected = [
+            {
+                "toolCallId": str(call.get("id") or ""),
+                "toolName": str(call.get("name") or "unknown"),
+                "assistantMessageIndex": index,
+            }
+            for index, calls in missing_calls_by_ai_index.items()
+            for call in calls
+        ]
+        report = {
+            "status": (
+                "REPAIRED"
+                if injected or isolated_results
+                else "MALFORMED_UNRECOVERED"
+                if malformed_call_count
+                else "UNCHANGED"
+            ),
+            "originalMessageCount": len(original),
+            "modelMessageCount": len(original) + len(injected) - len(isolated_results),
+            "injectedToolResultCount": len(injected),
+            "injectedToolResults": injected,
+            "isolatedToolResultCount": len(isolated_results),
+            "isolatedToolResults": isolated_results,
+            "malformedToolCallCount": malformed_call_count,
+            "checkpointMutated": False,
+        }
+        if not injected and not isolated_results:
+            return None, report
+
+        isolated_indexes = {
+            int(item["messageIndex"])
+            for item in isolated_results
+        }
+        patched: list[Any] = []
+        for index, message in enumerate(original):
+            if index in isolated_indexes:
+                continue
+            patched.append(message)
+            for call in missing_calls_by_ai_index.get(index, []):
+                patched.append(
+                    ToolMessage(
+                        content=cls.INTERRUPTED_MESSAGE,
+                        tool_call_id=str(call.get("id") or ""),
+                        name=str(call.get("name") or "unknown"),
+                        status="error",
+                    )
+                )
+        return patched, report
+
+    @staticmethod
+    def _session_from_request(
+        request: Any,
+    ) -> Optional[GroundedDeepAgentSession]:
+        runtime = getattr(request, "runtime", None)
+        context = getattr(runtime, "context", None)
+        candidate = getattr(context, "session", None)
+        return candidate if isinstance(candidate, GroundedDeepAgentSession) else None
+
+    @staticmethod
+    def _record_report(
+        session: Optional[GroundedDeepAgentSession],
+        report: dict[str, Any],
+    ) -> None:
+        if session is None or report.get("status") == "UNCHANGED":
+            return
+        with session.lock:
+            session.tool_call_recovery_reports.append(deepcopy(report))
+            session.tool_call_recovery_reports = session.tool_call_recovery_reports[-32:]
+
+    @staticmethod
+    def _override_messages(request: Any, messages: list[Any]) -> Any:
+        override = getattr(request, "override", None)
+        if callable(override):
+            return override(messages=messages)
+        return request
+
+    def wrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Any],
+    ) -> Any:
+        patched, report = self._repair_messages(
+            list(getattr(request, "messages", None) or [])
+        )
+        self._record_report(self._session_from_request(request), report)
+        if patched is not None:
+            request = self._override_messages(request, patched)
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        patched, report = self._repair_messages(
+            list(getattr(request, "messages", None) or [])
+        )
+        self._record_report(self._session_from_request(request), report)
+        if patched is not None:
+            request = self._override_messages(request, patched)
+        return await handler(request)
 
 
 class GroundedContextManagementMiddleware(AgentMiddleware):
@@ -6665,7 +7164,20 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
 
     name = "GroundedRuntimeBudgetMiddleware"
 
-    def __init__(self, settings: Any = None) -> None:
+    def __init__(
+        self,
+        settings: Any = None,
+        *,
+        sleeper: Callable[[float], None] = time.sleep,
+        jitter: Callable[[float, float], float] = random.uniform,
+        wall_clock: Callable[[], float] = time.time,
+        provider_token_counter: Optional[
+            Callable[[list[Any], Any, list[Any]], int]
+        ] = None,
+    ) -> None:
+        self.token_counter = ProviderAwareContextTokenCounter(
+            provider_counter=provider_token_counter,
+        )
         self.model_call_timeout_seconds = max(
             1.0,
             float(
@@ -6690,6 +7202,207 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
                 or 2
             ),
         )
+        self.model_retry_base_delay_seconds = max(
+            0.0,
+            float(
+                getattr(
+                    settings,
+                    "grounded_core_model_retry_base_delay_ms",
+                    500,
+                )
+                or 0
+            )
+            / 1000.0,
+        )
+        self.model_retry_max_delay_seconds = max(
+            self.model_retry_base_delay_seconds,
+            float(
+                getattr(
+                    settings,
+                    "grounded_core_model_retry_max_delay_ms",
+                    4000,
+                )
+                or 0
+            )
+            / 1000.0,
+        )
+        self._sleep = sleeper
+        self._jitter = jitter
+        self._wall_clock = wall_clock
+        self.model_circuit_threshold = max(
+            1,
+            int(getattr(settings, "llm_circuit_threshold", 3) or 3),
+        )
+        self.model_circuit_cooldown_seconds = max(
+            1.0,
+            float(
+                getattr(
+                    settings,
+                    "llm_circuit_cooldown_seconds",
+                    30,
+                )
+                or 30
+            ),
+        )
+        self._model_failure_count = 0
+        self._model_circuit_open_until = 0.0
+        self._model_half_open_probe_in_flight = False
+        self._model_circuit_lock = RLock()
+
+    def bind_model(self, model: Any) -> None:
+        self.token_counter.model = model
+
+    def _circuit_report(self) -> dict[str, Any]:
+        now = float(self._wall_clock())
+        with self._model_circuit_lock:
+            return {
+                "failureCount": self._model_failure_count,
+                "open": bool(
+                    self._model_circuit_open_until
+                    and self._model_circuit_open_until > now
+                ),
+                "openUntilEpochMs": int(
+                    self._model_circuit_open_until * 1000
+                ),
+                "halfOpenProbeInFlight": (
+                    self._model_half_open_probe_in_flight
+                ),
+                "threshold": self.model_circuit_threshold,
+                "cooldownSeconds": self.model_circuit_cooldown_seconds,
+            }
+
+    @staticmethod
+    def _session_from_request(
+        request: Any,
+    ) -> Optional[GroundedDeepAgentSession]:
+        runtime = getattr(request, "runtime", None)
+        context = getattr(runtime, "context", None)
+        session = getattr(context, "session", None)
+        return (
+            session
+            if isinstance(session, GroundedDeepAgentSession)
+            else None
+        )
+
+    def _sync_circuit_report(
+        self,
+        session: Optional[GroundedDeepAgentSession],
+    ) -> None:
+        if session is None:
+            return
+        with session.lock:
+            session.provider_circuit_report = self._circuit_report()
+
+    def _circuit_is_open(self) -> bool:
+        now = float(self._wall_clock())
+        with self._model_circuit_lock:
+            if self._model_half_open_probe_in_flight:
+                return True
+            if (
+                self._model_circuit_open_until
+                and self._model_circuit_open_until > now
+            ):
+                return True
+            if self._model_circuit_open_until:
+                # Cooldown elapsed. Permit one new logical call and let its
+                # outcome close or reopen the circuit.
+                self._model_circuit_open_until = 0.0
+                self._model_failure_count = 0
+                self._model_half_open_probe_in_flight = True
+            return False
+
+    def _record_model_success(self) -> None:
+        with self._model_circuit_lock:
+            self._model_failure_count = 0
+            self._model_circuit_open_until = 0.0
+            self._model_half_open_probe_in_flight = False
+
+    def _record_model_failure(self) -> None:
+        with self._model_circuit_lock:
+            self._model_half_open_probe_in_flight = False
+            self._model_failure_count += 1
+            if (
+                self._model_failure_count
+                >= self.model_circuit_threshold
+            ):
+                self._model_circuit_open_until = (
+                    float(self._wall_clock())
+                    + self.model_circuit_cooldown_seconds
+                )
+
+    def _response_token_count(
+        self,
+        response: Any,
+    ) -> tuple[int, str]:
+        messages = list(getattr(response, "result", None) or [])
+        if not messages and (
+            hasattr(response, "content")
+            or hasattr(response, "usage_metadata")
+        ):
+            messages = [response]
+        provider_output_tokens = 0
+        provider_usage_found = False
+        for message in messages:
+            usage = getattr(message, "usage_metadata", None) or {}
+            if not isinstance(usage, Mapping):
+                continue
+            raw_count = usage.get("output_tokens")
+            if raw_count is None:
+                raw_count = usage.get("outputTokens")
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue
+            if count >= 0:
+                provider_usage_found = True
+                provider_output_tokens += count
+        if provider_usage_found:
+            return provider_output_tokens, "provider_usage"
+        if not messages:
+            return 0, "empty_response"
+        estimate = self.token_counter.count(messages, None, [])
+        return estimate.tokens, estimate.source
+
+    def _retry_delay_seconds(self, failed_attempt: int) -> float:
+        if self.model_retry_base_delay_seconds <= 0:
+            return 0.0
+        exponential = min(
+            self.model_retry_max_delay_seconds,
+            self.model_retry_base_delay_seconds
+            * (2 ** max(0, int(failed_attempt) - 1)),
+        )
+        # Half-to-full jitter prevents concurrent failed calls from retrying
+        # on the same exponential-backoff boundary.
+        return max(
+            0.0,
+            min(
+                self.model_retry_max_delay_seconds,
+                float(self._jitter(exponential * 0.5, exponential)),
+            ),
+        )
+
+    def _wait_before_retry(
+        self,
+        budget: GroundedRuntimeBudget,
+        *,
+        failed_attempt: int,
+        reason: str,
+    ) -> None:
+        delay_seconds = self._retry_delay_seconds(failed_attempt)
+        if delay_seconds <= 0:
+            budget.checkpoint()
+            return
+        bounded_delay = budget.clamp_timeout_seconds(
+            delay_seconds,
+            minimum_seconds=delay_seconds,
+            operation=(
+                "llm:grounded_core:backoff_%s:%s"
+                % (failed_attempt, reason)
+            ),
+        )
+        with budget.stage("llm.grounded_core.retry_backoff"):
+            self._sleep(bounded_delay)
+        budget.checkpoint()
 
     @staticmethod
     def _budget_from_runtime(runtime: Any) -> Optional[GroundedRuntimeBudget]:
@@ -6701,6 +7414,13 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
         budget = self._budget_from_runtime(getattr(request, "runtime", None))
         if budget is None:
             return handler(request)
+        session = self._session_from_request(request)
+        budget.consume_action(name="grounded_core")
+        if self._circuit_is_open():
+            self._sync_circuit_report(session)
+            raise RuntimeError(
+                "service unavailable: grounded Core model circuit is open"
+            )
         original_model_settings = dict(getattr(request, "model_settings", None) or {})
         requested_timeout = original_model_settings.get("timeout")
         try:
@@ -6715,6 +7435,15 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
             )
 
         for attempt in range(1, self.model_retry_attempts + 1):
+            input_count = self.token_counter.count(
+                list(getattr(request, "messages", None) or []),
+                getattr(request, "system_message", None),
+                list(getattr(request, "tools", None) or []),
+            )
+            budget.consume_estimated_tokens(
+                input_count.tokens,
+                name="grounded_core.input.%s" % input_count.source,
+            )
             budget.consume_llm_call(name="grounded_core")
             model_settings = dict(original_model_settings)
             model_settings["timeout"] = budget.clamp_timeout_seconds(
@@ -6728,13 +7457,35 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
             try:
                 with budget.stage("llm.grounded_core"):
                     with budget.stage("llm.grounded_core.attempt_%s" % attempt):
-                        return handler(attempt_request)
+                        response = handler(attempt_request)
+                self._record_model_success()
+                self._sync_circuit_report(session)
+                output_tokens, output_source = (
+                    self._response_token_count(response)
+                )
+                if output_tokens > 0:
+                    budget.consume_estimated_tokens(
+                        output_tokens,
+                        name=(
+                            "grounded_core.output.%s"
+                            % output_source
+                        ),
+                    )
+                return response
             except Exception as exc:
-                if attempt >= self.model_retry_attempts or not _is_provider_timeout_error(exc):
+                retry_reason = _provider_retry_reason(exc)
+                if attempt >= self.model_retry_attempts or retry_reason is None:
+                    if retry_reason is not None:
+                        self._record_model_failure()
+                        self._sync_circuit_report(session)
                     raise
-                # Do not let a retry escape the shared wall-time or LLM-call
-                # budgets.  The next loop reserves another real provider call.
-                budget.checkpoint()
+                # Waiting and the next provider attempt must both remain inside
+                # the shared wall-time and LLM-call budgets.
+                self._wait_before_retry(
+                    budget,
+                    failed_attempt=attempt,
+                    reason=retry_reason,
+                )
         raise RuntimeError("grounded Core model attempts exhausted")
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
@@ -6750,38 +7501,11 @@ class GroundedRuntimeBudgetMiddleware(AgentMiddleware):
 class GroundedDeepAgentRuntime:
     """Single DeepAgent Core backed only by GroundedRuntimeKernel tools."""
 
-    # Phase-specific procedures are emitted by trusted session middleware;
-    # keeping them out of the stable prompt avoids stale workflow instructions.
-
-    # Stable Diana-style Core rules.  Phase-specific instructions are injected
-    # on every model call through trustedSessionContext.runtime.nextAction and
-    # semanticReadControl instead of keeping the entire workflow in one static
-    # prompt.
-    BASE_SYSTEM_PROMPT = """You are the single merchant-analysis Core running a ReAct loop.
-
-Authority and scope
-- trustedExecutionScope and trustedSessionContext are server-owned state. Never change or bypass merchant, role, store, ACL or tenant scope. Never author a merchant literal predicate; trusted execution injects it.
-- Topic routing, manifests and search ranks are navigation priority only, never merchant authorization. Every published Topic may be discovered through the governed Topic index. Query bindings still require exact governed /knowledge reads retained by the Kernel.
-- /knowledge is governed read-only semantic context, /artifacts contains immutable verified run results, and /workspace is run-scoped scratch/recovery context.
-
-Decision ownership
-- You own business understanding, progressive asset exploration, table/metric/field selection, query count and topology, complex SQL, and genuine user clarification.
-- The Harness owns deterministic schema/evidence/relationship checks, SQL safety and ACL, tenant injection, execution, result verification and final artifact authority checks. A zero-tool evaluator judges whether the candidate answer covers the user's visible outcomes; it does not plan or execute work.
-- Subagents and complex Skills are isolation boundaries, not alternate planning authorities. You decide per invocation: load_skill keeps a short bounded procedure in this Core loop; run_skill isolates a long or complex procedure in a SubAgent. The Harness may force isolation for scripts, oversized procedures or hard resource requirements. Both Core and a granted SubAgent use the same query_data protocol. Query branches are execution units, not agents.
-- Deep Agents native task is available as the grounded-researcher isolation primitive for long read-only semantic investigations. Call it only with a JSON grounded_native_task.v1 contract and READ_CONTEXT capability. Governed query or Skill work must use the typed governed delegation boundary, which issues the required grant before execution.
-
-Required lifecycle
-1. If no original-question Goal ledger exists, declare it exactly once. The Harness binds the original question automatically; do not copy a question field into the declaration. Every TIME_WINDOW Goal must retain the exact user-facing timeExpression (for example, "最近7天") in addition to any parsed days/start/end. Preserve every requested metric, dimension, time window, comparison, ranking limit/order, entity, detail field, dependency, rule and analysis objective. RULE means the merchant explicitly asks about a business rule, policy, definition, condition or restriction; presentation instructions such as "分别展示" or "给我看一下" are not RULE Goals. This ledger records answer obligations only: do not bind formal semantic refs, population/result artifacts, query nodes, tables or execution modes. A Goal dependency does not by itself mean a population dependency.
-2. Inspect goalRecallCoverage after Goal declaration. It evaluates navigation candidates only and never counts as Evidence. When selected required Goals are MISSING and another recall can make progress, call retrieve_knowledge with the live coverageReceiptId and only those goalIds; do not repeat recall for COVERED Goals. AMBIGUOUS means candidates exist and should be resolved through exact governed reads or business clarification, not broader recall by default. Then progressively read only the formal assets needed for the Goals. For a published scalar metric, table detail plus the exact metric definition is normally sufficient. For a generic DETAIL request with no requested columns, submit detailProjectionMode=DEFAULT and no selectedFields; the table's published defaultDetailProjection is authoritative. For an explicit column list, submit detailProjectionMode=EXPLICIT and bind only those columns. For an explicit request for all fields, submit detailProjectionMode=ALL_ALLOWED and use the table's ACL-filtered allowlist; never use SELECT *. Bind a separate timeFieldRef only when the user names a governed business clock or the Contract requires it; every submitted ref must first be read.
-3. After evidence is sufficient, bind every requested metric to its formal owner table, grain and time semantics before choosing topology. Merge Goals into one Contract only when those bindings form one coherent query; metrics on different tables that are independently aggregatable belong in parallel graph nodes, while a JOIN is valid only when one requested result truly requires governed cross-table combination.
-4. Treat trustedSessionContext.runtime.semanticReadControl and every ToolMessage Observation as advisory runtime context, not a workflow. Inspect repairOptions, readNext and repairReceipt, then choose the next ReAct action that can make progress: read an exact semantic leaf, revise a binding or topology, call query_data, call query_batch, delegate for isolation, or ask the merchant only when the business question is genuinely ambiguous. The Harness validates the chosen action at the tool boundary; it does not prescribe a fixed transition. Never replace newer typed evidence with historical recovery text or repeat an unchanged action.
-5. Use query_data for one governed query and query_batch when the caller's reasoning identifies mutually independent requests. Both tools own Contract construction, SQL validation, execution, ACL/tenant injection and Evidence verification. For CORE_SQL_REQUIRED, submit the QueryRequest with one complete Doris SELECT/WITH sqlCandidate implementing the returned Contract obligations, without tenant literals or invented tables/columns. The facade repairs bounded mechanical SQL/execution errors internally. When a tool returns NEEDS_REASONING, inspect the structured Observation, preserve its repairReceipt, and decide whether to read, replan, retry the same tool, choose the other query tool, or delegate. DENIED is terminal for that request and must never be bypassed.
-6. Treat verified results as immutable evidence. The Goal ledger supports recall, contracts and evidence accounting; internal helper Goals do not each need a separate visible answer span. Before claiming completion, call compose_verified_answer. Its isolated evaluator checks the candidate against the user's visible outcomes, while deterministic code checks every cited Artifact and claim. If it returns an incomplete Observation, decide in the same ReAct loop whether to query, clarify a genuine business ambiguity, or explicitly accept an evidence-backed partial answer with disclosed gaps.
-7. Finish only through compose_verified_rule_answer, an accepted compose_verified_answer result, or ask_human. After compose_verified_answer returns ANSWERED, stop without another tool call. Never answer from ordinary assistant prose or invent formulas, rows, evidence or provenance.
-
-Use the currently visible tools and server-owned evidence as capabilities and constraints, not as a prewritten procedure. Delegate only when isolation or real parallel reasoning is useful. Ask the user only for genuine business ambiguity, never for Topic selection, internal failures, merchant identity already bound by runtime, or information available in governed assets.
-"""
-    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
+    CORE_SYSTEM_PROMPT_ID = "grounded.core.system"
+    NATIVE_GENERAL_PROMPT_ID = "grounded.native.general_purpose"
+    NATIVE_RESEARCHER_PROMPT_ID = "grounded.native.researcher"
+    ISOLATED_SUBAGENT_PROMPT_ID = "grounded.subagent.system"
+    SKILL_SUBAGENT_PROMPT_ID = "grounded.skill_subagent.system"
 
     def __init__(
         self,
@@ -6809,6 +7533,16 @@ Use the currently visible tools and server-owned evidence as capabilities and co
         self.kernel = kernel
         self.semantic_catalog = semantic_catalog
         self.settings = settings
+        self.prompt_assembler = PromptAssembler()
+        self.core_prompt_render = self.prompt_assembler.render(
+            self.CORE_SYSTEM_PROMPT_ID
+        )
+        self.native_general_prompt_render = self.prompt_assembler.render(
+            self.NATIVE_GENERAL_PROMPT_ID
+        )
+        self.native_researcher_prompt_render = self.prompt_assembler.render(
+            self.NATIVE_RESEARCHER_PROMPT_ID
+        )
         self.memory_store = memory_store
         self.conversation_state_store = conversation_state_store
         self.conversation_online_authority = conversation_online_authority
@@ -6878,11 +7612,15 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             read_only=False,
             settings=settings,
         )
-        self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(self.knowledge_backend)
+        self.core_tool_boundary = GroundedCoreToolBoundaryMiddleware(
+            self.knowledge_backend,
+            settings=settings,
+        )
         self.trusted_session_context_middleware = GroundedTrustedSessionContextMiddleware(
             settings=settings,
             memory_store=memory_store,
         )
+        self.tool_call_repair_middleware = GroundedToolCallRepairMiddleware()
         self.context_middleware = GroundedContextManagementMiddleware(
             settings=settings,
         )
@@ -6924,6 +7662,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 model
             )
         self.context_middleware.bind_model(model)
+        self.budget_middleware.bind_model(model)
         self._agent_factory = agent_factory
         subagent_model = self._resolve_model(isolated_subagent_model) or model
         native_task_permissions = [
@@ -6960,9 +7699,10 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             self.deep_agent_graph = agent_factory(
                 model=model,
                 tools=self.tools,
-                system_prompt=self.SYSTEM_PROMPT,
+                system_prompt=self.core_prompt_render.system_prompt,
                 middleware=[
                     self.trusted_session_context_middleware,
+                    self.tool_call_repair_middleware,
                     self.context_middleware,
                     self.budget_middleware,
                     self.core_tool_boundary,
@@ -6976,8 +7716,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         "name": "general-purpose",
                         "description": "Read-only isolated semantic investigation for parallel evidence gathering.",
                         "system_prompt": (
-                            "Use only native read-only filesystem tools. Return refs and concise findings. "
-                            "Do not route, propose a Contract, execute SQL, verify evidence, answer, or ask the user."
+                            self.native_general_prompt_render.system_prompt
                         ),
                         "tools": [],
                         "skills": None,
@@ -6990,12 +7729,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                             "context-heavy evidence navigation."
                         ),
                         "system_prompt": (
-                            "You are a grounded read-only researcher. The user message "
-                            "contains one validated grounded_native_task.v1 contract. "
-                            "Pursue only its objective using /knowledge exact reads. "
-                            "Do not call task, query data, execute SQL, mutate Goals, "
-                            "publish evidence, or ask the merchant. Return a concise "
-                            "structured result with evidenceRefs, gaps and summary."
+                            self.native_researcher_prompt_render.system_prompt
                         ),
                         "model": subagent_model,
                         "tools": [],
@@ -14638,26 +15372,15 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 ],
             },
         }
-        system_prompt = (
-            "You are one isolated worker selected dynamically by the single Grounded Core. "
-            "The subGoalContract is immutable: pursue its objective and required outputs, "
-            "choose your own execution steps inside the server-issued capability grant, and "
-            "satisfy its evidence requirements. Do not call task, ask the user, change Root "
-            "Goals or this contract, widen scope, publish evidence, or answer the merchant. "
-            "Return one concise JSON object with summary, evidenceRefs, gaps, "
-            "recommendedNextAction, proposedSubGoals and evidenceGaps. proposedSubGoals are "
-            "non-executable suggestions that only the Root may turn into a new contract. "
-            "Filesystem findings are advisory navigation only unless the granted query tool "
-            "returns a verified artifact receipt."
-        )
+        capability_rules: list[str] = []
         if selected_branch_ids:
-            system_prompt += (
+            capability_rules.append(
                 " This task owns no query branch; it may only call execute_assigned_query "
                 "against the exact already-prepared branch in its grant. It may repair and "
                 "retry only while that branch remains PREPARED and within its tool budget."
             )
         if "QUERY_DATA" in capability_set:
-            system_prompt += (
+            capability_rules.append(
                 " Use query_data for governed reads required by this SubGoal. It enforces "
                 "the same Contract, SQL validation, tenant/ACL injection, execution and "
                 "Evidence verification as Root. Handle NEEDS_REASONING Observations and "
@@ -14665,10 +15388,24 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 "outside grantedGoalIds. Only VERIFIED artifacts are adopted into Root."
             )
         if selected_skill_names:
-            system_prompt += (
+            capability_rules.append(
                 " Read exactly the mounted SKILL.md and apply it only to the selected verified "
                 "artifacts. Skill prose remains advisory; do not claim publication authority."
             )
+        subagent_prompt_render = self.prompt_assembler.render(
+            self.ISOLATED_SUBAGENT_PROMPT_ID,
+            variables={
+                "capability_rules": "\n".join(
+                    rule.strip() for rule in capability_rules
+                )
+            },
+        )
+        system_prompt = subagent_prompt_render.system_prompt
+        task_payload["promptTrace"] = subagent_prompt_render.trace()
+        with session.lock:
+            session.prompt_traces[
+                "subagent:%s" % job_id
+            ] = subagent_prompt_render.trace()
         permissions = [
             FilesystemPermission(
                 operations=["write"],
@@ -15161,35 +15898,17 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 ensure_ascii=False,
             )
 
+        skill_prompt_render = self.prompt_assembler.render(
+            self.SKILL_SUBAGENT_PROMPT_ID
+        )
+        with session.lock:
+            session.prompt_traces[
+                "skillSubagent:%s" % skill_run_id
+            ] = skill_prompt_render.trace()
         isolated_job = IsolatedSubagentJob(
             job_id=skill_run_id,
             thread_id=skill_thread_id,
-            system_prompt=(
-                "You are a generic isolated subagent with one mounted Skill resource. "
-                "Read the selected SKILL.md and execute its procedure against /input.json "
-                "and, when present, /script-output.json. You may read current-Topic "
-                "knowledge and call retrieve_knowledge for governed background, but you "
-                "may not propose the parent Contract, execute SQL, alter parent evidence, "
-                "ask the user, dispatch task, or request that the parent query more data. "
-                "Every observed fact must be grounded in the immutable input evidence. "
-                "The verifiedArtifactAccess catalog in /input.json is the only data "
-                "authority. Read selected immutable rows through /artifacts with paging; "
-                "unselected artifacts are outside your authority. PREVIEW and OBSERVATION "
-                "inputs are samples only and must never be treated as a complete population. "
-                "Never replace or extend a governed metric formula. Put measured facts in "
-                "observations, governed definitions in semanticDisclosures, calculations "
-                "using an already-declared governed formula in derivedFacts, uncertain ideas "
-                "in hypotheses, actions in recommendations, and missing evidence in gaps. "
-                "When /input.json contains analysisGoals, also return "
-                "analysisPublicationRequests: one request per analysis goal using only "
-                "that goal's publicationInterface schema. Select mappings and an allowed "
-                "deterministic method; never return computed results, conclusions, causal "
-                "claims, rows, or answerMarkdown inside a publication request. "
-                "Return one JSON object with answerMarkdown, observations, "
-                "semanticDisclosures, derivedFacts, hypotheses, recommendations, "
-                "evidenceRefs, gaps, executionConfidence between 0 and 1, and when "
-                "required analysisPublicationRequests."
-            ),
+            system_prompt=skill_prompt_render.system_prompt,
             user_payload={
                 "mountedSkill": "/skills/%s/SKILL.md" % normalized_name,
                 "objective": objective,
@@ -15210,6 +15929,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     ],
                     "conditional": {"whenInputAnalysisGoalsPresent": ["analysisPublicationRequests"]},
                 },
+                "promptTrace": skill_prompt_render.trace(),
             },
             backend=isolated_backend,
             tools=[skill_retrieve_knowledge],
@@ -15399,20 +16119,25 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 feedback,
                 immutable=True,
             )
+            repair_prompt_render = self.prompt_assembler.render(
+                self.SKILL_SUBAGENT_PROMPT_ID,
+                sections={"repair_constraints": GROUNDED_SKILL_REPAIR_RULES},
+            )
+            with session.lock:
+                session.prompt_traces[
+                    "skillSubagent:%s:repair1" % skill_run_id
+                ] = repair_prompt_render.trace()
             repair_job = replace(
                 isolated_job,
                 job_id="%s_repair1" % skill_run_id,
                 thread_id="%s__repair1" % skill_thread_id,
-                system_prompt=(
-                    isolated_job.system_prompt + " This is the only permitted repair attempt. Read /draft-output.json "
-                    "and /verification-feedback.json, then return a corrected JSON object. "
-                    "Use exactly the same immutable evidence and never ask the parent to query."
-                ),
+                system_prompt=repair_prompt_render.system_prompt,
                 user_payload={
                     **dict(isolated_job.user_payload),
                     "draftArtifact": "/draft-output.json",
                     "verificationFeedbackArtifact": "/verification-feedback.json",
                     "repairAttempt": 1,
+                    "promptTrace": repair_prompt_render.trace(),
                 },
             )
             try:
@@ -17585,6 +18310,15 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     ),
                 ),
                 population_gate_enforced=self.population_gate_enforced,
+                prompt_traces={
+                    "root": self.core_prompt_render.trace(),
+                    "nativeGeneralPurpose": (
+                        self.native_general_prompt_render.trace()
+                    ),
+                    "nativeResearcher": (
+                        self.native_researcher_prompt_render.trace()
+                    ),
+                },
                 conversation_context=(
                     {
                         "resolution": {
@@ -17660,7 +18394,9 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 listener=listener,
             )
             with budget.stage("bootstrap.context"):
-                first_context = self._initial_context(session)
+                session.trusted_bootstrap_context = (
+                    self._build_trusted_bootstrap_context(session)
+                )
             if self.checkpoint_config_factory is not None:
                 config = self.checkpoint_config_factory(actual_thread_id, actual_run_id)
             elif self.checkpointer is not None:
@@ -17675,7 +18411,14 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             with self.knowledge_backend.scope(session):
                 with budget.stage("core.react_loop"):
                     self.deep_agent_graph.invoke(
-                        {"messages": [{"role": "user", "content": first_context}]},
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": session.runtime.question,
+                                }
+                            ]
+                        },
                         config=config,
                         context=context,
                     )
@@ -17765,20 +18508,36 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                         detail="%s:%s" % (type(exc).__name__, str(exc)[:300]),
                     )
                 )
-            elif _is_provider_timeout_error(exc):
+            elif _provider_retry_reason(exc) is not None:
                 if session is None and kernel_session is not None:
                     session = GroundedDeepAgentSession(runtime=kernel_session)
                 if session is None:
                     raise
+                provider_failure_reason = (
+                    _provider_retry_reason(exc) or "service_unavailable"
+                )
                 session.operational_failure = {
-                    "code": "GROUNDED_PROVIDER_TIMEOUT",
+                    "code": (
+                        "GROUNDED_PROVIDER_TIMEOUT"
+                        if provider_failure_reason == "timeout"
+                        else "GROUNDED_PROVIDER_TRANSIENT_FAILURE"
+                    ),
                     "message": "%s:%s" % (type(exc).__name__, str(exc)[:500]),
                     "retryable": True,
+                    "reason": provider_failure_reason,
                 }
-                session.runtime.phase = "PROVIDER_TIMEOUT"
+                session.runtime.phase = (
+                    "PROVIDER_TIMEOUT"
+                    if provider_failure_reason == "timeout"
+                    else "PROVIDER_UNAVAILABLE"
+                )
                 _emit_runtime_listener(
                     listener,
-                    "runtime.provider_timeout",
+                    (
+                        "runtime.provider_timeout"
+                        if provider_failure_reason == "timeout"
+                        else "runtime.provider_unavailable"
+                    ),
                     "GROUNDED_CORE",
                     session.operational_failure,
                 )
@@ -18057,7 +18816,10 @@ Use the currently visible tools and server-owned evidence as capabilities and co
             "previewRowsAreCompletePopulation": False,
         }
 
-    def _initial_context(self, session: GroundedDeepAgentSession) -> str:
+    def _build_trusted_bootstrap_context(
+        self,
+        session: GroundedDeepAgentSession,
+    ) -> dict[str, Any]:
         manifests: list[dict[str, Any]] = []
         for topic_name in session.runtime.workspace_topics:
             result = self.semantic_catalog.read(
@@ -18161,7 +18923,6 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 ),
             }
         payload = {
-            "question": session.runtime.question,
             "trustedConversationContext": {
                 "resolution": dict(conversation_context.get("resolution") or {}),
                 "activeScope": {
@@ -18352,7 +19113,7 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 )
             ),
         }
-        return json.dumps(payload, ensure_ascii=False, default=str)
+        return payload
 
     @staticmethod
     def _governed_response(
@@ -18386,6 +19147,10 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                 "activeAttemptId": state.active_attempt_id,
                 "activeGeneration": state.active_generation,
                 "legacyFallbackUsed": False,
+                "promptManagement": {
+                    key: dict(value)
+                    for key, value in session.prompt_traces.items()
+                },
                 "verifiedQueryArtifactIds": list(state.answer_artifact_ids),
                 "verifiedQueryArtifactCount": len(state.answer_artifact_ids),
                 "verifiedRuleArtifactIds": list(state.answer_rule_artifact_ids),
@@ -18440,6 +19205,9 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     if isinstance(item, dict)
                 ],
                 "runtimeBudget": dict(session.runtime_budget_report),
+                "providerCircuit": dict(
+                    session.provider_circuit_report
+                ),
                 "performance": {
                     "totalDurationMs": session.runtime_budget_report.get(
                         "elapsedMs",
@@ -18458,6 +19226,30 @@ Use the currently visible tools and server-owned evidence as capabilities and co
                     "modelCallCount": len(session.core_context_reports),
                     "latest": (dict(session.core_context_reports[-1]) if session.core_context_reports else {}),
                     "calls": [dict(item) for item in session.core_context_reports[-16:]],
+                },
+                "toolCallRecovery": {
+                    "recoveryCount": len(
+                        session.tool_call_recovery_reports
+                    ),
+                    "latest": (
+                        dict(session.tool_call_recovery_reports[-1])
+                        if session.tool_call_recovery_reports
+                        else {}
+                    ),
+                    "events": [
+                        dict(item)
+                        for item in session.tool_call_recovery_reports[-16:]
+                    ],
+                },
+                "toolLoopGuard": {
+                    "blockedTools": sorted(session.tool_loop_blocked),
+                    "toolTypeCounts": dict(
+                        sorted(session.tool_loop_type_counts.items())
+                    ),
+                    "events": [
+                        dict(item)
+                        for item in session.tool_loop_events[-16:]
+                    ],
                 },
                 "trustedSessionContext": {
                     "modelCallCount": len(session.trusted_session_context_reports),

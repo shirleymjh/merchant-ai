@@ -4,6 +4,14 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping
 
+from merchant_ai.services.grounded_prompt_text import (
+    GROUNDED_CORE_SYSTEM_PROMPT,
+    GROUNDED_ISOLATED_SUBAGENT_PROMPT,
+    GROUNDED_NATIVE_GENERAL_PURPOSE_PROMPT,
+    GROUNDED_NATIVE_RESEARCHER_PROMPT,
+    GROUNDED_SKILL_SUBAGENT_PROMPT,
+)
+
 
 class SafeFormatDict(dict):
     def __missing__(self, key: str) -> str:
@@ -238,6 +246,51 @@ def default_prompt_registry() -> PromptRegistry:
             version="v1",
             title="回答证据边界",
             content="回答只能基于已验证证据、结果摘要和证据缺口；缺证据要说明，不得把缺失、失败或未知解释成业务为 0。",
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
+            prompt_id="grounded.core.system",
+            version="v1",
+            agent="GroundedCore",
+            description="Stable root ReAct contract for governed merchant analysis.",
+            template=GROUNDED_CORE_SYSTEM_PROMPT,
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
+            prompt_id="grounded.native.general_purpose",
+            version="v1",
+            agent="GroundedNativeGeneralPurpose",
+            description="Read-only fallback worker with no business decision authority.",
+            template=GROUNDED_NATIVE_GENERAL_PURPOSE_PROMPT,
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
+            prompt_id="grounded.native.researcher",
+            version="v1",
+            agent="GroundedResearcher",
+            description="Read-only semantic investigation worker.",
+            template=GROUNDED_NATIVE_RESEARCHER_PROMPT,
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
+            prompt_id="grounded.subagent.system",
+            version="v1",
+            agent="GroundedIsolatedSubagent",
+            description="Capability-scoped SubGoal worker prompt.",
+            template=GROUNDED_ISOLATED_SUBAGENT_PROMPT,
+        )
+    )
+    registry.register(
+        PromptTemplateSpec(
+            prompt_id="grounded.skill_subagent.system",
+            version="v1",
+            agent="GroundedSkillSubagent",
+            description="Isolated Skill worker over immutable verified evidence.",
+            template=GROUNDED_SKILL_SUBAGENT_PROMPT,
         )
     )
     registry.register(

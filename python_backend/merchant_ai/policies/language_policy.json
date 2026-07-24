@@ -91,8 +91,7 @@
     "scopeLockMarkers": ["只看", "仅看", "只分析", "仅分析", "限定在", "仅限", "单独看", "只查"],
     "correctionMarkers": ["不对", "不是", "改为", "改成", "纠正", "口径应该"],
     "entityAssignmentOperators": ["等于", "为", "=", ":", "："],
-    "timeClarificationOptions": ["最近7天", "最近30天", "最近90天"],
-    "memoryAuthoringMarkers": ["请记住", "记住", "以后", "默认", "长期", "固定"]
+    "timeClarificationOptions": ["最近7天", "最近30天", "最近90天"]
   },
   "answer": {
     "definitionMarkers": ["口径", "定义", "含义", "什么意思", "是否扣", "怎么算", "计算方式"],

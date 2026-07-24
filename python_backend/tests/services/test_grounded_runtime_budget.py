@@ -27,18 +27,22 @@ class FakeClock:
 def make_budget(
     *,
     duration: float = 90,
+    actions: int = 20,
     llm: int = 8,
     tools: int = 60,
     doris: int = 12,
+    tokens: int = 60_000,
     monotonic: FakeClock | None = None,
     wall: FakeClock | None = None,
 ) -> GroundedRuntimeBudget:
     return GroundedRuntimeBudget(
         GroundedRuntimeBudgetLimits(
             max_duration_seconds=duration,
+            max_actions=actions,
             max_llm_calls=llm,
             max_tool_calls=tools,
             max_doris_queries=doris,
+            max_estimated_tokens=tokens,
         ),
         monotonic_clock=monotonic or FakeClock(),
         wall_clock=wall or FakeClock(1_700_000_000),
@@ -49,9 +53,11 @@ def test_budget_uses_existing_settings_for_complex_and_fast_profiles() -> None:
     settings = SimpleNamespace(
         run_budget_max_duration_seconds=90,
         run_budget_fast_duration_seconds=25,
+        run_budget_max_actions=13,
         run_budget_max_llm_calls=7,
         run_budget_max_tool_calls=41,
         run_budget_max_doris_queries=9,
+        run_budget_max_estimated_tokens=44_000,
     )
 
     complex_budget = GroundedRuntimeBudget.from_settings(settings)
@@ -59,9 +65,11 @@ def test_budget_uses_existing_settings_for_complex_and_fast_profiles() -> None:
 
     assert complex_budget.limits.as_dict() == {
         "maxDurationSeconds": 90.0,
+        "maxActions": 13,
         "maxLlmCalls": 7,
         "maxToolCalls": 41,
         "maxDorisQueries": 9,
+        "maxEstimatedTokens": 44_000,
         "profile": "complex",
     }
     assert fast_budget.limits.max_duration_seconds == 25
@@ -76,9 +84,12 @@ def test_report_tracks_llm_turns_tools_by_name_and_doris_queries() -> None:
     budget.consume_llm_call(name="core", turns=2)
     budget.consume_llm_call(name="sql_repair")
     budget.consume_llm_turns(2, name="core")
+    budget.consume_action(name="core", count=2)
     budget.consume_tool_call("read_file", count=2)
     budget.consume_tool_call("submit_grounded_contract")
     budget.consume_doris_query(name="deterministic_query", count=2)
+    budget.consume_estimated_tokens(1_500, name="core.input")
+    budget.consume_estimated_tokens(250, name="core.output")
     monotonic.advance(1.25)
 
     report = budget.report()
@@ -86,6 +97,8 @@ def test_report_tracks_llm_turns_tools_by_name_and_doris_queries() -> None:
     assert report["elapsedMs"] == 1250
     assert report["deadlineEpochMs"] == 1_700_000_090_000
     assert report["usage"] == {
+        "actions": 2,
+        "actionsByName": {"core": 2},
         "llmCalls": 2,
         "llmTurns": 5,
         "llmCallsByName": {"core": 1, "sql_repair": 1},
@@ -94,12 +107,19 @@ def test_report_tracks_llm_turns_tools_by_name_and_doris_queries() -> None:
         "toolCallsByName": {"read_file": 2, "submit_grounded_contract": 1},
         "dorisQueries": 2,
         "dorisQueriesByName": {"deterministic_query": 2},
+        "estimatedTokens": 1_750,
+        "estimatedTokensByName": {
+            "core.input": 1_500,
+            "core.output": 250,
+        },
     }
     assert report["remaining"] == {
         "durationMs": 88750,
+        "actions": 18,
         "llmCalls": 6,
         "toolCalls": 57,
         "dorisQueries": 10,
+        "estimatedTokens": 58_250,
     }
     json.dumps(report)
 
@@ -107,13 +127,24 @@ def test_report_tracks_llm_turns_tools_by_name_and_doris_queries() -> None:
 @pytest.mark.parametrize(
     ("consume", "breach"),
     [
+        (lambda item: item.consume_action(), "actions"),
         (lambda item: item.consume_llm_call(), "llm_calls"),
         (lambda item: item.consume_tool_call("read_file"), "tool_calls"),
         (lambda item: item.consume_doris_query(), "doris_queries"),
+        (
+            lambda item: item.consume_estimated_tokens(1),
+            "estimated_tokens",
+        ),
     ],
 )
 def test_count_limits_allow_exact_limit_and_reject_next_call(consume, breach: str) -> None:
-    budget = make_budget(llm=1, tools=1, doris=1)
+    budget = make_budget(
+        actions=1,
+        llm=1,
+        tools=1,
+        doris=1,
+        tokens=1,
+    )
 
     consume(budget)
     with pytest.raises(GroundedRuntimeBudgetExceeded) as raised:

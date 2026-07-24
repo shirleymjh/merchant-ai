@@ -155,26 +155,79 @@ def require_ops_token(
     request: Request,
     authorization: Optional[str] = Header(default=None),
     x_ops_token: Optional[str] = Header(default=None, alias="X-Ops-Token"),
-) -> None:
+    x_dev_ops_actor: Optional[str] = Header(default=None, alias="X-Dev-Ops-Actor"),
+) -> Dict[str, Any]:
     expected = str(settings.ops_token or "").strip()
-    if not expected:
-        client_host = str(request.client.host if request.client else "")
-        if not settings.identity_auth_required and client_host in {"127.0.0.1", "::1", "localhost"}:
-            return
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="ops token is not configured")
     bearer_prefix = "Bearer "
-    provided = str(x_ops_token or "").strip()
-    if not provided and authorization and authorization.startswith(bearer_prefix):
-        provided = authorization[len(bearer_prefix) :].strip()
-    if not hmac.compare_digest(provided, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid ops token",
-            headers={"WWW-Authenticate": "Bearer"},
+    bearer = ""
+    if authorization and authorization.startswith(bearer_prefix):
+        bearer = authorization[len(bearer_prefix) :].strip()
+    provided = str(x_ops_token or bearer or "").strip()
+
+    if expected and provided and hmac.compare_digest(provided, expected):
+        return {
+            "actor": "shared_ops_token",
+            "authenticationMethod": "shared_ops_token",
+        }
+
+    identity_token = str(request.cookies.get("yshopping_ops_session") or "").strip()
+    if not identity_token and bearer and (not expected or not hmac.compare_digest(bearer, expected)):
+        identity_token = bearer
+    if identity_token and settings.identity_jwt_secret:
+        identity = resolve_authenticated_identity(
+            settings,
+            "%s%s" % (bearer_prefix, identity_token),
+            None,
         )
+        principal = principal_from_authenticated_identity(identity)
+        if not principal.is_ops:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="authenticated identity is not an operator",
+            )
+        return {
+            "actor": str(identity.user_id or identity.display_name or "platform_operator"),
+            "displayName": str(identity.display_name or ""),
+            "authenticationMethod": "operator_identity",
+        }
+
+    client_host = str(request.client.host if request.client else "")
+    if (
+        not expected
+        and not settings.identity_auth_required
+        and client_host in {"127.0.0.1", "::1", "localhost"}
+    ):
+        actor = "".join(
+            character
+            for character in str(x_dev_ops_actor or "local_ops").strip()
+            if character.isalnum() or character in {"_", "-", ".", "@"}
+        )[:120]
+        return {
+            "actor": actor or "local_ops",
+            "authenticationMethod": "local_development",
+        }
+
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="operator identity is not configured",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="invalid operator credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 OpsAuth = Depends(require_ops_token)
+
+
+def ops_actor(auth_context: Any) -> str:
+    if isinstance(auth_context, dict):
+        actor = str(auth_context.get("actor") or "").strip()
+        if actor:
+            return actor[:120]
+    return "unknown_operator"
 
 
 def require_merchant_access(
@@ -793,15 +846,35 @@ def operator_knowledge_suggestions(
     return {"success": True, "items": items}
 
 
+@router.post("/api/ops/knowledge-suggestions/{item_id}/conflict-check")
+def check_operator_knowledge_suggestion_conflicts(
+    item_id: str,
+    merchant_id: str = Query(default=""),
+    _auth: None = OpsAuth,
+) -> Dict[str, Any]:
+    target = require_ops_merchant_access(
+        merchant_id or settings.merchant_id,
+        Permission.OPS_WRITE,
+    )
+    return memory_governance_service.check_suggestion_conflicts(target, item_id)
+
+
 @router.post("/api/ops/knowledge-suggestions/{item_id}/review")
 def review_operator_knowledge_suggestion(
     item_id: str,
     request: KnowledgeSuggestionReviewRequest,
     merchant_id: str = Query(default=""),
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
     target = require_ops_merchant_access(merchant_id or settings.merchant_id)
-    return memory_governance_service.review_and_activate_suggestion(target, item_id, request)
+    reviewed_request = request.model_copy(
+        update={"reviewer": ops_actor(_auth)}
+    )
+    return memory_governance_service.review_and_activate_suggestion(
+        target,
+        item_id,
+        reviewed_request,
+    )
 
 
 @router.post("/api/ops/knowledge-suggestions/{item_id}/request-publish")
@@ -809,10 +882,15 @@ def request_operator_knowledge_publish(
     item_id: str,
     request: KnowledgeSuggestionPublishRequest,
     merchant_id: str = Query(default=""),
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
     target = require_ops_merchant_access(merchant_id or settings.merchant_id)
-    return memory_governance_service.request_publish_suggestion(target, item_id, request.reviewer, request.review_note)
+    return memory_governance_service.request_publish_suggestion(
+        target,
+        item_id,
+        ops_actor(_auth),
+        request.review_note,
+    )
 
 
 @router.post("/api/ops/knowledge-suggestions/{item_id}/publish")
@@ -820,13 +898,13 @@ def publish_operator_knowledge_suggestion(
     item_id: str,
     request: KnowledgeSuggestionPublishRequest,
     merchant_id: str = Query(default=""),
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
     target = require_ops_merchant_access(merchant_id or settings.merchant_id)
     result = memory_governance_service.publish_suggestion(
         target,
         item_id,
-        reviewer=request.reviewer,
+        reviewer=ops_actor(_auth),
         review_note=request.review_note,
         topic=request.topic,
         table_name=request.table_name,
@@ -846,8 +924,15 @@ def list_skill_drafts(status: Optional[str] = Query(default=None), _auth: None =
 
 
 @router.post("/api/ops/skill-drafts/{draft_id}/review")
-def review_skill_draft(draft_id: str, request: SkillDraftReviewRequest, _auth: None = OpsAuth) -> Dict[str, Any]:
-    return skill_draft_service.review_draft(draft_id, request)
+def review_skill_draft(
+    draft_id: str,
+    request: SkillDraftReviewRequest,
+    _auth: Dict[str, Any] = OpsAuth,
+) -> Dict[str, Any]:
+    return skill_draft_service.review_draft(
+        draft_id,
+        request.model_copy(update={"reviewer": ops_actor(_auth)}),
+    )
 
 
 @router.post("/api/ops/skill-evaluations")
@@ -1050,10 +1135,26 @@ def publish_topic_asset(
     topic: str,
     table_name: str,
     request: TopicReviewRequest,
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
-    preflight = semantic_governance.preflight_publish(topic, table_name) if request.approved else {}
-    if request.approved and not preflight.get("publishable", False):
+    if not request.approved:
+        return {
+            "success": False,
+            "status": "APPROVAL_REQUIRED",
+            "topic": topic,
+            "tableName": table_name,
+        }
+    actor = ops_actor(_auth)
+    publish_authorization = semantic_governance.authorize_publish(
+        topic,
+        table_name,
+        actor,
+    )
+    if not publish_authorization.get("success"):
+        return publish_authorization
+    workflow = publish_authorization.get("reviewWorkflow") or {}
+    preflight = semantic_governance.preflight_publish(topic, table_name)
+    if not preflight.get("publishable", False):
         return {
             "success": False,
             "status": "PREFLIGHT_FAILED",
@@ -1061,15 +1162,51 @@ def publish_topic_asset(
             "tableName": table_name,
             "preflight": preflight,
         }
-    if request.approved:
-        return semantic_publish_coordinator.publish_approved(
+    result = semantic_publish_coordinator.publish_approved(
+        topic,
+        table_name,
+        str(workflow.get("reviewedBy") or actor),
+        str(workflow.get("reviewNote") or request.review_note or ""),
+        preflight,
+    )
+    if result.get("success"):
+        result["reviewWorkflow"] = semantic_governance.mark_published(
             topic,
             table_name,
-            request.reviewer,
-            request.review_note,
-            preflight,
+            actor,
         )
-    return topic_assets.publish(topic, table_name, False, request.reviewer, request.review_note)
+    return result
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/submit-review")
+def submit_topic_asset_review(
+    topic: str,
+    table_name: str,
+    request: TopicReviewRequest,
+    _auth: Dict[str, Any] = OpsAuth,
+) -> Dict[str, Any]:
+    return semantic_governance.submit_review(
+        topic,
+        table_name,
+        ops_actor(_auth),
+        request.review_note,
+    )
+
+
+@router.post("/api/topics/{topic}/tables/{table_name}/review")
+def review_topic_asset(
+    topic: str,
+    table_name: str,
+    request: TopicReviewRequest,
+    _auth: Dict[str, Any] = OpsAuth,
+) -> Dict[str, Any]:
+    return semantic_governance.review_submission(
+        topic,
+        table_name,
+        ops_actor(_auth),
+        request.approved,
+        request.review_note,
+    )
 
 
 @router.post("/api/topics/{topic}/tables/{table_name}/schema-diff")
@@ -1100,11 +1237,27 @@ def rollback_semantic_asset(
     version: str = Query(default=""),
     reviewer: str = Query(default=""),
     reason: str = Query(default=""),
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
-    result = semantic_governance.rollback(topic, table_name, version=version, reviewer=reviewer, reason=reason)
+    del reviewer
+    result = semantic_governance.rollback(
+        topic,
+        table_name,
+        version=version,
+        reviewer=ops_actor(_auth),
+        reason=reason,
+    )
     if result.get("success"):
-        index_result = recall_index_manager.rebuild(changed_only=True, topic=topic, table_name=table_name)
+        recall_scope_table = (
+            ""
+            if "relationships.json" in (result.get("restoredFiles") or [])
+            else table_name
+        )
+        index_result = recall_index_manager.rebuild(
+            changed_only=True,
+            topic=topic,
+            table_name=recall_scope_table,
+        )
         result["recallIndex"] = index_result
         result["cacheInvalidated"] = bool(index_result.get("cacheInvalidated"))
     return result
@@ -1168,6 +1321,11 @@ def topic_assets_endpoint(topic: str, _auth: None = OpsAuth) -> Dict[str, Any]:
 def topic_table_governance(topic: str, table_name: str, _auth: None = OpsAuth) -> Dict[str, Any]:
     target = topic_assets.table_asset_dir(topic, table_name)
     pending = topic_assets.root / topic / "pending" / table_name
+    active_relationships = topic_assets.relationships_for_table(topic, table_name)
+    pending_relationships_path = pending / topic_assets.PENDING_RELATIONSHIPS_FILE
+    pending_relationships = read_json_file(pending_relationships_path)
+    if not isinstance(pending_relationships, list):
+        pending_relationships = active_relationships
     return {
         "success": target.exists(),
         "topic": topic,
@@ -1175,7 +1333,10 @@ def topic_table_governance(topic: str, table_name: str, _auth: None = OpsAuth) -
         "asset": topic_assets.load_table_asset(topic, table_name),
         "pendingAsset": read_json_file(pending / "asset.json"),
         "pendingPatch": read_json_file(pending / "knowledge_suggestion_patch.json"),
+        "relationships": active_relationships,
+        "pendingRelationships": pending_relationships,
         "publishHistory": read_json_file(target / "semantic_publish_history.json"),
+        "reviewWorkflow": semantic_governance.review_workflow(topic, table_name),
         "impact": semantic_governance.impact_analysis(topic, table_name),
     }
 
@@ -1185,7 +1346,7 @@ def stage_topic_table_draft(
     topic: str,
     table_name: str,
     payload: Dict[str, Any] = Body(default_factory=dict),
-    _auth: None = OpsAuth,
+    _auth: Dict[str, Any] = OpsAuth,
 ) -> Dict[str, Any]:
     current = topic_assets.load_table_asset(topic, table_name)
     allowed = {"description", "schemaColumns", "semanticColumns", "metrics", "terms", "knowledgeRules"}
@@ -1193,13 +1354,52 @@ def stage_topic_table_draft(
     pending = topic_assets.root / topic / "pending" / table_name
     pending.mkdir(parents=True, exist_ok=True)
     write_json(pending / "asset.json", draft)
+    if "relationships" in payload:
+        relationships = payload.get("relationships")
+        if not isinstance(relationships, list):
+            raise HTTPException(status_code=422, detail="relationships must be an array")
+        invalid = [
+            item
+            for item in relationships
+            if not isinstance(item, dict)
+            or table_name
+            not in {
+                str(item.get("leftTable") or ""),
+                str(item.get("rightTable") or ""),
+            }
+        ]
+        if invalid:
+            raise HTTPException(
+                status_code=422,
+                detail="every relationship must reference the governed table",
+            )
+        write_json(
+            pending / topic_assets.PENDING_RELATIONSHIPS_FILE,
+            relationships,
+        )
     for file_name in topic_assets.SEMANTIC_SIDECAR_FILES:
         sidecar = pending / file_name
         if sidecar.exists() and sidecar.is_file():
             sidecar.unlink()
+    actor = ops_actor(_auth)
     write_json(
         pending / "editor_metadata.json",
-        {"editor": str(payload.get("editor") or "merchant_ops"), "updatedAt": datetime_now_iso(), "fields": sorted(set(payload) & allowed)},
+        {
+            "editor": actor,
+            "updatedAt": datetime_now_iso(),
+            "fields": sorted(
+                (set(payload) & allowed)
+                | ({"relationships"} if "relationships" in payload else set())
+            ),
+            "relationshipCount": len(payload.get("relationships") or [])
+            if "relationships" in payload
+            else None,
+        },
+    )
+    review_workflow = semantic_governance.stage_review_draft(
+        topic,
+        table_name,
+        actor,
     )
     return {
         "success": True,
@@ -1207,6 +1407,7 @@ def stage_topic_table_draft(
         "topic": topic,
         "tableName": table_name,
         "pendingPath": str(pending),
+        "reviewWorkflow": review_workflow,
         "preflight": semantic_governance.preflight_publish(topic, table_name),
     }
 

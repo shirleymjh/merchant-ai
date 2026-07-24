@@ -64,7 +64,6 @@ def test_packaged_language_policy_is_structured_and_versioned() -> None:
     assert policy.routing.scope_lock_markers
     assert policy.routing.correction_markers
     assert policy.routing.time_clarification_options
-    assert policy.routing.memory_authoring_markers
     assert policy.answer.definition_markers
     assert set(policy.answer.trend_direction_markers) == {"up", "down", "flat"}
 

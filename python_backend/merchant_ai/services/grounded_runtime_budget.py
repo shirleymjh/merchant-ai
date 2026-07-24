@@ -16,9 +16,11 @@ class GroundedRuntimeBudgetLimits:
     """Hard limits shared by one grounded-runtime invocation."""
 
     max_duration_seconds: float = 90.0
+    max_actions: int = 20
     max_llm_calls: int = 16
     max_tool_calls: int = 60
     max_doris_queries: int = 12
+    max_estimated_tokens: int = 60_000
     profile: str = "complex"
 
     @classmethod
@@ -35,18 +37,32 @@ class GroundedRuntimeBudgetLimits:
                 0.001,
                 float(getattr(settings, duration_setting, duration_default) or duration_default),
             ),
+            max_actions=max(1, int(getattr(settings, "run_budget_max_actions", 20) or 20)),
             max_llm_calls=max(1, int(getattr(settings, "run_budget_max_llm_calls", 16) or 16)),
             max_tool_calls=max(1, int(getattr(settings, "run_budget_max_tool_calls", 60) or 60)),
             max_doris_queries=max(1, int(getattr(settings, "run_budget_max_doris_queries", 12) or 12)),
+            max_estimated_tokens=max(
+                1,
+                int(
+                    getattr(
+                        settings,
+                        "run_budget_max_estimated_tokens",
+                        60_000,
+                    )
+                    or 60_000
+                ),
+            ),
             profile="fast" if fast_path else "complex",
         )
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "maxDurationSeconds": self.max_duration_seconds,
+            "maxActions": self.max_actions,
             "maxLlmCalls": self.max_llm_calls,
             "maxToolCalls": self.max_tool_calls,
             "maxDorisQueries": self.max_doris_queries,
+            "maxEstimatedTokens": self.max_estimated_tokens,
             "profile": self.profile,
         }
 
@@ -105,10 +121,14 @@ class GroundedRuntimeBudget:
         self._llm_turns = 0
         self._llm_calls_by_name: Counter[str] = Counter()
         self._llm_turns_by_name: Counter[str] = Counter()
+        self._actions = 0
+        self._actions_by_name: Counter[str] = Counter()
         self._tool_calls = 0
         self._tool_calls_by_name: Counter[str] = Counter()
         self._doris_queries = 0
         self._doris_queries_by_name: Counter[str] = Counter()
+        self._estimated_tokens = 0
+        self._estimated_tokens_by_name: Counter[str] = Counter()
 
         self._stage_sequence = 0
         self._active_stages: Dict[int, _ActiveStage] = {}
@@ -208,6 +228,22 @@ class GroundedRuntimeBudget:
             self._llm_calls_by_name[normalized_name] += 1
             self._llm_turns_by_name[normalized_name] += turns
 
+    def consume_action(self, *, name: str = "core", count: int = 1) -> None:
+        """Reserve logical ReAct turns independently from provider retries."""
+
+        count = _positive_count(count, "count")
+        normalized_name = _counter_name(name)
+        with self._lock:
+            breaches = self._duration_breaches_locked()
+            if self._actions + count > self.limits.max_actions:
+                breaches.append("actions")
+            self._raise_for_breaches_locked(
+                breaches,
+                operation="action:%s" % normalized_name,
+            )
+            self._actions += count
+            self._actions_by_name[normalized_name] += count
+
     def consume_llm_turns(self, count: int = 1, *, name: str = "core") -> None:
         """Record extra logical turns that did not create another provider call."""
 
@@ -239,6 +275,30 @@ class GroundedRuntimeBudget:
             self._raise_for_breaches_locked(breaches, operation="doris:%s" % normalized_name)
             self._doris_queries += count
             self._doris_queries_by_name[normalized_name] += count
+
+    def consume_estimated_tokens(
+        self,
+        count: int,
+        *,
+        name: str = "core",
+    ) -> None:
+        """Reserve estimated provider input/output tokens for this run."""
+
+        count = _positive_count(count, "count")
+        normalized_name = _counter_name(name)
+        with self._lock:
+            breaches = self._duration_breaches_locked()
+            if (
+                self._estimated_tokens + count
+                > self.limits.max_estimated_tokens
+            ):
+                breaches.append("estimated_tokens")
+            self._raise_for_breaches_locked(
+                breaches,
+                operation="tokens:%s" % normalized_name,
+            )
+            self._estimated_tokens += count
+            self._estimated_tokens_by_name[normalized_name] += count
 
     def start_stage(self, name: str) -> int:
         normalized_name = _counter_name(name)
@@ -357,9 +417,14 @@ class GroundedRuntimeBudget:
 
         remaining = {
             "durationMs": _milliseconds(max(0.0, self.limits.max_duration_seconds - elapsed_seconds)),
+            "actions": max(0, self.limits.max_actions - self._actions),
             "llmCalls": max(0, self.limits.max_llm_calls - self._llm_calls),
             "toolCalls": max(0, self.limits.max_tool_calls - self._tool_calls),
             "dorisQueries": max(0, self.limits.max_doris_queries - self._doris_queries),
+            "estimatedTokens": max(
+                0,
+                self.limits.max_estimated_tokens - self._estimated_tokens,
+            ),
         }
         return {
             "startedAtEpochMs": self._started_epoch_ms,
@@ -368,6 +433,8 @@ class GroundedRuntimeBudget:
             "elapsedMs": _milliseconds(elapsed_seconds),
             "limits": self.limits.as_dict(),
             "usage": {
+                "actions": self._actions,
+                "actionsByName": dict(sorted(self._actions_by_name.items())),
                 "llmCalls": self._llm_calls,
                 "llmTurns": self._llm_turns,
                 "llmCallsByName": dict(sorted(self._llm_calls_by_name.items())),
@@ -376,6 +443,10 @@ class GroundedRuntimeBudget:
                 "toolCallsByName": dict(sorted(self._tool_calls_by_name.items())),
                 "dorisQueries": self._doris_queries,
                 "dorisQueriesByName": dict(sorted(self._doris_queries_by_name.items())),
+                "estimatedTokens": self._estimated_tokens,
+                "estimatedTokensByName": dict(
+                    sorted(self._estimated_tokens_by_name.items())
+                ),
             },
             "remaining": remaining,
             "stages": stages,
@@ -394,12 +465,16 @@ class GroundedRuntimeBudget:
         breaches: list[str] = []
         if elapsed_seconds >= self.limits.max_duration_seconds:
             breaches.append("duration")
+        if self._actions >= self.limits.max_actions:
+            breaches.append("actions")
         if self._llm_calls >= self.limits.max_llm_calls:
             breaches.append("llm_calls")
         if self._tool_calls >= self.limits.max_tool_calls:
             breaches.append("tool_calls")
         if self._doris_queries >= self.limits.max_doris_queries:
             breaches.append("doris_queries")
+        if self._estimated_tokens >= self.limits.max_estimated_tokens:
+            breaches.append("estimated_tokens")
         return breaches
 
 

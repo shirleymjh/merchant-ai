@@ -344,8 +344,9 @@ def _spawn_graph_revision_recovery(
                 context: Any = None,
             ) -> None:
                 del config
-                captured["initialContext"] = json.loads(
-                    payload["messages"][0]["content"]
+                captured["userMessage"] = payload["messages"][0]["content"]
+                captured["initialContext"] = dict(
+                    context.session.trusted_bootstrap_context
                 )
                 captured["session"] = context.session
                 context.session.runtime.clarification = (
@@ -367,6 +368,7 @@ def _spawn_graph_revision_recovery(
         )
         session = captured["session"]
         initial_context = captured["initialContext"]
+        assert captured["userMessage"] == "two independent metrics"
         bootstrap_recovery = next(
             item
             for item in session.execution_graph_history

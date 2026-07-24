@@ -20,7 +20,7 @@
 
 运行时按 `L0 Topic manifest -> L1 表详情 -> L2 指标/字段/schema -> L3 relationship/规则` 渐进披露。Core 自行选择 `ls/read_file/grep`；只有成功读取的 Topic-scoped 精确证据可以被 Grounded Query Contract 引用。旧 Planner 文件工具循环不参与在线查询 authority。
 
-DeepAgent 负责短期 message state、checkpoint、自动摘要、state filesystem 与大结果 offload。个人 memory 由 domain store 做租户隔离、按题选择、TTL、冲突和反馈后自动沉淀，使用 `write/reject/quarantine` 自动门禁而非人工审核；共享指标口径/规则/术语则进入独立 knowledge `confirm/review/publish` 生命周期，只有显式 platform/shared scope 才能发布。DeepAgent 的 `AGENTS.md` MemoryMiddleware 无法保持这一区分，因此不启用，并禁止模型直接写入 `/memory`。
+DeepAgent 负责短期 message state、checkpoint、自动摘要、state filesystem 与大结果 offload。个人 memory 由 domain store 做租户隔离、按题选择、TTL、冲突和反馈后自动沉淀，使用 `write/reject/quarantine` 自动门禁而非人工审核；共享指标口径/规则/术语则进入独立 knowledge `confirm/review/publish` 生命周期，只有显式 platform/shared scope 才能发布。公共 Knowledge 在审核、申请发布和正式发布前都会执行“范围内相似候选粗筛 + 结构化语义冲突判断”，存在冲突时必须使用当前报告指纹完成人工处理，旧报告或未处理冲突无法发布。DeepAgent 的 `AGENTS.md` MemoryMiddleware 无法保持这一区分，因此不启用，并禁止模型直接写入 `/memory`。
 
 ## 启动
 

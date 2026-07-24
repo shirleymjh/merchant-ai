@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from threading import RLock
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 
@@ -56,6 +58,7 @@ from merchant_ai.services.repositories import (
 from merchant_ai.services.retrieval import (
     EsKnowledgeRetrievalService,
     HybridKnowledgeRetrievalService,
+    ResilientKnowledgeRetrievalService,
 )
 from merchant_ai.services.routing import (
     KeywordExtractService,
@@ -123,6 +126,20 @@ class GroundedApplicationRuntime:
         self._unavailable_reason = str(unavailable_reason or "").strip()
         self._closed = False
         self.runtime_kind = "grounded_deepagent"
+        self._memory_hook_lock = RLock()
+        self._memory_hook_futures: dict[str, set[Future[Any]]] = {}
+        self._memory_hook_executor = (
+            ThreadPoolExecutor(
+                max_workers=max(
+                    1,
+                    int(getattr(settings, "memory_curator_workers", 1) or 1),
+                ),
+                thread_name_prefix="personal-memory-hook",
+            )
+            if services.memory_store is not None
+            and bool(getattr(settings, "memory_curator_async", True))
+            else None
+        )
 
     def run(
         self,
@@ -148,6 +165,11 @@ class GroundedApplicationRuntime:
                 "messageHistoryCount": len(message_history or []),
                 "preflightEnabled": True,
             },
+        )
+        self._await_pending_personal_memory_hooks(
+            effective_merchant_id,
+            context,
+            listener=listener,
         )
         preflight = self._preflight_understanding(
             question,
@@ -193,6 +215,7 @@ class GroundedApplicationRuntime:
                     run_id=actual_run_id,
                     preflight=preflight,
                     core_invoked=False,
+                    message_history=message_history,
                 )
             if route == QuestionRoute.INVALID:
                 write_operation = bool(
@@ -244,6 +267,7 @@ class GroundedApplicationRuntime:
                     run_id=actual_run_id,
                     preflight=preflight,
                     core_invoked=False,
+                    message_history=message_history,
                 )
         if self.core is None:
             reason = self._unavailable_reason or "required model authority is unavailable"
@@ -299,6 +323,7 @@ class GroundedApplicationRuntime:
             run_id=actual_run_id,
             preflight=preflight,
             core_invoked=True,
+            message_history=message_history,
         )
 
     def _preflight_understanding(
@@ -363,6 +388,7 @@ class GroundedApplicationRuntime:
         run_id: str,
         preflight: Any,
         core_invoked: bool,
+        message_history: Optional[Sequence[ConversationMessage]],
     ) -> ChatResponse:
         if not response.id:
             response.id = "qa_%s" % uuid.uuid4().hex
@@ -403,6 +429,17 @@ class GroundedApplicationRuntime:
             }
         )
         response.debug_trace = {**dict(response.debug_trace or {}), "harness": harness}
+        self._dispatch_personal_memory_hook(
+            response,
+            question=question,
+            merchant_id=merchant_id,
+            context=response_context,
+            listener=listener,
+            thread_id=thread_id,
+            run_id=run_id,
+            message_history=message_history,
+            preflight=preflight,
+        )
         self._persist_verified_answer(
             response,
             question=question,
@@ -425,6 +462,241 @@ class GroundedApplicationRuntime:
             },
         )
         return response
+
+    def _dispatch_personal_memory_hook(
+        self,
+        response: ChatResponse,
+        *,
+        question: str,
+        merchant_id: str,
+        context: ChatContext,
+        listener: Optional[EventListener],
+        thread_id: str,
+        run_id: str,
+        message_history: Optional[Sequence[ConversationMessage]],
+        preflight: Any,
+    ) -> None:
+        """Inspect every authenticated interaction outside the Agent loop.
+
+        The Hook is independent of query-answer persistence: self-description,
+        display preferences and feedback-like business chat can therefore be
+        learned even when no SQL artifact was produced.
+        """
+
+        harness = dict((response.debug_trace or {}).get("harness") or {})
+        identity = context.user_identity
+        scope = identity_scope_payload(identity, merchant_id)
+        user_id = str(scope.get("userId") or "").strip()
+        if self.services.memory_store is None:
+            hook_trace = {"status": "disabled", "written": False}
+        elif not user_id:
+            hook_trace = {
+                "status": "skipped",
+                "reason": "authenticated_user_scope_required",
+                "written": False,
+            }
+        elif bool(harness.get("operationalFailure")):
+            hook_trace = {
+                "status": "skipped",
+                "reason": "operational_failure",
+                "written": False,
+            }
+        elif bool((getattr(preflight, "surface_signals", {}) or {}).get("writeOperation")):
+            hook_trace = {
+                "status": "skipped",
+                "reason": "unsupported_write_operation",
+                "written": False,
+            }
+        else:
+            topics = [
+                str(item.value if hasattr(item, "value") else item)
+                for item in context.topics
+            ]
+            metrics = [str(item) for item in context.metric_keys if str(item).strip()]
+            days = int(context.resolved_time_window_days or context.days or 0)
+            plan_intent = SimpleNamespace(
+                category=str(context.topic or (topics[0] if topics else "")),
+                metric_resolution={"metricKey": metrics[0] if metrics else ""},
+                metric_name=metrics[0] if metrics else "",
+                days=days,
+            )
+            verified = bool(
+                harness.get("verifiedQueryArtifactIds")
+                or harness.get("verifiedRuleArtifactIds")
+            )
+            memory_state = {
+                "requested_merchant_id": merchant_id,
+                "question": question,
+                "answer": response.answer,
+                "message_history": list(message_history or []),
+                "plan": SimpleNamespace(
+                    intents=[plan_intent] if topics or metrics or days else [],
+                    question_understanding={
+                        "analysisIntent": str(context.answer_mode or "")
+                    },
+                ),
+                "route_slots": {"timeWindow": {"days": days}},
+                "user_identity": identity,
+                "persisted": True,
+                "agent_run_result": SimpleNamespace(
+                    task_results=[object()] if verified else [],
+                    verified_evidence=SimpleNamespace(passed=verified),
+                    evidence_gaps=[],
+                ),
+                "semantic_evidence": [],
+                "memory_hook": {
+                    "type": "interaction_completed",
+                    "threadId": thread_id,
+                    "runId": run_id,
+                },
+            }
+
+            def write_memory() -> dict[str, Any]:
+                try:
+                    result = self.services.memory_store.update_from_state(memory_state)
+                    ingestion_trace = (
+                        dict(result.get("memoryIngestionTrace") or {})
+                        if isinstance(result, dict)
+                        else {}
+                    )
+                    written = bool(
+                        ingestion_trace.get("written")
+                        or ingestion_trace.get("preferenceUpdates")
+                        or (
+                            isinstance(result, dict)
+                            and result.get("written") is True
+                        )
+                    )
+                    _emit(
+                        listener,
+                        "memory.extraction.completed",
+                        "PERSONAL_MEMORY_HOOK",
+                        {
+                            "threadId": thread_id,
+                            "runId": run_id,
+                            "userId": user_id,
+                            "written": written,
+                        },
+                    )
+                    return {
+                        "status": "completed",
+                        "written": written,
+                        "outcome": (
+                            "stored"
+                            if written
+                            else str(
+                                ingestion_trace.get("reason")
+                                or "no_durable_personal_signal"
+                            )
+                        ),
+                    }
+                except Exception as exc:
+                    _emit(
+                        listener,
+                        "memory.extraction.failed",
+                        "PERSONAL_MEMORY_HOOK",
+                        {
+                            "threadId": thread_id,
+                            "runId": run_id,
+                            "errorType": type(exc).__name__,
+                            "error": str(exc)[:300],
+                        },
+                    )
+                    return {
+                        "status": "failed",
+                        "written": False,
+                        "errorType": type(exc).__name__,
+                    }
+
+            if self._memory_hook_executor is not None:
+                principal_key = "%s:%s" % (merchant_id, user_id)
+                future = self._memory_hook_executor.submit(write_memory)
+                with self._memory_hook_lock:
+                    self._memory_hook_futures.setdefault(
+                        principal_key,
+                        set(),
+                    ).add(future)
+                future.add_done_callback(
+                    lambda completed, key=principal_key: self._forget_memory_hook(
+                        key,
+                        completed,
+                    )
+                )
+                hook_trace = {
+                    "status": "scheduled",
+                    "written": False,
+                    "mode": "background",
+                    "refreshPolicy": "EVERY_INTERACTION",
+                }
+                _emit(
+                    listener,
+                    "memory.extraction.scheduled",
+                    "PERSONAL_MEMORY_HOOK",
+                    {
+                        "threadId": thread_id,
+                        "runId": run_id,
+                        "userId": user_id,
+                    },
+                )
+            else:
+                hook_trace = {
+                    **write_memory(),
+                    "mode": "inline",
+                    "refreshPolicy": "EVERY_INTERACTION",
+                }
+        harness["personalMemoryHook"] = hook_trace
+        response.debug_trace = {
+            **dict(response.debug_trace or {}),
+            "harness": harness,
+        }
+
+    def _await_pending_personal_memory_hooks(
+        self,
+        merchant_id: str,
+        context: Optional[ChatContext],
+        *,
+        listener: Optional[EventListener],
+    ) -> None:
+        identity = getattr(context, "user_identity", None) if context is not None else None
+        scope = identity_scope_payload(identity, merchant_id)
+        user_id = str(scope.get("userId") or "").strip()
+        if not user_id:
+            return
+        principal_key = "%s:%s" % (merchant_id, user_id)
+        with self._memory_hook_lock:
+            pending = set(self._memory_hook_futures.get(principal_key) or set())
+        if not pending:
+            return
+        timeout_seconds = max(
+            1,
+            int(getattr(self.settings, "memory_curator_timeout_seconds", 8) or 8)
+            + 1,
+        )
+        _, still_pending = wait(pending, timeout=timeout_seconds)
+        _emit(
+            listener,
+            "memory.extraction.awaited",
+            "PERSONAL_MEMORY_HOOK",
+            {
+                "userId": user_id,
+                "pendingCount": len(pending),
+                "stillPendingCount": len(still_pending),
+                "timeoutSeconds": timeout_seconds,
+            },
+        )
+
+    def _forget_memory_hook(
+        self,
+        principal_key: str,
+        future: Future[Any],
+    ) -> None:
+        with self._memory_hook_lock:
+            futures = self._memory_hook_futures.get(principal_key)
+            if futures is None:
+                return
+            futures.discard(future)
+            if not futures:
+                self._memory_hook_futures.pop(principal_key, None)
 
     def _persist_verified_answer(
         self,
@@ -510,48 +782,14 @@ class GroundedApplicationRuntime:
                 type(exc).__name__,
                 str(exc)[:300],
             )
-        memory_written = False
-        if pending_written and self.services.memory_store is not None:
-            try:
-                topics = [str(item.value if hasattr(item, "value") else item) for item in context.topics]
-                metrics = [str(item) for item in context.metric_keys if str(item).strip()]
-                days = int(context.resolved_time_window_days or context.days or 0)
-                plan_intent = SimpleNamespace(
-                    category=str(context.topic or (topics[0] if topics else "")),
-                    metric_resolution={"metricKey": metrics[0] if metrics else ""},
-                    metric_name=metrics[0] if metrics else "",
-                    days=days,
-                )
-                memory_state = {
-                    "requested_merchant_id": merchant_id,
-                    "question": question,
-                    "answer": response.answer,
-                    "plan": SimpleNamespace(
-                        intents=[plan_intent],
-                        question_understanding={"analysisIntent": str(context.answer_mode or "")},
-                    ),
-                    "route_slots": {"timeWindow": {"days": days}},
-                    "user_identity": identity,
-                    "persisted": bool(answer_written or pending_written),
-                    "agent_run_result": SimpleNamespace(
-                        task_results=[object()],
-                        verified_evidence=SimpleNamespace(passed=True),
-                        evidence_gaps=[],
-                    ),
-                    "semantic_evidence": [],
-                }
-                self.services.memory_store.update_from_state(memory_state)
-                memory_written = True
-            except Exception as exc:
-                harness["memoryPersistenceError"] = "%s:%s" % (
-                    type(exc).__name__,
-                    str(exc)[:300],
-                )
+        memory_hook = dict(harness.get("personalMemoryHook") or {})
+        memory_written = bool(memory_hook.get("written"))
         response.persisted = bool(answer_written)
         harness["persistence"] = {
             "pendingAnswerWritten": pending_written,
             "answerRepositoryWritten": answer_written,
             "memoryWritten": memory_written,
+            "memoryHookStatus": str(memory_hook.get("status") or ""),
             "verifiedQueryArtifactIds": verified_query_ids,
             "verifiedRuleArtifactIds": verified_rule_ids,
             "feedbackPending": pending_written,
@@ -626,6 +864,8 @@ class GroundedApplicationRuntime:
         if self._closed:
             return
         self._closed = True
+        if self._memory_hook_executor is not None:
+            self._memory_hook_executor.shutdown(wait=True, cancel_futures=False)
         self._checkpoint_manager.close()
 
     def runtime_trace(self) -> dict[str, Any]:
@@ -672,10 +912,17 @@ def create_grounded_runtime(settings: Settings) -> GroundedApplicationRuntime:
     recall_service = HybridRecallService(settings, topic_assets)
     semantic_catalog = recall_service.semantic_catalog
     knowledge_retriever: Any
+    local_knowledge_retriever = HybridKnowledgeRetrievalService(
+        recall_service
+    )
     if settings.es_enabled:
-        knowledge_retriever = EsKnowledgeRetrievalService(settings, topic_assets)
+        knowledge_retriever = ResilientKnowledgeRetrievalService(
+            EsKnowledgeRetrievalService(settings, topic_assets),
+            local_knowledge_retriever,
+            settings=settings,
+        )
     else:
-        knowledge_retriever = HybridKnowledgeRetrievalService(recall_service)
+        knowledge_retriever = local_knowledge_retriever
 
     keyword_service = KeywordExtractService(topic_assets)
     route_slot_extractor = RouteSlotExtractor(topic_assets)

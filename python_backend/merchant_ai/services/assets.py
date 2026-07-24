@@ -461,6 +461,8 @@ def active_recall_manifest_token(settings: Settings) -> str:
 
 
 class TopicAssetService:
+    REVIEW_WORKFLOW_FILE = "review-workflow.json"
+    PENDING_RELATIONSHIPS_FILE = "relationships.json"
     SEMANTIC_LIST_FIELDS = set(ACTIVE_SEMANTIC_SIDECAR_FIELDS)
     SEMANTIC_SIDECAR_FILES = {
         "schema.json",
@@ -480,6 +482,7 @@ class TopicAssetService:
         "sample_rows.json",
         "sample_profile.json",
         "asset_production_report.json",
+        REVIEW_WORKFLOW_FILE,
     }
     GOVERNANCE_FILENAMES = {
         "semantic_version.json",
@@ -580,6 +583,22 @@ class TopicAssetService:
                 if target_path.exists() and target_path.is_file():
                     target_path.unlink()
                     deleted_files.append(name)
+            relationships_changed = False
+            pending_relationships_path = pending / self.PENDING_RELATIONSHIPS_FILE
+            if pending_relationships_path.exists() and pending_relationships_path.is_file():
+                scoped_relationships = read_json(pending_relationships_path)
+                if not isinstance(scoped_relationships, list):
+                    raise ValueError("pending relationships must be a JSON array")
+                merged_relationships = self._merge_scoped_relationships(
+                    topic,
+                    table_name,
+                    scoped_relationships,
+                )
+                relationships_path = self.root / topic / "relationships.json"
+                existing_relationships = read_json(relationships_path)
+                if existing_relationships != merged_relationships:
+                    write_json(relationships_path, merged_relationships)
+                    relationships_changed = True
             manifest_changed = self._upsert_published_manifest_entry(topic, active_asset)
             self._table_asset_cache.pop((topic, table_name), None)
             self._manifest_cache.pop(topic, None)
@@ -603,8 +622,74 @@ class TopicAssetService:
                 "unchangedFiles": unchanged_files,
                 "deletedFiles": deleted_files,
                 "manifestChanged": manifest_changed,
+                "relationshipsChanged": relationships_changed,
             }
         return {"success": True, "status": "REJECTED", "topic": topic, "tableName": table_name}
+
+    def relationships_for_table(
+        self,
+        topic: str,
+        table_name: str,
+        relationships: List[Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        source = relationships if relationships is not None else self.load_relationships(topic)
+        return [
+            dict(item)
+            for item in source
+            if isinstance(item, dict)
+            and table_name
+            in {
+                str(item.get("leftTable") or ""),
+                str(item.get("rightTable") or ""),
+            }
+        ]
+
+    def candidate_relationships(self, topic: str, table_name: str) -> List[Dict[str, Any]]:
+        pending_path = (
+            self.root
+            / topic
+            / "pending"
+            / table_name
+            / self.PENDING_RELATIONSHIPS_FILE
+        )
+        if not pending_path.exists():
+            return list(self.load_relationships(topic))
+        scoped = read_json(pending_path)
+        if not isinstance(scoped, list):
+            return list(self.load_relationships(topic))
+        return self._merge_scoped_relationships(topic, table_name, scoped)
+
+    def _merge_scoped_relationships(
+        self,
+        topic: str,
+        table_name: str,
+        scoped_relationships: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        raw_relationships = read_json(self.root / topic / "relationships.json")
+        active_relationships = (
+            raw_relationships if isinstance(raw_relationships, list) else []
+        )
+        retained = [
+            dict(item)
+            for item in active_relationships
+            if isinstance(item, dict)
+            and table_name
+            not in {
+                str(item.get("leftTable") or ""),
+                str(item.get("rightTable") or ""),
+            }
+        ]
+        replacements = [
+            dict(item)
+            for item in scoped_relationships
+            if isinstance(item, dict)
+            and table_name
+            in {
+                str(item.get("leftTable") or ""),
+                str(item.get("rightTable") or ""),
+            }
+        ]
+        return retained + replacements
 
     def load_manifest(self, topic: str) -> List[Dict[str, Any]]:
         """Return only manifest coordinates backed by an executable asset.
@@ -1140,6 +1225,36 @@ class TopicAssetService:
             "terms": len(asset.get("terms") or []),
             "knowledgeRules": len(asset.get("knowledgeRules") or []),
         }
+        target_kind = (
+            "term"
+            if suggestion_type == "term"
+            else (
+                "metric"
+                if suggestion_type == "metric"
+                and (suggestion.get("sourceFields") or suggestion.get("aggregation"))
+                else "rule"
+            )
+        )
+        conflict_resolution = apply_resolved_knowledge_conflicts_to_asset(
+            asset,
+            topic,
+            table,
+            suggestion,
+            target_kind,
+        )
+        if conflict_resolution.get("success") is not True:
+            return {
+                **conflict_resolution,
+                "success": False,
+                "topic": topic,
+                "tableName": table,
+                "suggestionId": suggestion_id,
+            }
+        asset = (
+            conflict_resolution.get("asset")
+            if isinstance(conflict_resolution.get("asset"), dict)
+            else asset
+        )
         patched_kind = "knowledgeRules"
         if suggestion_type == "term":
             patched_kind = "terms"
@@ -1195,6 +1310,12 @@ class TopicAssetService:
             "patchedKind": patched_kind,
             "before": before,
             "after": after,
+            "conflictResolution": {
+                "status": conflict_resolution.get("status"),
+                "removedKnowledgeIds": list(
+                    conflict_resolution.get("removedKnowledgeIds") or []
+                ),
+            },
             "pendingPath": str(pending),
         }
         write_json(pending / "knowledge_suggestion_patch.json", diff)
@@ -3137,6 +3258,141 @@ def upsert_semantic_suggestion_item(items: List[Dict[str, Any]], candidate: Dict
             return result
     result.append(candidate)
     return result
+
+
+def apply_resolved_knowledge_conflicts_to_asset(
+    asset: Dict[str, Any],
+    topic: str,
+    table: str,
+    suggestion: Dict[str, Any],
+    target_kind: str,
+) -> Dict[str, Any]:
+    """Apply a reviewed merge/replace decision to one pending semantic asset.
+
+    Cross-asset and cross-kind replacement is deliberately rejected. Those
+    changes require an explicit semantic-asset edit and cannot be hidden inside
+    a single Knowledge proposal publish.
+    """
+
+    payload = suggestion.get("payload") if isinstance(suggestion.get("payload"), dict) else {}
+    resolution = str(payload.get("conflictResolution") or "").strip().lower()
+    if resolution not in {"merge", "replace"}:
+        return {
+            "success": True,
+            "status": "NO_ASSET_REPLACEMENT",
+            "asset": asset,
+            "removedKnowledgeIds": [],
+        }
+    report = payload.get("conflictCheck") if isinstance(payload.get("conflictCheck"), dict) else {}
+    report_id = str(report.get("reportId") or "")
+    if not report_id or str(payload.get("conflictResolutionReportId") or "") != report_id:
+        return {
+            "success": False,
+            "status": "STALE_CONFLICT_RESOLUTION",
+            "conflictReportId": report_id,
+        }
+    relevant = [
+        item
+        for item in report.get("matches") or []
+        if isinstance(item, dict)
+        and str(item.get("scope") or "") == "platform"
+        and str(item.get("relation") or "") not in {"independent", "different_scope"}
+    ]
+    cross_asset = [
+        str(item.get("existingKnowledgeId") or "")
+        for item in relevant
+        if (
+            str(item.get("topic") or "")
+            and str(item.get("topic") or "") != topic
+        )
+        or (
+            str(item.get("tableName") or "")
+            and str(item.get("tableName") or "") != table
+        )
+    ]
+    incompatible = [
+        str(item.get("existingKnowledgeId") or "")
+        for item in relevant
+        if str(item.get("kind") or "") in {"metric", "term", "rule"}
+        and str(item.get("kind") or "") != target_kind
+    ]
+    if cross_asset or incompatible:
+        return {
+            "success": False,
+            "status": "MANUAL_CONFLICT_RESOLUTION_REQUIRED",
+            "crossAssetKnowledgeIds": cross_asset,
+            "incompatibleKnowledgeIds": incompatible,
+        }
+
+    rewritten = {**asset}
+    removed: List[str] = []
+    by_kind = {
+        "metric": "metrics",
+        "term": "terms",
+        "rule": "knowledgeRules",
+    }
+    collection_name = by_kind.get(target_kind)
+    if not collection_name:
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_CONFLICT_TARGET_KIND",
+            "targetKind": target_kind,
+        }
+    candidates = [
+        item
+        for item in relevant
+        if str(item.get("kind") or "") == target_kind
+    ]
+    retained: List[Dict[str, Any]] = []
+    for raw in rewritten.get(collection_name) or []:
+        if not isinstance(raw, dict):
+            continue
+        matched_id = ""
+        for conflict in candidates:
+            conflict_id = str(conflict.get("existingKnowledgeId") or "")
+            if target_kind == "metric":
+                metric_key = str(raw.get("metricKey") or raw.get("canonicalMetricKey") or "")
+                matched = bool(metric_key) and (
+                    conflict_id == metric_key
+                    or conflict_id.endswith(":metric:%s" % metric_key)
+                )
+            elif target_kind == "rule":
+                rule_id = str(raw.get("ruleId") or "")
+                existing_text = str(conflict.get("existingText") or "").strip()
+                content = str(raw.get("content") or raw.get("description") or "").strip()
+                matched = bool(rule_id and conflict_id == rule_id) or bool(
+                    existing_text and content == existing_text
+                )
+            else:
+                canonical = str(raw.get("term") or raw.get("canonicalName") or "")
+                title = str(conflict.get("title") or "")
+                matched = bool(canonical) and canonical == title
+            if matched:
+                matched_id = conflict_id
+                break
+        if matched_id:
+            removed.append(matched_id)
+        else:
+            retained.append(dict(raw))
+    rewritten[collection_name] = retained
+    expected = {
+        str(item.get("existingKnowledgeId") or "")
+        for item in candidates
+        if str(item.get("existingKnowledgeId") or "")
+    }
+    missing = sorted(expected - set(removed))
+    if missing:
+        return {
+            "success": False,
+            "status": "MANUAL_CONFLICT_RESOLUTION_REQUIRED",
+            "unresolvedKnowledgeIds": missing,
+        }
+    return {
+        "success": True,
+        "status": "ASSET_CONFLICTS_RESOLVED",
+        "asset": rewritten,
+        "removedKnowledgeIds": removed,
+    }
 
 
 def compact_semantic_asset_for_recall(asset: Dict[str, Any]) -> str:
@@ -8889,6 +9145,250 @@ class SemanticAssetGovernanceService:
         self.doris_repository = doris_repository
         self.topic_assets = topic_assets
 
+    def review_workflow(self, topic: str, table: str) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        payload = read_json(pending_dir / TopicAssetService.REVIEW_WORKFLOW_FILE)
+        if isinstance(payload, dict) and payload:
+            return payload
+        return {
+            "topic": topic,
+            "tableName": table,
+            "status": "DRAFT" if (pending_dir / "asset.json").exists() else "NOT_FOUND",
+            "sourceHash": semantic_candidate_source_hash(pending_dir),
+            "events": [],
+        }
+
+    def stage_review_draft(self, topic: str, table: str, actor: str) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        if not (pending_dir / "asset.json").exists():
+            return {
+                "success": False,
+                "status": "NOT_FOUND",
+                "topic": topic,
+                "tableName": table,
+            }
+        now = datetime.utcnow().isoformat() + "Z"
+        source_hash = semantic_candidate_source_hash(pending_dir)
+        previous = self.review_workflow(topic, table)
+        events = list(previous.get("events") or [])
+        events.append(
+            {
+                "action": "DRAFT_STAGED",
+                "actor": actor,
+                "at": now,
+                "sourceHash": source_hash,
+            }
+        )
+        payload = {
+            "topic": topic,
+            "tableName": table,
+            "status": "DRAFT",
+            "sourceHash": source_hash,
+            "draftedBy": actor,
+            "draftedAt": now,
+            "submittedBy": "",
+            "submittedAt": "",
+            "reviewedBy": "",
+            "reviewedAt": "",
+            "reviewNote": "",
+            "approvedSourceHash": "",
+            "publishedBy": "",
+            "publishedAt": "",
+            "events": events[-100:],
+        }
+        _atomic_write_json_file(
+            pending_dir / TopicAssetService.REVIEW_WORKFLOW_FILE,
+            payload,
+        )
+        return {"success": True, **payload}
+
+    def submit_review(
+        self,
+        topic: str,
+        table: str,
+        actor: str,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        preflight = self.preflight_publish(topic, table)
+        if not preflight.get("publishable"):
+            return {
+                "success": False,
+                "status": "PREFLIGHT_FAILED",
+                "topic": topic,
+                "tableName": table,
+                "preflight": preflight,
+            }
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        now = datetime.utcnow().isoformat() + "Z"
+        source_hash = str(preflight.get("pendingSourceHash") or "")
+        previous = self.review_workflow(topic, table)
+        events = list(previous.get("events") or [])
+        events.append(
+            {
+                "action": "SUBMITTED_FOR_REVIEW",
+                "actor": actor,
+                "at": now,
+                "sourceHash": source_hash,
+                "note": str(note or "")[:500],
+            }
+        )
+        payload = {
+            **previous,
+            "topic": topic,
+            "tableName": table,
+            "status": "PENDING_REVIEW",
+            "sourceHash": source_hash,
+            "submittedBy": actor,
+            "submittedAt": now,
+            "submissionNote": str(note or "")[:500],
+            "reviewedBy": "",
+            "reviewedAt": "",
+            "reviewNote": "",
+            "approvedSourceHash": "",
+            "publishedBy": "",
+            "publishedAt": "",
+            "events": events[-100:],
+        }
+        _atomic_write_json_file(
+            pending_dir / TopicAssetService.REVIEW_WORKFLOW_FILE,
+            payload,
+        )
+        return {"success": True, **payload, "preflight": preflight}
+
+    def review_submission(
+        self,
+        topic: str,
+        table: str,
+        actor: str,
+        approved: bool,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        workflow = self.review_workflow(topic, table)
+        if workflow.get("status") != "PENDING_REVIEW":
+            return {
+                "success": False,
+                "status": "INVALID_REVIEW_STATE",
+                "topic": topic,
+                "tableName": table,
+                "reviewWorkflow": workflow,
+            }
+        if actor == str(workflow.get("submittedBy") or ""):
+            return {
+                "success": False,
+                "status": "SELF_REVIEW_FORBIDDEN",
+                "topic": topic,
+                "tableName": table,
+                "reviewWorkflow": workflow,
+            }
+        current_hash = semantic_candidate_source_hash(pending_dir)
+        if not current_hash or current_hash != str(workflow.get("sourceHash") or ""):
+            return {
+                "success": False,
+                "status": "DRAFT_CHANGED_AFTER_SUBMISSION",
+                "topic": topic,
+                "tableName": table,
+                "expectedSourceHash": str(workflow.get("sourceHash") or ""),
+                "actualSourceHash": current_hash,
+                "reviewWorkflow": workflow,
+            }
+        now = datetime.utcnow().isoformat() + "Z"
+        status_value = "APPROVED" if approved else "REJECTED"
+        events = list(workflow.get("events") or [])
+        events.append(
+            {
+                "action": status_value,
+                "actor": actor,
+                "at": now,
+                "sourceHash": current_hash,
+                "note": str(note or "")[:500],
+            }
+        )
+        payload = {
+            **workflow,
+            "status": status_value,
+            "reviewedBy": actor,
+            "reviewedAt": now,
+            "reviewNote": str(note or "")[:500],
+            "approvedSourceHash": current_hash if approved else "",
+            "events": events[-100:],
+        }
+        _atomic_write_json_file(
+            pending_dir / TopicAssetService.REVIEW_WORKFLOW_FILE,
+            payload,
+        )
+        return {"success": True, **payload}
+
+    def authorize_publish(self, topic: str, table: str, actor: str) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        workflow = self.review_workflow(topic, table)
+        if workflow.get("status") != "APPROVED":
+            return {
+                "success": False,
+                "status": "REVIEW_REQUIRED",
+                "topic": topic,
+                "tableName": table,
+                "reviewWorkflow": workflow,
+            }
+        current_hash = semantic_candidate_source_hash(pending_dir)
+        approved_hash = str(workflow.get("approvedSourceHash") or "")
+        if not current_hash or current_hash != approved_hash:
+            return {
+                "success": False,
+                "status": "APPROVAL_STALE",
+                "topic": topic,
+                "tableName": table,
+                "expectedSourceHash": approved_hash,
+                "actualSourceHash": current_hash,
+                "reviewWorkflow": workflow,
+            }
+        if actor == str(workflow.get("submittedBy") or ""):
+            return {
+                "success": False,
+                "status": "SELF_PUBLISH_FORBIDDEN",
+                "topic": topic,
+                "tableName": table,
+                "reviewWorkflow": workflow,
+            }
+        return {
+            "success": True,
+            "status": "PUBLISH_AUTHORIZED",
+            "topic": topic,
+            "tableName": table,
+            "reviewWorkflow": workflow,
+        }
+
+    def mark_published(self, topic: str, table: str, actor: str) -> Dict[str, Any]:
+        pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
+        target_dir = self.topic_assets.table_asset_dir(topic, table)
+        workflow = self.review_workflow(topic, table)
+        now = datetime.utcnow().isoformat() + "Z"
+        events = list(workflow.get("events") or [])
+        events.append(
+            {
+                "action": "PUBLISHED",
+                "actor": actor,
+                "at": now,
+                "sourceHash": str(workflow.get("approvedSourceHash") or ""),
+            }
+        )
+        payload = {
+            **workflow,
+            "status": "PUBLISHED",
+            "publishedBy": actor,
+            "publishedAt": now,
+            "events": events[-100:],
+        }
+        _atomic_write_json_file(
+            pending_dir / TopicAssetService.REVIEW_WORKFLOW_FILE,
+            payload,
+        )
+        _atomic_write_json_file(
+            target_dir / TopicAssetService.REVIEW_WORKFLOW_FILE,
+            payload,
+        )
+        return {"success": True, **payload}
+
     def preflight_publish(self, topic: str, table: str) -> Dict[str, Any]:
         pending_dir = self.settings.resolved_topic_path / topic / "pending" / table
         if not pending_dir.exists():
@@ -8918,7 +9418,10 @@ class SemanticAssetGovernanceService:
                 semantic_column_count=len(column_name_set(semantic_schema)),
             )
         )
-        validation = validate_semantic_asset(asset, self.topic_assets.load_relationships(topic))
+        validation = validate_semantic_asset(
+            asset,
+            self.topic_assets.candidate_relationships(topic, table),
+        )
         drift_gate = schema_drift_release_gate(drift)
         validation_gate = semantic_validation_gate(validation)
         release_gate = combine_release_gates(validation_gate, drift_gate)
@@ -9107,8 +9610,17 @@ class SemanticAssetGovernanceService:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(source.read_bytes())
                 restored.append(name)
+        relationships_path = self.topic_assets.root / topic / "relationships.json"
+        relationships_snapshot = snapshot_dir / "topic_relationships.json"
+        if relationships_snapshot.exists():
+            relationships_path.parent.mkdir(parents=True, exist_ok=True)
+            relationships_path.write_bytes(relationships_snapshot.read_bytes())
+            restored.append("relationships.json")
+        elif snapshot.get("relationshipsExisted") is False and relationships_path.exists():
+            relationships_path.unlink()
         self.topic_assets._table_asset_cache.pop((topic, table), None)
         self.topic_assets._manifest_cache.pop(topic, None)
+        self.topic_assets._relationship_cache.pop(topic, None)
         self.topic_assets._semantic_source_hash_cache.clear()
         payload = {
             "success": True,
@@ -9178,11 +9690,17 @@ class SemanticAssetGovernanceService:
             if source.exists() and source.is_file():
                 shutil.copy2(source, snapshot_dir / name)
                 copied.append(name)
+        relationships_path = self.topic_assets.root / topic / "relationships.json"
+        relationships_existed = relationships_path.exists() and relationships_path.is_file()
+        if relationships_existed:
+            shutil.copy2(relationships_path, snapshot_dir / "topic_relationships.json")
+            copied.append("relationships.json")
         payload = {
             "semanticVersion": version,
             "path": str(snapshot_dir),
             "createdAt": datetime.utcnow().isoformat() + "Z",
             "files": copied,
+            "relationshipsExisted": relationships_existed,
         }
         write_json(snapshot_dir / "snapshot.json", payload)
         return payload
@@ -10859,7 +11377,12 @@ def semantic_candidate_source_hash(candidate_dir: Path) -> str:
         (
             path
             for path in candidate_dir.rglob("*")
-            if path.is_file() and path.name != "review-result.json"
+            if path.is_file()
+            and path.name
+            not in {
+                "review-result.json",
+                TopicAssetService.REVIEW_WORKFLOW_FILE,
+            }
         ),
     )
 

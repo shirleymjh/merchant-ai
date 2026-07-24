@@ -415,6 +415,9 @@ class KnowledgeSuggestionReviewRequest(APIModel):
     action: str = "review"
     topic: str = ""
     table_name: str = ""
+    conflict_resolution: str = ""
+    conflict_report_id: str = ""
+    merged_content: str = ""
     activate_immediately: bool = True
     auto_index: bool = True
 
@@ -480,6 +483,7 @@ class KnowledgeSuggestion(APIModel):
     published_ref_id: str = ""
     indexed_at: str = ""
     scope_type: str = "merchant"
+    conflict_review_status: str = ""
     merchant_action: str = ""
     actioned_by: str = ""
     actioned_at: str = ""

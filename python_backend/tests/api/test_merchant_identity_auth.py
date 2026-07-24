@@ -116,6 +116,31 @@ def test_explicitly_disabled_identity_auth_keeps_local_merchant_access(tmp_path:
     assert client.get("/api/runs?merchantId=100").status_code == 200
 
 
+def test_operator_session_cookie_authenticates_internal_governance(tmp_path: Path) -> None:
+    client, secret = authenticated_client(tmp_path)
+    client.cookies.set(
+        "yshopping_ops_session",
+        identity_token(secret, role="platform_operator"),
+    )
+
+    response = client.get("/api/topics")
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
+def test_merchant_session_cookie_cannot_open_internal_governance(tmp_path: Path) -> None:
+    client, secret = authenticated_client(tmp_path)
+    client.cookies.set(
+        "yshopping_ops_session",
+        identity_token(secret, role="merchant_owner"),
+    )
+
+    response = client.get("/api/topics")
+
+    assert response.status_code == 403
+
+
 def test_unconfigured_grounded_data_plane_is_typed_503_and_control_plane_stays_ready(
     tmp_path: Path,
     monkeypatch,
